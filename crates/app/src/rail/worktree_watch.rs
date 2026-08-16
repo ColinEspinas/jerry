@@ -92,37 +92,7 @@ pub fn spawn_worktree_watcher(repo_path: &Path, dirty: DirtyFlag) -> Option<Reco
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use std::process::Command;
     use std::time::{Duration, Instant};
-    use tempfile::TempDir;
-
-    fn git(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn init_repo() -> TempDir {
-        let dir = TempDir::new().expect("tempdir");
-        git(dir.path(), &["init", "-b", "main"]);
-        git(dir.path(), &["config", "user.email", "test@example.com"]);
-        git(dir.path(), &["config", "user.name", "Test User"]);
-        fs::write(dir.path().join("base.txt"), "base\n").expect("write");
-        git(dir.path(), &["add", "base.txt"]);
-        git(dir.path(), &["commit", "-m", "initial"]);
-        dir
-    }
 
     /// Real-time bounded wait for the watcher's async, OS-thread-delivered callback to fire -
     /// there is no deterministic/simulated clock to advance here (unlike `gpui`'s test
@@ -142,15 +112,15 @@ mod tests {
 
     #[test]
     fn a_real_worktree_add_is_noticed() {
-        let repo = init_repo();
+        let repo = crate::test_support::temp_repo();
         let dirty: DirtyFlag = Arc::new(AtomicBool::new(false));
         let _watcher =
             spawn_worktree_watcher(repo.path(), dirty.clone()).expect("spawn_worktree_watcher");
 
-        let container = TempDir::new().expect("tempdir");
+        let container = crate::test_support::temp_root();
         let linked_path = container.path().join("added-wt");
         drop(container);
-        git(
+        test_support::git(
             repo.path(),
             &[
                 "worktree",
@@ -169,11 +139,11 @@ mod tests {
 
     #[test]
     fn a_real_worktree_remove_is_noticed() {
-        let repo = init_repo();
-        let container = TempDir::new().expect("tempdir");
+        let repo = crate::test_support::temp_repo();
+        let container = crate::test_support::temp_root();
         let linked_path = container.path().join("removed-wt");
         drop(container);
-        git(
+        test_support::git(
             repo.path(),
             &[
                 "worktree",
@@ -188,7 +158,7 @@ mod tests {
         let _watcher =
             spawn_worktree_watcher(repo.path(), dirty.clone()).expect("spawn_worktree_watcher");
 
-        git(
+        test_support::git(
             repo.path(),
             &[
                 "worktree",
@@ -205,11 +175,11 @@ mod tests {
 
     #[test]
     fn a_real_worktree_lock_is_noticed() {
-        let repo = init_repo();
-        let container = TempDir::new().expect("tempdir");
+        let repo = crate::test_support::temp_repo();
+        let container = crate::test_support::temp_root();
         let linked_path = container.path().join("locked-wt");
         drop(container);
-        git(
+        test_support::git(
             repo.path(),
             &[
                 "worktree",
@@ -224,7 +194,7 @@ mod tests {
         let _watcher =
             spawn_worktree_watcher(repo.path(), dirty.clone()).expect("spawn_worktree_watcher");
 
-        git(
+        test_support::git(
             repo.path(),
             &[
                 "worktree",
@@ -246,14 +216,14 @@ mod tests {
     /// lives one level up from `worktrees/`.
     #[test]
     fn a_branch_switch_in_the_main_worktree_is_noticed() {
-        let repo = init_repo();
-        git(repo.path(), &["branch", "other"]);
+        let repo = crate::test_support::temp_repo();
+        test_support::git(repo.path(), &["branch", "other"]);
 
         let dirty: DirtyFlag = Arc::new(AtomicBool::new(false));
         let _watcher =
             spawn_worktree_watcher(repo.path(), dirty.clone()).expect("spawn_worktree_watcher");
 
-        git(repo.path(), &["checkout", "other"]);
+        test_support::git(repo.path(), &["checkout", "other"]);
 
         assert!(
             wait_until_dirty(&dirty),
@@ -265,11 +235,11 @@ mod tests {
     /// alone, since that worktree's real `HEAD` lives under there.
     #[test]
     fn a_branch_switch_in_a_linked_worktree_is_noticed() {
-        let repo = init_repo();
-        let container = TempDir::new().expect("tempdir");
+        let repo = crate::test_support::temp_repo();
+        let container = crate::test_support::temp_root();
         let linked_path = container.path().join("switch-wt");
         drop(container);
-        git(
+        test_support::git(
             repo.path(),
             &[
                 "worktree",
@@ -279,13 +249,13 @@ mod tests {
                 linked_path.to_str().expect("utf8 path"),
             ],
         );
-        git(&linked_path, &["branch", "switch-target"]);
+        test_support::git(&linked_path, &["branch", "switch-target"]);
 
         let dirty: DirtyFlag = Arc::new(AtomicBool::new(false));
         let _watcher =
             spawn_worktree_watcher(repo.path(), dirty.clone()).expect("spawn_worktree_watcher");
 
-        git(&linked_path, &["checkout", "switch-target"]);
+        test_support::git(&linked_path, &["checkout", "switch-target"]);
 
         assert!(
             wait_until_dirty(&dirty),
@@ -295,7 +265,7 @@ mod tests {
 
     #[test]
     fn a_non_repository_yields_no_watcher_rather_than_panicking() {
-        let dir = TempDir::new().expect("tempdir");
+        let dir = crate::test_support::temp_root();
         let dirty: DirtyFlag = Arc::new(AtomicBool::new(false));
         assert!(spawn_worktree_watcher(dir.path(), dirty).is_none());
     }
@@ -307,7 +277,7 @@ mod tests {
     /// that fallback, not silently missed until the next poll.
     #[test]
     fn the_very_first_worktree_add_in_a_repo_is_still_noticed_via_the_fallback_watch() {
-        let repo = init_repo();
+        let repo = crate::test_support::temp_repo();
         assert!(
             !repo.path().join(".git").join("worktrees").exists(),
             "precondition: this repo has never had a linked worktree"
@@ -322,10 +292,10 @@ mod tests {
         );
         let _watcher = watcher;
 
-        let container = TempDir::new().expect("tempdir");
+        let container = crate::test_support::temp_root();
         let linked_path = container.path().join("first-ever-wt");
         drop(container);
-        git(
+        test_support::git(
             repo.path(),
             &[
                 "worktree",

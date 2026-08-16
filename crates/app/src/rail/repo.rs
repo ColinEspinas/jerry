@@ -437,14 +437,14 @@ mod tests {
 
     #[test]
     fn a_missing_file_loads_as_empty_state_rather_than_failing() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::temp_root();
         let state = RepoState::load_at(&dir.path().join("does-not-exist.toml"));
         assert_eq!(state, RepoState::default());
     }
 
     #[test]
     fn a_corrupted_file_loads_as_empty_state_rather_than_failing() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::temp_root();
         let path = dir.path().join("repos.toml");
         std::fs::write(&path, "this is not valid toml {{{").expect("write");
         assert_eq!(RepoState::load_at(&path), RepoState::default());
@@ -455,7 +455,7 @@ mod tests {
     /// selection (unknown repo, never selected in, since deleted).
     #[test]
     fn a_remembered_worktree_is_returned_only_while_it_still_exists() {
-        let worktree = tempfile::tempdir().expect("tempdir");
+        let worktree = crate::test_support::temp_root();
         let mut state = RepoState::default();
         state.repos.insert(
             "/repo/a".to_string(),
@@ -490,7 +490,7 @@ mod tests {
 
     #[test]
     fn saving_and_loading_round_trips_a_real_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::temp_root();
         let path = dir.path().join("repos.toml");
         let mut state = RepoState::default();
         state.repos.insert(
@@ -515,7 +515,7 @@ mod tests {
 
     #[test]
     fn saving_leaves_no_temp_file_behind() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::temp_root();
         let path = dir.path().join("nested").join("repos.toml");
         let mut state = RepoState::default();
         state.repos.insert(
@@ -545,7 +545,7 @@ mod tests {
     /// a second `jerry` instance saving its own repo must not erase the first's.
     #[test]
     fn saving_merges_with_another_instances_repo_instead_of_erasing_it() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::temp_root();
         let path = dir.path().join("repos.toml");
 
         let mut instance_a = RepoState::default();
@@ -586,7 +586,7 @@ mod tests {
     /// disk.
     #[test]
     fn a_merged_save_really_deletes_an_owned_repos_entry() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::temp_root();
         let path = dir.path().join("repos.toml");
         let owned: std::collections::BTreeSet<String> =
             ["/repo/a".to_string()].into_iter().collect();
@@ -632,7 +632,7 @@ mod tests {
 
     #[test]
     fn last_focused_existing_path_is_none_when_the_remembered_directory_no_longer_exists() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::temp_root();
         let gone = dir.path().join("deleted-repo");
         std::fs::create_dir(&gone).expect("mkdir");
         let key = gone.to_str().expect("utf8 path").to_string();
@@ -663,7 +663,7 @@ mod tests {
     /// check that must reject this, not merely "something is there".
     #[test]
     fn last_focused_existing_path_is_none_when_the_remembered_path_was_replaced_by_a_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::temp_root();
         let replaced = dir.path().join("was-a-repo");
         std::fs::create_dir(&replaced).expect("mkdir");
         let key = replaced.to_str().expect("utf8 path").to_string();
@@ -698,7 +698,7 @@ mod tests {
 
     #[test]
     fn last_focused_existing_path_resolves_a_real_known_and_still_existing_repo() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::temp_root();
         let key = dir.path().to_str().expect("utf8 path").to_string();
 
         let mut state = RepoState::default();
@@ -721,7 +721,7 @@ mod tests {
     /// real mechanism GitHub issue #90's "remembers the last-opened folder" needs.
     #[test]
     fn save_merged_at_persists_last_focused() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::temp_root();
         let path = dir.path().join("repos.toml");
         let owned: std::collections::BTreeSet<String> =
             ["/repo/a".to_string()].into_iter().collect();
@@ -746,7 +746,7 @@ mod tests {
     /// separate `save_merged_at` calls simulating two real `AdeApp::focus_repo` calls.
     #[test]
     fn save_merged_at_overwrites_a_previous_last_focused_with_a_newer_one() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::temp_root();
         let path = dir.path().join("repos.toml");
         let owned: std::collections::BTreeSet<String> =
             ["/repo/a".to_string(), "/repo/b".to_string()]

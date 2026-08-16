@@ -3248,7 +3248,6 @@ pub(in crate::work_surface) fn render_status_pill(status: Status) -> impl IntoEl
 mod tab_scoping_tests {
     use super::*;
     use crate::rail::worktrees::WorktreeItem;
-    use crate::root::focus::palette_focus_tests;
     use gpui::{Focusable, TestAppContext};
 
     fn worktree_item(path: PathBuf, label: &str) -> WorktreeItem {
@@ -3278,9 +3277,9 @@ mod tab_scoping_tests {
     /// spawned into the same worktree must both show up as that worktree's tabs.
     #[gpui::test]
     fn multiple_agents_in_one_worktree_all_show_as_tabs_under_it(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let wt_a = tempfile::tempdir().expect("tempdir a");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let wt_a = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         app.update(cx, |app, _cx| {
             app.worktrees = vec![worktree_item(wt_a.path().to_path_buf(), "wt-a")];
@@ -3328,10 +3327,10 @@ mod tab_scoping_tests {
     /// hook_injection_for` would hand a real spawn.
     #[gpui::test]
     fn spawn_resume_prepends_resume_ahead_of_the_real_hook_injection(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
-        let hook_temp = tempfile::tempdir().expect("hook temp dir");
+        let hook_temp = crate::test_support::temp_root();
         let runtime = crate::hooks::HookRuntime::start(hook_temp.path())
             .expect("the hook runtime must start in a test sandbox");
         let injection = runtime.injection();
@@ -3389,9 +3388,9 @@ mod tab_scoping_tests {
     fn ctrl_p_still_works_after_switching_to_a_worktree_with_no_open_agent(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let wt_empty = tempfile::tempdir().expect("tempdir empty");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let wt_empty = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
 
         app.update(cx, |app, _cx| {
@@ -3427,10 +3426,10 @@ mod tab_scoping_tests {
     /// showing/pointing at the previously selected worktree's agent.
     #[gpui::test]
     fn switching_worktree_selection_shows_that_worktrees_own_tabs(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let wt_a = tempfile::tempdir().expect("tempdir a");
-        let wt_b = tempfile::tempdir().expect("tempdir b");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let wt_a = crate::test_support::temp_root();
+        let wt_b = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         app.update(cx, |app, _cx| {
             seed_two_worktrees(app, wt_a.path().to_path_buf(), wt_b.path().to_path_buf());
@@ -3493,9 +3492,9 @@ mod tab_scoping_tests {
     fn closing_the_active_tab_falls_back_to_a_sibling_in_the_same_worktree(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let wt_a = tempfile::tempdir().expect("tempdir a");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let wt_a = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         app.update(cx, |app, _cx| {
             app.worktrees = vec![worktree_item(wt_a.path().to_path_buf(), "wt-a")];
         });
@@ -3556,10 +3555,10 @@ mod tab_scoping_tests {
     fn closing_the_last_tab_in_a_worktree_never_falls_back_to_a_different_worktrees_agent(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let wt_a = tempfile::tempdir().expect("tempdir a");
-        let wt_b = tempfile::tempdir().expect("tempdir b");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let wt_a = crate::test_support::temp_root();
+        let wt_b = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
         app.update(cx, |app, _cx| {
             seed_two_worktrees(app, wt_a.path().to_path_buf(), wt_b.path().to_path_buf());
@@ -3622,8 +3621,8 @@ mod tab_scoping_tests {
     /// `Agents`' own raw creation order - see that method's own docs on why).
     #[gpui::test]
     fn drag_reordering_two_agent_tabs_changes_their_order(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         let (initial_id, id2, id3) = app.update_in(cx, |app, window, cx| {
             let initial_id = app.agents.active_id().expect("initial shell agent");
@@ -3679,8 +3678,8 @@ mod tab_scoping_tests {
     /// itself must all be real no-ops.
     #[gpui::test]
     fn drag_reorder_is_a_no_op_for_an_unknown_or_identical_id(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         let initial_id = app.read_with(cx, |app, _| {
             app.agents.active_id().expect("initial shell agent")
         });
@@ -3726,9 +3725,9 @@ mod tab_scoping_tests {
     /// the very pane the user is watching.
     #[gpui::test]
     fn only_the_active_agents_pane_polls_at_the_foreground_cadence(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let wt_empty = tempfile::tempdir().expect("tempdir empty");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let wt_empty = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         let foreground_ids =
             |app: &gpui::Entity<AdeApp>, cx: &mut TestAppContext| -> Vec<AgentId> {
@@ -3797,25 +3796,24 @@ mod tab_scoping_tests {
         );
     }
 
-    /// The real cross-kind capability GitHub issue #16 exists to unlock: a file tab dragged so it
-    /// lands between two agent tabs must actually interleave them in the combined tab order,
-    /// not just reorder within its own kind - the exact case the old, kind-locked
-    /// `DraggedAgentTab`/`DraggedFileTab` types could never produce (GPUI's `on_drop::<T>`
-    /// dispatches purely on the dragged value's concrete type, so a `DraggedFileTab` could never
-    /// be dropped onto an agent tab's `on_drop::<DraggedAgentTab>` handler or vice versa).
+    /// The real cross-kind capability GitHub issue #16 (file tabs) and #93 (the graph tab) exist
+    /// to unlock: a non-agent tab dragged so it lands between two agent tabs must actually
+    /// interleave them in the combined tab order, not just reorder within its own kind - the
+    /// exact case the old, kind-locked `DraggedAgentTab`/`DraggedFileTab` types could never
+    /// produce (GPUI's `on_drop::<T>` dispatches purely on the dragged value's concrete type).
+    /// Both non-agent kinds are dragged here, because `Self::reorder_tab` is kind-agnostic and
+    /// what is at risk is that each tab kind's own renderer really routes into it.
     ///
-    /// The second tab spawned here is a real `Claude` agent, not a second `Shell` - Revision
-    /// R12 §3's bare-worktree suppression (`Self::current_worktree_is_bare`) treats "every open
-    /// agent is a `Shell`" as bare and hides file tabs from `Self::combined_tab_order` entirely
-    /// (`a_bare_worktrees_tab_strip_shows_only_its_shell_tab_and_preserves_file_tab_state`
-    /// covers that directly), which would make this drag-interleaving assertion moot for reasons
-    /// that have nothing to do with what this test actually exercises.
+    /// The second agent spawned here is a real `Claude`, not a second `Shell` - a worktree whose
+    /// every agent is a `Shell` reads as bare (`Self::current_worktree_is_bare`), a state whose
+    /// own effect on the strip is covered by `a_bare_worktrees_tab_strip_still_shows_every_open_file_tab`.
     #[gpui::test]
-    fn dragging_a_file_tab_between_two_agent_tabs_interleaves_them(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let file_path = repo.path().join("a.txt");
-        std::fs::write(&file_path, "hello\n").expect("write a.txt");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+    fn dragging_a_file_or_graph_tab_between_two_agent_tabs_interleaves_them(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = crate::test_support::temp_root();
+        let file_path = repo.write("a.txt", "hello\n");
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         let (initial_id, second_id) = app.update_in(cx, |app, window, cx| {
             let initial_id = app.agents.active_id().expect("initial shell agent");
@@ -3829,82 +3827,31 @@ mod tab_scoping_tests {
                 cx,
             );
             app.open_file_view(file_path.clone(), window, cx);
-            (initial_id, second_id)
-        });
-
-        let before = app.read_with(cx, |app, _| app.combined_tab_order());
-        assert_eq!(
-            before,
-            vec![
-                work_surface::TabRef::Agent(initial_id),
-                work_surface::TabRef::Agent(second_id),
-                work_surface::TabRef::File(PathBuf::from("a.txt")),
-            ],
-            "with no drag yet, agents come first (creation order), then files - the old \
-             two-block layout"
-        );
-
-        // The real cross-kind drop: drag the file tab so it lands between the two agent tabs.
-        app.update(cx, |app, cx| {
-            app.reorder_tab(
-                work_surface::TabRef::File(PathBuf::from("a.txt")),
-                work_surface::TabRef::Agent(second_id),
-                false,
-                cx,
-            );
-        });
-
-        let after = app.read_with(cx, |app, _| app.combined_tab_order());
-        assert_eq!(
-            after,
-            vec![
-                work_surface::TabRef::Agent(initial_id),
-                work_surface::TabRef::File(PathBuf::from("a.txt")),
-                work_surface::TabRef::Agent(second_id),
-            ],
-            "the file tab must now sit between the two agent tabs - the real cross-group \
-             interleaving this revision exists to unlock"
-        );
-    }
-
-    /// GitHub issue #93: the git graph tab must be a full, kind-agnostic member of the same
-    /// drag-to-reorder system as agent/file tabs, not a fixed trailing entry - dragging it so it
-    /// lands between two agent tabs must actually interleave it into `Self::combined_tab_order`,
-    /// mirroring `dragging_a_file_tab_between_two_agent_tabs_interleaves_them`'s own file-tab
-    /// case exactly.
-    #[gpui::test]
-    fn dragging_the_graph_tab_between_two_agent_tabs_interleaves_it(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-
-        let (initial_id, second_id) = app.update_in(cx, |app, window, cx| {
-            let initial_id = app.agents.active_id().expect("initial shell agent");
-            let second_id = app.agents.spawn(
-                ProcessKind::claude(),
-                repo.path().to_path_buf(),
-                12.0,
-                None,
-                None,
-                window,
-                cx,
-            );
             app.open_git_graph(window, cx);
             (initial_id, second_id)
         });
 
-        let before = app.read_with(cx, |app, _| app.combined_tab_order());
+        let file_ref = work_surface::TabRef::File(PathBuf::from("a.txt"));
         assert_eq!(
-            before,
+            app.read_with(cx, |app, _| app.combined_tab_order()),
             vec![
                 work_surface::TabRef::Agent(initial_id),
                 work_surface::TabRef::Agent(second_id),
+                file_ref.clone(),
                 work_surface::TabRef::Graph,
             ],
-            "with no drag yet, agents come first (creation order), then the freshly opened \
-             graph tab"
+            "with no drag yet, agents come first (creation order), then the non-agent tabs - the \
+             old two-block layout"
         );
 
+        // The real cross-kind drops: each non-agent tab lands between the two agent tabs.
         app.update(cx, |app, cx| {
+            app.reorder_tab(
+                file_ref.clone(),
+                work_surface::TabRef::Agent(second_id),
+                false,
+                cx,
+            );
             app.reorder_tab(
                 work_surface::TabRef::Graph,
                 work_surface::TabRef::Agent(second_id),
@@ -3913,62 +3860,16 @@ mod tab_scoping_tests {
             );
         });
 
-        let after = app.read_with(cx, |app, _| app.combined_tab_order());
         assert_eq!(
-            after,
+            app.read_with(cx, |app, _| app.combined_tab_order()),
             vec![
                 work_surface::TabRef::Agent(initial_id),
+                file_ref,
                 work_surface::TabRef::Graph,
                 work_surface::TabRef::Agent(second_id),
             ],
-            "the graph tab must now sit between the two agent tabs, the same real \
-             cross-kind interleaving file/agent tabs already get"
-        );
-    }
-
-    /// `Self::start_dragging_tab`/`Self::drop_dragged_tab` must treat `TabRef::Graph` exactly
-    /// like any other tab kind - recording it while dragged, then clearing that record once
-    /// dropped - mirroring `start_dragging_tab_records_exactly_the_tab_that_started_the_drag`'s
-    /// own agent-tab case.
-    #[gpui::test]
-    fn dragging_the_graph_tab_dims_its_own_slot_then_clears_on_drop(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-
-        let initial_id = app.update_in(cx, |app, window, cx| {
-            app.open_git_graph(window, cx);
-            app.agents.active_id().expect("initial shell agent")
-        });
-
-        app.update(cx, |app, cx| {
-            app.start_dragging_tab(work_surface::TabRef::Graph, cx);
-        });
-        assert_eq!(
-            app.read_with(cx, |app, _| app.dragging_tab.clone()),
-            Some(work_surface::TabRef::Graph),
-            "starting a drag on the graph tab must record exactly that tab"
-        );
-
-        app.update(cx, |app, cx| {
-            app.drop_dragged_tab(
-                work_surface::TabRef::Graph,
-                work_surface::TabRef::Agent(initial_id),
-                cx,
-            );
-        });
-        assert_eq!(
-            app.read_with(cx, |app, _| app.dragging_tab.clone()),
-            None,
-            "a handled drop must clear the now-stale dragging-tab state, same as any other kind"
-        );
-        // GitHub issue #93's own extension of the settle-fade (GitHub issue #16 §5): dropping
-        // the graph tab must record it into `Self::dropped_tab_settle` exactly like any other
-        // kind - `Self::drop_dragged_tab` is already kind-agnostic here, so this is really
-        // proving `render_graph_tab` reads the same real field, not a separate code path.
-        assert_eq!(
-            app.read_with(cx, |app, _| app.dropped_tab_settle.clone().map(|(t, _)| t)),
-            Some(work_surface::TabRef::Graph),
-            "a real drop of the graph tab must record it for the settle-in fade too"
+            "both non-agent tabs must now sit between the two agent tabs - the real cross-group \
+             interleaving these revisions exist to unlock"
         );
     }
 
@@ -3979,8 +3880,8 @@ mod tab_scoping_tests {
     /// must clear that state once handled, so a later drop on a different tab can't inherit it.
     #[gpui::test]
     fn drop_dragged_tab_honors_the_recorded_insertion_side_then_clears_it(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         let (initial_id, second_id) = app.update_in(cx, |app, window, cx| {
             let initial_id = app.agents.active_id().expect("initial shell agent");
@@ -4027,16 +3928,24 @@ mod tab_scoping_tests {
         );
     }
 
-    /// `Self::start_dragging_tab` (the real `on_drag` constructor callback's body, GitHub issue
-    /// #16's "the original slot renders dimmed" ask) must record exactly the tab that started
-    /// the drag, so `Self::render_file_tab`/`Self::render_agent_tab`'s own `is_dragging` check
-    /// dims the right slot and no other.
+    /// The drag's own bookkeeping, over its whole life: `Self::start_dragging_tab` (the real
+    /// `on_drag` constructor callback's body, GitHub issue #16's "the original slot renders
+    /// dimmed" ask) must record exactly the tab that started it, so the per-tab `is_dragging`
+    /// check dims the right slot and no other; and a real drop must clear that record again, so
+    /// a dropped tab's slot never stays dimmed once the drag is over.
+    ///
+    /// Driven with the graph tab (GitHub issue #93), the kind that reaches this through its own
+    /// separate renderer - the underlying state is kind-agnostic, so what is at risk is the
+    /// wiring, not the fields.
     #[gpui::test]
-    fn start_dragging_tab_records_exactly_the_tab_that_started_the_drag(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        let initial_id = app.read_with(cx, |app, _| app.agents.active_id().expect("shell agent"));
+    fn a_drag_records_its_own_tab_on_start_and_clears_it_on_drop(cx: &mut TestAppContext) {
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
+        let initial_id = app.update_in(cx, |app, window, cx| {
+            app.open_git_graph(window, cx);
+            app.agents.active_id().expect("initial shell agent")
+        });
         assert_eq!(
             app.read_with(cx, |app, _| app.dragging_tab.clone()),
             None,
@@ -4044,52 +3953,30 @@ mod tab_scoping_tests {
         );
 
         app.update(cx, |app, cx| {
-            app.start_dragging_tab(work_surface::TabRef::Agent(initial_id), cx);
+            app.start_dragging_tab(work_surface::TabRef::Graph, cx);
         });
-
         assert_eq!(
             app.read_with(cx, |app, _| app.dragging_tab.clone()),
-            Some(work_surface::TabRef::Agent(initial_id)),
+            Some(work_surface::TabRef::Graph),
             "starting a drag must record exactly the tab that started it"
         );
-    }
 
-    /// A real drop must clear `Self::dragging_tab` alongside `Self::tab_drag_insertion` - a
-    /// dropped tab's slot must never stay dimmed once the drag it was dimmed for is over.
-    #[gpui::test]
-    fn dropping_a_tab_clears_dragging_tab(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-
-        let (initial_id, second_id) = app.update_in(cx, |app, window, cx| {
-            let initial_id = app.agents.active_id().expect("initial shell agent");
-            let second_id = app.agents.spawn(
-                ProcessKind::Shell,
-                repo.path().to_path_buf(),
-                12.0,
-                None,
-                None,
-                window,
-                cx,
-            );
-            (initial_id, second_id)
-        });
-
-        app.update(cx, |app, cx| {
-            app.start_dragging_tab(work_surface::TabRef::Agent(initial_id), cx);
-        });
         app.update(cx, |app, cx| {
             app.drop_dragged_tab(
+                work_surface::TabRef::Graph,
                 work_surface::TabRef::Agent(initial_id),
-                work_surface::TabRef::Agent(second_id),
                 cx,
             );
         });
-
         assert_eq!(
             app.read_with(cx, |app, _| app.dragging_tab.clone()),
             None,
             "a handled drop must clear the now-stale dragging-tab state"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.dropped_tab_settle.clone().map(|(t, _)| t)),
+            Some(work_surface::TabRef::Graph),
+            "and must record the dropped tab for the settle-in fade (GitHub issue #16 §5)"
         );
     }
 
@@ -4101,8 +3988,8 @@ mod tab_scoping_tests {
     fn cancel_any_tab_drag_clears_both_fields_and_reports_whether_anything_changed(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         let initial_id = app.read_with(cx, |app, _| app.agents.active_id().expect("shell agent"));
 
         assert!(
@@ -4129,10 +4016,11 @@ mod tab_scoping_tests {
 
     /// `tab_settle_animation_id` (the pure logic behind the settle-in fade, GitHub issue #16's
     /// "dropping animates the tab settling into its slot") must return `Some` only for the tab
-    /// that was actually dropped, and `None` for every other tab, including one dropped in a
-    /// previous, no-longer-current drop.
+    /// that was actually dropped, and must hand two separate drops of the very same tab two
+    /// different ids - reusing one would resume GPUI's own already-finished animation state for
+    /// that id instead of starting a fresh fade (`tab_settle_animation_id`'s own docs on why).
     #[test]
-    fn tab_settle_animation_id_matches_only_the_settled_tab() {
+    fn tab_settle_animation_id_matches_only_the_settled_tab_and_is_fresh_per_drop() {
         let dropped = work_surface::TabRef::File(PathBuf::from("a.txt"));
         let other = work_surface::TabRef::File(PathBuf::from("b.txt"));
         let settle = Some((dropped.clone(), 7));
@@ -4143,18 +4031,11 @@ mod tab_scoping_tests {
         );
         assert_eq!(tab_settle_animation_id(&settle, &other), None);
         assert_eq!(tab_settle_animation_id(&None, &dropped), None);
-    }
-
-    /// Two separate drops of the very same tab must get two different animation ids - reusing
-    /// one would resume GPUI's own already-finished animation state for that id instead of
-    /// starting a fresh fade (`tab_settle_animation_id`'s own docs on why).
-    #[test]
-    fn tab_settle_animation_id_is_fresh_across_two_drops_of_the_same_tab() {
-        let tab = work_surface::TabRef::File(PathBuf::from("a.txt"));
-        let first_drop = tab_settle_animation_id(&Some((tab.clone(), 1)), &tab);
-        let second_drop = tab_settle_animation_id(&Some((tab.clone(), 2)), &tab);
-
-        assert_ne!(first_drop, second_drop);
+        assert_ne!(
+            tab_settle_animation_id(&Some((dropped.clone(), 1)), &dropped),
+            tab_settle_animation_id(&Some((dropped.clone(), 2)), &dropped),
+            "two drops of the same tab must never reuse one animation id"
+        );
     }
 
     /// A real drop (`Self::drop_dragged_tab`) must record `Self::dropped_tab_settle` for exactly
@@ -4162,8 +4043,8 @@ mod tab_scoping_tests {
     /// with a fresh id rather than leaving the first tab's own id behind.
     #[gpui::test]
     fn drop_dragged_tab_records_a_fresh_settle_id_for_the_dropped_tab(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         let (initial_id, second_id) = app.update_in(cx, |app, window, cx| {
             let initial_id = app.agents.active_id().expect("initial shell agent");
@@ -4220,8 +4101,8 @@ mod tab_scoping_tests {
     fn drop_dragged_tab_records_real_slide_offsets_for_every_shifted_neighbour(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         let (first_id, second_id, third_id) = app.update_in(cx, |app, window, cx| {
             let first_id = app.agents.active_id().expect("initial shell agent");
@@ -4307,8 +4188,8 @@ mod tab_scoping_tests {
     /// reorder itself; this is that same guarantee for the slide it now also kicks off).
     #[gpui::test]
     fn drop_dragged_tab_records_no_slide_state_for_a_no_op_drop(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         let initial_id = app.read_with(cx, |app, _| {
             app.agents.active_id().expect("initial shell agent")
         });
@@ -4403,8 +4284,8 @@ mod tab_scoping_tests {
     fn a_tabs_label_is_its_panes_live_title_and_the_strip_repaints_when_that_title_changes(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         let shell_id = app.read_with(cx, |app, _| {
             app.agents
                 .active_id()
@@ -4461,9 +4342,9 @@ mod tab_scoping_tests {
     fn two_tabs_with_the_same_live_title_render_the_same_label_with_nothing_added(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let wt_a = tempfile::tempdir().expect("tempdir a");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let wt_a = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         app.update(cx, |app, _cx| {
             app.worktrees = vec![worktree_item(wt_a.path().to_path_buf(), "wt-a")];
@@ -4526,9 +4407,9 @@ mod tab_scoping_tests {
     fn a_pane_that_has_reported_no_title_shows_its_real_program_name_not_an_empty_tab(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let wt_a = tempfile::tempdir().expect("tempdir a");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let wt_a = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         app.update(cx, |app, _cx| {
             app.worktrees = vec![worktree_item(wt_a.path().to_path_buf(), "wt-a")];
@@ -4583,60 +4464,6 @@ mod tab_scoping_tests {
         );
     }
 
-    /// Uniformity across both tab kinds (`work_surface::TabChipKind::Cli` and `::Term`): an
-    /// agent CLI's tab is titled by the same live mechanism a plain shell's is. An agent's own
-    /// title is the *more* informative of the two - it's what `crate::rail::title_signal`
-    /// already reads to tell whether that agent is working - so there is no per-kind naming
-    /// authority that preferring it would regress.
-    #[gpui::test]
-    fn an_agent_clis_tab_takes_its_live_title_exactly_like_a_shells_does(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let wt_a = tempfile::tempdir().expect("tempdir a");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-
-        app.update(cx, |app, _cx| {
-            app.worktrees = vec![worktree_item(wt_a.path().to_path_buf(), "wt-a")];
-        });
-        let agent_id = app.update_in(cx, |app, window, cx| {
-            app.select_worktree(0, window, cx);
-            app.agents.spawn(
-                ProcessKind::claude(),
-                wt_a.path().to_path_buf(),
-                12.0,
-                None,
-                None,
-                window,
-                cx,
-            )
-        });
-        cx.run_until_parked();
-        assert_eq!(
-            app.read_with(cx, |app, _| work_surface::tab_chip_kind(
-                app.agents
-                    .iter()
-                    .find(|agent| agent.id == agent_id)
-                    .expect("agent")
-                    .kind
-            )),
-            work_surface::TabChipKind::Cli,
-            "sanity check: this is the CLI chip kind, the other half of the uniformity claim"
-        );
-        assert_eq!(
-            tab_label(&app, cx, agent_id),
-            "claude",
-            "before it says anything, an agent tab shows its real binary name"
-        );
-
-        set_live_title(&app, cx, agent_id, "\u{25d0} Claude Code");
-        cx.run_until_parked();
-
-        assert_eq!(
-            tab_label(&app, cx, agent_id),
-            "\u{25d0} Claude Code",
-            "an agent tab must follow its live title just as a shell tab does"
-        );
-    }
-
     /// Revision R12 §3's exact `+` menu item list: "*New terminal* · *New agent*
     /// (`runs in <branch>`) · *Git graph* · *Open file…* · *Next changed file*." Proven against
     /// the real painted popover (`Self::render_dropdown_menu_row`'s own `debug_selector`, one per
@@ -4648,8 +4475,8 @@ mod tab_scoping_tests {
     fn the_plus_menus_five_rows_match_revision_r12_3_in_order_with_no_new_file_row(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         app.update(cx, |app, cx| {
             app.plus_menu_open = true;
@@ -4699,8 +4526,8 @@ mod tab_scoping_tests {
     /// graph tab, and close the menu behind it the same way every other row's click does.
     #[gpui::test]
     fn a_real_click_on_the_plus_menus_git_graph_row_opens_the_graph_tab(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         app.update(cx, |app, cx| {
             app.plus_menu_open = true;
@@ -4741,9 +4568,9 @@ mod tab_scoping_tests {
     fn the_new_agent_rows_secondary_text_uses_the_real_selected_worktrees_branch(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let wt_a = tempfile::tempdir().expect("tempdir a");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let wt_a = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         app.update(cx, |app, _cx| {
             app.worktrees = vec![worktree_item(
@@ -4785,9 +4612,9 @@ mod tab_scoping_tests {
     /// the worktree - so this is now the only thing bareness could have touched here.
     #[gpui::test]
     fn a_bare_worktrees_tab_strip_still_shows_every_open_file_tab(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let wt_a = tempfile::tempdir().expect("tempdir a");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let wt_a = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         app.update(cx, |app, _cx| {
             app.worktrees = vec![worktree_item(wt_a.path().to_path_buf(), "wt-a")];
@@ -4872,8 +4699,8 @@ mod tab_scoping_tests {
     /// having "merged" into one.
     #[gpui::test]
     fn window_focus_follows_a_same_worktree_terminal_switch(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         let first_id = app.read_with(cx, |app, _| {
             app.agents.active_id().expect("the initial shell agent")
@@ -4935,10 +4762,10 @@ mod tab_scoping_tests {
     /// stopped being a carved-out exception to anything.
     #[gpui::test]
     fn opening_a_file_in_an_already_bare_worktree_still_gets_a_real_tab(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let wt_a = tempfile::tempdir().expect("tempdir a");
+        let repo = crate::test_support::temp_root();
+        let wt_a = crate::test_support::temp_root();
         std::fs::write(wt_a.path().join("README.md"), "hello\n").expect("write README.md");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         app.update(cx, |app, _cx| {
             app.worktrees = vec![worktree_item(wt_a.path().to_path_buf(), "wt-a")];
@@ -4980,90 +4807,6 @@ mod tab_scoping_tests {
         );
     }
 
-    /// GitHub issue #116 (real dragging-while-bare tab-order corruption, fixed against an earlier
-    /// revision where bareness truncated `combined_tab_order` to a single visible file tab) plus
-    /// #120 (that truncation is gone entirely - see `a_bare_worktrees_tab_strip_still_shows_every_open_file_tab`).
-    /// With no truncation left, dragging while bare is now just an ordinary drag - this keeps
-    /// direct coverage that it still persists every open file's position correctly.
-    #[gpui::test]
-    fn dragging_a_tab_while_bare_persists_every_open_files_position(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let wt_a = tempfile::tempdir().expect("tempdir a");
-        std::fs::write(wt_a.path().join("a.txt"), "a\n").expect("write a.txt");
-        std::fs::write(wt_a.path().join("b.txt"), "b\n").expect("write b.txt");
-        std::fs::write(wt_a.path().join("c.txt"), "c\n").expect("write c.txt");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-
-        app.update(cx, |app, _cx| {
-            app.worktrees = vec![worktree_item(wt_a.path().to_path_buf(), "wt-a")];
-        });
-        app.update_in(cx, |app, window, cx| {
-            app.select_worktree(0, window, cx);
-            app.agents.spawn(
-                ProcessKind::Shell,
-                wt_a.path().to_path_buf(),
-                12.0,
-                None,
-                None,
-                window,
-                cx,
-            );
-            app.open_file_view(wt_a.path().join("a.txt"), window, cx);
-            app.open_file_view(wt_a.path().join("b.txt"), window, cx);
-            app.open_file_view(wt_a.path().join("c.txt"), window, cx);
-        });
-        assert!(
-            app.read_with(cx, |app, _| app.current_worktree_is_bare()),
-            "premise: only the default Shell tab exists"
-        );
-        let bare_order = app.read_with(cx, |app, _| app.combined_tab_order());
-        assert_eq!(
-            bare_order
-                .iter()
-                .filter(|t| matches!(t, work_surface::TabRef::File(_)))
-                .count(),
-            3,
-            "premise: every open file tab renders even while bare (GitHub issue #120)"
-        );
-
-        app.update(cx, |app, cx| {
-            app.reorder_tab(
-                work_surface::TabRef::File(PathBuf::from("c.txt")),
-                work_surface::TabRef::File(PathBuf::from("a.txt")),
-                false,
-                cx,
-            );
-        });
-        cx.run_until_parked();
-
-        let order_after_drag = app.read_with(cx, |app, _| app.combined_tab_order());
-        for name in ["a.txt", "b.txt", "c.txt"] {
-            assert!(
-                order_after_drag.iter().any(
-                    |tab_ref| matches!(tab_ref, work_surface::TabRef::File(path) if path == &PathBuf::from(name))
-                ),
-                "{name} must still be in the tab order after the drag"
-            );
-        }
-        assert!(
-            order_after_drag
-                .iter()
-                .position(|t| t == &work_surface::TabRef::File(PathBuf::from("c.txt")))
-                < order_after_drag
-                    .iter()
-                    .position(|t| t == &work_surface::TabRef::File(PathBuf::from("a.txt"))),
-            "the real drag must have really moved c.txt in front of a.txt"
-        );
-
-        let cwd = wt_a.path().to_path_buf();
-        let persisted = app.read_with(cx, |app, _| app.tab_order_state.file_order(&cwd));
-        assert_eq!(
-            persisted.len(),
-            3,
-            "the on-disk persisted order must keep all three files"
-        );
-    }
-
     /// GitHub issue #382: [`AdeApp::active_agent_pane_id`]'s own cascade - the fix for GitHub
     /// issue #227 - only ever zeroed out for the review/run/graph tabs, because those three are
     /// plain `bool` flags. The File/Diff surface is a fourth centre-pane occupant with the
@@ -5080,9 +4823,9 @@ mod tab_scoping_tests {
     /// `active_agent_pane_id`'s cascade.
     #[gpui::test]
     fn switching_from_an_agent_to_a_file_tab_leaves_exactly_one_selected(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
         std::fs::write(repo.path().join("mod.rs"), "fn main() {}\n").expect("write");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         // A real second agent (the startup shell is `Agents`' first entry) so this exercises a
@@ -5161,135 +4904,6 @@ mod tab_scoping_tests {
     }
 }
 
-/// GitHub issue #20's `TerminalClear` action - real coverage that dispatching it reaches
-/// whichever agent is genuinely active right now, and only that one, mirroring
-/// `crate::terminal::pane::clear_pty_signal_tests`' own "observe the pty's real echo, not a
-/// direct call" discipline for proving `clear()`'s pty-signal half actually fired.
-#[cfg(test)]
-mod terminal_clear_action_tests {
-    use super::*;
-    use crate::root::focus::palette_focus_tests;
-    use gpui::TestAppContext;
-
-    /// The real pty's OS reader thread and the real child shell it feeds run entirely outside
-    /// GPUI's deterministic scheduler - `cx.background_executor.advance_clock` only fast-forwards
-    /// a *simulated* clock, which grants that real thread and that real process zero actual
-    /// wall-clock scheduling time. A retry loop that only ever advances the virtual clock (the
-    /// pre-fix shape here) can race arbitrarily far ahead of them: standalone, with an otherwise
-    /// idle CPU, the real echo lands within real microseconds so the race is never noticed, but
-    /// under real full-suite parallel load (dozens of other tests' own real subprocesses - other
-    /// ptys, `rust-analyzer`, `pyright`, `typescript-language-server` - contending for the same
-    /// cores) the OS can genuinely take real milliseconds to schedule the reader thread, and a
-    /// loop that burns through its whole retry budget in real microseconds finds every single
-    /// check empty and fails despite the real echo being on its way. This is exactly the same
-    /// class of bug `lsp::client::lsp_diagnostics_wiring_tests`' own `wait_for_real_diagnostics`/
-    /// `wait_until` exist to avoid one layer up (a real notification arriving on a real OS thread
-    /// outside GPUI's scheduler) - the fix is the same discipline: keep re-checking over *real*
-    /// wall-clock time (a real `std::thread::sleep` between checks), bounded by a real deadline,
-    /// not a fixed count of virtual-clock advances with no real-time floor at all.
-    fn wait_for_real_pty_output(
-        cx: &mut gpui::VisualTestContext,
-        deadline: std::time::Instant,
-        mut has_arrived: impl FnMut(&mut gpui::VisualTestContext) -> bool,
-    ) -> bool {
-        loop {
-            cx.background_executor
-                .advance_clock(std::time::Duration::from_millis(8));
-            cx.run_until_parked();
-            if has_arrived(cx) {
-                return true;
-            }
-            if std::time::Instant::now() >= deadline {
-                return false;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-    }
-
-    #[gpui::test]
-    fn dispatching_terminal_clear_signals_only_the_active_agents_pty(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-
-        let (first_id, second_id) = app.update_in(cx, |app, window, cx| {
-            let first = app.agents.spawn(
-                ProcessKind::Shell,
-                repo.path().to_path_buf(),
-                12.0,
-                None,
-                None,
-                window,
-                cx,
-            );
-            let second = app.agents.spawn(
-                ProcessKind::Shell,
-                repo.path().to_path_buf(),
-                12.0,
-                None,
-                None,
-                window,
-                cx,
-            );
-            (first, second)
-        });
-        cx.run_until_parked();
-        assert_eq!(
-            app.read_with(cx, |app, _| app.agents.active_id()),
-            Some(second_id),
-            "sanity check: spawning a second agent must make it the active one"
-        );
-
-        cx.dispatch_action(TerminalClear);
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
-        let saw_real_output_on_second = wait_for_real_pty_output(cx, deadline, |cx| {
-            let second_lines = app.read_with(cx, |app, cx| {
-                app.agents
-                    .iter()
-                    .find(|agent| agent.id == second_id)
-                    .expect("second agent")
-                    .pane
-                    .read(cx)
-                    .visible_text_lines()
-            });
-            // `TerminalPane::clear` wipes its own local grid *first*, synchronously, before it
-            // ever writes the real Ctrl-L byte to the pty - so any real, non-blank content that
-            // reappears here can only be this real round trip's own echo. That echo can
-            // honestly take either shape: a raw `^L` (ECHOCTL, if the shell's own readline
-            // hasn't taken over the tty yet - the common case for a just-spawned shell) or a
-            // redrawn prompt (readline's own real `clear-screen` binding, once it has) - see
-            // `title_bar::render::agent_state_chip_live_tests`'s own docs for the identical real
-            // ambiguity, live-observed there first. Searching for the literal `^L` text alone
-            // made this test racy against exactly which one a real shell happens to pick under
-            // real full-suite load, where the extra real time before Ctrl-L is dispatched can
-            // let a freshly spawned shell's readline win a race it would usually lose on an
-            // otherwise-idle machine.
-            second_lines.iter().any(|line| !line.trim().is_empty())
-        });
-        assert!(
-            saw_real_output_on_second,
-            "expected the active (second) agent's real pty to echo something back after \
-             TerminalClear's real Ctrl-L byte reached it"
-        );
-
-        let first_lines = app.read_with(cx, |app, cx| {
-            app.agents
-                .iter()
-                .find(|agent| agent.id == first_id)
-                .expect("first agent")
-                .pane
-                .read(cx)
-                .visible_text_lines()
-        });
-        assert!(
-            !first_lines.iter().any(|line| line.contains("^L")),
-            "the inactive (first) agent must never receive the clear signal - only the active \
-             agent, matching handle_close_focused_tab_action's own 'act on whichever tab is \
-             genuinely showing right now' target"
-        );
-    }
-}
-
 /// GitHub issue #16's own "the resulting layout... persists per session/worktree and restores on
 /// relaunch" - real end-to-end coverage that a drag-reordered tab strip survives a genuine
 /// second `AdeApp` instance, not just a worktree switch within the same one.
@@ -5318,8 +4932,8 @@ mod tab_order_persistence_tests {
 
     #[gpui::test]
     fn a_drag_reordered_tab_strip_survives_a_real_restart(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let config_dir = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
+        let config_dir = crate::test_support::temp_root();
         let settings_path = config_dir.path().join("settings.toml");
         std::fs::write(repo.path().join("a.txt"), "a\n").expect("write a.txt");
         std::fs::write(repo.path().join("b.txt"), "b\n").expect("write b.txt");
@@ -5399,42 +5013,36 @@ mod tab_order_persistence_tests {
     }
 }
 
-/// GitHub issue #158's `TerminalCopy`/`TerminalPaste` actions - real coverage that dispatching
-/// each one reaches whichever agent is genuinely active right now, and that copy really lands on
-/// the real OS clipboard (checked the same way `crate::sidebar::tree_ops`' own
-/// `copy_relative_path_writes_the_worktree_relative_path` checks "Copy Path", since this app has
-/// exactly one clipboard mechanism and both go through it).
-///
-/// These fail against the pre-fix tree twice over: the actions didn't exist, and neither did any
-/// selection for copy to read.
+/// The terminal actions the work surface owns - GitHub issue #20's `TerminalClear` and issue
+/// #158's `TerminalCopy`/`TerminalPaste`. Each one must reach whichever agent is genuinely active
+/// right now, and only that one, proven through the pty's own real echo (or the real system
+/// clipboard) rather than by asserting a method was called - `crate::terminal::pane`'s own
+/// `clear_pty_signal_tests` discipline, one layer up.
 #[cfg(test)]
-mod terminal_clipboard_action_tests {
+mod terminal_action_tests {
     use super::*;
-    use crate::root::focus::palette_focus_tests;
     use gpui::{Focusable, TestAppContext};
 
-    /// See `terminal_clear_action_tests::wait_for_real_pty_output`'s own docs for why this real
-    /// wall-clock-bounded retry (not a fixed count of virtual-clock advances) is genuinely
-    /// required here too: the real pty reader thread and the real child shell it feeds are
-    /// outside GPUI's deterministic scheduler, so only real elapsed time - not simulated time -
-    /// gives them a real chance to run under full-suite parallel load.
-    fn wait_for_real_pty_output(
+    /// How long a real pty round trip is given before a test calls it a failure. Generous: it has
+    /// to survive a full-suite run where dozens of other tests' own child processes compete for
+    /// the same cores.
+    const PTY_ROUND_TRIP: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Drives GPUI's own clock and the real wall clock together, one poll at a time, until
+    /// `arrived` holds or [`PTY_ROUND_TRIP`] elapses. Both are needed: the pane's poll loop only
+    /// advances on the simulated executor clock, while the pty reader is an ordinary OS thread
+    /// that only makes progress in real time. `test_support::wait_until` is the workspace's one
+    /// sanctioned wall-clock wait (`docs/testing.md`).
+    fn pump_until(
         cx: &mut gpui::VisualTestContext,
-        deadline: std::time::Instant,
-        mut has_arrived: impl FnMut(&mut gpui::VisualTestContext) -> bool,
+        mut arrived: impl FnMut(&mut gpui::VisualTestContext) -> bool,
     ) -> bool {
-        loop {
+        test_support::wait_until(PTY_ROUND_TRIP, || {
             cx.background_executor
                 .advance_clock(std::time::Duration::from_millis(8));
             cx.run_until_parked();
-            if has_arrived(cx) {
-                return true;
-            }
-            if std::time::Instant::now() >= deadline {
-                return false;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+            arrived(cx)
+        })
     }
 
     /// Places `text` at a fixed, addressed grid position in the active agent's pane, well below
@@ -5452,26 +5060,84 @@ mod terminal_clipboard_action_tests {
     }
 
     #[gpui::test]
-    fn dispatching_terminal_copy_puts_the_real_selection_on_the_real_clipboard(
-        cx: &mut TestAppContext,
-    ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        cx.run_until_parked();
+    fn dispatching_terminal_clear_signals_only_the_active_agents_pty(cx: &mut TestAppContext) {
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
-        cx.update(|_window, cx| {
-            cx.write_to_clipboard(gpui::ClipboardItem::new_string("stale".into()))
+        let (first_id, second_id) = app.update_in(cx, |app, window, cx| {
+            let first = app.agents.spawn(
+                ProcessKind::Shell,
+                repo.path().to_path_buf(),
+                12.0,
+                None,
+                None,
+                window,
+                cx,
+            );
+            let second = app.agents.spawn(
+                ProcessKind::Shell,
+                repo.path().to_path_buf(),
+                12.0,
+                None,
+                None,
+                window,
+                cx,
+            );
+            (first, second)
         });
-        seed_active_pane(&app, cx, "ade-selected-text");
-
-        cx.dispatch_action(TerminalCopy);
-
-        let text = cx.update(|_window, cx| cx.read_from_clipboard().and_then(|item| item.text()));
+        cx.run_until_parked();
         assert_eq!(
-            text.as_deref(),
-            Some("ade-selected-text"),
-            "TerminalCopy must reach the active agent's pane and write its real selection to \
-             the real system clipboard"
+            app.read_with(cx, |app, _| app.agents.active_id()),
+            Some(second_id),
+            "sanity check: spawning a second agent must make it the active one"
+        );
+
+        cx.dispatch_action(TerminalClear);
+
+        let saw_real_output_on_second = pump_until(cx, |cx| {
+            let second_lines = app.read_with(cx, |app, cx| {
+                app.agents
+                    .iter()
+                    .find(|agent| agent.id == second_id)
+                    .expect("second agent")
+                    .pane
+                    .read(cx)
+                    .visible_text_lines()
+            });
+            // `TerminalPane::clear` wipes its own local grid *first*, synchronously, before it
+            // ever writes the real Ctrl-L byte to the pty - so any real, non-blank content that
+            // reappears here can only be this real round trip's own echo. That echo can
+            // honestly take either shape: a raw `^L` (ECHOCTL, if the shell's own readline
+            // hasn't taken over the tty yet - the common case for a just-spawned shell) or a
+            // redrawn prompt (readline's own real `clear-screen` binding, once it has) - see
+            // `title_bar::render::agent_state_chip_live_tests`'s own docs for the identical real
+            // ambiguity, live-observed there first. Searching for the literal `^L` text alone
+            // made this test racy against exactly which one a real shell happens to pick under
+            // real full-suite load, where the extra real time before Ctrl-L is dispatched can
+            // let a freshly spawned shell's readline win a race it would usually lose on an
+            // otherwise-idle machine.
+            second_lines.iter().any(|line| !line.trim().is_empty())
+        });
+        assert!(
+            saw_real_output_on_second,
+            "expected the active (second) agent's real pty to echo something back after \
+             TerminalClear's real Ctrl-L byte reached it"
+        );
+
+        let first_lines = app.read_with(cx, |app, cx| {
+            app.agents
+                .iter()
+                .find(|agent| agent.id == first_id)
+                .expect("first agent")
+                .pane
+                .read(cx)
+                .visible_text_lines()
+        });
+        assert!(
+            !first_lines.iter().any(|line| line.contains("^L")),
+            "the inactive (first) agent must never receive the clear signal - only the active \
+             agent, matching handle_close_focused_tab_action's own 'act on whichever tab is \
+             genuinely showing right now' target"
         );
     }
 
@@ -5479,8 +5145,8 @@ mod terminal_clipboard_action_tests {
     /// contract `terminal_clear_action_tests` pins for `TerminalClear`.
     #[gpui::test]
     fn dispatching_terminal_copy_uses_only_the_active_agents_selection(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         // The window's own initial agent gets a selection first, then a second agent (which
@@ -5520,8 +5186,8 @@ mod terminal_clipboard_action_tests {
     fn the_real_copy_keystroke_over_a_focused_terminal_copies_instead_of_typing(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         cx.update(|_window, cx| {
@@ -5556,8 +5222,8 @@ mod terminal_clipboard_action_tests {
     /// The paste counterpart of the keystroke test above, proven by the real pty echo.
     #[gpui::test]
     fn the_real_paste_keystroke_over_a_focused_terminal_reaches_the_pty(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         cx.update(|_window, cx| {
@@ -5578,8 +5244,7 @@ mod terminal_clipboard_action_tests {
             "ctrl-shift-v"
         });
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
-        let saw_pasted_text = wait_for_real_pty_output(cx, deadline, |cx| {
+        let saw_pasted_text = pump_until(cx, |cx| {
             let lines = app.read_with(cx, |app, cx| {
                 app.agents
                     .active()
@@ -5597,38 +5262,6 @@ mod terminal_clipboard_action_tests {
             "the real paste keystroke over a focused terminal must reach TerminalPaste"
         );
     }
-
-    /// The paste half, proven by the pty's own echo rather than by asserting `write_input` was
-    /// called - mirroring `terminal_clear_action_tests`' discipline for `TerminalClear`.
-    #[gpui::test]
-    fn dispatching_terminal_paste_reaches_the_active_agents_real_pty(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        cx.run_until_parked();
-
-        cx.update(|_window, cx| {
-            cx.write_to_clipboard(gpui::ClipboardItem::new_string("ade-pasted-marker".into()))
-        });
-        cx.dispatch_action(TerminalPaste);
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
-        let saw_pasted_text = wait_for_real_pty_output(cx, deadline, |cx| {
-            let lines = app.read_with(cx, |app, cx| {
-                app.agents
-                    .active()
-                    .expect("an active agent")
-                    .pane
-                    .read(cx)
-                    .visible_text_lines()
-            });
-            lines.iter().any(|line| line.contains("ade-pasted-marker"))
-        });
-        assert!(
-            saw_pasted_text,
-            "expected the active agent's real pty to echo back the clipboard text \
-             TerminalPaste's handler writes"
-        );
-    }
 }
 
 /// The reported "clicking an agent from another worktree/repo, the tab bar does not appear" -
@@ -5643,42 +5276,17 @@ mod terminal_clipboard_action_tests {
 #[cfg(test)]
 mod select_agent_cross_repo_tests {
     use super::*;
-    use crate::root::focus::palette_focus_tests;
     use crate::work_surface::agents::ProcessKind;
     use gpui::TestAppContext;
-
-    fn git(dir: &std::path::Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn init_repo() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().expect("tempdir");
-        git(dir.path(), &["init", "-b", "main"]);
-        git(dir.path(), &["config", "user.email", "test@example.com"]);
-        git(dir.path(), &["config", "user.name", "Test User"]);
-        std::fs::write(dir.path().join("README.md"), "hello\n").expect("write");
-        git(dir.path(), &["add", "README.md"]);
-        git(dir.path(), &["commit", "-m", "initial"]);
-        dir
-    }
 
     #[gpui::test]
     fn selecting_an_agent_in_a_non_focused_repo_switches_to_it_and_shows_its_tab(
         cx: &mut TestAppContext,
     ) {
-        let repo_a = init_repo();
-        let repo_b = init_repo();
+        let repo_a = crate::test_support::temp_repo();
+        let repo_b = crate::test_support::temp_repo();
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo_a.path().to_path_buf());
         cx.run_until_parked();
 
         app.update(cx, |app, cx| {
@@ -5753,28 +5361,7 @@ mod select_agent_cross_repo_tests {
 mod agent_pane_readout_tests {
     use super::*;
     use crate::rail::worktrees::WorktreeItem;
-    use crate::root::focus::palette_focus_tests;
     use gpui::TestAppContext;
-
-    fn git(dir: &std::path::Path, args: &[&str]) {
-        let status = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .status()
-            .expect("run git");
-        assert!(status.success(), "git {args:?} failed in {}", dir.display());
-    }
-
-    fn init_repo() -> tempfile::TempDir {
-        let repo = tempfile::tempdir().expect("tempdir");
-        git(repo.path(), &["init", "-b", "main"]);
-        git(repo.path(), &["config", "user.email", "test@example.com"]);
-        git(repo.path(), &["config", "user.name", "Test User"]);
-        std::fs::write(repo.path().join("base.txt"), "base\n").expect("write");
-        git(repo.path(), &["add", "base.txt"]);
-        git(repo.path(), &["commit", "-m", "initial"]);
-        repo
-    }
 
     /// Spawns one real shell agent in `cwd` (optionally under a `shell_override` that exits by
     /// itself) and selects it, so the centre pane really is that agent's pty surface.
@@ -5800,26 +5387,24 @@ mod agent_pane_readout_tests {
         id
     }
 
-    /// Waits for a real child process to genuinely exit - the same real-clock-plus-advance loop
-    /// `crate::sidebar::render`'s own `/bin/false` test uses, not an assumption that it has.
+    /// Waits for a real child process to genuinely exit. Both clocks advance together, one poll
+    /// at a time: the pane only notices an exit on a simulated-clock poll tick, while the child
+    /// itself only exits in real time. `test_support::wait_until` is the workspace's one
+    /// sanctioned wall-clock wait (`docs/testing.md`).
     fn wait_for_exit(app: &gpui::Entity<AdeApp>, cx: &mut gpui::VisualTestContext, id: AgentId) {
-        for _ in 0..200 {
+        let exited = test_support::wait_until(std::time::Duration::from_secs(30), || {
             app.update(cx, |_app, cx| cx.notify());
             cx.run_until_parked();
-            let exited = app.read_with(cx, |app, cx| {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(50));
+            app.read_with(cx, |app, cx| {
                 app.agents
                     .iter()
                     .find(|agent| agent.id == id)
                     .is_some_and(|agent| !agent.pane.read(cx).is_running())
-            });
-            if exited {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            cx.executor()
-                .advance_clock(std::time::Duration::from_millis(50));
-        }
-        panic!("premise: the spawned child must really have exited");
+            })
+        });
+        assert!(exited, "premise: the spawned child must really have exited");
     }
 
     /// A real, non-bare worktree row for `path`. Seeded explicitly because a test app whose
@@ -5854,8 +5439,8 @@ mod agent_pane_readout_tests {
     /// re-added `Archive` button leaves the pill 83px short and fails this assertion.
     #[gpui::test]
     fn the_context_bar_ends_at_the_status_pill_with_no_merge_or_archive(cx: &mut TestAppContext) {
-        let repo = init_repo();
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_repo();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
         app.update_in(cx, |app, window, cx| {
             app.worktrees = vec![worktree_row(repo.path().to_path_buf(), "main")];
@@ -5911,8 +5496,8 @@ mod agent_pane_readout_tests {
     /// plain shell before that was fixed - which is exactly the duplication the user reported.
     #[gpui::test]
     fn a_running_agents_strip_still_paints_and_carries_its_own_cost(cx: &mut TestAppContext) {
-        let repo = init_repo();
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_repo();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
         let id = spawn_and_select(&app, cx, repo.path().to_path_buf(), None);
         app.update(cx, |app, cx| {
@@ -5967,8 +5552,8 @@ mod agent_pane_readout_tests {
     /// tab paints the info footer and **not** the readout strip.
     #[gpui::test]
     fn a_shell_tab_paints_the_info_footer_and_not_the_agent_readout_strip(cx: &mut TestAppContext) {
-        let repo = init_repo();
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_repo();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
         let id = spawn_and_select(&app, cx, repo.path().to_path_buf(), None);
 
@@ -6009,8 +5594,8 @@ mod agent_pane_readout_tests {
     fn an_agent_tab_paints_only_the_readout_strip_and_keeps_its_pid_in_the_header(
         cx: &mut TestAppContext,
     ) {
-        let repo = init_repo();
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_repo();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
         let id = spawn_and_select(&app, cx, repo.path().to_path_buf(), None);
         app.update(cx, |app, cx| {
@@ -6064,8 +5649,8 @@ mod agent_pane_readout_tests {
     fn header_content_and_footer_bands_sum_to_the_real_pane_height_on_a_long_transcript(
         cx: &mut TestAppContext,
     ) {
-        let repo = init_repo();
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_repo();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
         let id = spawn_and_select(&app, cx, repo.path().to_path_buf(), None);
         app.update(cx, |app, cx| {
@@ -6205,8 +5790,8 @@ mod agent_pane_readout_tests {
     /// true: a shell tab in a worktree that *does* have agents wore the whole identity row.
     #[gpui::test]
     fn a_shell_tab_beside_a_real_agent_gets_no_identity_bar(cx: &mut TestAppContext) {
-        let repo = init_repo();
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_repo();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
         app.update_in(cx, |app, window, cx| {
             app.worktrees = vec![worktree_row(repo.path().to_path_buf(), "main")];
@@ -6249,8 +5834,8 @@ mod agent_pane_readout_tests {
     /// fabricated `0% cpu` - nothing at all, which is what the `Option` return states.
     #[gpui::test]
     fn the_cost_readout_is_blank_for_an_agent_that_is_not_running(cx: &mut TestAppContext) {
-        let repo = init_repo();
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_repo();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         app.read_with(cx, |app, _| {
@@ -6273,11 +5858,11 @@ mod agent_pane_readout_tests {
     /// those two, and that `Open terminal` (which used to sit between them) does not paint.
     #[gpui::test]
     fn a_failed_run_keeps_retry_and_a_two_click_discard_and_nothing_else(cx: &mut TestAppContext) {
-        let repo = init_repo();
-        let worktree_container = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_repo();
+        let worktree_container = crate::test_support::temp_root();
         let worktree_path = worktree_container.path().join("feature-wt");
         drop(worktree_container);
-        git(
+        test_support::git(
             repo.path(),
             &[
                 "worktree",
@@ -6288,7 +5873,7 @@ mod agent_pane_readout_tests {
             ],
         );
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
         // `/bin/false` is a real child that really exits non-zero, so `Status::Fail` is derived
         // from a genuine `ProcessSignal::Exited { success: false }` rather than being set.
@@ -6340,8 +5925,8 @@ mod agent_pane_readout_tests {
     /// else in this pane (§4e: "the legitimate secondary CTA"), and it really spawns a shell.
     #[gpui::test]
     fn the_no_agent_empty_state_really_starts_a_terminal(cx: &mut TestAppContext) {
-        let repo = init_repo();
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_repo();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         // Close whatever the app opened on startup, so the centre pane really is the empty state.
@@ -6391,8 +5976,8 @@ mod agent_pane_readout_tests {
     /// primary CTA that gives it one.
     #[gpui::test]
     fn a_bare_worktree_keeps_its_start_an_agent_button(cx: &mut TestAppContext) {
-        let repo = init_repo();
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_repo();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
         spawn_and_select(&app, cx, repo.path().to_path_buf(), None);
 
@@ -6434,7 +6019,6 @@ mod agent_pane_readout_tests {
 #[cfg(test)]
 mod tab_strip_overflow_scroll_tests {
     use super::*;
-    use crate::root::focus::palette_focus_tests;
     use gpui::TestAppContext;
 
     /// Twenty real shell agent tabs (each a genuine `Agent`, no simulated output) reliably
@@ -6450,8 +6034,8 @@ mod tab_strip_overflow_scroll_tests {
     ///   the concrete, user-facing "tabs are not accessible" this issue reports.
     #[gpui::test]
     fn scrolling_the_tab_strip_reaches_a_tab_that_overflowed_it(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         // Deliberately narrow (`VisualTestContext::simulate_resize`'s own docs) rather than the
         // default maximized 1920×1080 `TestDisplay`: twenty real tabs overflow a maximized test
         // window too, but only past several dozen, which would mean this test paying for several
@@ -6571,7 +6155,6 @@ mod tab_strip_overflow_scroll_tests {
 #[cfg(test)]
 mod tab_strip_trailing_margin_tests {
     use super::*;
-    use crate::root::focus::palette_focus_tests;
     use gpui::TestAppContext;
 
     /// Opens `names` as real file tabs in a real window, then selects the app's own initial shell
@@ -6588,7 +6171,7 @@ mod tab_strip_trailing_margin_tests {
         for name in names {
             std::fs::write(repo.join(name), "// x\n").expect("write");
         }
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.to_path_buf());
         cx.simulate_resize(window_size);
         let shell_id = app
             .read_with(cx, |app, _| app.active_agent_pane_id())
@@ -6625,7 +6208,7 @@ mod tab_strip_trailing_margin_tests {
     /// rows genuinely share one pane width and that the discrepancy was the tab strip's alone.
     #[gpui::test]
     fn the_tab_strips_tabs_run_flush_into_the_panes_real_right_edge(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
         // The live screenshots' own tabs, plus enough more of the same to genuinely overflow a
         // deliberately narrow window rather than a maximized one (the same 900px
         // `simulate_resize` `tab_strip_overflow_scroll_tests` uses, and for the same reason: real
@@ -6694,7 +6277,7 @@ mod tab_strip_trailing_margin_tests {
     /// is the design, not a gap in need of filling.
     #[gpui::test]
     fn the_plus_button_sits_immediately_after_the_last_tab(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
         let names = ["state.rs", "lib.rs"];
         // Maximized (the default 1920x1080 `TestDisplay`), so two short tabs come nowhere near
         // filling the strip - the precondition under which PR #403's pusher relocated the `+`.

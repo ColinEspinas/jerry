@@ -518,7 +518,7 @@ mod tests {
 
     #[test]
     fn saving_and_reloading_round_trips_through_a_real_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::temp_root();
         let path = dir.path().join("tab-order.toml");
         let root = Path::new("/repo/worktree-a");
 
@@ -536,7 +536,7 @@ mod tests {
 
     #[test]
     fn saving_merges_with_another_instances_entries_instead_of_erasing_them() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::temp_root();
         let path = dir.path().join("tab-order.toml");
         let a = Path::new("/repo/worktree-a");
         let b = Path::new("/repo/worktree-b");
@@ -562,14 +562,14 @@ mod tests {
 
     #[test]
     fn a_missing_file_loads_as_empty_state_rather_than_failing() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::temp_root();
         let state = TabOrderState::load_at(&dir.path().join("does-not-exist.toml"));
         assert_eq!(state, TabOrderState::default());
     }
 
     #[test]
     fn a_corrupted_file_loads_as_empty_state_rather_than_failing() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::temp_root();
         let path = dir.path().join("tab-order.toml");
         std::fs::write(&path, "this is not valid toml {{{").expect("write");
         assert_eq!(TabOrderState::load_at(&path), TabOrderState::default());
@@ -577,7 +577,7 @@ mod tests {
 
     #[test]
     fn a_traversal_entry_in_a_hand_edited_file_is_ignored() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::temp_root();
         let path = dir.path().join("tab-order.toml");
         std::fs::write(
             &path,
@@ -595,7 +595,7 @@ mod tests {
 
     #[test]
     fn saving_leaves_no_temp_file_behind_and_the_result_parses() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::temp_root();
         let path = dir.path().join("nested").join("tab-order.toml");
         let root = Path::new("/repo/worktree-a");
         let mut state = TabOrderState::default();
@@ -622,7 +622,7 @@ mod tests {
     /// payload, and the real interleaved *order* intact.
     #[test]
     fn a_mixed_session_round_trips_through_a_real_file_with_its_order_intact() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::temp_root();
         let path = dir.path().join("tab-order.toml");
         let root = Path::new("/repo/worktree-a");
         let session = vec![
@@ -701,7 +701,7 @@ mod tests {
     /// order, and must still be restored rather than silently ignored.
     #[test]
     fn a_file_written_before_sessions_existed_still_restores_its_file_tabs() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::temp_root();
         let path = dir.path().join("tab-order.toml");
         std::fs::write(
             &path,
@@ -724,7 +724,7 @@ mod tests {
     /// the real tabs recorded around it.
     #[test]
     fn an_unrecognised_record_is_skipped_without_losing_the_real_tabs_around_it() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::temp_root();
         let path = dir.path().join("tab-order.toml");
         std::fs::write(
             &path,
@@ -754,7 +754,7 @@ mod tests {
     /// `..` path must never decode into a file outside the worktree it is filed under.
     #[test]
     fn a_traversal_session_entry_in_a_hand_edited_file_is_ignored() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::temp_root();
         let path = dir.path().join("tab-order.toml");
         std::fs::write(
             &path,

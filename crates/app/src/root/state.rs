@@ -2396,61 +2396,22 @@ mod tests {
 #[cfg(test)]
 mod load_worktrees_integration_tests {
     use super::*;
-    use crate::root::focus::palette_focus_tests;
     use gpui::TestAppContext;
     use std::fs;
     use std::path::Path;
-    use std::process::Command;
-    use tempfile::TempDir;
-
-    fn git(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn init_repo() -> TempDir {
-        let dir = TempDir::new().expect("tempdir");
-        git(dir.path(), &["init", "-b", "main"]);
-        git(dir.path(), &["config", "user.email", "test@example.com"]);
-        git(dir.path(), &["config", "user.name", "Test User"]);
-        fs::write(dir.path().join("base.txt"), "base\n").expect("write");
-        git(dir.path(), &["add", "base.txt"]);
-        git(dir.path(), &["commit", "-m", "initial"]);
-        dir
-    }
 
     fn add_worktree(repo_path: &Path, branch: &str, name: &str) -> PathBuf {
-        let container = TempDir::new().expect("tempdir");
+        let container = crate::test_support::temp_root();
         let path = container.path().join(name);
         drop(container);
-        git(
-            repo_path,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                branch,
-                path.to_str().expect("utf8 path"),
-            ],
-        );
+        test_support::add_worktree(repo_path, branch, &path);
         path
     }
 
     #[gpui::test]
     fn a_real_worktree_add_appears_after_a_refresh(cx: &mut TestAppContext) {
-        let repo = init_repo();
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_repo();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
         assert_eq!(
             app.read_with(cx, |app, _| app.worktrees.len()),
@@ -2475,9 +2436,9 @@ mod load_worktrees_integration_tests {
 
     #[gpui::test]
     fn a_real_worktree_remove_disappears_after_a_refresh(cx: &mut TestAppContext) {
-        let repo = init_repo();
+        let repo = crate::test_support::temp_repo();
         let feature = add_worktree(repo.path(), "feature", "removed-wt");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
         assert_eq!(app.read_with(cx, |app, _| app.worktrees.len()), 2);
 
@@ -2497,12 +2458,12 @@ mod load_worktrees_integration_tests {
 
     #[gpui::test]
     fn a_real_lock_with_reason_is_reflected_after_a_refresh(cx: &mut TestAppContext) {
-        let repo = init_repo();
+        let repo = crate::test_support::temp_repo();
         let feature = add_worktree(repo.path(), "feature", "locked-wt");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
-        git(
+        test_support::git(
             repo.path(),
             &[
                 "worktree",
@@ -2533,9 +2494,9 @@ mod load_worktrees_integration_tests {
     fn a_manually_deleted_worktree_directory_is_marked_broken_after_a_refresh(
         cx: &mut TestAppContext,
     ) {
-        let repo = init_repo();
+        let repo = crate::test_support::temp_repo();
         let feature = add_worktree(repo.path(), "feature", "gone-wt");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         fs::remove_dir_all(&feature).expect("manually delete the worktree directory");
@@ -2559,9 +2520,9 @@ mod load_worktrees_integration_tests {
     fn selection_survives_a_refresh_when_the_selected_worktree_is_still_present(
         cx: &mut TestAppContext,
     ) {
-        let repo = init_repo();
+        let repo = crate::test_support::temp_repo();
         let feature = add_worktree(repo.path(), "feature", "stays-wt");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         let feature_index = app
@@ -2607,9 +2568,9 @@ mod load_worktrees_integration_tests {
     fn selecting_a_worktree_then_really_removing_it_falls_back_to_main_with_a_notice(
         cx: &mut TestAppContext,
     ) {
-        let repo = init_repo();
+        let repo = crate::test_support::temp_repo();
         let feature = add_worktree(repo.path(), "feature", "vanishes-wt");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         let feature_index = app
@@ -2676,44 +2637,14 @@ mod load_worktrees_integration_tests {
 #[cfg(test)]
 mod multi_repo_worktree_loading_tests {
     use super::*;
-    use crate::root::focus::palette_focus_tests;
     use gpui::TestAppContext;
     use std::path::Path;
-    use std::process::Command;
-    use tempfile::TempDir;
-
-    fn git(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn init_repo() -> TempDir {
-        let dir = TempDir::new().expect("tempdir");
-        git(dir.path(), &["init", "-b", "main"]);
-        git(dir.path(), &["config", "user.email", "test@example.com"]);
-        git(dir.path(), &["config", "user.name", "Test User"]);
-        std::fs::write(dir.path().join("base.txt"), "base\n").expect("write");
-        git(dir.path(), &["add", "base.txt"]);
-        git(dir.path(), &["commit", "-m", "initial"]);
-        dir
-    }
 
     fn add_worktree(repo_path: &Path, branch: &str, name: &str) {
-        let container = TempDir::new().expect("tempdir");
+        let container = crate::test_support::temp_root();
         let path = container.path().join(name);
         drop(container);
-        git(
+        test_support::git(
             repo_path,
             &[
                 "worktree",
@@ -2730,9 +2661,9 @@ mod multi_repo_worktree_loading_tests {
     /// the currently focused repo A's.
     #[gpui::test]
     fn a_non_focused_repos_worktrees_load_in_the_background(cx: &mut TestAppContext) {
-        let repo_a = init_repo();
-        let repo_b = init_repo();
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        let repo_a = crate::test_support::temp_repo();
+        let repo_b = crate::test_support::temp_repo();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo_a.path().to_path_buf());
         cx.run_until_parked();
 
         let repo_b_id = app.update(cx, |app, cx| app.add_repo(repo_b.path().to_path_buf(), cx));
@@ -2793,12 +2724,12 @@ mod multi_repo_worktree_loading_tests {
     /// gives the focused repo's own `AdeApp::worktrees_error` case on a real fetch failure.
     #[gpui::test]
     fn a_repo_whose_path_disappears_before_its_first_load_does_not_panic(cx: &mut TestAppContext) {
-        let repo_a = init_repo();
-        let doomed = TempDir::new().expect("tempdir");
+        let repo_a = crate::test_support::temp_repo();
+        let doomed = crate::test_support::temp_root();
         let doomed_path = doomed.path().to_path_buf();
-        git(&doomed_path, &["init", "-b", "main"]);
+        test_support::git(&doomed_path, &["init", "-b", "main"]);
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo_a.path().to_path_buf());
         cx.run_until_parked();
 
         let doomed_id = app.update(cx, |app, cx| app.add_repo(doomed_path.clone(), cx));
@@ -2834,9 +2765,9 @@ mod multi_repo_worktree_loading_tests {
     fn a_non_focused_repos_worktrees_are_not_refetched_before_the_poll_interval_elapses(
         cx: &mut TestAppContext,
     ) {
-        let repo_a = init_repo();
-        let repo_b = init_repo();
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        let repo_a = crate::test_support::temp_repo();
+        let repo_b = crate::test_support::temp_repo();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo_a.path().to_path_buf());
         cx.run_until_parked();
 
         let repo_b_id = app.update(cx, |app, cx| app.add_repo(repo_b.path().to_path_buf(), cx));
@@ -2908,11 +2839,13 @@ mod multi_repo_worktree_loading_tests {
     fn the_periodic_sweep_refreshes_every_repo_even_with_more_than_the_concurrency_cap(
         cx: &mut TestAppContext,
     ) {
-        let repo_focused = init_repo();
+        let repo_focused = crate::test_support::temp_repo();
         let extra_count = REPO_WORKTREES_FETCH_CONCURRENCY * 2 + 1;
-        let extra_repos: Vec<TempDir> = (0..extra_count).map(|_| init_repo()).collect();
+        let extra_repos: Vec<crate::test_support::TempRoot> = (0..extra_count)
+            .map(|_| crate::test_support::temp_repo())
+            .collect();
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_focused.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo_focused.path().to_path_buf());
         cx.run_until_parked();
 
         let extra_ids: Vec<RepoId> = extra_repos
@@ -2974,35 +2907,7 @@ mod file_tree_watch_integration_tests {
     use crate::root::AdeApp;
     use crate::settings::store as settings_store;
     use gpui::TestAppContext;
-    use std::fs;
-    use std::path::{Path, PathBuf};
-    use std::process::Command;
-    use tempfile::TempDir;
-
-    fn git(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}",
-            args,
-            dir
-        );
-    }
-
-    fn init_repo() -> TempDir {
-        let dir = TempDir::new().expect("tempdir");
-        git(dir.path(), &["init", "-b", "main"]);
-        git(dir.path(), &["config", "user.email", "test@example.com"]);
-        git(dir.path(), &["config", "user.name", "Test User"]);
-        fs::write(dir.path().join("base.txt"), "base\n").expect("write");
-        git(dir.path(), &["add", "base.txt"]);
-        git(dir.path(), &["commit", "-m", "initial"]);
-        dir
-    }
+    use std::path::PathBuf;
 
     /// `Self::start_file_tree_watch` only ever arms a real watcher for a real, `Some` settings
     /// path (see that method's own docs on why) - `root::focus::palette_focus_tests::
@@ -3012,7 +2917,7 @@ mod file_tree_watch_integration_tests {
         cx: &mut TestAppContext,
         repo_path: PathBuf,
     ) -> (gpui::Entity<AdeApp>, &mut gpui::VisualTestContext) {
-        let config_dir = tempfile::tempdir().expect("tempdir");
+        let config_dir = crate::test_support::temp_root();
         let settings_path = config_dir.path().join("settings.toml");
         // Leaked deliberately: `config_dir` must outlive the returned `AdeApp`, and this helper
         // has no later point to drop it at - the OS reclaims it at process exit either way, the
@@ -3032,7 +2937,7 @@ mod file_tree_watch_integration_tests {
 
     #[gpui::test]
     fn opening_the_app_arms_a_real_file_tree_watcher(cx: &mut TestAppContext) {
-        let repo = init_repo();
+        let repo = crate::test_support::temp_repo();
         let (app, cx) = open_test_app_with_real_settings_path(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
@@ -3044,11 +2949,11 @@ mod file_tree_watch_integration_tests {
 
     #[gpui::test]
     fn selecting_a_different_worktree_re_arms_the_watcher_on_the_new_root(cx: &mut TestAppContext) {
-        let repo = init_repo();
-        let container = TempDir::new().expect("tempdir");
+        let repo = crate::test_support::temp_repo();
+        let container = crate::test_support::temp_root();
         let linked_path = container.path().join("added-wt");
         drop(container);
-        git(
+        test_support::git(
             repo.path(),
             &[
                 "worktree",

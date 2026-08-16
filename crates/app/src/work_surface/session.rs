@@ -357,40 +357,20 @@ mod session_restore_tests {
     use crate::rail::status::Status;
     use crate::settings::store as settings_store;
     use gpui::TestAppContext;
-    use std::process::Command;
-    use tempfile::TempDir;
-
-    fn git(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(output.status.success(), "git {args:?} failed in {dir:?}");
-    }
 
     /// A real repo with a real initial commit, so `git worktree list --porcelain` reports a real
     /// main-worktree row for the app to select - and so `git worktree add` below works at all.
-    /// Returns the *canonicalized* path, because every one of this app's per-worktree lookups is an
-    /// exact comparison against git's own fully-resolved answers (see
-    /// `crate::rail::repo::canonical_repo_path`'s own docs).
-    fn init_repo() -> (TempDir, PathBuf) {
-        let dir = TempDir::new().expect("tempdir");
-        git(dir.path(), &["init", "-b", "main"]);
-        git(dir.path(), &["config", "user.email", "test@example.com"]);
-        git(dir.path(), &["config", "user.name", "Test User"]);
-        std::fs::write(dir.path().join("README.md"), "hello\n").expect("write");
-        git(dir.path(), &["add", "README.md"]);
-        git(dir.path(), &["commit", "-m", "initial"]);
-        let canonical = std::fs::canonicalize(dir.path()).expect("canonicalize");
-        (dir, canonical)
+    fn init_repo() -> (crate::test_support::TempRoot, PathBuf) {
+        let dir = crate::test_support::temp_repo();
+        let root = dir.to_path_buf();
+        (dir, root)
     }
 
     /// A real linked worktree of `repo`, created under `container` (worktrees live outside the
     /// repo - `crate::rail::repo::Repo::path`'s own docs).
     fn add_worktree(repo: &Path, container: &Path, branch: &str) -> PathBuf {
         let path = container.join(branch);
-        git(
+        test_support::git(
             repo,
             &[
                 "worktree",
@@ -483,9 +463,9 @@ mod session_restore_tests {
         cx: &mut TestAppContext,
     ) {
         let (_repo, repo_path) = init_repo();
-        let container = TempDir::new().expect("tempdir");
+        let container = crate::test_support::temp_root();
         let feature = add_worktree(&repo_path, container.path(), "feature");
-        let settings_dir = TempDir::new().expect("tempdir");
+        let settings_dir = crate::test_support::temp_root();
         let settings_path = settings_dir.path().join("settings.toml");
 
         std::fs::write(repo_path.join("a.txt"), "a\n").expect("write");
@@ -580,9 +560,9 @@ mod session_restore_tests {
         cx: &mut TestAppContext,
     ) {
         let (_repo, repo_path) = init_repo();
-        let container = TempDir::new().expect("tempdir");
+        let container = crate::test_support::temp_root();
         let feature = add_worktree(&repo_path, container.path(), "feature");
-        let settings_dir = TempDir::new().expect("tempdir");
+        let settings_dir = crate::test_support::temp_root();
         let settings_path = settings_dir.path().join("settings.toml");
 
         {
@@ -648,7 +628,7 @@ mod session_restore_tests {
     #[gpui::test]
     fn a_file_deleted_between_sessions_is_skipped_with_a_real_reason(cx: &mut TestAppContext) {
         let (_repo, repo_path) = init_repo();
-        let settings_dir = TempDir::new().expect("tempdir");
+        let settings_dir = crate::test_support::temp_root();
         let settings_path = settings_dir.path().join("settings.toml");
         std::fs::write(repo_path.join("kept.txt"), "kept\n").expect("write");
         std::fs::write(repo_path.join("gone.txt"), "gone\n").expect("write");
@@ -698,7 +678,7 @@ mod session_restore_tests {
         cx: &mut TestAppContext,
     ) {
         let (_repo, repo_path) = init_repo();
-        let settings_dir = TempDir::new().expect("tempdir");
+        let settings_dir = crate::test_support::temp_root();
         let settings_path = settings_dir.path().join("settings.toml");
         let session_id = "5af4c210-34fa-4ab2-9c35-f6ceab76551c";
 
@@ -786,7 +766,7 @@ mod session_restore_tests {
     #[gpui::test]
     fn an_agent_with_no_resumable_session_is_refused_honestly_and_alone(cx: &mut TestAppContext) {
         let (_repo, repo_path) = init_repo();
-        let settings_dir = TempDir::new().expect("tempdir");
+        let settings_dir = crate::test_support::temp_root();
         let settings_path = settings_dir.path().join("settings.toml");
         std::fs::write(repo_path.join("kept.txt"), "kept\n").expect("write");
 
@@ -860,9 +840,9 @@ mod session_restore_tests {
         cx: &mut TestAppContext,
     ) {
         let (_repo, repo_path) = init_repo();
-        let container = TempDir::new().expect("tempdir");
+        let container = crate::test_support::temp_root();
         let feature = add_worktree(&repo_path, container.path(), "feature");
-        let settings_dir = TempDir::new().expect("tempdir");
+        let settings_dir = crate::test_support::temp_root();
         let settings_path = settings_dir.path().join("settings.toml");
         std::fs::write(feature.join("only-here.txt"), "hi\n").expect("write");
 
@@ -904,9 +884,9 @@ mod session_restore_tests {
     #[gpui::test]
     fn an_explicitly_named_path_still_wins_over_the_remembered_worktree(cx: &mut TestAppContext) {
         let (_repo, repo_path) = init_repo();
-        let container = TempDir::new().expect("tempdir");
+        let container = crate::test_support::temp_root();
         let feature = add_worktree(&repo_path, container.path(), "feature");
-        let settings_dir = TempDir::new().expect("tempdir");
+        let settings_dir = crate::test_support::temp_root();
         let settings_path = settings_dir.path().join("settings.toml");
 
         {
@@ -936,7 +916,7 @@ mod session_restore_tests {
     fn both_repos_tab_sessions_survive_a_relaunch(cx: &mut TestAppContext) {
         let (_repo_a, repo_a) = init_repo();
         let (_repo_b, repo_b) = init_repo();
-        let settings_dir = TempDir::new().expect("tempdir");
+        let settings_dir = crate::test_support::temp_root();
         let settings_path = settings_dir.path().join("settings.toml");
         std::fs::write(repo_a.join("in-a.txt"), "a\n").expect("write");
         std::fs::write(repo_b.join("in-b.txt"), "b\n").expect("write");
@@ -1000,7 +980,7 @@ mod session_restore_tests {
     #[gpui::test]
     fn a_deliberately_closed_tab_stays_closed_across_a_relaunch(cx: &mut TestAppContext) {
         let (_repo, repo_path) = init_repo();
-        let settings_dir = TempDir::new().expect("tempdir");
+        let settings_dir = crate::test_support::temp_root();
         let settings_path = settings_dir.path().join("settings.toml");
         std::fs::write(repo_path.join("kept.txt"), "kept\n").expect("write");
         std::fs::write(repo_path.join("closed.txt"), "closed\n").expect("write");

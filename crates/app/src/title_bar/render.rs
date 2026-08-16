@@ -4,8 +4,6 @@
 //! [`super::menu`].
 
 use super::*;
-#[cfg(test)]
-use crate::root::focus::palette_focus_tests;
 use crate::root::plural;
 
 /// Half-diagonal of an 11×1px rect rotated ±45° about its own center - `5.5 * cos(45°)`. Used to
@@ -630,8 +628,8 @@ mod caption_button_tests {
     /// calls the real `Window::remove_window` and closes the real window - not a mock.
     #[gpui::test]
     fn clicking_the_close_caption_button_closes_the_real_window(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         // Pin the Windows/Linux caption-button variant regardless of the real host OS this test
         // happens to run on, so the test is deterministic everywhere.
@@ -673,8 +671,8 @@ mod caption_button_tests {
     fn a_single_click_on_empty_title_bar_space_never_reaches_the_maximize_call(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
         let _ = app;
 
@@ -721,8 +719,8 @@ mod macos_dot_cluster_tests {
     /// regression by failing its second assertion.
     #[gpui::test]
     fn clicking_the_macos_maximize_dot_toggles_fullscreen_both_ways(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         // Pin the macOS dot-cluster variant regardless of the real host OS this test happens to
         // run on, so the test is deterministic everywhere (the same reasoning
@@ -1040,7 +1038,6 @@ mod agent_state_chip_text_tests {
 #[cfg(test)]
 mod agent_state_chip_live_tests {
     use super::*;
-    use crate::root::focus::palette_focus_tests;
     use gpui::TestAppContext;
 
     fn worktree_item(path: PathBuf, label: &str) -> WorktreeItem {
@@ -1078,8 +1075,8 @@ mod agent_state_chip_live_tests {
     /// real spawned process, only the bookkeeping `kind` the rail/chip logic reads.
     #[gpui::test]
     fn closing_the_only_real_agent_makes_the_chip_row_disappear(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         let startup_agent_id = app
@@ -1139,9 +1136,9 @@ mod agent_state_chip_live_tests {
     fn a_second_real_spawned_agent_flips_the_live_chip_from_singular_to_plural(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let wt_b = tempfile::tempdir().expect("tempdir wt-b");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let wt_b = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         let startup_agent_id = app

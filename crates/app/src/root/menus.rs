@@ -221,7 +221,7 @@ impl AdeApp {
 #[cfg(test)]
 mod menu_surface_tests {
     use super::*;
-    use crate::root::focus::palette_focus_tests::open_test_app;
+    use crate::test_support::open_test_app;
     use gpui::TestAppContext;
 
     /// Opens every one of them at once by writing their real state fields directly - the state
@@ -263,7 +263,7 @@ mod menu_surface_tests {
 
     #[gpui::test]
     fn closing_all_menu_surfaces_really_closes_every_one_of_them(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
         let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
         app.update(cx, |app, cx| {
@@ -298,7 +298,7 @@ mod menu_surface_tests {
     /// level of the shared primitive: whichever surface is being opened is the only survivor.
     #[gpui::test]
     fn opening_any_one_surface_closes_all_the_others(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
         let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
         for keep in MenuSurface::ALL {
@@ -334,7 +334,7 @@ mod menu_surface_tests {
     /// calls the close path directly.
     #[gpui::test]
     fn the_window_losing_focus_really_closes_every_open_menu(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
         let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
         // `deactivate_window` is a no-op unless this window really is the platform's active one,

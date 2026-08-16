@@ -251,7 +251,7 @@ pub(crate) mod palette_focus_tests {
     /// click first.
     #[gpui::test]
     fn toggle_palette_reopens_after_being_closed(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
         let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
         cx.dispatch_action(TogglePalette);
@@ -279,7 +279,7 @@ pub(crate) mod palette_focus_tests {
     /// initial agent's pane focus up front, the very first ⌘P would silently do nothing.
     #[gpui::test]
     fn toggle_palette_works_on_a_fresh_window_with_nothing_clicked_yet(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
         let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
         cx.dispatch_action(TogglePalette);
@@ -296,7 +296,7 @@ pub(crate) mod palette_focus_tests {
     /// [`OverlayFocus`]'s `opened_agent` field).
     #[gpui::test]
     fn toggle_palette_still_works_after_a_palette_spawned_new_shell(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
         let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
         let initial_agent_id = app.read_with(cx, |app, _| app.agents.active_id());
@@ -332,7 +332,7 @@ pub(crate) mod palette_focus_tests {
     /// mid-query, it's an ordinary character appended to the query like any other.
     #[gpui::test]
     fn scope_prefix_only_fires_on_an_empty_query(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
         let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
         cx.dispatch_action(TogglePalette);
@@ -375,7 +375,7 @@ pub(crate) mod palette_focus_tests {
     fn secondary_keystroke_opens_the_palette_through_the_real_key_bindings(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
         let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
 
@@ -417,8 +417,8 @@ mod tab_strip_keybinding_tests {
     /// sense over.
     #[gpui::test]
     fn opening_the_palette_closes_an_already_open_plus_menu(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         app.update(cx, |app, cx| {
             app.plus_menu_open = true;
@@ -435,8 +435,8 @@ mod tab_strip_keybinding_tests {
 
     #[gpui::test]
     fn opening_settings_closes_an_already_open_plus_menu(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         app.update(cx, |app, cx| {
             app.plus_menu_open = true;
@@ -458,8 +458,8 @@ mod tab_strip_keybinding_tests {
     fn ctrl_shift_t_spawns_a_real_shell_agent_through_the_real_key_bindings(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         bind_real_keys(cx);
 
         let agents_before = app.read_with(cx, |app, _| app.agents.iter().count());
@@ -490,8 +490,8 @@ mod tab_strip_keybinding_tests {
     fn secondary_shift_n_spawns_a_real_agent_through_the_real_key_bindings(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         bind_real_keys(cx);
 
         let agents_before = app.read_with(cx, |app, _| app.agents.iter().count());
@@ -527,8 +527,8 @@ mod tab_strip_keybinding_tests {
     /// in practice) pty-forwarding half of `Ctrl+P`.
     #[gpui::test]
     fn ctrl_p_opens_the_palette_even_while_a_terminal_is_focused(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         bind_real_keys(cx);
 
         // Explicitly focus the initial shell agent - the real, concrete "a terminal pane
@@ -575,9 +575,9 @@ mod tab_strip_keybinding_tests {
     /// unconditionally, silently killing every bound shortcut until the next click.
     #[gpui::test]
     fn ctrl_p_still_works_after_ctrl_shift_t_with_a_file_tab_active(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
         std::fs::write(repo.path().join("a.txt"), "hello\n").expect("write a.txt");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         bind_real_keys(cx);
 
         app.update_in(cx, |app, window, cx| {
@@ -612,8 +612,8 @@ mod tab_strip_keybinding_tests {
     /// next click.
     #[gpui::test]
     fn ctrl_p_still_works_after_closing_the_active_agent_tab(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         bind_real_keys(cx);
 
         let first_id = app.read_with(cx, |app, _| {
@@ -658,8 +658,8 @@ mod tab_strip_keybinding_tests {
     /// rail (`AdeApp::archive_agent`, which delegates to `Self::close_agent`).
     #[gpui::test]
     fn ctrl_p_still_works_after_archiving_the_active_agent(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         bind_real_keys(cx);
 
         let first_id = app.read_with(cx, |app, _| {
@@ -700,22 +700,6 @@ mod tab_strip_keybinding_tests {
         );
     }
 
-    fn git(dir: &std::path::Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
     #[gpui::test]
     fn bracket_advances_to_the_next_changed_file_through_the_real_key_bindings(
         cx: &mut TestAppContext,
@@ -724,19 +708,19 @@ mod tab_strip_keybinding_tests {
         // bare `]` would swallow a literal `]` typed into any focused terminal instead of
         // forwarding it to the pty. This opens a file first (`AdeApp::open_change_diff`) to
         // establish "diff"-context focus before simulating the keystroke.
-        let repo = tempfile::tempdir().expect("tempdir");
-        git(repo.path(), &["init", "-b", "main"]);
-        git(repo.path(), &["config", "user.email", "test@example.com"]);
-        git(repo.path(), &["config", "user.name", "Test User"]);
+        let repo = crate::test_support::temp_root();
+        test_support::git(repo.path(), &["init", "-b", "main"]);
+        test_support::git(repo.path(), &["config", "user.email", "test@example.com"]);
+        test_support::git(repo.path(), &["config", "user.name", "Test User"]);
         std::fs::write(repo.path().join("a.txt"), "1\n").expect("write a.txt");
         std::fs::write(repo.path().join("b.txt"), "1\n").expect("write b.txt");
-        git(repo.path(), &["add", "."]);
-        git(repo.path(), &["commit", "-m", "initial"]);
-        git(repo.path(), &["checkout", "-b", "feature"]);
+        test_support::git(repo.path(), &["add", "."]);
+        test_support::git(repo.path(), &["commit", "-m", "initial"]);
+        test_support::git(repo.path(), &["checkout", "-b", "feature"]);
         std::fs::write(repo.path().join("a.txt"), "1\nchanged\n").expect("rewrite a.txt");
         std::fs::write(repo.path().join("b.txt"), "1\nchanged\n").expect("rewrite b.txt");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
         bind_real_keys(cx);
 
@@ -776,17 +760,17 @@ mod tab_strip_keybinding_tests {
     /// before and after `]` for an uninteresting reason instead of proving the scoping works.
     #[gpui::test]
     fn bracket_does_not_fire_globally_while_a_terminal_is_focused(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        git(repo.path(), &["init", "-b", "main"]);
-        git(repo.path(), &["config", "user.email", "test@example.com"]);
-        git(repo.path(), &["config", "user.name", "Test User"]);
+        let repo = crate::test_support::temp_root();
+        test_support::git(repo.path(), &["init", "-b", "main"]);
+        test_support::git(repo.path(), &["config", "user.email", "test@example.com"]);
+        test_support::git(repo.path(), &["config", "user.name", "Test User"]);
         std::fs::write(repo.path().join("a.txt"), "1\n").expect("write a.txt");
-        git(repo.path(), &["add", "."]);
-        git(repo.path(), &["commit", "-m", "initial"]);
-        git(repo.path(), &["checkout", "-b", "feature"]);
+        test_support::git(repo.path(), &["add", "."]);
+        test_support::git(repo.path(), &["commit", "-m", "initial"]);
+        test_support::git(repo.path(), &["checkout", "-b", "feature"]);
         std::fs::write(repo.path().join("a.txt"), "1\nchanged\n").expect("rewrite a.txt");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
         bind_real_keys(cx);
 
@@ -827,8 +811,8 @@ mod tab_strip_keybinding_tests {
     fn secondary_3_jumps_to_the_third_real_agent_through_the_real_key_bindings(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         bind_real_keys(cx);
 
         // Tab 1 is `open_test_app`'s own startup shell. Four more, then retagged so the strip
@@ -898,8 +882,8 @@ mod tab_strip_keybinding_tests {
     /// case is covered by the keystroke test above.
     #[gpui::test]
     fn jump_to_agent_at_activates_the_right_agent_by_position(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         let mut ids = vec![app.read_with(cx, |app, _| {
             app.agents.active_id().expect("the initial shell agent")
@@ -968,8 +952,8 @@ mod settings_focus_tests {
     fn toggle_settings_action_opens_then_real_escape_closes_it_and_focus_stays_live(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         cx.dispatch_action(ToggleSettings);
         assert!(
@@ -999,8 +983,8 @@ mod settings_focus_tests {
     /// here for Settings.
     #[gpui::test]
     fn toggle_settings_works_on_a_fresh_window_with_nothing_clicked_yet(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         cx.dispatch_action(ToggleSettings);
 
@@ -1020,8 +1004,8 @@ mod settings_focus_tests {
     fn secondary_comma_keystroke_opens_settings_through_the_real_key_bindings(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
 
         let secondary_comma = if cfg!(target_os = "macos") {
@@ -1046,8 +1030,8 @@ mod settings_focus_tests {
     /// ([`AdeApp::render_workspace_body`]) without touching `AdeApp::agents` itself.
     #[gpui::test]
     fn closing_settings_leaves_open_agent_tabs_intact(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         let agents_before = app.read_with(cx, |app, _| app.agents.iter().count());
         let active_before = app.read_with(cx, |app, _| app.agents.active_id());
@@ -1079,8 +1063,8 @@ mod settings_focus_tests {
     /// not reset settings_page" contract.
     #[gpui::test]
     fn settings_page_selection_persists_across_a_close_and_reopen(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         cx.dispatch_action(ToggleSettings);
         app.update_in(cx, |app, window, cx| {
@@ -1108,8 +1092,8 @@ mod settings_focus_tests {
     /// palette handle - covers `AdeApp::close_palette`'s Settings-aware branch.
     #[gpui::test]
     fn open_settings_palette_command_leaves_real_focus_on_settings(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         cx.dispatch_action(TogglePalette);
         app.update_in(cx, |app, window, cx| {
@@ -1146,8 +1130,8 @@ mod settings_focus_tests {
     fn opening_settings_populates_real_agent_rows_from_a_background_path_search(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         assert!(
             app.read_with(cx, |app, _| app.agent_rows.is_empty()),
@@ -1179,8 +1163,8 @@ mod settings_focus_tests {
     fn opening_settings_populates_real_lsp_rows_from_a_background_path_search(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         assert!(app.read_with(cx, |app, _| app.lsp_rows.is_empty()));
 
@@ -1197,8 +1181,8 @@ mod settings_focus_tests {
 
     #[gpui::test]
     fn settings_opens_to_general_by_default_on_a_fresh_window(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         cx.dispatch_action(ToggleSettings);
 
@@ -1214,8 +1198,8 @@ mod settings_focus_tests {
     /// `select_settings_page` performs.
     #[gpui::test]
     fn every_settings_page_renders_without_panicking(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         cx.dispatch_action(ToggleSettings);
         cx.run_until_parked();
@@ -1243,8 +1227,8 @@ mod settings_focus_tests {
     fn window_controls_style_change_updates_the_real_persisted_settings_field(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         assert_eq!(
             app.read_with(cx, |app, _| app.window_controls_style()),
@@ -1280,10 +1264,10 @@ mod code_focus_tests {
     fn open_test_app_with_a_plain_text_file(
         cx: &mut TestAppContext,
     ) -> (Entity<AdeApp>, &mut gpui::VisualTestContext, PathBuf) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
         let file_path = repo.path().join("notes.txt");
         std::fs::write(&file_path, "hello\n").expect("write notes.txt");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         (app, cx, file_path)
     }
 
@@ -1430,10 +1414,10 @@ mod text_undo_scoping_tests {
     /// covers the other half of.
     #[gpui::test]
     fn secondary_z_with_a_terminal_focused_does_not_reach_text_undo(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
         let file_path = repo.path().join("notes.txt");
         std::fs::write(&file_path, "hello\n").expect("write notes.txt");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         bind_real_keys(cx);
         let relative = PathBuf::from("notes.txt");
@@ -1484,10 +1468,10 @@ mod text_undo_scoping_tests {
     fn secondary_z_with_the_palette_open_undoes_the_query_not_the_file_editor_behind_it(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
         let file_path = repo.path().join("notes.txt");
         std::fs::write(&file_path, "hello\n").expect("write notes.txt");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         bind_real_keys(cx);
         let relative = PathBuf::from("notes.txt");
@@ -1537,8 +1521,8 @@ mod text_undo_scoping_tests {
     /// be reachable, or Ctrl+Z would resurrect a query the user already dismissed.
     #[gpui::test]
     fn reopening_the_palette_starts_a_genuinely_fresh_history(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         bind_real_keys(cx);
 
         app.update_in(cx, |app, window, cx| app.open_palette(window, cx));
@@ -1561,8 +1545,8 @@ mod text_undo_scoping_tests {
     /// `"text-input"` - only the filter row itself is tagged.
     #[gpui::test]
     fn secondary_z_in_the_settings_keybindings_filter_undoes_the_filter(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         bind_real_keys(cx);
 
         app.update_in(cx, |app, window, cx| {
@@ -1604,8 +1588,8 @@ mod text_undo_scoping_tests {
     fn secondary_z_in_the_rail_filter_undoes_it_including_a_real_escape_clear(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         bind_real_keys(cx);
 
         app.update_in(cx, |app, window, cx| {
@@ -1645,8 +1629,8 @@ mod text_undo_scoping_tests {
     fn secondary_z_in_the_new_file_prompt_undoes_the_name_and_a_fresh_prompt_has_no_history(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         bind_real_keys(cx);
 
         app.update_in(cx, |app, window, cx| {
@@ -1712,11 +1696,10 @@ mod palette_result_focus_tests {
     use crate::palette::state as palette;
     use gpui::{Entity, TestAppContext};
     use std::fs;
-    use tempfile::TempDir;
 
     /// `src/main.rs` (the file every test opens) plus a sibling, so the palette's own filtering
     /// has something to actually discriminate between.
-    fn seed(repo: &TempDir) {
+    fn seed(repo: &crate::test_support::TempRoot) {
         fs::create_dir_all(repo.path().join("src")).expect("mkdir");
         fs::write(repo.path().join("src/main.rs"), "fn main() {}\n").expect("write");
         fs::write(repo.path().join("src/other.rs"), "pub fn o() {}\n").expect("write");
@@ -1724,10 +1707,14 @@ mod palette_result_focus_tests {
 
     fn open_seeded(
         cx: &mut TestAppContext,
-    ) -> (TempDir, Entity<AdeApp>, &mut gpui::VisualTestContext) {
-        let repo = TempDir::new().expect("tempdir");
+    ) -> (
+        crate::test_support::TempRoot,
+        Entity<AdeApp>,
+        &mut gpui::VisualTestContext,
+    ) {
+        let repo = crate::test_support::temp_root();
         seed(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
         cx.run_until_parked();
         (repo, app, cx)
@@ -2172,8 +2159,8 @@ mod palette_result_focus_tests {
     /// itself expects and excludes.
     #[gpui::test]
     fn every_palette_command_is_findable_by_its_own_label(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         for command in palette::PaletteCommand::ALL {
             if matches!(
@@ -2255,13 +2242,13 @@ mod tabless_window_keybinding_tests {
     ) -> (
         Entity<AdeApp>,
         &mut gpui::VisualTestContext,
-        tempfile::TempDir,
+        crate::test_support::TempRoot,
         PathBuf,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
         let file_path = repo.path().join("a.txt");
         std::fs::write(&file_path, "hello\n").expect("write a.txt");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
         (app, cx, repo, file_path)
     }

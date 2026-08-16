@@ -2217,46 +2217,19 @@ mod tests {
         assert_eq!(sum_diff_stat(&diff), (2, 1));
     }
 
-    fn git(dir: &Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn init_repo() -> tempfile::TempDir {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        git(dir.path(), &["init", "-b", "main"]);
-        git(dir.path(), &["config", "user.email", "test@example.com"]);
-        git(dir.path(), &["config", "user.name", "Test User"]);
-        std::fs::write(dir.path().join("file.txt"), "hello\n").expect("write file");
-        git(dir.path(), &["add", "file.txt"]);
-        git(dir.path(), &["commit", "-m", "initial commit"]);
-        dir
-    }
-
     /// End-to-end, against a real tempdir git repo: [`compute_status_snapshot`] reports a
     /// prunable, clean, merged worktree correctly, and a dirty one as not prunable, in one
     /// snapshot covering both the diff side and the worktree-note side.
     #[test]
     fn compute_status_snapshot_reports_real_diff_and_merge_state() {
-        let repo = init_repo();
+        let repo = crate::test_support::temp_repo();
 
         // A linked worktree with an uncommitted change - should show up in `diffs` with a
         // real added-line count, and not be considered clean.
-        let dirty_wt_dir = tempfile::TempDir::new().expect("tempdir");
+        let dirty_wt_dir = crate::test_support::temp_root();
         let dirty_wt_path = dirty_wt_dir.path().join("dirty-wt");
         drop(dirty_wt_dir);
-        git(
+        test_support::git(
             repo.path(),
             &[
                 "worktree",
@@ -2270,10 +2243,10 @@ mod tests {
 
         // A linked worktree that's clean and fully merged (no unique commits) - a real prune
         // candidate.
-        let merged_wt_dir = tempfile::TempDir::new().expect("tempdir");
+        let merged_wt_dir = crate::test_support::temp_root();
         let merged_wt_path = merged_wt_dir.path().join("merged-wt");
         drop(merged_wt_dir);
-        git(
+        test_support::git(
             repo.path(),
             &[
                 "worktree",
@@ -2358,7 +2331,7 @@ mod tests {
 
     #[test]
     fn disk_usage_bytes_sums_real_file_sizes_recursively() {
-        let dir = tempfile::TempDir::new().expect("tempdir");
+        let dir = crate::test_support::temp_root();
         std::fs::write(dir.path().join("a.txt"), vec![b'x'; 100]).expect("write");
         let sub = dir.path().join("sub");
         std::fs::create_dir(&sub).expect("mkdir");

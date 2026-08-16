@@ -456,14 +456,14 @@ impl AdeApp {
 #[cfg(test)]
 mod menu_command_tests {
     use super::*;
-    use crate::root::focus::palette_focus_tests::open_test_app;
+    use crate::test_support::open_test_app;
     use gpui::TestAppContext;
 
     /// `menu_command_enabled(Save)` must track real edit-buffer state: `false` with nothing
     /// open, `true` once a real file is loaded into the File view.
     #[gpui::test]
     fn menu_command_enabled_save_tracks_the_real_active_edit_buffer(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
         let file_path = repo.path().join("notes.txt");
         std::fs::write(&file_path, "hello\n").expect("write notes.txt");
         let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
@@ -488,7 +488,7 @@ mod menu_command_tests {
     /// in a genuinely empty window.
     #[gpui::test]
     fn menu_command_enabled_zoom_requires_a_real_code_surface(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
         let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
         assert!(
@@ -504,7 +504,7 @@ mod menu_command_tests {
     /// initial shell agent, so "no active agent" has to be reached by really archiving it).
     #[gpui::test]
     fn menu_command_enabled_archive_agent_tracks_the_real_active_agent(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
         let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
@@ -539,7 +539,7 @@ mod menu_command_tests {
     /// will dispatch through - not just a direct method call.
     #[gpui::test]
     fn dispatching_zoom_in_action_reaches_the_real_zoom_in_handler(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
         let file_path = repo.path().join("notes.rs");
         std::fs::write(&file_path, "fn main() {}\n").expect("write notes.rs");
         let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
@@ -568,7 +568,7 @@ mod menu_command_tests {
     /// separate `disabled:` bookkeeping.
     #[gpui::test]
     fn zoom_in_action_is_unavailable_with_no_code_surface_showing(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
         let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         let _ = app;
 
