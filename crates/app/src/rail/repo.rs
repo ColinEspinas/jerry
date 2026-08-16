@@ -422,29 +422,30 @@ mod tests {
         );
     }
 
+    /// A repo's display name is its path's own basename, falling back to the whole path when
+    /// there is no basename to take - and a freshly constructed repo starts with nothing loaded,
+    /// so nothing renders a worktree list it has not actually fetched yet.
     #[test]
-    fn repo_new_derives_a_display_name_from_the_path_basename() {
+    fn repo_new_names_itself_from_its_path_and_starts_with_nothing_loaded() {
         let repo = Repo::new(RepoId(0), PathBuf::from("/home/user/code/jerry-core"));
         assert_eq!(repo.name, "jerry-core");
         assert!(repo.worktrees.is_empty());
+        assert!(!repo.worktrees_loaded);
+
+        assert_eq!(Repo::new(RepoId(0), PathBuf::from("/")).name, "/");
     }
 
+    /// Neither a file that is not there nor one that is not valid TOML may fail the load - a
+    /// hand-edited or half-written `repos.toml` degrades to the empty state, never an error the
+    /// caller has to handle at startup.
     #[test]
-    fn repo_new_falls_back_to_the_whole_path_when_there_is_no_basename() {
-        let repo = Repo::new(RepoId(0), PathBuf::from("/"));
-        assert_eq!(repo.name, "/");
-    }
-
-    #[test]
-    fn a_missing_file_loads_as_empty_state_rather_than_failing() {
+    fn a_missing_or_corrupted_file_loads_as_empty_state_rather_than_failing() {
         let dir = crate::test_support::temp_root();
-        let state = RepoState::load_at(&dir.path().join("does-not-exist.toml"));
-        assert_eq!(state, RepoState::default());
-    }
+        assert_eq!(
+            RepoState::load_at(&dir.path().join("does-not-exist.toml")),
+            RepoState::default()
+        );
 
-    #[test]
-    fn a_corrupted_file_loads_as_empty_state_rather_than_failing() {
-        let dir = crate::test_support::temp_root();
         let path = dir.path().join("repos.toml");
         std::fs::write(&path, "this is not valid toml {{{").expect("write");
         assert_eq!(RepoState::load_at(&path), RepoState::default());
@@ -611,83 +612,61 @@ mod tests {
         );
     }
 
-    /// GitHub issue #90's own real "still valid" check - the four cases
-    /// [`RepoState::last_focused_existing_path`]'s own docs enumerate.
+    /// GitHub issue #90's own real "still valid" check - every case
+    /// [`RepoState::last_focused_existing_path`]'s own docs enumerate. The last is the one an
+    /// independent audit found missing: the remembered path still `exists()` (so a plain
+    /// `exists()` check would wrongly accept it) but the directory has been replaced by a plain
+    /// file, which only `is_dir()` rejects.
     #[test]
-    fn last_focused_existing_path_is_none_when_nothing_was_ever_remembered() {
-        let state = RepoState::default();
-        assert_eq!(state.last_focused_existing_path(), None);
-    }
+    fn last_focused_existing_path_resolves_only_a_known_repo_that_is_still_a_real_directory() {
+        assert_eq!(RepoState::default().last_focused_existing_path(), None);
 
-    #[test]
-    fn last_focused_existing_path_is_none_when_the_key_is_not_a_known_repo() {
-        // `last_focused` names a key that was never actually added to `repos` (e.g. a hand-
-        // edited file, or a repo since removed) - must not resolve to a path anyway.
-        let state = RepoState {
+        // `last_focused` naming a key that was never added to `repos` (a hand-edited file, or a
+        // repo since removed) must not resolve to a path anyway.
+        let unknown = RepoState {
             last_focused: Some("/repo/never-added".to_string()),
             ..RepoState::default()
         };
-        assert_eq!(state.last_focused_existing_path(), None);
-    }
+        assert_eq!(unknown.last_focused_existing_path(), None);
 
-    #[test]
-    fn last_focused_existing_path_is_none_when_the_remembered_directory_no_longer_exists() {
         let dir = crate::test_support::temp_root();
+        let remembered = |path: &std::path::Path| {
+            let key = path.to_str().expect("utf8 path").to_string();
+            let mut state = RepoState::default();
+            state.repos.insert(
+                key.clone(),
+                RepoRecord {
+                    name: "repo".to_string(),
+                    selected_worktree: None,
+                },
+            );
+            state.last_focused = Some(key);
+            state
+        };
+
+        let live = dir.path().join("live-repo");
+        std::fs::create_dir(&live).expect("mkdir");
+        assert_eq!(
+            remembered(&live).last_focused_existing_path(),
+            Some(live.clone())
+        );
+
         let gone = dir.path().join("deleted-repo");
         std::fs::create_dir(&gone).expect("mkdir");
-        let key = gone.to_str().expect("utf8 path").to_string();
-
-        let mut state = RepoState::default();
-        state.repos.insert(
-            key.clone(),
-            RepoRecord {
-                name: "deleted-repo".to_string(),
-                selected_worktree: None,
-            },
-        );
-        state.last_focused = Some(key);
-        // The directory is removed *after* being recorded - simulating a repo that was open,
-        // remembered, and has since been deleted or moved.
+        let state = remembered(&gone);
         std::fs::remove_dir(&gone).expect("rmdir");
-
         assert_eq!(
             state.last_focused_existing_path(),
             None,
             "a deleted/moved remembered folder must fall back to empty, not a broken path"
         );
-    }
 
-    /// The other real "no longer a usable repo" case an independent audit found this method
-    /// missing: the remembered path still `exists()` (so a plain `exists()` check would wrongly
-    /// accept it), but a real directory was replaced by a plain file - `is_dir()` is the real
-    /// check that must reject this, not merely "something is there".
-    #[test]
-    fn last_focused_existing_path_is_none_when_the_remembered_path_was_replaced_by_a_file() {
-        let dir = crate::test_support::temp_root();
         let replaced = dir.path().join("was-a-repo");
         std::fs::create_dir(&replaced).expect("mkdir");
-        let key = replaced.to_str().expect("utf8 path").to_string();
-
-        let mut state = RepoState::default();
-        state.repos.insert(
-            key.clone(),
-            RepoRecord {
-                name: "was-a-repo".to_string(),
-                selected_worktree: None,
-            },
-        );
-        state.last_focused = Some(key);
-
-        // The directory is removed and replaced with a plain file of the same name - the path
-        // still `exists()`, but is no longer a real, usable repo checkout.
+        let state = remembered(&replaced);
         std::fs::remove_dir(&replaced).expect("rmdir");
         std::fs::write(&replaced, "not a repo").expect("write");
-        assert!(replaced.exists(), "sanity check: the path still exists");
-        assert!(
-            !replaced.is_dir(),
-            "sanity check: it is a file now, not a directory"
-        );
-
+        assert!(replaced.exists() && !replaced.is_dir());
         assert_eq!(
             state.last_focused_existing_path(),
             None,
@@ -696,56 +675,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn last_focused_existing_path_resolves_a_real_known_and_still_existing_repo() {
-        let dir = crate::test_support::temp_root();
-        let key = dir.path().to_str().expect("utf8 path").to_string();
-
-        let mut state = RepoState::default();
-        state.repos.insert(
-            key.clone(),
-            RepoRecord {
-                name: "repo".to_string(),
-                selected_worktree: None,
-            },
-        );
-        state.last_focused = Some(key);
-
-        assert_eq!(
-            state.last_focused_existing_path(),
-            Some(dir.path().to_path_buf())
-        );
-    }
-
     /// [`RepoState::save_merged_at`] must persist `last_focused` too, not just `repos` - the
-    /// real mechanism GitHub issue #90's "remembers the last-opened folder" needs.
+    /// real mechanism GitHub issue #90's "remembers the last-opened folder" needs - and it is a
+    /// single global value, so a later save with a genuine new focus overwrites whatever the
+    /// previous save left, across two separate calls simulating two real `AdeApp::focus_repo`s.
     #[test]
-    fn save_merged_at_persists_last_focused() {
-        let dir = crate::test_support::temp_root();
-        let path = dir.path().join("repos.toml");
-        let owned: std::collections::BTreeSet<String> =
-            ["/repo/a".to_string()].into_iter().collect();
-
-        let mut state = RepoState::default();
-        state.repos.insert(
-            "/repo/a".to_string(),
-            RepoRecord {
-                name: "a".to_string(),
-                selected_worktree: None,
-            },
-        );
-        state.last_focused = Some("/repo/a".to_string());
-        state.save_merged_at(&path, &owned).expect("save");
-
-        let reloaded = RepoState::load_at(&path);
-        assert_eq!(reloaded.last_focused, Some("/repo/a".to_string()));
-    }
-
-    /// `last_focused` is a real, single global value - a later save from the same instance with
-    /// a genuine new focus must overwrite whatever the previous save left, even across two
-    /// separate `save_merged_at` calls simulating two real `AdeApp::focus_repo` calls.
-    #[test]
-    fn save_merged_at_overwrites_a_previous_last_focused_with_a_newer_one() {
+    fn save_merged_at_persists_last_focused_and_a_later_save_overwrites_it() {
         let dir = crate::test_support::temp_root();
         let path = dir.path().join("repos.toml");
         let owned: std::collections::BTreeSet<String> =
@@ -754,20 +689,16 @@ mod tests {
                 .collect();
 
         let mut state = RepoState::default();
-        state.repos.insert(
-            "/repo/a".to_string(),
-            RepoRecord {
-                name: "a".to_string(),
-                selected_worktree: None,
-            },
-        );
-        state.repos.insert(
-            "/repo/b".to_string(),
-            RepoRecord {
-                name: "b".to_string(),
-                selected_worktree: None,
-            },
-        );
+        for name in ["a", "b"] {
+            state.repos.insert(
+                format!("/repo/{name}"),
+                RepoRecord {
+                    name: name.to_string(),
+                    selected_worktree: None,
+                },
+            );
+        }
+
         state.last_focused = Some("/repo/a".to_string());
         state.save_merged_at(&path, &owned).expect("save a focused");
         assert_eq!(
@@ -784,55 +715,32 @@ mod tests {
         );
     }
 
-    #[test]
-    fn repo_new_starts_with_worktrees_unloaded() {
-        let repo = Repo::new(RepoId(0), PathBuf::from("/home/user/code/jerry-core"));
-        assert!(!repo.worktrees_loaded);
-    }
-
     /// The concurrency cap's real shape: ten due repos with a cap of four must split into
     /// `[4, 4, 2]`, never a single batch of ten (which would let all ten real `git worktree list`
     /// subprocesses fire at once) and never one repo per batch either (which would serialize the
-    /// whole sweep needlessly).
+    /// whole sweep needlessly). A cap of zero is a defensive floor rather than a real call site -
+    /// every real caller passes a positive constant - and must neither panic (`[T]::chunks`
+    /// itself panics on a zero chunk size) nor silently drop every id.
     #[test]
-    fn batch_repos_for_refresh_splits_into_capped_chunks() {
-        let ids: Vec<RepoId> = (0..10).map(RepoId).collect();
-        let batches = batch_repos_for_refresh(&ids, 4);
-        assert_eq!(
-            batches.iter().map(Vec::len).collect::<Vec<_>>(),
-            vec![4, 4, 2],
-            "ten ids with a cap of four must split 4/4/2, bounding every single batch's real \
-             concurrent subprocess count to the cap"
-        );
-        // Order is preserved and nothing is dropped or duplicated - every id from the input
-        // appears exactly once, in its original relative order.
-        let flattened: Vec<RepoId> = batches.into_iter().flatten().collect();
-        assert_eq!(flattened, ids);
-    }
-
-    #[test]
-    fn batch_repos_for_refresh_fewer_ids_than_the_cap_is_a_single_batch() {
-        let ids: Vec<RepoId> = (0..3).map(RepoId).collect();
-        let batches = batch_repos_for_refresh(&ids, 4);
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].len(), 3);
-    }
-
-    #[test]
-    fn batch_repos_for_refresh_of_no_ids_is_no_batches() {
-        assert!(batch_repos_for_refresh(&[], 4).is_empty());
-    }
-
-    /// A defensive floor, not a real call site (every real caller uses a real positive constant):
-    /// `concurrency == 0` must not panic (`[T]::chunks` itself panics on a zero chunk size) or
-    /// silently drop every id - it degrades to one id per batch instead.
-    #[test]
-    fn batch_repos_for_refresh_treats_a_zero_concurrency_as_one() {
-        let ids: Vec<RepoId> = (0..3).map(RepoId).collect();
-        let batches = batch_repos_for_refresh(&ids, 0);
-        assert_eq!(
-            batches.iter().map(Vec::len).collect::<Vec<_>>(),
-            vec![1, 1, 1]
-        );
+    fn batch_repos_for_refresh_caps_every_batch_and_never_loses_an_id() {
+        for (count, concurrency, expected) in [
+            (10, 4, vec![4, 4, 2]),
+            (3, 4, vec![3]),
+            (0, 4, vec![]),
+            (3, 0, vec![1, 1, 1]),
+        ] {
+            let ids: Vec<RepoId> = (0..count).map(RepoId).collect();
+            let batches = batch_repos_for_refresh(&ids, concurrency);
+            assert_eq!(
+                batches.iter().map(Vec::len).collect::<Vec<_>>(),
+                expected,
+                "{count} ids at a concurrency of {concurrency}"
+            );
+            let flattened: Vec<RepoId> = batches.into_iter().flatten().collect();
+            assert_eq!(
+                flattened, ids,
+                "every id must appear exactly once, in its original relative order"
+            );
+        }
     }
 }

@@ -275,20 +275,39 @@ pub(crate) mod palette_focus_tests {
         );
     }
 
-    /// A fresh window starts with `Window::focus == None` - without `AdeApp::new` giving the
-    /// initial agent's pane focus up front, the very first ⌘P would silently do nothing.
+    /// Scope-prefix coverage requested alongside the focus fix: `>`/`@` should only switch the
+    /// palette's scope when typed as the very first character of an empty query - typed
+    /// mid-query, it's an ordinary character appended to the query like any other.
     #[gpui::test]
-    fn toggle_palette_works_on_a_fresh_window_with_nothing_clicked_yet(cx: &mut TestAppContext) {
+    fn scope_prefix_only_fires_on_an_empty_query(cx: &mut TestAppContext) {
         let repo = crate::test_support::temp_root();
         let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
         cx.dispatch_action(TogglePalette);
+        cx.simulate_input(">");
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.palette_scope, palette::PaletteScope::Commands);
+            assert_eq!(app.palette_query.as_str(), "");
+        });
 
-        assert!(
-            app.read_with(cx, |app, _| app.palette_open),
-            "secondary-p on a completely fresh window (nothing clicked yet) should still open the \
-             palette"
-        );
+        // Back to a fresh, empty-query palette state before the mid-query case.
+        cx.dispatch_action(TogglePalette);
+        cx.dispatch_action(TogglePalette);
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.palette_scope, palette::PaletteScope::All);
+            assert_eq!(app.palette_query.as_str(), "");
+        });
+
+        cx.simulate_input("x");
+        cx.simulate_input(">");
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.palette_scope,
+                palette::PaletteScope::All,
+                "a `>` typed mid-query (query is non-empty) must not switch scope"
+            );
+            assert_eq!(app.palette_query.as_str(), "x>");
+        });
     }
 
     /// Spawning an agent from the palette swaps the active agent; verifies `close_palette`
@@ -325,41 +344,6 @@ pub(crate) mod palette_focus_tests {
              center pane now renders a different agent's terminal pane than the one focus \
              was captured from, so close_palette must not restore that now-stale handle"
         );
-    }
-
-    /// Scope-prefix coverage requested alongside the focus fix: `>`/`@` should only switch the
-    /// palette's scope when typed as the very first character of an empty query - typed
-    /// mid-query, it's an ordinary character appended to the query like any other.
-    #[gpui::test]
-    fn scope_prefix_only_fires_on_an_empty_query(cx: &mut TestAppContext) {
-        let repo = crate::test_support::temp_root();
-        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
-
-        cx.dispatch_action(TogglePalette);
-        cx.simulate_input(">");
-        app.read_with(cx, |app, _| {
-            assert_eq!(app.palette_scope, palette::PaletteScope::Commands);
-            assert_eq!(app.palette_query.as_str(), "");
-        });
-
-        // Back to a fresh, empty-query palette state before the mid-query case.
-        cx.dispatch_action(TogglePalette);
-        cx.dispatch_action(TogglePalette);
-        app.read_with(cx, |app, _| {
-            assert_eq!(app.palette_scope, palette::PaletteScope::All);
-            assert_eq!(app.palette_query.as_str(), "");
-        });
-
-        cx.simulate_input("x");
-        cx.simulate_input(">");
-        app.read_with(cx, |app, _| {
-            assert_eq!(
-                app.palette_scope,
-                palette::PaletteScope::All,
-                "a `>` typed mid-query (query is non-empty) must not switch scope"
-            );
-            assert_eq!(app.palette_query.as_str(), "x>");
-        });
     }
 
     /// Unlike every other test in this module, which dispatches `TogglePalette` directly, this
@@ -412,29 +396,11 @@ mod tab_strip_keybinding_tests {
     }
 
     /// The `+` menu popover is rendered as an unconditional sibling of both the palette and
-    /// Settings (`AdeApp::plus_menu_open`'s own docs) - opening either while it happened to
-    /// still be open must close it, or it would paint on top of a surface it no longer makes
-    /// sense over.
+    /// Settings (`AdeApp::plus_menu_open`'s own docs) - opening either while it happened to still
+    /// be open must close it, or it would paint on top of a surface it no longer makes sense
+    /// over.
     #[gpui::test]
-    fn opening_the_palette_closes_an_already_open_plus_menu(cx: &mut TestAppContext) {
-        let repo = crate::test_support::temp_root();
-        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
-
-        app.update(cx, |app, cx| {
-            app.plus_menu_open = true;
-            cx.notify();
-        });
-        cx.dispatch_action(TogglePalette);
-
-        assert!(app.read_with(cx, |app, _| app.palette_open));
-        assert!(
-            !app.read_with(cx, |app, _| app.plus_menu_open),
-            "opening the palette should have closed the still-open plus menu"
-        );
-    }
-
-    #[gpui::test]
-    fn opening_settings_closes_an_already_open_plus_menu(cx: &mut TestAppContext) {
+    fn opening_the_palette_or_settings_closes_an_already_open_plus_menu(cx: &mut TestAppContext) {
         let repo = crate::test_support::temp_root();
         let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
@@ -443,11 +409,21 @@ mod tab_strip_keybinding_tests {
             cx.notify();
         });
         cx.dispatch_action(ToggleSettings);
-
         assert!(app.read_with(cx, |app, _| app.settings_open));
         assert!(
             !app.read_with(cx, |app, _| app.plus_menu_open),
             "opening Settings should have closed the still-open plus menu"
+        );
+
+        app.update(cx, |app, cx| {
+            app.plus_menu_open = true;
+            cx.notify();
+        });
+        cx.dispatch_action(TogglePalette);
+        assert!(app.read_with(cx, |app, _| app.palette_open));
+        assert!(
+            !app.read_with(cx, |app, _| app.plus_menu_open),
+            "and opening the palette should have closed it too"
         );
     }
 
@@ -978,22 +954,6 @@ mod settings_focus_tests {
         );
     }
 
-    /// `secondary-,` works from a fresh window with nothing clicked yet - same case as
-    /// `palette_focus_tests::toggle_palette_works_on_a_fresh_window_with_nothing_clicked_yet`,
-    /// here for Settings.
-    #[gpui::test]
-    fn toggle_settings_works_on_a_fresh_window_with_nothing_clicked_yet(cx: &mut TestAppContext) {
-        let repo = crate::test_support::temp_root();
-        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
-
-        cx.dispatch_action(ToggleSettings);
-
-        assert!(
-            app.read_with(cx, |app, _| app.settings_open),
-            "secondary-, on a completely fresh window (nothing clicked yet) should still open Settings"
-        );
-    }
-
     /// With the old `"cmd-,"` binding, `Ctrl+,` was never recognized as matching any
     /// `KeyBinding` (`"cmd"`/`"super"`/`"win"` only ever mean the platform modifier, never Ctrl,
     /// on Linux - `vendor/zed/crates/gpui/src/platform/keystroke.rs`), so the keystroke fell
@@ -1067,6 +1027,11 @@ mod settings_focus_tests {
         let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         cx.dispatch_action(ToggleSettings);
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings_page),
+            SettingsPage::General,
+            "a fresh window opens Settings on General"
+        );
         app.update_in(cx, |app, window, cx| {
             app.select_settings_page(SettingsPage::Worktrees, window, cx);
         });
@@ -1123,21 +1088,25 @@ mod settings_focus_tests {
         );
     }
 
-    /// Opening Settings must populate [`AdeApp::agent_rows`] from the background `$PATH` search
-    /// (see [`AdeApp::load_agent_rows`]) rather than leave it empty. `run_until_parked` drives
-    /// the spawned task to completion; without it this would race the still-in-flight search.
+    /// Opening Settings must populate both background-`$PATH`-searched row lists
+    /// ([`AdeApp::agent_rows`] for the Agents page, [`AdeApp::lsp_rows`] for Language servers -
+    /// see [`AdeApp::load_agent_rows`]) rather than leave them empty, and must not run either
+    /// search before it is opened. `run_until_parked` drives the spawned tasks to completion;
+    /// without it this would race the still-in-flight searches.
     #[gpui::test]
-    fn opening_settings_populates_real_agent_rows_from_a_background_path_search(
+    fn opening_settings_populates_both_row_lists_from_a_background_path_search(
         cx: &mut TestAppContext,
     ) {
         let repo = crate::test_support::temp_root();
         let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
-        assert!(
-            app.read_with(cx, |app, _| app.agent_rows.is_empty()),
-            "agent_rows should still be empty before Settings has ever been opened - nothing \
-             should eagerly run a $PATH search that's only ever shown on the Agents page"
-        );
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.agent_rows.is_empty() && app.lsp_rows.is_empty(),
+                "neither list may be populated before Settings has ever been opened - nothing \
+                 should eagerly run a $PATH search that's only ever shown on those pages"
+            );
+        });
 
         cx.dispatch_action(ToggleSettings);
         cx.run_until_parked();
@@ -1156,40 +1125,13 @@ mod settings_focus_tests {
                 "{kind:?} should have a real row after a real $PATH search"
             );
         }
-    }
 
-    /// Mirrors the Agents-page test above, for [`AdeApp::lsp_rows`] (the Language servers page).
-    #[gpui::test]
-    fn opening_settings_populates_real_lsp_rows_from_a_background_path_search(
-        cx: &mut TestAppContext,
-    ) {
-        let repo = crate::test_support::temp_root();
-        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
-
-        assert!(app.read_with(cx, |app, _| app.lsp_rows.is_empty()));
-
-        cx.dispatch_action(ToggleSettings);
-        cx.run_until_parked();
-
-        let rows = app.read_with(cx, |app, _| app.lsp_rows.clone());
+        let lsp_rows = app.read_with(cx, |app, _| app.lsp_rows.clone());
         let languages = settings::lsp_languages();
-        assert_eq!(rows.len(), languages.len());
+        assert_eq!(lsp_rows.len(), languages.len());
         for def in languages {
-            assert!(rows.iter().any(|row| row.language == def.language));
+            assert!(lsp_rows.iter().any(|row| row.language == def.language));
         }
-    }
-
-    #[gpui::test]
-    fn settings_opens_to_general_by_default_on_a_fresh_window(cx: &mut TestAppContext) {
-        let repo = crate::test_support::temp_root();
-        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
-
-        cx.dispatch_action(ToggleSettings);
-
-        assert_eq!(
-            app.read_with(cx, |app, _| app.settings_page),
-            SettingsPage::General
-        );
     }
 
     /// Every page in `SettingsPage::ALL` must render without panicking. Running the test
@@ -1271,8 +1213,18 @@ mod code_focus_tests {
         (app, cx, file_path)
     }
 
+    /// Every window-level action must still reach its real handler once a plain `.txt` File
+    /// view is mounted. Without [`AdeApp::code_focus_handle`] tracking real focus there, these
+    /// dispatches silently fall back to the window's internal dispatch root (GPUI's own
+    /// `Window::focus_node_id_in_rendered_frame` falls back to `dispatch_tree.root_node_id()`
+    /// whenever the focused `FocusId` isn't found in the last rendered frame) instead of
+    /// reaching the handler at all.
+    ///
+    /// `GotoDefinition` is included even though a `.txt` file has no hover entry for it to act
+    /// on: `handle_goto_definition_action`'s early return with `hover == None` is harmless, and
+    /// what is under test is that dispatch reached the handler, not what it did once there.
     #[gpui::test]
-    fn toggle_settings_action_reaches_the_real_handler_with_a_file_view_open(
+    fn every_window_action_still_reaches_its_handler_with_a_file_view_open(
         cx: &mut TestAppContext,
     ) {
         let (app, cx, file_path) = open_test_app_with_a_plain_text_file(cx);
@@ -1287,53 +1239,14 @@ mod code_focus_tests {
         );
 
         cx.dispatch_action(ToggleSettings);
-        assert!(
-            app.read_with(cx, |app, _| app.settings_open),
-            "secondary-, must still reach handle_toggle_settings_action once a plain .txt File view is \
-             mounted - without AdeApp::code_focus_handle tracking real focus there, this dispatch \
-             would silently fall back to the window's internal dispatch root (GPUI's own \
-             `Window::focus_node_id_in_rendered_frame` falls back to `dispatch_tree.root_node_id\
-             ()` whenever the focused FocusId isn't found in the last rendered frame) instead of \
-             reaching this handler"
-        );
-    }
-
-    #[gpui::test]
-    fn toggle_palette_action_reaches_the_real_handler_with_a_file_view_open(
-        cx: &mut TestAppContext,
-    ) {
-        let (app, cx, file_path) = open_test_app_with_a_plain_text_file(cx);
-
-        app.update_in(cx, |app, window, cx| {
-            app.open_file_view(file_path.clone(), window, cx);
-        });
-        cx.run_until_parked();
+        assert!(app.read_with(cx, |app, _| app.settings_open));
 
         cx.dispatch_action(TogglePalette);
-        assert!(
-            app.read_with(cx, |app, _| app.palette_open),
-            "secondary-p must still reach handle_toggle_palette_action once a File view is mounted, \
-             for exactly the same real reason secondary-, must"
-        );
-    }
-
-    #[gpui::test]
-    fn goto_definition_action_reaches_the_real_handler_with_a_file_view_open(
-        cx: &mut TestAppContext,
-    ) {
-        let (app, cx, file_path) = open_test_app_with_a_plain_text_file(cx);
-
-        app.update_in(cx, |app, window, cx| {
-            app.open_file_view(file_path.clone(), window, cx);
-        });
-        cx.run_until_parked();
+        assert!(app.read_with(cx, |app, _| app.palette_open));
 
         assert_eq!(app.read_with(cx, |app, _| app.hover.clone()), None);
         cx.dispatch_action(GotoDefinition);
         cx.run_until_parked();
-        // `handle_goto_definition_action` only has a harmless early return with `hover == None`
-        // (a .txt file has no hover entry) - what's under test is that dispatch reached the
-        // handler at all with a File view open, not what it did once there.
         assert_eq!(app.read_with(cx, |app, _| app.hover.clone()), None);
     }
 

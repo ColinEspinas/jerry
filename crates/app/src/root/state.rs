@@ -2217,89 +2217,43 @@ pub(super) fn reset_per_worktree_ui_state(
 mod tests {
     use super::*;
 
+    /// Every piece of per-worktree UI state this function owns is cleared in one call - staged
+    /// files, the open change, expanded directories, and both halves of the tree selection - and
+    /// calling it against already-empty state is a real no-op rather than a panic.
     #[test]
-    fn reset_per_worktree_ui_state_clears_staged_files_and_open_change() {
-        let mut staged_files = HashSet::new();
-        staged_files.insert(PathBuf::from("src/main.rs"));
-        staged_files.insert(PathBuf::from("Cargo.toml"));
+    fn reset_per_worktree_ui_state_clears_every_field_it_owns() {
+        let mut staged_files: HashSet<PathBuf> = ["src/main.rs", "Cargo.toml"]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
         let mut open_change = Some(PathBuf::from("src/main.rs"));
-        let mut expanded_dirs = HashSet::new();
-        let mut selected_tree_path = None;
-        let mut additional_tree_selection = HashSet::new();
-
-        reset_per_worktree_ui_state(
-            &mut staged_files,
-            &mut open_change,
-            &mut expanded_dirs,
-            &mut selected_tree_path,
-            &mut additional_tree_selection,
-        );
-
-        assert!(staged_files.is_empty());
-        assert_eq!(open_change, None);
-    }
-
-    #[test]
-    fn reset_per_worktree_ui_state_is_a_no_op_when_already_empty() {
-        let mut staged_files = HashSet::new();
-        let mut open_change = None;
-        let mut expanded_dirs = HashSet::new();
-        let mut selected_tree_path = None;
-        let mut additional_tree_selection = HashSet::new();
-
-        reset_per_worktree_ui_state(
-            &mut staged_files,
-            &mut open_change,
-            &mut expanded_dirs,
-            &mut selected_tree_path,
-            &mut additional_tree_selection,
-        );
-
-        assert!(staged_files.is_empty());
-        assert_eq!(open_change, None);
-        assert!(expanded_dirs.is_empty());
-    }
-
-    #[test]
-    fn reset_per_worktree_ui_state_clears_expanded_dirs_too() {
-        let mut staged_files = HashSet::new();
-        let mut open_change = None;
-        let mut expanded_dirs = HashSet::new();
-        let mut selected_tree_path = None;
-        let mut additional_tree_selection = HashSet::new();
-        expanded_dirs.insert(PathBuf::from("/repo/worktree-a/src"));
-        expanded_dirs.insert(PathBuf::from("/repo/worktree-a/tests"));
-
-        reset_per_worktree_ui_state(
-            &mut staged_files,
-            &mut open_change,
-            &mut expanded_dirs,
-            &mut selected_tree_path,
-            &mut additional_tree_selection,
-        );
-
-        assert!(expanded_dirs.is_empty());
-    }
-
-    #[test]
-    fn reset_per_worktree_ui_state_clears_selected_tree_path() {
-        let mut staged_files = HashSet::new();
-        let mut open_change = None;
-        let mut expanded_dirs = HashSet::new();
+        let mut expanded_dirs: HashSet<PathBuf> =
+            ["/repo/worktree-a/src", "/repo/worktree-a/tests"]
+                .into_iter()
+                .map(PathBuf::from)
+                .collect();
         let mut selected_tree_path = Some(PathBuf::from("/repo/worktree-a/src/main.rs"));
-        let mut additional_tree_selection = HashSet::new();
-        additional_tree_selection.insert(PathBuf::from("/repo/worktree-a/src/lib.rs"));
+        let mut additional_tree_selection: HashSet<PathBuf> =
+            [PathBuf::from("/repo/worktree-a/src/lib.rs")]
+                .into_iter()
+                .collect();
 
-        reset_per_worktree_ui_state(
-            &mut staged_files,
-            &mut open_change,
-            &mut expanded_dirs,
-            &mut selected_tree_path,
-            &mut additional_tree_selection,
-        );
+        // Twice: once against real state, once against the empty state it leaves behind.
+        for _ in 0..2 {
+            reset_per_worktree_ui_state(
+                &mut staged_files,
+                &mut open_change,
+                &mut expanded_dirs,
+                &mut selected_tree_path,
+                &mut additional_tree_selection,
+            );
 
-        assert_eq!(selected_tree_path, None);
-        assert!(additional_tree_selection.is_empty());
+            assert!(staged_files.is_empty());
+            assert_eq!(open_change, None);
+            assert!(expanded_dirs.is_empty());
+            assert_eq!(selected_tree_path, None);
+            assert!(additional_tree_selection.is_empty());
+        }
     }
 
     /// [`AdeApp::open_files`]/[`AdeApp::open_files_mut`] resolve through

@@ -523,28 +523,27 @@ mod title_menu_tests {
         )
     }
 
-    /// Clicking the real "File" label - a genuine painted div with its own `on_click`, hit-test
-    /// via a real simulated click at its own captured bounds - opens the real File dropdown, not
+    /// Clicking each real label - a genuine painted div with its own `on_click`, hit-tested via a
+    /// real simulated click at its own captured bounds - opens that label's own dropdown, not
     /// just a state flip.
     #[gpui::test]
-    fn clicking_the_file_label_opens_the_real_file_menu(cx: &mut TestAppContext) {
+    fn clicking_each_title_label_opens_its_own_real_menu(cx: &mut TestAppContext) {
         let (app, cx) = open_windows_variant(cx);
-        let bounds = app.read_with(cx, |app, _| {
-            app.title_menu_button_bounds[TitleMenu::File.index()]
-        });
-        assert_ne!(
-            bounds,
-            gpui::Bounds::default(),
-            "the File label should have really painted by now"
-        );
 
-        cx.simulate_click(center_of(bounds), gpui::Modifiers::none());
-        cx.run_until_parked();
+        for menu in TitleMenu::ALL {
+            let bounds = app.read_with(cx, |app, _| app.title_menu_button_bounds[menu.index()]);
+            assert_ne!(
+                bounds,
+                gpui::Bounds::default(),
+                "the {} label should have really painted by now",
+                menu.label()
+            );
 
-        assert_eq!(
-            app.read_with(cx, |app, _| app.title_menu_open),
-            Some(TitleMenu::File)
-        );
+            cx.simulate_click(center_of(bounds), gpui::Modifiers::none());
+            cx.run_until_parked();
+
+            assert_eq!(app.read_with(cx, |app, _| app.title_menu_open), Some(menu));
+        }
     }
 
     /// The File menu's first row ("Open File…") really opens the command palette scoped to
@@ -676,22 +675,6 @@ mod title_menu_tests {
         });
     }
 
-    #[gpui::test]
-    fn clicking_the_edit_label_opens_the_real_edit_menu(cx: &mut TestAppContext) {
-        let (app, cx) = open_windows_variant(cx);
-        let bounds = app.read_with(cx, |app, _| {
-            app.title_menu_button_bounds[TitleMenu::Edit.index()]
-        });
-
-        cx.simulate_click(center_of(bounds), gpui::Modifiers::none());
-        cx.run_until_parked();
-
-        assert_eq!(
-            app.read_with(cx, |app, _| app.title_menu_open),
-            Some(TitleMenu::Edit)
-        );
-    }
-
     /// The Edit menu's *first* row is now real **text** undo (GitHub issue #17), and it is a real
     /// affordance in both directions: inert with nothing to undo (no `on_click` attached at all,
     /// per `render_dropdown_menu_row`'s own enabled/disabled contract), and genuinely undoing the
@@ -767,22 +750,6 @@ mod title_menu_tests {
         assert_eq!(app.read_with(cx, |app, _| app.title_menu_open), None);
     }
 
-    #[gpui::test]
-    fn clicking_the_view_label_opens_the_real_view_menu(cx: &mut TestAppContext) {
-        let (app, cx) = open_windows_variant(cx);
-        let bounds = app.read_with(cx, |app, _| {
-            app.title_menu_button_bounds[TitleMenu::View.index()]
-        });
-
-        cx.simulate_click(center_of(bounds), gpui::Modifiers::none());
-        cx.run_until_parked();
-
-        assert_eq!(
-            app.read_with(cx, |app, _| app.title_menu_open),
-            Some(TitleMenu::View)
-        );
-    }
-
     /// The View menu's first row ("Command Palette") really opens the real palette (default
     /// scope, unlike the File menu's files-scoped row).
     #[gpui::test]
@@ -804,22 +771,6 @@ mod title_menu_tests {
             assert!(app.palette_open);
             assert_eq!(app.title_menu_open, None);
         });
-    }
-
-    #[gpui::test]
-    fn clicking_the_agent_label_opens_the_real_agent_menu(cx: &mut TestAppContext) {
-        let (app, cx) = open_windows_variant(cx);
-        let bounds = app.read_with(cx, |app, _| {
-            app.title_menu_button_bounds[TitleMenu::Agent.index()]
-        });
-
-        cx.simulate_click(center_of(bounds), gpui::Modifiers::none());
-        cx.run_until_parked();
-
-        assert_eq!(
-            app.read_with(cx, |app, _| app.title_menu_open),
-            Some(TitleMenu::Agent)
-        );
     }
 
     /// The Agent menu's first row ("New Terminal") really spawns a new real agent tab (the
@@ -849,22 +800,6 @@ mod title_menu_tests {
             );
             assert_eq!(app.title_menu_open, None);
         });
-    }
-
-    #[gpui::test]
-    fn clicking_the_help_label_opens_the_real_help_menu(cx: &mut TestAppContext) {
-        let (app, cx) = open_windows_variant(cx);
-        let bounds = app.read_with(cx, |app, _| {
-            app.title_menu_button_bounds[TitleMenu::Help.index()]
-        });
-
-        cx.simulate_click(center_of(bounds), gpui::Modifiers::none());
-        cx.run_until_parked();
-
-        assert_eq!(
-            app.read_with(cx, |app, _| app.title_menu_open),
-            Some(TitleMenu::Help)
-        );
     }
 
     /// The Help menu's real "About" row (the third row, after a divider - so this test drives it

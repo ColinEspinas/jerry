@@ -2361,18 +2361,15 @@ mod agent_trailing_text_count_tests {
         }
     }
 
+    /// The row's trailing text conjugates with its own count - and no count at all is an empty
+    /// string, not `"0 files"`: the absence of a measurement and a measured zero are different
+    /// facts, and only the latter is a conjugation case.
     #[test]
-    fn review_file_count_conjugates_at_zero_one_and_two() {
+    fn the_review_file_count_conjugates_and_an_unmeasured_row_says_nothing() {
         assert_eq!(agent_trailing_text(&review_row(Some(0))), "0 files");
         assert_eq!(agent_trailing_text(&review_row(Some(1))), "1 file");
         assert_eq!(agent_trailing_text(&review_row(Some(2))), "2 files");
         assert_eq!(agent_trailing_text(&review_row(Some(12))), "12 files");
-    }
-
-    /// No count at all is still an empty string, not `"0 files"` - the absence of a measurement
-    /// and a measured zero are different facts, and only the latter is a conjugation case.
-    #[test]
-    fn an_unmeasured_review_row_has_no_trailing_text() {
         assert_eq!(agent_trailing_text(&review_row(None)), "");
     }
 }
@@ -3176,16 +3173,10 @@ mod rail_row_tests {
              {:?}",
             spec.args
         );
-    }
 
-    /// A stale/unknown key (the record was pruned, or never existed) must be a genuine no-op -
-    /// nothing is spawned, and nothing else about the app's state changes.
-    #[gpui::test]
-    fn resume_past_agent_is_a_no_op_for_an_unknown_key(cx: &mut TestAppContext) {
-        let repo = crate::test_support::temp_root();
-        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
+        // A stale/unknown key (the record was pruned, or never existed) is a genuine no-op -
+        // nothing is spawned, and nothing else about the app's state changes.
         let count_before = app.read_with(cx, |app, _| app.agents.iter().count());
-
         let resumed = app.update_in(cx, |app, window, cx| {
             app.resume_past_agent("no-such-key", window, cx)
         });
@@ -5690,8 +5681,11 @@ mod rail_filter_selection_tests {
         );
     }
 
+    /// Any edit made while a selection is live replaces that whole range rather than acting at
+    /// the caret: a paste substitutes its clipboard content for it, and one Backspace empties it
+    /// rather than removing a single character from its end.
     #[gpui::test]
-    fn paste_over_a_selection_replaces_it(cx: &mut TestAppContext) {
+    fn an_edit_over_a_live_selection_replaces_the_whole_range(cx: &mut TestAppContext) {
         let repo = crate::test_support::temp_root();
         let (app, cx) = open_filter_with(cx, repo.path(), "origin/main");
         cx.update(|_window, cx| {
@@ -5708,12 +5702,7 @@ mod rail_filter_selection_tests {
             "upstream/main",
             "a paste with a live selection replaces that whole range"
         );
-    }
 
-    #[gpui::test]
-    fn backspace_over_a_selection_deletes_the_whole_range(cx: &mut TestAppContext) {
-        let repo = crate::test_support::temp_root();
-        let (app, cx) = open_filter_with(cx, repo.path(), "origin/main");
         cx.simulate_keystrokes(&secondary("a"));
         cx.simulate_keystrokes("backspace");
         cx.run_until_parked();
