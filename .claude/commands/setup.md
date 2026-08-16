@@ -15,6 +15,14 @@ rustc --version   # should report 1.95.0, matching rust-toolchain.toml
 If it doesn't match, `rustup` picks up `rust-toolchain.toml` automatically on the next `cargo`
 invocation in this directory — nothing to install by hand unless `rustup` itself is missing.
 
+Tests run under `cargo-nextest`, which this repo configures in `.config/nextest.toml` (per-test
+process isolation and a two-minute per-test timeout). Unlike rtk below, it is not optional — check
+for it and install it if absent:
+
+```sh
+cargo nextest --version || cargo install cargo-nextest --locked
+```
+
 ## 2. System dependencies
 
 Detect the platform and check accordingly; don't run installer commands for a platform other than

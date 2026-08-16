@@ -9,6 +9,12 @@ it that way as more people touch it.
 — see the [README](README.md#gpui-version-pin) for the pinned revision. Cargo fetches them
 automatically; no manual checkout is needed.
 
+Tests run under [`cargo-nextest`](https://nexte.st), not `cargo test` — install it once:
+
+```sh
+cargo install cargo-nextest --locked
+```
+
 Coding standards (what "no fake functionality" means, the exact hard rules on `unwrap`/`unsafe`/
 paths/git argv, comment style, GPUI patterns) live in [`CLAUDE.md`](CLAUDE.md) — read that, not this
 file, for how the code itself should look. This file covers the human contribution process around
@@ -25,9 +31,17 @@ cargo fmt --all -- --check
 ```
 
 Run them together as `/check` if you're working through Claude Code. None are optional or "mostly
-passing." `cargo test --workspace` is intentionally not part of this list right now — see
-[issue #348](https://github.com/ColinEspinas/jerry/issues/348); run tests relevant to what you're
-touching manually instead.
+passing." The test suite is intentionally not part of this list right now — see
+[issue #348](https://github.com/ColinEspinas/jerry/issues/348); run the tests relevant to what
+you're touching manually instead, scoped to a crate:
+
+```sh
+cargo nextest run -p wt-core
+```
+
+`.config/nextest.toml` gives every test its own process and kills one that is still running after
+two minutes, so a hung test fails that test instead of the whole run. `cargo test` has no
+equivalent and will sit there indefinitely — prefer `cargo nextest run`.
 
 See [`docs/development-workflow.md`](docs/development-workflow.md) for how a change actually moves
 from a GitHub issue to a merged PR in this repo, including which Claude Code skill covers which
