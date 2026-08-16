@@ -1,70 +1,14 @@
 //! Read-only diff of a worktree's `HEAD` (including uncommitted changes) against the
 //! merge-base with the repository's default branch.
 //!
-//! ## What "base" means
+//! The default branch is detected in order: `refs/remotes/origin/HEAD`, a local `main`, a local
+//! `master`, then the main worktree's checked-out branch. If none resolve, or the worktree is
+//! already on it, or the histories share no ancestor, [`diff_against_base`] returns
+//! [`DiffBase::NoBase`] and still diffs uncommitted changes; [`DiffBase::NoBaseFound`] means
+//! `HEAD` is unborn.
 //!
-//! A git worktree has no notion of an explicit "base branch": it just has a branch (or a
-//! detached commit) checked out. The useful comparison for reviewing what changed before
-//! merging is against the point where the worktree's branch diverged from the repository's
-//! default branch - i.e. the merge-base between the worktree's `HEAD` and the default
-//! branch's tip.
-//!
-//! The default branch itself is detected, in order:
-//! 1. `refs/remotes/origin/HEAD`, if it exists and is a symbolic ref (mirrors
-//!    `git symbolic-ref refs/remotes/origin/HEAD`).
-//! 2. A local `main` branch, if one exists.
-//! 3. A local `master` branch, if one exists.
-//! 4. The main worktree's own currently checked-out branch, as a last resort (so a
-//!    repository with neither an `origin` remote nor a `main`/`master` branch still gets a
-//!    sensible base).
-//!
-//! If none of these yield a branch, or the selected worktree's branch *is* the detected
-//! default branch, or no merge-base exists between the two histories, [`diff_against_base`]
-//! returns [`DiffBase::NoBase`] rather than fabricating a base branch to diff against - but it
-//! still computes a real `git diff HEAD` of uncommitted changes for that case (GitHub issue
-//! #108), so `DiffBase::NoBase` is not "nothing to show". [`DiffBase::NoBaseFound`] is reserved
-//! for the one case where even that fallback is impossible: `HEAD` itself is unborn.
-//!
-//! ## What the diff includes
-//!
-//! This runs `git diff <merge-base>` (not `git diff <merge-base>..HEAD`), with the worktree
-//! itself as the current directory. `git diff <commit>` compares `<commit>`'s tree against
-//! the *working tree* (index and unstaged changes included), which is deliberate: an agent
-//! working in this worktree may not have committed anything yet, so limiting the diff to
-//! committed history would hide exactly the changes a reviewer most wants to see. One gap:
-//! `git diff <commit>` (with no `--cached`) only ever considers paths already present in
-//! `<commit>`'s tree or in the index, so a genuinely untracked file is invisible to it.
-//! [`diff_against_base`] works around this with [`prepare_shadow_index`]: a throwaway,
-//! `--intent-to-add`-augmented copy of the index, passed to `git diff` via a
-//! `GIT_INDEX_FILE` override so untracked files show up as additions too, without ever
-//! touching the real index. See that function's docs for the mechanics.
-//!
-//! ## Explicit git config, not caller defaults
-//!
-//! The `git diff` invocation pins `diff.mnemonicPrefix=false`, `diff.noprefix=false`, and
-//! `core.quotePath=false` via `-c` (before the `diff` subcommand, where git requires global
-//! config overrides to appear). Without this, the path-prefix parsing below
-//! ([`strip_diff_prefix`]) would silently mislabel every file under a caller's
-//! `diff.mnemonicPrefix=true` config (prefixes become `i/`/`w/`/`c/` instead of `a/`/`b/`),
-//! and non-ASCII filenames would render octal-escaped under `core.quotePath`'s default (on)
-//! setting.
-//!
-//! ## gix vs. the `git` CLI
-//!
-//! Per this crate's convention, reads go through `gix` where practical: base-branch
-//! detection and merge-base computation use [`gix::Repository::find_reference`] and
-//! [`gix::Repository::merge_base`].
-//!
-//! Producing the diff *text* is different: `gix-diff` operates at the level of tree and blob
-//! objects, not the working tree, and has no built-in formatter that reproduces `git diff`'s
-//! unified-diff text (hunk headers, context lines, rename/binary detection, and blending in
-//! uncommitted working-tree state). Reimplementing that on top of `gix-diff`'s lower-level
-//! primitives would mean re-deriving `git diff`'s own output format from scratch. `git diff`
-//! already handles all of this correctly, so this module shells out to it for the diff text
-//! specifically, the same way [`super::remove_worktree`]'s dirty-check shells out to `git
-//! status`.
-//!
-//! Performs blocking I/O; see the crate-level docs.
+//! Detection uses `gix`; the diff text itself comes from `git` - see
+//! `docs/architecture/decisions.md` §5. Performs blocking I/O; see the crate-level docs.
 
 use std::ffi::OsString;
 use std::io::Read as _;
@@ -74,18 +18,13 @@ use std::process::Stdio;
 use crate::error::{Error, GitExit};
 use crate::{check_success, format_args, git_command, open_repo, run_git};
 
-/// Cap on how many bytes of `git diff` stdout are read into memory. A diff larger than this
-/// (thousands of changed lines, or a huge generated file slipping past `.gitignore`) is
-/// truncated rather than buffered without bound or left to hang the read loop; see
-/// [`WorktreeDiff::truncated`].
+/// Cap on how many bytes of `git diff` stdout are buffered; beyond it the diff is truncated.
 pub(crate) const MAX_DIFF_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 
-/// Cap on how many changed files are kept from a single diff. Mirrors the "cap the loaded
-/// data, independent of what's rendered" approach `file_tree::build_file_tree` uses.
+/// Cap on how many changed files are kept from a single diff.
 const MAX_FILES: usize = 300;
 
-/// Cap on how many hunk lines are kept per file. A single enormous file (e.g. a generated
-/// lockfile) shouldn't be allowed to blow up memory or rendering on its own.
+/// Cap on how many hunk lines are kept per file.
 const MAX_HUNK_LINES_PER_FILE: usize = 2000;
 
 /// One line within a diff hunk.
@@ -128,58 +67,45 @@ pub struct DiffFile {
     /// The file's path before the change, if different (only set for renames).
     pub old_path: Option<PathBuf>,
     pub status: FileChangeStatus,
-    /// `true` if `git diff` reported this as a binary file; `hunks` is always empty in that
-    /// case (binary content is never diffed line-by-line here).
+    /// `true` if `git diff` reported this as binary; `hunks` is then always empty.
     pub is_binary: bool,
     pub hunks: Vec<DiffHunk>,
     /// `true` if this file's hunk lines were cut short by [`MAX_HUNK_LINES_PER_FILE`].
     pub truncated: bool,
 }
 
-/// A real, computed diff of a worktree against its base.
+/// A computed diff of a worktree against its base.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeDiff {
     /// The short name of the detected default branch this was diffed against.
     pub base_branch: String,
-    /// The full commit id of the merge-base between the worktree's `HEAD` and the default
-    /// branch (i.e. exactly what `git diff <base_commit>` was run against).
+    /// The commit `git diff` was actually run against.
     pub base_commit: String,
     pub files: Vec<DiffFile>,
-    /// `true` if the raw `git diff` output was too large to read in full
-    /// ([`MAX_DIFF_OUTPUT_BYTES`]) or if more than [`MAX_FILES`] files changed; some files or
-    /// hunk lines may be missing as a result.
+    /// `true` if output exceeded [`MAX_DIFF_OUTPUT_BYTES`] or [`MAX_FILES`], so content is missing.
     pub truncated: bool,
 }
 
 /// The outcome of trying to compute a worktree's diff against its base.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffBase {
-    /// A usable base branch was found; here is the diff against it (possibly with zero changed
-    /// files, if the worktree exactly matches its base).
+    /// A usable base branch was found; here is the diff against it.
     Diff(WorktreeDiff),
-    /// No meaningful base *branch* to diff against - either this worktree's own branch *is*
-    /// the detected default branch (`branch: Some(name)`), or none could be detected, or the
-    /// two histories share no common ancestor (`branch: None` for either of those). `HEAD` is
-    /// still a real, born commit though, so `uncommitted` is a genuine `git diff HEAD` (staged
-    /// and unstaged local edits) rather than a fabricated "nothing to show" - see GitHub issue
-    /// #108: a worktree on its default branch (or with no detectable base) still deserves to
-    /// show real, reviewable changes if it has any.
+    /// No usable base *branch*, so `uncommitted` holds a `git diff HEAD` instead. `branch` names
+    /// the detected default branch when the worktree is simply already on it.
     NoBase {
         branch: Option<String>,
         uncommitted: WorktreeDiff,
     },
-    /// Truly nothing to diff, even uncommitted changes: `HEAD` itself is unborn (a brand new
-    /// repository with no commits yet), so there is no commit to diff the working tree against.
+    /// Nothing to diff at all: `HEAD` is unborn, so there is no commit to compare against.
     NoBaseFound,
 }
 
 impl DiffBase {
-    /// The real diff content this outcome carries, if any - `Some` for both [`DiffBase::Diff`]
-    /// (a real base branch) and [`DiffBase::NoBase`] (no real base branch, but real uncommitted
-    /// changes against `HEAD` instead), `None` only for [`DiffBase::NoBaseFound`]. Every
-    /// consumer that wants to *show* a diff regardless of why - the Changes sidebar, tab diff
-    /// stats, the rail's per-worktree summary - should read through this rather than matching
-    /// `Diff` alone, or it would silently drop GitHub issue #108's fallback.
+    /// The diff content this outcome carries, `None` only for [`DiffBase::NoBaseFound`].
+    ///
+    /// Callers that want to show a diff regardless of whether a base branch was found should
+    /// read through this rather than matching [`DiffBase::Diff`] alone.
     pub fn diff(&self) -> Option<&WorktreeDiff> {
         match self {
             DiffBase::Diff(diff)
@@ -193,30 +119,22 @@ impl DiffBase {
 
 /// The comparison points one worktree offers, resolved once through `gix`.
 ///
-/// Extracted so the three scopes the Changes panel draws (GitHub issue #285: *Uncommitted* =
-/// working tree vs `HEAD`, *Commits* = the branch's own commits, *Against main* = the merge-base
-/// diff) all agree about where `HEAD` is and where the base is, instead of each re-deriving it
-/// from its own `gix` walk and being able to disagree about the answer mid-refresh.
+/// Resolved once and shared so every scope the Changes panel draws agrees about where `HEAD`
+/// and the base are, rather than each re-deriving them and disagreeing mid-refresh.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BaseResolution {
     /// The worktree's own checked-out branch, `None` when `HEAD` is detached.
     pub(crate) worktree_branch: Option<String>,
-    /// The worktree's `HEAD` commit, as a hex sha. Always a real, born commit - a resolution is
-    /// only produced at all once `HEAD` peels to something.
+    /// The worktree's `HEAD` commit, as a hex sha. Always a born commit.
     pub(crate) head_sha: String,
-    /// The detected default branch, whether or not a merge-base with it exists (see the module
-    /// docs' "What 'base' means" section for the detection order).
+    /// The detected default branch, whether or not a merge-base with it exists.
     pub(crate) detected_base_branch: Option<String>,
-    /// `Some((base branch, merge-base sha))` only when there is a genuinely usable base to diff
-    /// against: a default branch was detected, it is not this worktree's own branch, and the two
-    /// histories share a common ancestor.
+    /// `Some((base branch, merge-base sha))` only when there is a usable base to diff against.
     pub(crate) base: Option<(String, String)>,
 }
 
 impl BaseResolution {
-    /// The branch name a diff produced from this resolution is *labelled* with - the real base
-    /// branch where there is one, otherwise the worktree's own branch (possibly empty for a
-    /// detached `HEAD`). Purely descriptive; nothing is diffed against it.
+    /// The branch name a diff from this resolution is *labelled* with; nothing is diffed against it.
     fn label_branch(&self) -> String {
         self.detected_base_branch
             .clone()
@@ -224,9 +142,7 @@ impl BaseResolution {
     }
 }
 
-/// Resolves `worktree_path`'s `HEAD` and its base, per this module's own base-detection order.
-/// `Ok(None)` means `HEAD` is unborn - a freshly initialized repository with no commits at all,
-/// which has nothing to compare against, not even its own working tree.
+/// Resolves `worktree_path`'s `HEAD` and its base. `Ok(None)` means `HEAD` is unborn.
 ///
 /// Performs blocking I/O (`gix` reads only).
 pub(crate) fn resolve_base(worktree_path: &Path) -> Result<Option<BaseResolution>, Error> {
@@ -254,8 +170,7 @@ pub(crate) fn resolve_base(worktree_path: &Path) -> Result<Option<BaseResolution
         }));
     };
 
-    // The worktree's own branch *is* the default branch: there is a detected base, but nothing
-    // meaningful to diff against it.
+    // On the default branch itself: a base was detected, but nothing to diff against it.
     if worktree_branch.as_deref() == Some(base_branch.as_str()) {
         return Ok(Some(BaseResolution {
             worktree_branch,
@@ -267,8 +182,7 @@ pub(crate) fn resolve_base(worktree_path: &Path) -> Result<Option<BaseResolution
 
     let merge_base = match repo.merge_base(worktree_head_id.detach(), base_commit_id) {
         Ok(id) => Some(id.detach().to_string()),
-        // A real default branch exists, but shares no common ancestor with this worktree's
-        // history - so there is no point to diff from.
+        // Unrelated histories: no common ancestor, so no point to diff from.
         Err(gix::repository::merge_base::Error::NotFound { .. }) => None,
         Err(source) => return Err(Error::MergeBase(Box::new(source))),
     };
@@ -281,14 +195,9 @@ pub(crate) fn resolve_base(worktree_path: &Path) -> Result<Option<BaseResolution
     }))
 }
 
-/// Compute the real diff of the worktree at `worktree_path` against its base, per this
-/// module's docs. Performs blocking I/O (opens the repository via `gix`, and spawns a real
-/// `git diff` child process).
+/// Diffs the worktree at `worktree_path` against its base. Performs blocking I/O.
 pub fn diff_against_base(worktree_path: &Path) -> Result<DiffBase, Error> {
     let Some(resolved) = resolve_base(worktree_path)? else {
-        // Unborn HEAD: a freshly initialized repository with no commits yet has nothing to
-        // diff against any base - not even its own uncommitted changes, since there is no
-        // commit to diff the working tree against.
         return Ok(DiffBase::NoBaseFound);
     };
 
@@ -314,27 +223,15 @@ pub fn diff_against_base(worktree_path: &Path) -> Result<DiffBase, Error> {
     Ok(DiffBase::Diff(diff))
 }
 
-/// The **Uncommitted** scope (GitHub issue #285): the worktree's working tree against its own
-/// `HEAD` - "what is dirty in the checkout".
+/// The working tree against its own `HEAD` - what is dirty in the checkout, untracked files
+/// included.
 ///
-/// Deliberately a *different question* from [`diff_against_base`], not a filtered view of it.
-/// `diff_against_base` compares against the merge-base with the default branch, so its file list
-/// mixes work that is already committed on this branch with work that is not
-/// (`design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §1's *Against main* scope: "what
-/// would land"). This compares against `HEAD`, so a file whose only difference from `main` is
-/// already inside a commit on this branch does not appear here at all. The two agree only on a
-/// branch with no commits of its own.
+/// A different question from [`diff_against_base`], not a filtered view of it: this compares
+/// against `HEAD`, so work already committed on the branch does not appear.
 ///
-/// Untracked files are included, via the same `--intent-to-add` shadow index
-/// ([`prepare_shadow_index`]) `diff_against_base` uses - an agent's brand-new file is exactly the
-/// kind of dirty the checkout has.
+/// `Ok(None)` means `HEAD` is unborn; "nothing changed" is `Ok(Some(_))` with empty `files`.
 ///
-/// `Ok(None)` means `HEAD` is unborn: there is no commit to diff the working tree against, which
-/// is the same single case [`DiffBase::NoBaseFound`] is reserved for. It is never used to mean
-/// "nothing changed" - that is `Ok(Some(diff))` with an empty `files`.
-///
-/// Performs blocking I/O (opens the repository via `gix`, and spawns a real `git diff` child
-/// process).
+/// Performs blocking I/O.
 pub fn diff_against_head(worktree_path: &Path) -> Result<Option<WorktreeDiff>, Error> {
     let Some(resolved) = resolve_base(worktree_path)? else {
         return Ok(None);
@@ -351,18 +248,10 @@ pub fn diff_against_head(worktree_path: &Path) -> Result<Option<WorktreeDiff>, E
     )?))
 }
 
-/// Defensive validation for an object id about to be handed to a spawned `git` process as a
-/// bare argument: it must be a non-empty, all-ASCII-hex string, so it can never be misparsed as
-/// a flag or as revision syntax. Every in-crate caller produces these from a real `gix` object
-/// id (or from `git write-tree`'s own stdout), but re-checking costs nothing and means a future
-/// change to how one is derived can't silently turn into a git-argument injection.
+/// Rejects an object id that is not non-empty ASCII hex, so it can never reach `git` as a flag
+/// or as revision syntax.
 ///
-/// Deliberately does **not** pin a length (40 for SHA-1, 64 for SHA-256): a repository's hash
-/// algorithm is the repository's business, and hardcoding today's two lengths here would be a
-/// latent failure for a future one without buying anything the hex-only check doesn't already.
-///
-/// `pub(crate)` so [`crate::review`]'s own tree-id arguments go through this exact check rather
-/// than a second, drifting copy of it.
+/// Deliberately does not pin a length: the repository's hash algorithm is its own business.
 pub(crate) fn validate_object_id(id: &str, what: &str) -> Result<(), Error> {
     if id.is_empty() || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(Error::WorktreeIo(std::io::Error::other(format!(
@@ -372,16 +261,11 @@ pub(crate) fn validate_object_id(id: &str, what: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// Runs `git diff <object_id>` against the worktree's real working tree (see the module docs'
-/// "What the diff includes" section) and folds the result into a [`WorktreeDiff`]. `label_branch`
-/// is purely descriptive - the real base branch name for [`DiffBase::Diff`], or whatever branch
-/// name is available (possibly none) for the [`DiffBase::NoBase`] uncommitted-vs-`HEAD` fallback.
+/// Runs `git diff <object_id>` against the working tree and folds the result into a
+/// [`WorktreeDiff`]. `label_branch` is purely descriptive.
 ///
-/// `object_id` is a commit id for every caller in this module, but `git diff <object>` resolves a
-/// **tree** id exactly the same way - it diffs that tree against the working tree either way - so
-/// [`crate::review::diff_against_tree`] reuses this function verbatim against a
-/// `git write-tree` snapshot rather than duplicating the invocation, the shadow index, the pinned
-/// config, and the parser. That is why this is `pub(crate)` rather than private.
+/// `object_id` may be a commit or a tree: `git diff <object>` resolves both against the working
+/// tree the same way, which is what lets [`crate::review::diff_against_tree`] reuse this.
 pub(crate) fn compute_diff(
     worktree_path: &Path,
     object_id: &str,
@@ -394,9 +278,9 @@ pub(crate) fn compute_diff(
     let shadow_index = prepare_shadow_index(worktree_path, shadow_content)?;
 
     let args: Vec<OsString> = vec![
-        // Global config overrides (`-c key=value`) must precede the subcommand for `git` to
-        // accept them - see the module docs' "Explicit git config" section for why these are
-        // pinned rather than left to the caller's own git config.
+        // Pinned, not left to the caller's config: `diff.mnemonicPrefix` would turn the `a/`/`b/`
+        // prefixes `strip_diff_prefix` parses into `i/`/`w/`/`c/`, and `core.quotePath` defaults
+        // to octal-escaping non-ASCII filenames. `-c` must precede the subcommand.
         "-c".into(),
         "diff.mnemonicPrefix=false".into(),
         "-c".into(),
@@ -426,73 +310,49 @@ pub(crate) fn compute_diff(
     })
 }
 
-/// Cap on how many commits the **Commits** scope loads, mirroring [`MAX_FILES`]' "cap the loaded
-/// data, independent of what's rendered" convention. A branch with more commits than this than its
-/// base is truncated, not silently hung on.
+/// Cap on how many commits are loaded for a branch.
 const MAX_BRANCH_COMMITS: usize = 300;
 
-/// One commit written down on this branch since its base - a row of the **Commits** section
-/// (GitHub issue #285).
+/// One commit on this branch since its base.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BranchCommit {
     /// The full hex commit id.
     pub id: String,
-    /// git's own abbreviation of [`Self::id`] (`%h`), honouring the repository's real
-    /// `core.abbrev`/uniqueness rules - never a hand-truncated prefix.
+    /// git's own `%h` abbreviation of [`Self::id`], never a hand-truncated prefix.
     pub short_id: String,
     pub subject: String,
     pub author_name: String,
     pub author_time_unix: i64,
-    /// Lines this commit added, summed over its own `--numstat`.
+    /// Lines this commit added, per its own `--numstat`.
     ///
-    /// **Zero for a merge commit**, and honestly so: `git log --numstat` with no `-m`/`-c` reports
-    /// no file lines for a merge, git's own "a merge has no single meaningful diff" behaviour -
-    /// exactly what [`crate::graph::commit_changed_files`] already documents for the same reason.
-    /// A binary file also contributes nothing, since git prints `-` rather than a line count for
-    /// one; that is a real absence of a line count, not a zero this function invented.
+    /// Zero for a merge commit and for binary files: git reports no line counts for either, so
+    /// this is a genuine absence rather than a computed zero.
     pub added: u32,
     pub removed: u32,
 }
 
-/// The **Commits** scope (GitHub issue #285): what is already written down on this branch, and
-/// the net diffstat of writing it.
+/// What is already committed on this branch, and the net diffstat of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BranchCommits {
-    /// The short name of the base branch the range was taken against, or `None` when there is no
-    /// usable base (see [`DiffBase::NoBase`]'s own cases) - in which case [`Self::commits`] is
-    /// empty rather than falling back to the whole of history.
+    /// The base branch the range was taken against; `None` leaves [`Self::commits`] empty rather
+    /// than falling back to the whole of history.
     pub base_branch: Option<String>,
     /// The merge-base commit the range starts at, when there is one.
     pub base_commit: Option<String>,
     /// Newest first, exactly as `git log` lists them.
     pub commits: Vec<BranchCommit>,
-    /// The **net** diffstat of `<merge-base>..HEAD` - one `git diff --numstat`, not the sum of
-    /// [`Self::commits`]' own stats.
-    ///
-    /// The two are genuinely different numbers and the net one is the honest answer to "what is
-    /// written down": a line a commit added and a later commit removed is in the sum twice and in
-    /// the net answer not at all, and a merge commit contributes nothing to the sum at all (see
-    /// [`BranchCommit::added`]). This is the same quantity `Against main` reports, minus whatever
-    /// is still uncommitted.
+    /// The *net* diffstat of the range, not the sum of [`Self::commits`]' own stats - a line
+    /// added then later removed counts in the sum but not here.
     pub added: u32,
     pub removed: u32,
-    /// `true` if more than [`MAX_BRANCH_COMMITS`] commits were on the branch, so [`Self::commits`]
-    /// is a prefix of the real range.
+    /// `true` if the branch had more than [`MAX_BRANCH_COMMITS`] commits.
     pub truncated: bool,
 }
 
-/// Reads the commits on `worktree_path`'s branch since its merge-base with the detected default
-/// branch, plus the net diffstat of that range - the **Commits** section's data (GitHub issue
-/// #285: "what is written down").
+/// Reads the commits on `worktree_path`'s branch since its merge-base, plus the range's net
+/// diffstat. With no usable base this returns an empty range rather than all of history.
 ///
-/// With no usable base (an unborn `HEAD`, no detectable default branch, the worktree sitting on
-/// the default branch itself, or unrelated histories) this returns an **empty** range rather than
-/// falling back to all of history: "the commits this branch added" has no answer without a point
-/// to have added them from, and listing every commit in the repository would be a different,
-/// wrong answer rather than a degraded one.
-///
-/// Performs blocking I/O: opens the repository via `gix` and spawns two real `git` child
-/// processes.
+/// Performs blocking I/O.
 pub fn commits_since_base(worktree_path: &Path) -> Result<BranchCommits, Error> {
     let empty = BranchCommits {
         base_branch: None,
@@ -514,10 +374,8 @@ pub fn commits_since_base(worktree_path: &Path) -> Result<BranchCommits, Error> 
 
     let range = format!("{merge_base_sha}..{}", resolved.head_sha);
 
-    // One `git log` for both the commit list and each commit's own numstat. `%x1e` (RS) starts
-    // every record and `%x1f` (US) separates the fields inside its header line, so a subject
-    // containing tabs, newlines or any other punctuation cannot be misparsed as a field boundary
-    // or as the start of a numstat line.
+    // RS/US (`%x1e`/`%x1f`) delimit records and fields so a subject containing tabs or newlines
+    // cannot be misparsed as a field boundary or as the start of a numstat line.
     let log_args: Vec<OsString> = vec![
         "-c".into(),
         "core.quotePath=false".into(),
@@ -535,8 +393,6 @@ pub fn commits_since_base(worktree_path: &Path) -> Result<BranchCommits, Error> 
     let over_cap = commits.len() > MAX_BRANCH_COMMITS;
     commits.truncate(MAX_BRANCH_COMMITS);
 
-    // The section header's own diffstat: the *net* change across the whole range, in one call.
-    // `..` (two dots) with a real merge-base on the left is the same range `git log` above walked.
     let numstat_args: Vec<OsString> = vec![
         "-c".into(),
         "core.quotePath=false".into(),
@@ -560,13 +416,11 @@ pub fn commits_since_base(worktree_path: &Path) -> Result<BranchCommits, Error> 
     })
 }
 
-/// Parses `git log --numstat --format=%x1e%H%x1f%h%x1f%an%x1f%at%x1f%s` output - see
-/// [`commits_since_base`] for why those separators.
+/// Parses `git log --numstat --format=%x1e%H%x1f%h%x1f%an%x1f%at%x1f%s` output.
 fn parse_branch_commits(text: &str) -> Vec<BranchCommit> {
     let mut commits = Vec::new();
-    // `split('\u{1e}')` yields one leading empty piece before the first record; `filter` drops it
-    // rather than a `skip(1)` that would silently eat a real record if git ever stopped emitting
-    // the leading separator.
+    // Skipping empty records, rather than `skip(1)`, keeps a real record if git ever stops
+    // emitting the leading separator.
     for record in text.split('\u{1e}') {
         let record = record.trim_start_matches('\n');
         if record.is_empty() {
@@ -586,8 +440,7 @@ fn parse_branch_commits(text: &str) -> Vec<BranchCommit> {
         ) else {
             continue;
         };
-        // A header that doesn't carry a real hex id is not a commit record - skipped rather than
-        // recorded with a fabricated id that a later `git show` would fail on.
+        // Not a commit record: skipped rather than recorded with an id `git show` would reject.
         if id.is_empty() || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
             continue;
         }
@@ -597,8 +450,8 @@ fn parse_branch_commits(text: &str) -> Vec<BranchCommit> {
             short_id: short_id.to_string(),
             subject: subject.to_string(),
             author_name: author_name.to_string(),
-            // An unparseable `%at` becomes `0` rather than dropping the commit: the timestamp only
-            // drives a relative-age label, and losing the commit entirely would be the bigger lie.
+            // The timestamp only drives an age label, so an unparseable one loses less than
+            // dropping the whole commit would.
             author_time_unix: author_time.parse().unwrap_or(0),
             added,
             removed,
@@ -607,11 +460,9 @@ fn parse_branch_commits(text: &str) -> Vec<BranchCommit> {
     commits
 }
 
-/// Sums `git --numstat` lines (`<added>\t<removed>\t<path>`).
+/// Sums `git --numstat` lines (`<added>\t<removed>\t<path>`), saturating.
 ///
-/// A binary file's `-\t-\t<path>` contributes nothing, which is git's own way of saying it has no
-/// line counts - deliberately not counted as a zero-line change *or* skipped silently into some
-/// other bucket. Saturating, so a pathological diff cannot wrap a total into a smaller number.
+/// A binary file's `-\t-\t<path>` contributes nothing: git reports no line counts for one.
 fn sum_numstat(text: &str) -> (u32, u32) {
     let mut added = 0u32;
     let mut removed = 0u32;
@@ -633,35 +484,23 @@ fn sum_numstat(text: &str) -> (u32, u32) {
     (added, removed)
 }
 
-/// Merge-state of a worktree's `HEAD` against the repository's detected default base branch
-/// (see the module docs' "What 'base' means" section for the detection order) - powers the
-/// session rail's "by project" worktree rows
-/// (`design_handoff_jerry_ade/README.md`: a worktree whose branch is fully merged into the
-/// default branch, with no running session, is offered as `merged HH:MM · prunable`).
+/// Merge-state of a worktree's `HEAD` against the detected default base branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeMergeStatus {
     /// The short name of the detected default branch this was checked against.
     pub base_branch: String,
-    /// `true` if the worktree's `HEAD` is an ancestor of (or equal to) the base branch's
-    /// tip - i.e. every commit reachable from `HEAD` is already reachable from the base
-    /// branch, the same condition `git branch --merged <base>` reports. Computed via
-    /// `gix::Repository::merge_base`: `HEAD` is merged iff its own id *is* the merge-base of
-    /// (`HEAD`, base tip).
+    /// `true` if `HEAD` is an ancestor of (or equal to) the base branch's tip - what
+    /// `git branch --merged <base>` reports.
     pub merged: bool,
-    /// The worktree `HEAD` commit's committer timestamp, as seconds since the Unix epoch
-    /// (UTC) - read via `gix`'s `Commit::time()`. `None` only if the commit object itself
-    /// could not be decoded; treated as "unknown" rather than a hard error, since it only
-    /// affects a display label, not the `merged` verdict itself.
+    /// The `HEAD` commit's committer timestamp, in seconds since the Unix epoch. `None` means
+    /// the commit could not be decoded; it only affects a display label, not `merged`.
     pub head_committer_unix_seconds: Option<i64>,
 }
 
-/// Compute [`WorktreeMergeStatus`] for the worktree at `worktree_path`: whether its `HEAD`
-/// has already been fully merged into the repository's detected default branch, per this
-/// module's own base-detection order. Returns `Ok(None)` if no sensible base could be
-/// detected or `HEAD` is unborn, rather than guessing.
+/// Whether `worktree_path`'s `HEAD` is already merged into the detected default branch.
+/// `Ok(None)` if no base could be detected or `HEAD` is unborn.
 ///
-/// Performs blocking I/O (`gix` reads only - no `git` child process is spawned here, unlike
-/// [`diff_against_base`]).
+/// Performs blocking I/O (`gix` reads only).
 pub fn merge_status_against_base(
     worktree_path: &Path,
 ) -> Result<Option<WorktreeMergeStatus>, Error> {
@@ -707,8 +546,7 @@ pub fn merge_status_against_base(
     }))
 }
 
-/// Real ahead/behind commit counts for a worktree's `HEAD` against the repository's detected
-/// default base branch - the status bar's `↑2 ↓0` indicator.
+/// Ahead/behind commit counts for a worktree's `HEAD` against the detected default base branch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AheadBehind {
     /// Commits reachable from `HEAD` but not from the base branch's tip.
@@ -717,33 +555,11 @@ pub struct AheadBehind {
     pub behind: usize,
 }
 
-/// Computes real [`AheadBehind`] counts for the worktree at `worktree_path` against its
-/// detected default base branch, per this module's own base-detection order (see the module
-/// docs). Returns `Ok(None)` for the same "nothing sensible to compare" cases
-/// [`merge_status_against_base`] does: no base could be detected, or `HEAD` is unborn.
-/// [`AheadBehind`] is trivially `{0, 0}` when the worktree's own branch *is* the detected base.
+/// Ahead/behind counts for `worktree_path` against its detected default base branch. `Ok(None)`
+/// if no base could be detected, `HEAD` is unborn, or the histories are unrelated; `{0, 0}` when
+/// the worktree is already on the base branch.
 ///
-/// Shells out to `git rev-list --left-right --count <base_commit>...HEAD` (the `...` symmetric
-/// difference already computes the merge-base internally, so there's no need to pass one
-/// explicitly) - `<base_commit>...HEAD` reports `<count only reachable from base>\t<count only
-/// reachable from HEAD>`, i.e. `<behind>\t<ahead>`. Before running it, this confirms via `gix`
-/// that a real common ancestor exists (mirrors [`diff_against_base`]'s own `NoBaseFound`
-/// handling for unrelated histories) - without that check, two branches with no shared history
-/// would silently degrade into "every commit reachable from either side", not a real ahead/
-/// behind count.
-///
-/// The `git` invocation is given `base_commit_id`'s real hex sha - *not* `base_branch`'s short
-/// name - exactly as [`diff_against_base`] already does for its own `git diff` invocation. A
-/// bare short name is not safe here: when `detect_default_base` finds its base via
-/// `refs/remotes/origin/HEAD` (a common, normal case), the short name it returns (e.g. `main`)
-/// is ambiguous in a repository that *also* has a local branch of the same name - git's own
-/// disambiguation rules resolve a bare `main...HEAD` against the local `refs/heads/main` first,
-/// not the remote-tracking `refs/remotes/origin/main` that was actually detected as the real
-/// base. A local `main` that's gone stale relative to `origin/main` would then silently compare
-/// against the wrong, stale commit and could under-report (or entirely miss) how far behind the
-/// worktree really is. The hex commit id has no such ambiguity.
-///
-/// Performs blocking I/O: opens the repository via `gix` and spawns a real `git` child process.
+/// Performs blocking I/O.
 pub fn ahead_behind_against_base(worktree_path: &Path) -> Result<Option<AheadBehind>, Error> {
     let repo = open_repo(worktree_path)?;
 
@@ -774,16 +590,16 @@ pub fn ahead_behind_against_base(worktree_path: &Path) -> Result<Option<AheadBeh
     }
 
     let base_commit_sha = base_commit_id.to_string();
-    // Same defensive hex-only check `diff_against_base` applies to its own merge-base sha
-    // before handing it to a spawned `git` argument - see that function's own comment for why
-    // this costs nothing and guards against a future change silently turning into a
-    // git-argument injection.
     if base_commit_sha.is_empty() || !base_commit_sha.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(Error::WorktreeIo(std::io::Error::other(
             "detected base commit id was not a hex object id",
         )));
     }
 
+    // The sha, never `base_branch`'s short name: when the base came from
+    // `refs/remotes/origin/HEAD`, a bare `main...HEAD` resolves to a local `refs/heads/main`
+    // first, which may be stale and would under-report how far behind the worktree is.
+    // `...` computes the merge-base itself and reports `<behind>\t<ahead>`.
     let args: Vec<OsString> = vec![
         "rev-list".into(),
         "--left-right".into(),
@@ -796,12 +612,10 @@ pub fn ahead_behind_against_base(worktree_path: &Path) -> Result<Option<AheadBeh
     Ok(parse_ahead_behind_counts(&text))
 }
 
-/// Parses `git rev-list --left-right --count <base>...HEAD`'s stdout (`<behind> <ahead>`,
-/// whitespace-separated) into a real [`AheadBehind`]. `None` - not a fabricated `{0, 0}` via
-/// `.unwrap_or(0)` - if either field is missing or isn't a real number, matching this codebase's
-/// own established "no entry rather than a fabricated value" convention (e.g. `rail.rs`'s
-/// clean/merge note handling) for exactly this class of situation: a confident-looking but wrong
-/// "up to date" is worse than an honestly-omitted value.
+/// Parses `git rev-list --left-right --count`'s `<behind> <ahead>` stdout.
+///
+/// `None`, rather than `{0, 0}`, when a field is missing or unparseable: a confident but wrong
+/// "up to date" is worse than an omitted value.
 fn parse_ahead_behind_counts(text: &str) -> Option<AheadBehind> {
     let mut parts = text.split_whitespace();
     let behind = parts.next().and_then(|part| part.parse::<usize>().ok())?;
@@ -809,15 +623,8 @@ fn parse_ahead_behind_counts(text: &str) -> Option<AheadBehind> {
     Some(AheadBehind { ahead, behind })
 }
 
-/// Detect the repository's default branch and its tip commit id, per this module's
-/// documented detection order. Returns `Ok(None)` if none of the strategies yield a branch
-/// (rather than an `Err`): an undetectable default branch is a real, expected outcome (e.g. a
-/// repository with no `origin` remote and a default branch named something other than `main`
-/// or `master`), not a failure.
-///
-/// `pub(crate)` (not private): `crate::merge` reuses this exact detection logic to find the
-/// real base branch a session's worktree merges into, rather than reimplementing it - see
-/// that module's docs.
+/// Detects the repository's default branch and its tip, per the module docs' order.
+/// `Ok(None)` rather than `Err` when none is detectable: that is an expected outcome.
 pub(crate) fn detect_default_base(
     repo: &gix::Repository,
 ) -> Result<Option<(String, gix::ObjectId)>, Error> {
@@ -842,14 +649,8 @@ pub(crate) fn detect_default_base(
         }
     }
 
-    // Last resort: the main worktree's own currently checked-out branch. `main_repo()`
-    // succeeds even when the main repository is bare (per gix's own docs, "the main repo
-    // might be bare") - it just opens the common dir either way. The "nothing to fall back
-    // to" cases are handled explicitly below: the main repo's `HEAD` being unborn
-    // (`try_peel_to_id_in_place` returns `None`) or detached (`referent_name` returns
-    // `None`). `main_repo()` can still fail for other reasons (e.g. a corrupt common dir),
-    // treated the same as "nothing found" here, consistent with this function's `Ok(None)`
-    // contract.
+    // Last resort: the main worktree's checked-out branch. A failure here (corrupt common dir)
+    // is treated as "nothing found", per this function's `Ok(None)` contract.
     let Ok(main_repo) = repo.main_repo() else {
         return Ok(None);
     };
@@ -866,17 +667,13 @@ pub(crate) fn detect_default_base(
     Ok(id.map(|id| (short, id.detach())))
 }
 
-/// Cap on how many bytes of a spawned child's stderr are read into memory - see
-/// [`read_streams_concurrently`]'s docs for why stderr needs its own cap and its own
-/// concurrent reader thread, not just stdout's own cap.
+/// Cap on how many bytes of a spawned child's stderr are buffered.
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 
-/// Run `git` with `args` in `dir`, capturing up to `max_bytes` of stdout. If `index_override`
-/// is `Some`, the child runs with `GIT_INDEX_FILE` pointed at that path instead of the
-/// worktree's real index - see [`prepare_shadow_index`]. If more stdout is available than
-/// `max_bytes`, the child is killed (rather than waited on to completion) and the second
-/// element of the returned tuple is `true` - mirrors [`super::is_dirty`]'s reasoning for not
-/// risking a blocked read against a pipe the child may still be filling.
+/// Runs `git` in `dir`, capturing up to `max_bytes` of stdout; `index_override` sets
+/// `GIT_INDEX_FILE` (see [`prepare_shadow_index`]).
+///
+/// Past `max_bytes` the child is killed rather than waited on, and the returned flag is `true`.
 pub(crate) fn capture_git_stdout(
     dir: &Path,
     args: &[OsString],
@@ -922,20 +719,13 @@ pub(crate) fn capture_git_stdout(
     Ok((buf, false))
 }
 
-/// Reads `child`'s stdout (capped at `max_stdout_bytes`) and stderr (capped at
-/// [`MAX_STDERR_BYTES`]) *concurrently* - stderr is drained on a dedicated thread while this
-/// thread drains stdout - rather than reading one pipe to completion before starting on the
-/// other.
+/// Drains `child`'s stdout and stderr concurrently, capped at `max_stdout_bytes` and
+/// [`MAX_STDERR_BYTES`]. Returns `(stdout, stdout_truncated, stderr_text)` without waiting on
+/// `child`; the caller must do that, killing it first if truncated.
 ///
-/// Reading them sequentially (stdout to EOF, only then stderr) can deadlock: each pipe has a
-/// bounded OS buffer (64KB on Linux), and if the child writes enough to stderr before
-/// finishing stdout - plausible for `git diff` (e.g. one CRLF/smudge-filter warning line per
-/// changed file, across up to `MAX_FILES` files) - the child blocks writing stderr while
-/// this process is blocked reading stdout, and neither side can make progress. Draining both
-/// concurrently means neither pipe can ever back up far enough to block the child's writes.
-///
-/// Returns `(stdout, stdout_truncated, stderr_text)`; does not wait on `child` - the caller
-/// is responsible for that (and for killing it first if truncated).
+/// Concurrently, because reading stdout to EOF first deadlocks: pipe buffers are bounded, so a
+/// child that fills stderr (one warning line per changed file, say) blocks writing it while this
+/// thread blocks reading stdout.
 fn read_streams_concurrently(
     child: &mut std::process::Child,
     max_stdout_bytes: usize,
@@ -961,9 +751,8 @@ fn read_streams_concurrently(
                         let take = n.min(MAX_STDERR_BYTES.saturating_sub(buf.len()));
                         buf.extend_from_slice(&chunk[..take]);
                         if buf.len() >= MAX_STDERR_BYTES {
-                            // Past the cap: keep draining so the child can never block on a
-                            // full stderr pipe, but stop accumulating what's read - mirrors
-                            // stdout's own cap-then-keep-not-blocking approach.
+                            // Keep draining past the cap, without accumulating, so the child
+                            // can never block on a full stderr pipe.
                             while matches!(stderr.read(&mut chunk), Ok(n) if n > 0) {}
                             break;
                         }
@@ -1004,64 +793,31 @@ fn read_streams_concurrently(
 }
 
 /// Which flavour of `git add` [`prepare_shadow_index`] runs into the throwaway index copy.
-///
-/// `pub(crate)` because [`crate::review::snapshot_worktree_tree`] needs the second flavour: a
-/// `git write-tree` snapshot has to name real blobs, and an intent-to-add stub has no blob to
-/// name (`write-tree` refuses outright with `fatal: ... has intent-to-add entries`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShadowIndexContent {
-    /// `git add --intent-to-add -A` - records just enough for `git diff <object>` to treat an
-    /// untracked path as present, without writing any blob into the object database. The
-    /// long-standing default for [`compute_diff`]; see this function's own docs for why that is
-    /// sufficient there.
+    /// `git add --intent-to-add -A` - enough for `git diff <object>` to see an untracked path,
+    /// without writing any blob.
     IntentToAdd,
-    /// `git add -A` - stages real content, so every untracked/modified file's blob genuinely
-    /// lands in the object database and `git write-tree` can name it. Writes real objects (the
-    /// only way to snapshot a working tree at all), but still only ever into the object database:
-    /// the real index, working tree, `HEAD` and stash are as untouched as with `IntentToAdd`,
-    /// because every mutation still goes through the same `GIT_INDEX_FILE` override.
+    /// `git add -A` - stages content, so `git write-tree` can name every blob.
     ///
-    /// **Unbounded in the size of the untracked set**, which is why
-    /// [`crate::review::snapshot_worktree_tree`] measures that set before ever asking for this -
-    /// see [`crate::review::MAX_UNTRACKED_SNAPSHOT_BYTES`] and the real 19 GB worktree that
-    /// motivated the cap.
+    /// Unbounded in the size of the untracked set; [`crate::review::snapshot_worktree_tree`]
+    /// measures that set first (see [`crate::review::MAX_UNTRACKED_SNAPSHOT_BYTES`]).
     FullContent,
-    /// `git add -u` - stages real content for **tracked** paths only (including deletions), and
-    /// never touches untracked files at all.
+    /// `git add -u` - tracked paths only, so the work is bounded by what is already committed.
     ///
-    /// The bounded fallback for a worktree whose untracked set is too large to hash into the
-    /// object database. Bounded by construction: every path it can write a blob for is already
-    /// in git's history, so the work is proportional to what the user has actually committed
-    /// rather than to whatever build output happens to be sitting in the directory.
-    ///
-    /// Known limitation: `git write-tree` refuses an index containing intent-to-add entries, and
-    /// unlike [`Self::FullContent`]'s `add -A` this flavour does not materialize them. A worktree
-    /// where the user has run a real `git add -N` therefore fails to snapshot through this path.
-    /// That surfaces as an ordinary error (the caller logs it and leaves the review surface
-    /// unavailable), not as a wrong answer.
+    /// `git write-tree` refuses an index holding intent-to-add entries and this flavour does not
+    /// materialize them, so a worktree with a user's own `git add -N` fails to snapshot here.
+    /// That surfaces as an ordinary error, not a wrong answer.
     TrackedOnly,
 }
 
-/// Filename prefix every shadow index carries, so a file left behind by a hard-killed process is
-/// recognisable as this app's and not mistaken for something git itself owns. Leading dot for the
-/// same reason git's own transient files use one.
+/// Filename prefix marking a shadow index as this app's, should a killed process leave one behind.
 const SHADOW_INDEX_PREFIX: &str = ".jerry-shadow-index-";
 
-/// Creates the throwaway index file [`prepare_shadow_index`] hands to `GIT_INDEX_FILE`, in the
-/// directory holding `real_index_path` - this worktree's own git directory (`<repo>/.git` for a
-/// main checkout, `<common-dir>/worktrees/<name>` for a linked one, since
-/// `git rev-parse --git-path index` already resolves that distinction for us). See
-/// [`prepare_shadow_index`]'s own "Where the shadow index file lives" docs for why this is not
-/// `std::env::temp_dir()`.
+/// Creates the throwaway index file, beside `real_index_path` in the worktree's git directory.
 ///
-/// Falls back to the OS temp directory in the two cases where the git directory genuinely can't
-/// host the file: `real_index_path` has no parent at all (not reachable through any real
-/// `rev-parse` output, guarded rather than unwrapped), or creating a file there fails - a
-/// repository checked out on a read-only mount being the real instance of the latter, which still
-/// diffs fine through a temp-dir shadow index because an `--intent-to-add` pass writes nothing
-/// into the repository itself. The fallback is deliberately *not* silent about failing too: if
-/// both locations refuse, the git directory's own error is what propagates, since that's the one
-/// describing the repository the caller actually asked about.
+/// Falls back to the OS temp directory when that directory cannot host it (a read-only mount
+/// being the real case). If both refuse, the git directory's error is the one that propagates.
 fn shadow_index_file(real_index_path: &Path) -> Result<tempfile::NamedTempFile, Error> {
     let builder = || {
         tempfile::Builder::new()
@@ -1080,56 +836,17 @@ fn shadow_index_file(real_index_path: &Path) -> Result<tempfile::NamedTempFile, 
     }
 }
 
-/// Builds a temporary, throwaway copy of the worktree's index with untracked files added,
-/// either as "intent to add" stubs or with their real content ([`ShadowIndexContent`]), so
-/// `git diff <merge-base>` - which only ever considers paths already present in the index or in
-/// `<merge-base>`'s tree (see the module docs' "What the diff includes" section) - picks up new,
-/// unstaged files as additions instead of silently omitting them, and so
-/// [`crate::review::snapshot_worktree_tree`] can `git write-tree` a complete snapshot.
+/// Builds a throwaway copy of the worktree's index with untracked files added, so
+/// `git diff <object>` - which only considers paths already in the index or the target tree -
+/// reports new files as additions rather than omitting them.
 ///
-/// The real index is only ever *read* (to seed the copy); every mutation happens on the temp
-/// file via a `GIT_INDEX_FILE` override in the caller, so this can never perturb the real
-/// repository state - verified by checking that `git status` still reports the untracked
-/// file as untracked (`??`), never staged, immediately after diffing through a shadow index.
+/// The real index is only read; every mutation goes to the copy through the caller's
+/// `GIT_INDEX_FILE` override, so repository state is never perturbed.
 ///
-/// [`ShadowIndexContent::IntentToAdd`] (rather than a full `git add -A`) is deliberate for
-/// [`compute_diff`]: it records just enough (an empty-blob stub entry) for `git diff` to treat
-/// the path as present, without staging actual file content into the temp index - unnecessary,
-/// since `git diff <commit>` (no `--cached`) always compares against the real working-tree file
-/// content directly regardless of what's staged. [`crate::review::snapshot_worktree_tree`] is the
-/// one caller that genuinely does need the content, and asks for
-/// [`ShadowIndexContent::FullContent`] instead - see that variant's own docs.
-///
-/// The copy also inherits the real index's **mtime**, not just its bytes - an index's cached
-/// stat data only means anything relative to that index file's own timestamp (git's
-/// racy-index rule). See the inline comment at the copy itself, and the
-/// `a_same_length_edit_racy_against_the_index_timestamp_is_still_reported` test, for the real
-/// bug (GitHub issue #163) that came of not doing this.
-///
-/// ## Where the shadow index file lives
-///
-/// Next to the **real** index, inside this worktree's own git directory
-/// ([`shadow_index_file`]) - deliberately *not* `std::env::temp_dir()`. `git add` writes an
-/// index by creating `<GIT_INDEX_FILE>.lock` beside the target and renaming it over the top,
-/// so whichever directory this file sits in is the directory git has to be able to create,
-/// write, fsync and rename within. Pointing that at the OS-wide temp directory made every
-/// shadow-index-backed operation in this crate (`compute_diff`,
-/// [`crate::review::snapshot_worktree_tree`], [`crate::review::changed_paths_against_tree`])
-/// silently depend on a directory that has nothing to do with the repository being diffed, and
-/// that a real environment can make unusable in ways the repository itself is not: a `TMPDIR`
-/// pointed at a different (or cross-OS-mounted) filesystem, a sandbox with its own private
-/// `/tmp`, a full or quota-exceeded temp filesystem, or a cleanup daemon deleting files by age
-/// (which this function actively invites, since it back-dates the copy's mtime to the real
-/// index's possibly weeks-old mtime just above). A user running against a real repository hit
-/// exactly this class of failure: `git add --intent-to-add -A -- .` exiting 128 with
-/// `fatal: unable to write new index file`, which is git failing to write/rename the index at
-/// this very path. The git directory is guaranteed to be on the same filesystem as the
-/// repository git is already reading and writing, so if git can operate on the repo at all it
-/// can write here.
-///
-/// The file is still a real [`tempfile::NamedTempFile`] with unchanged drop-based cleanup -
-/// only its parent directory changed - and `.git` is never part of the worktree scan, so the
-/// `git add -A -- .` below cannot see (let alone stage) it.
+/// The copy lives beside the real index rather than in `std::env::temp_dir()`: `git add` writes
+/// an index by renaming a `.lock` file over it, so it needs a directory it can write to on the
+/// repository's own filesystem. A `TMPDIR` on another mount fails that with
+/// `fatal: unable to write new index file`.
 pub(crate) fn prepare_shadow_index(
     worktree_path: &Path,
     content: ShadowIndexContent,
@@ -1149,9 +866,7 @@ pub(crate) fn prepare_shadow_index(
     };
 
     let shadow = shadow_index_file(&real_index_path)?;
-    // Whether the real index couldn't be read at all - decided here, acted on only *after* the
-    // handle below is closed. See this function's own "Why the handle must be closed" docs for
-    // why acting on it immediately (as this used to) was itself part of the bug.
+    // Decided here, acted on only after the handle is closed below.
     let real_index_missing;
     match std::fs::read(&real_index_path) {
         Ok(real_index_bytes) => {
@@ -1161,26 +876,11 @@ pub(crate) fn prepare_shadow_index(
                 .write_all(&real_index_bytes)
                 .map_err(Error::WorktreeIo)?;
             (&shadow).flush().map_err(Error::WorktreeIo)?;
-            // GitHub issue #163. Copying the bytes is not enough: an index's cached stat data
-            // is only meaningful *relative to that index file's own mtime*. Git compares a
-            // working-tree file against its entry by whole-second mtime plus size (sub-second
-            // precision is a `USE_NSEC` build option that is off by default and off in every
-            // mainstream distro's git), so a same-length edit landing in the same second as
-            // the cached stat is indistinguishable from "unchanged" by stat alone. Git's
-            // defence is the racy-index rule: an entry whose cached mtime is not strictly
-            // older than the index file's own mtime is suspect, so its content gets re-read
-            // instead of trusted.
-            //
-            // A fresh `NamedTempFile` carries *now* as its mtime, which silently moves every
-            // copied entry out of that suspect window - git then trusts stat data the real
-            // index would have rechecked, and a genuine same-length edit disappears from the
-            // diff entirely. Carrying the source index's mtime across keeps the copy's
-            // racy-index verdict identical to the real index's, so `git add` below observes
-            // the same suspect entries git itself would and writes the shadow out with their
-            // stat data invalidated. Best-effort: a filesystem that refuses the timestamp
-            // update leaves the copy no worse than it was before this call existed, and
-            // failing the whole diff over it would be a far bigger regression than the narrow
-            // race it guards.
+            // The mtime matters as much as the bytes: git's racy-index rule only distrusts an
+            // entry whose cached mtime is not strictly older than the index file's own. A fresh
+            // temp file carries *now*, which moves every entry out of that suspect window and
+            // makes a same-length same-second edit vanish from the diff. Best-effort - a
+            // filesystem that refuses the update leaves the copy no worse off.
             if let Ok(mtime) = std::fs::metadata(&real_index_path).and_then(|meta| meta.modified())
             {
                 let _ = shadow
@@ -1189,43 +889,23 @@ pub(crate) fn prepare_shadow_index(
             }
         }
         Err(_) => {
-            // A repository whose index has never been written (e.g. immediately after
-            // `git init`, before any commit), or one whose index momentarily can't be read
-            // (a real interleaving hazard: an agent CLI's own `git add`/`git commit`
-            // rewriting the index at the exact moment this reads it), has no real bytes to
-            // seed the shadow copy with. `shadow_index_file` above already created a
-            // real, empty *file* at this path though - and an empty-but-*existing* file is
-            // not what git treats as "no index yet": confirmed directly (`GIT_INDEX_FILE`
-            // pointed at a 0-byte file makes real `git add` fail outright with `fatal: ...
-            // index file smaller than expected`, exit 128), where a path that simply
-            // doesn't exist at all is instead treated as a fresh empty index and succeeds.
-            // The placeholder is deleted below, once the handle is closed - `git add` then
-            // creates a real index there from scratch, exactly as it would for a brand-new
-            // repository's very first `git add`.
+            // No bytes to seed the copy with (an index never written, or one an agent's own
+            // `git add` is rewriting right now). The empty placeholder `shadow_index_file`
+            // created must be deleted rather than left: git rejects a 0-byte `GIT_INDEX_FILE`
+            // with `index file smaller than expected`, but treats a missing one as empty.
             real_index_missing = true;
         }
     }
 
-    // Why the handle must be closed before `git add` ever runs, not just *where the file lives*:
-    // a real, reported failure (`fatal: unable to write new index file`, two unrelated
-    // repositories, this app running natively on Windows) traced to this function itself, not
-    // anything external. `git add` writes an index by creating `<GIT_INDEX_FILE>.lock` and
-    // renaming it over the destination - and on Windows, that rename can fail outright whenever
-    // the destination has *any* open handle, even one opened with `FILE_SHARE_DELETE` (which
-    // `tempfile`'s default sharing mode already is): confirmed against git's own upstream fix,
-    // "compat/mingw: implement POSIX-style atomic renames over open files" (first shipped git
-    // 2.48, Jan 2025) - before that release, on any git version, filesystem, or Windows edition,
-    // this was a deterministic failure, not a transient one, because `shadow` above - a
-    // `NamedTempFile` - was kept alive (and so its handle open) for the *entire* `git add` child
-    // process below. Converting it to a [`tempfile::TempPath`] here closes that handle while
-    // keeping the same drop-based cleanup; every real caller of this function only ever uses the
-    // returned value's path, never its file content, so this is a pure signature narrowing, not
-    // a behavior change for anyone downstream.
+    // Closing the handle before `git add` runs is load-bearing, not tidiness: on Windows,
+    // renaming the `.lock` over a destination that still has any open handle fails outright
+    // (fixed upstream only in git 2.48), so holding the `NamedTempFile` across the child would
+    // be a deterministic `fatal: unable to write new index file`. `TempPath` keeps the same
+    // drop-based cleanup without the handle.
     let shadow = shadow.into_temp_path();
     if real_index_missing {
-        // Now genuinely safe: with the handle already closed above, this is a real, immediate
-        // delete - not the delete-*pending* state Windows leaves a still-open file in, which
-        // would have left this exact path unusable for the `git add` below to recreate.
+        // Safe only now the handle is closed: otherwise Windows leaves the path in a
+        // delete-pending state that `git add` could not recreate.
         std::fs::remove_file(&shadow).map_err(Error::WorktreeIo)?;
     }
 
@@ -1236,18 +916,13 @@ pub(crate) fn prepare_shadow_index(
             add_args.push("-A".into());
         }
         ShadowIndexContent::FullContent => add_args.push("-A".into()),
-        // `-u` restricts the update to paths git already tracks, so no untracked file's content
-        // can reach the object database through this flavour - see its own docs.
         ShadowIndexContent::TrackedOnly => add_args.push("-u".into()),
     }
     add_args.extend([OsString::from("--"), ".".into()]);
 
-    // A real, bounded retry remains here as defense-in-depth, *not* the fix above: even with our
-    // own handle closed, something else on the user's machine can still transiently hold this
-    // path open for a moment (real-time antivirus, a cloud-sync client watching the `.git`
-    // directory) on a git version/filesystem combination that still takes the handle-sensitive
-    // rename path. Scoped narrowly to that one failure text so a genuinely broken repository or a
-    // real permissions error still surfaces immediately, on the first attempt, with no delay.
+    // Defence-in-depth against something else on the machine (antivirus, a sync client) holding
+    // the path open for a moment. Scoped to that one failure text so a broken repository or a
+    // permissions error still fails on the first attempt.
     retry_transient_index_write_failure(|| {
         let output = git_command(worktree_path, &add_args)
             .env("GIT_INDEX_FILE", &shadow)
@@ -1262,24 +937,14 @@ pub(crate) fn prepare_shadow_index(
     Ok(shadow)
 }
 
-/// How many total attempts [`retry_transient_index_write_failure`] makes before giving up and
-/// returning the real error - the first attempt plus this many retries.
+/// Total attempts, including the first, before the error is returned.
 const MAX_INDEX_WRITE_ATTEMPTS: u32 = 3;
 
-/// The retry *policy* behind the git-directory placement's own docs above: retries `attempt_git`
-/// only when it fails with [`is_transient_index_write_failure`], up to
-/// [`MAX_INDEX_WRITE_ATTEMPTS`] total tries, with a short growing backoff between them. Every
-/// other failure - a genuinely broken repository, a permissions error that will not resolve
-/// itself - returns immediately on the first attempt; retrying those would only delay a real
-/// error the user needs to see.
+/// Retries `attempt_git` up to [`MAX_INDEX_WRITE_ATTEMPTS`] times with a growing backoff, but
+/// only for [`is_transient_index_write_failure`]. Anything else returns on the first attempt.
 ///
-/// A free function taking a closure, rather than inlined into [`prepare_shadow_index`], so this
-/// policy is independently testable: the real failure this exists for is a Windows-only
-/// antivirus/rename race that this Linux dev environment cannot genuinely reproduce (confirmed by
-/// direct testing - see this crate's own investigation notes), so what's verified here is that
-/// the retry *logic itself* is correct (retries transient failures, stops immediately on
-/// anything else, gives up after the bound), independent of ever reproducing the real OS
-/// condition that triggers it.
+/// Takes a closure so the policy stays testable without reproducing the Windows-only rename race
+/// it exists for.
 fn retry_transient_index_write_failure(
     mut attempt_git: impl FnMut() -> Result<(), Error>,
 ) -> Result<(), Error> {
@@ -1299,23 +964,16 @@ fn retry_transient_index_write_failure(
     }
 }
 
-/// Whether `stderr` names the one class of `git add` failure [`retry_transient_index_write_failure`]
-/// retries - see that function's own docs for why only this one. Matched by substring, not the
-/// full message: git's exact wording has varied by case across versions ("Unable"/"unable"), and
-/// a narrower exact-string match would silently stop retrying the very failure this exists for
-/// the moment a git upgrade rewords it.
+/// Whether `stderr` names the one retryable `git add` failure. Matched by lowercased substring:
+/// git's wording has varied by case across versions.
 fn is_transient_index_write_failure(stderr: &str) -> bool {
     stderr
         .to_ascii_lowercase()
         .contains("unable to write new index file")
 }
 
-/// Strip a leading `a/` or `b/` diff prefix, and treat `/dev/null` as "no file". Prefixes
-/// here are always exactly `a/`/`b/` *by construction*, not by assumption: `diff_against_base`
-/// always invokes `git diff` with `-c diff.mnemonicPrefix=false -c diff.noprefix=false` (see
-/// the module docs' "Explicit git config" section), which pins this regardless of the
-/// caller's own git config - `diff.mnemonicPrefix=true` (a fairly common user setting) would
-/// otherwise change these to `i/`/`w/`/`c/` and silently mislabel every file.
+/// Strips a leading `a/`/`b/` diff prefix and treats `/dev/null` as "no file". The prefixes are
+/// exactly these by construction: [`compute_diff`] pins the git config that decides them.
 fn strip_diff_prefix(path: &str) -> Option<PathBuf> {
     if path == "/dev/null" {
         return None;
@@ -1324,17 +982,9 @@ fn strip_diff_prefix(path: &str) -> Option<PathBuf> {
     Some(PathBuf::from(stripped.unwrap_or(path)))
 }
 
-/// A path as `git diff` printed it (after a `--- `/`+++ `/`rename from `/`rename to `
-/// prefix, or the `and `/` differ` markers of a `Binary files ...` line): unquoted in the
-/// common case. `diff_against_base` pins `-c core.quotePath=false` (see the module docs),
-/// which stops git from C-style-quoting paths just for containing non-ASCII characters -
-/// `core.quotePath`'s default (on) would otherwise render e.g. `café.txt` as the quoted,
-/// octal-escaped `"caf\303\251.txt"`. That pin doesn't cover every case though: git still
-/// quotes paths containing literal quote/backslash/control characters regardless of
-/// `core.quotePath`, with backslash escapes inside the quotes. Only the surrounding quotes
-/// are stripped here, not those inner escape sequences - a fully general C-style unquoter is
-/// out of scope for a read-only diff *viewer*, so a quoted path with escapes shows its
-/// escaped form rather than being misrendered as an invalid path.
+/// Strips the surrounding quotes git puts around a path, but not the backslash escapes inside
+/// them: a path containing a quote or control character keeps its escaped form rather than being
+/// rendered as an invalid path.
 fn unquote_path(raw: &str) -> &str {
     if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
         &raw[1..raw.len() - 1]
@@ -1395,29 +1045,14 @@ impl FileBuilder {
     }
 }
 
-/// Parse `git diff`'s unified-diff-format stdout into structured files/hunks/lines.
+/// Parses `git diff`'s unified-diff stdout into files/hunks/lines, plus whether [`MAX_FILES`]
+/// cut off any trailing files.
 ///
-/// Returns the parsed files plus whether the [`MAX_FILES`] cap cut off any trailing files.
-/// A file that hits [`MAX_HUNK_LINES_PER_FILE`] has its own `truncated` flag set instead
-/// (which also folds into the overall [`WorktreeDiff::truncated`] by the caller).
-///
-/// Header-line detection (`rename from `/`rename to `/`new file mode`/`deleted file
-/// mode`/`Binary files `/`--- `/`+++ `/`@@ `) only ever runs *outside* a hunk body
-/// (`!in_hunk`). This matters because a hunk's body lines are file content with a single
-/// `+`/`-`/` ` marker prepended, not escaped at all - a removed line whose own text happens
-/// to start with `-- ` (a SQL-style comment, say) renders as `--- <that text>`, textually
-/// indistinguishable from a `--- <path>` old-file header line (and likewise for `++
-/// `/`+++ `). Naively checking these prefixes unconditionally (an earlier version of this
-/// function did) both truncates the rest of that file's hunk and can misattribute the
-/// change to a bogus "path" - silently mislabeling a change under the wrong filename, a
-/// serious correctness bug for a tool whose purpose is reviewing changes before merge.
-///
-/// Knowing when a hunk body ends therefore can't rely on line-prefix heuristics; it comes
-/// from the hunk header itself. A `@@ -<old_start>[,<old_count>] +<new_start>[,<new_count>]
-/// @@` header declares exactly how many old-side and new-side body lines follow
-/// ([`parse_hunk_counts`]); this function counts both down as body lines are consumed (a
-/// context line decrements both, a removed line only the old count, an added line only the
-/// new count) and only leaves "in a hunk body" once both hit zero.
+/// Header prefixes (`--- `, `+++ `, `@@ `, `rename from `, ...) are only ever matched *outside* a
+/// hunk body. Body lines are unescaped file content behind a single marker char, so a removed
+/// line reading `-- a comment` is textually identical to a `--- <path>` header; matching prefixes
+/// unconditionally misfiles the change under a bogus path. The end of a body is therefore taken
+/// from the hunk header's own declared line counts ([`parse_hunk_counts`]), counted down here.
 fn parse_git_diff(text: &str) -> (Vec<DiffFile>, bool) {
     let mut files = Vec::new();
     let mut files_truncated = false;
@@ -1439,8 +1074,6 @@ fn parse_git_diff(text: &str) -> (Vec<DiffFile>, bool) {
             flush(&mut current, &mut files);
             if files.len() >= MAX_FILES {
                 files_truncated = true;
-                // Keep scanning is pointless once the cap is hit and there's nothing left to
-                // flush into; every subsequent line is for a file we won't keep.
                 current = None;
                 in_hunk = false;
                 continue;
@@ -1453,8 +1086,6 @@ fn parse_git_diff(text: &str) -> (Vec<DiffFile>, bool) {
         }
 
         let Some(builder) = current.as_mut() else {
-            // Preamble or trailing content outside any `diff --git` block; nothing to do
-            // with it.
             continue;
         };
         if files.len() > MAX_FILES {
@@ -1462,8 +1093,6 @@ fn parse_git_diff(text: &str) -> (Vec<DiffFile>, bool) {
         }
 
         if in_hunk {
-            // Hunk body content - see this function's docs for why header-line prefixes are
-            // never checked here, only the hunk's own declared old/new line counts.
             let kind = match line.chars().next() {
                 Some('+') => Some(DiffLineKind::Added),
                 Some('-') => Some(DiffLineKind::Removed),
@@ -1495,9 +1124,8 @@ fn parse_git_diff(text: &str) -> (Vec<DiffFile>, bool) {
                     builder.truncated = true;
                 }
             }
-            // A line starting with `\` (e.g. `\ No newline at end of file`) or anything else
-            // unrecognized inside a hunk is silently skipped: cosmetic, not a line of real
-            // content, and not counted against either remaining budget.
+            // `\ No newline at end of file` and anything else unrecognized is skipped without
+            // counting against either budget.
             if hunk_old_remaining == 0 && hunk_new_remaining == 0 {
                 in_hunk = false;
             }
@@ -1534,8 +1162,7 @@ fn parse_git_diff(text: &str) -> (Vec<DiffFile>, bool) {
                 header: format!("@@ {header}"),
                 lines: Vec::new(),
             });
-            // A degenerate zero-line hunk (shouldn't happen in real `git diff` output, but
-            // don't get stuck "in a hunk" forever if it does) stays out of hunk-body mode.
+            // A degenerate zero-line hunk would otherwise leave us in body mode forever.
             in_hunk = !(old_count == 0 && new_count == 0);
         }
     }
@@ -1544,12 +1171,8 @@ fn parse_git_diff(text: &str) -> (Vec<DiffFile>, bool) {
     (files, files_truncated)
 }
 
-/// Parses the part of a `@@ -<old_start>[,<old_count>] +<new_start>[,<new_count>] @@...`
-/// hunk header after the opening `"@@ "` (i.e. `header` starts with `-`) into
-/// `(old_count, new_count)`: how many old-side and new-side body lines this hunk declares,
-/// per the unified diff format. A range without an explicit `,<count>` means a count of
-/// exactly 1 (the unified diff spec's shorthand for a single-line range), which is why
-/// [`parse_range_count`] discards the start-line value and only returns the count.
+/// Parses a hunk header, minus its leading `"@@ "`, into the `(old, new)` body-line counts it
+/// declares. A range with no explicit `,<count>` means one line.
 fn parse_hunk_counts(header: &str) -> Option<(usize, usize)> {
     let mut parts = header.split_whitespace();
     let old_part = parts.next()?.strip_prefix('-')?;
@@ -1570,13 +1193,12 @@ fn strip_diff_prefix_or_raw(raw: &str) -> Option<PathBuf> {
     strip_diff_prefix(unquote_path(raw))
 }
 
-/// Best-effort fallback path extraction from a `diff --git a/<path> b/<path>` header line
-/// (`rest` is everything after `"diff --git "`), used only when a file has no hunks, no
-/// rename, and no binary marker to derive a path from otherwise (e.g. a pure file-mode
-/// change). When the two sides are identical (the common case here, since a rename always
-/// emits `rename from`/`rename to` lines instead), splitting on the last `" b/"` yields the
-/// correct path regardless of any space elsewhere in it; there's a narrow, documented
-/// ambiguity if the two sides genuinely differ *and* the path itself contains `" b/"`.
+/// Fallback path extraction from a `diff --git a/<path> b/<path>` line, for a file with no hunk,
+/// rename or binary marker to take one from (a pure mode change).
+///
+/// Splitting on the last `" b/"` is correct whenever both sides match, which holds here because a
+/// rename emits `rename from`/`rename to` instead. Ambiguous only if they differ *and* the path
+/// itself contains `" b/"`.
 fn parse_diff_git_header(rest: &str) -> Option<PathBuf> {
     let idx = rest.rfind(" b/")?;
     let b_path = &rest[idx + 3..];
@@ -1635,9 +1257,8 @@ mod tests {
         );
     }
 
-    /// GitHub issue #108: a worktree left on its own default branch used to report
-    /// `DiffBase::OnDefaultBranch` unconditionally, hiding real uncommitted edits from the
-    /// Changes sidebar. `diff_against_base` must fall back to a real `git diff HEAD` instead.
+    /// A worktree on its own default branch must still report uncommitted edits, by falling
+    /// back to `git diff HEAD`.
     #[test]
     fn on_default_branch_with_real_uncommitted_changes_shows_them() {
         let repo = init_repo();
@@ -1645,8 +1266,7 @@ mod tests {
         fs::write(repo.path().join("new.txt"), "brand new\n").expect("write");
 
         let result = diff_against_base(repo.path()).expect("diff_against_base");
-        // `DiffBase::diff()` - the one accessor every real UI consumer should read through -
-        // must surface this the same way it surfaces a real `Diff`.
+        // `diff()` must surface this the same way it surfaces a `Diff`.
         let via_diff_accessor = result.diff().cloned();
 
         let DiffBase::NoBase {
@@ -1663,31 +1283,15 @@ mod tests {
         assert_eq!(via_diff_accessor, Some(uncommitted));
     }
 
-    /// GitHub issue #163: the shadow index must not silently disable git's own racy-index
-    /// protection.
+    /// The shadow index must not disable git's racy-index protection.
     ///
-    /// Git (built without `USE_NSEC`, which is the default and what every mainstream distro
-    /// ships) compares a working-tree file against its index entry using **whole-second**
-    /// mtime plus size. So an edit that keeps a file's length identical and lands in the same
-    /// second as the stat data git cached for it is indistinguishable from "unchanged" by stat
-    /// alone. Git's defence is the *racy index* rule: an entry whose cached mtime is not
-    /// strictly older than the index file's **own** mtime is treated as suspect, and its
-    /// content is re-read rather than trusted.
+    /// Git compares a file against its index entry by whole-second mtime plus size, so a
+    /// same-length edit in the same second is indistinguishable from "unchanged" unless the
+    /// entry is racy against the index file's own mtime. A shadow copy carrying a fresh mtime
+    /// makes every entry look comfortably old, and the edit vanishes from the diff.
     ///
-    /// That rule is defined relative to the mtime of the index file git actually read - which
-    /// is exactly what [`prepare_shadow_index`] used to destroy: it copied the real index's
-    /// bytes into a brand-new temp file, giving the copy a *fresh* mtime while leaving every
-    /// cached entry's mtime untouched. Entries that were legitimately racy against the real
-    /// index looked comfortably old against the copy, so git trusted the stale stat data and
-    /// reported the file as unmodified - a real, same-length edit vanishing from the Changes
-    /// panel entirely.
-    ///
-    /// This test forces that exact alignment deterministically (rather than waiting for the
-    /// sub-second race to happen on its own, which is how it was originally found - as an
-    /// intermittent failure of `app`'s own
-    /// `switching_the_open_diff_to_a_different_file_recomputes_the_highlight_cache`): the
-    /// file's cached mtime, its on-disk mtime and the real index's mtime are all pinned to one
-    /// whole second, and the rewrite keeps the byte length identical.
+    /// The alignment is forced here rather than waited for: cached mtime, on-disk mtime and the
+    /// index's mtime all pinned to one second, with the rewrite keeping the byte length.
     #[test]
     fn a_same_length_edit_racy_against_the_index_timestamp_is_still_reported() {
         use std::time::{Duration, SystemTime};
@@ -1726,8 +1330,7 @@ mod tests {
         // the same second the index entry already records.
         fs::write(path.join("a.rs"), "fn a() -> i32 {\n    2\n}\n").expect("rewrite a.rs");
         pin_mtime(&path.join("a.rs"));
-        // The real index sits in the racy window too - which is what makes git's own
-        // protection apply here, and therefore what the shadow copy must not throw away.
+        // The index sits in the racy window too, which is what the shadow copy must preserve.
         let index = fs::OpenOptions::new()
             .write(true)
             .open(path.join(".git/index"))
@@ -1766,9 +1369,7 @@ mod tests {
         git(repo.path(), &["commit", "-m", "add keep.txt"]);
 
         git(repo.path(), &["checkout", "-b", "feature"]);
-        // Modify a tracked file, add a new one, delete another - all left uncommitted, to
-        // also prove uncommitted changes are included (per this module's documented `git
-        // diff <merge-base>` choice).
+        // Left uncommitted, to also prove uncommitted changes are included.
         fs::write(repo.path().join("file.txt"), "hello\nworld\n").expect("write");
         fs::write(repo.path().join("new.txt"), "new file\n").expect("write");
         git(repo.path(), &["add", "new.txt"]);
@@ -1851,8 +1452,7 @@ mod tests {
     #[test]
     fn rename_is_detected() {
         let repo = init_repo();
-        // `-M`'s similarity threshold needs enough content to recognize a rename rather than
-        // a delete+add; a single short line is not always enough, so pad the file.
+        // `-M`'s similarity threshold needs enough content to see a rename, not a delete+add.
         let content = "line\n".repeat(50);
         fs::write(repo.path().join("file.txt"), &content).expect("write");
         git(repo.path(), &["commit", "-am", "pad file.txt"]);
@@ -1916,10 +1516,8 @@ mod tests {
 
     #[test]
     fn deleted_sql_style_comment_line_is_not_misparsed_as_file_header() {
-        // A removed line whose own text starts with `-- ` renders in unified diff output as
-        // `--- <that text>` (marker `-` prepended to the real content) - textually identical
-        // to a `--- <path>` old-file header line. Before this fix, the parser matched that
-        // prefix unconditionally, truncating the rest of this hunk right after it.
+        // A removed line starting `-- ` renders as `--- <text>`, identical to a `--- <path>`
+        // header line.
         let repo = init_repo();
         let content = "line one\n-- a real sql comment\nline three\nline four\n";
         fs::write(repo.path().join("file.txt"), content).expect("write");
@@ -1929,7 +1527,7 @@ mod tests {
         );
 
         git(repo.path(), &["checkout", "-b", "feature"]);
-        // Delete the comment line, keep everything else - a real, ordinary edit.
+        // Delete the comment line, keep everything else.
         fs::write(
             repo.path().join("file.txt"),
             "line one\nline three\nline four\n",
@@ -1953,8 +1551,7 @@ mod tests {
             "the comment line should be parsed as a real removed line, not dropped as a \
              fake file header: {lines:?}"
         );
-        // The critical regression check: content *after* the `--- `-looking line must still
-        // be present, proving the hunk wasn't truncated at that point.
+        // Content after the `--- `-looking line must survive: the hunk was not truncated there.
         assert!(
             !lines
                 .iter()
@@ -1966,11 +1563,8 @@ mod tests {
 
     #[test]
     fn added_line_looking_like_a_file_header_does_not_misattribute_the_file() {
-        // An added line whose own text starts with `++ ` renders as `+++ <that text>` -
-        // textually identical to a `+++ <path>` new-file header line. Before this fix, the
-        // parser matched that prefix unconditionally, overwriting `new_path` with a bogus
-        // path parsed out of the line's *content* - misattributing the change to the wrong
-        // file, exactly the "worst case" scenario the checker flagged.
+        // An added line starting `++ ` renders as `+++ <text>`, identical to a `+++ <path>`
+        // header line - which would misattribute the change to a path parsed out of content.
         let repo = init_repo();
         git(repo.path(), &["checkout", "-b", "feature"]);
         fs::write(
@@ -1987,9 +1581,7 @@ mod tests {
         let DiffBase::Diff(diff) = result else {
             panic!("expected DiffBase::Diff, got {result:?}");
         };
-        // Must NOT have been misattributed to "evil.txt" (or any path derived from the
-        // line's content) - there must be exactly one changed file, and it must be the real
-        // one.
+        // Exactly one changed file, and not "evil.txt" or anything else derived from content.
         assert_eq!(
             diff.files.len(),
             1,
@@ -2009,11 +1601,8 @@ mod tests {
 
     #[test]
     fn detects_default_branch_via_origin_head() {
-        // A real bare repository standing in for a remote, with a "main" branch that isn't
-        // named `main`/`master` in a way local detection alone could ever fall into by
-        // accident - it's deliberately named something else so this test can only pass by
-        // actually following `refs/remotes/origin/HEAD`, not by coincidentally matching the
-        // local-branch fallback strategies.
+        // Deliberately named neither `main` nor `master`, so this can only pass by following
+        // `refs/remotes/origin/HEAD` rather than the local-branch fallbacks.
         let origin = TempDir::new().expect("tempdir");
         git(origin.path(), &["init", "--bare", "-b", "trunk"]);
 
@@ -2039,8 +1628,7 @@ mod tests {
         );
         git(dir.path(), &["config", "user.email", "test@example.com"]);
         git(dir.path(), &["config", "user.name", "Test User"]);
-        // `git clone` already sets up `refs/remotes/origin/HEAD` as a symbolic ref to the
-        // remote's default branch; this is exactly the case strategy 1 targets.
+        // `git clone` sets `refs/remotes/origin/HEAD` up as a symbolic ref for us.
         git(dir.path(), &["checkout", "-b", "feature"]);
         fs::write(dir.path().join("file.txt"), "hello\nfrom feature\n").expect("write");
 
@@ -2063,10 +1651,8 @@ mod tests {
 
     #[test]
     fn untracked_file_appears_in_diff_as_an_addition() {
-        // `git diff <merge-base>` alone never sees genuinely untracked (never `git add`ed)
-        // files, no matter what - the single most common thing an agent produces in a fresh
-        // worktree. `prepare_shadow_index`'s `--intent-to-add` trick is what makes this
-        // show up at all.
+        // `git diff <merge-base>` alone never sees untracked files; the shadow index's
+        // `--intent-to-add` pass is what surfaces them.
         let repo = init_repo();
         git(repo.path(), &["checkout", "-b", "feature"]);
         fs::write(repo.path().join("brand_new.txt"), "content nobody staged\n").expect("write");
@@ -2088,8 +1674,7 @@ mod tests {
             .flat_map(|h| &h.lines)
             .any(|l| l.kind == DiffLineKind::Added && l.content == "content nobody staged"));
 
-        // Confirm the real index was never touched by this: a plain `git status` still
-        // reports the file as untracked (`??`), never staged.
+        // The real index was never touched: `git status` still reports the file as untracked.
         let status = Command::new("git")
             .current_dir(repo.path())
             .args(["status", "--porcelain"])
@@ -2105,24 +1690,15 @@ mod tests {
 
     #[test]
     fn a_missing_or_unreadable_real_index_does_not_fail_the_whole_diff() {
-        // Reproduces a real, confirmed bug: `prepare_shadow_index` used to fall back to an
-        // empty *existing* temp file when the real index couldn't be read, on the (wrong)
-        // assumption that this "mirrors git's own missing index == empty index behavior."
-        // Verified directly with real git commands that it does not: `GIT_INDEX_FILE`
-        // pointed at a genuinely nonexistent path is treated as a fresh empty index (real
-        // `git add` succeeds), but pointed at an existing 0-byte file it fails outright
-        // (`fatal: ... index file smaller than expected`, exit 128) - a completely
-        // different, fatal code path. `diff_against_base` surfaced that fatal to the whole
-        // Changes panel as "failed to compute diff: ...".
+        // `GIT_INDEX_FILE` at a nonexistent path is a fresh empty index and `git add` succeeds;
+        // at an existing 0-byte file it fails with `index file smaller than expected`. Leaving
+        // the placeholder in place therefore breaks the whole Changes panel.
         let repo = init_repo();
         git(repo.path(), &["checkout", "-b", "feature"]);
         fs::write(repo.path().join("brand_new.txt"), "content nobody staged\n").expect("write");
 
-        // Simulate the real index being genuinely unreadable at the moment
-        // `prepare_shadow_index` reads it - a fresh worktree with no index written yet, or
-        // (the more likely real-world trigger) an agent CLI's own concurrent `git add`/
-        // `git commit` rewriting it in the same window. `git rev-parse --git-path index`
-        // matches exactly what `prepare_shadow_index` itself resolves.
+        // The index unreadable exactly when `prepare_shadow_index` reads it: no index written
+        // yet, or an agent's own concurrent `git add` rewriting it in the same window.
         let index_path_output = Command::new("git")
             .current_dir(repo.path())
             .args(["rev-parse", "--git-path", "index"])
@@ -2152,20 +1728,12 @@ mod tests {
         );
     }
 
-    /// The shadow index must be created inside the worktree's own git directory, next to the
-    /// real index - never in `std::env::temp_dir()`. See `prepare_shadow_index`'s own "Where the
-    /// shadow index file lives" docs: `git add` creates `<GIT_INDEX_FILE>.lock` beside this file
-    /// and renames it over the top, so this directory is exactly the one git must be able to
-    /// write and rename within, and the OS temp directory is a real, environment-specific
-    /// liability there (a `TMPDIR` on another mount, a sandboxed private `/tmp`, a full temp
-    /// filesystem, an age-based cleanup daemon).
+    /// The shadow index must be created in the worktree's own git directory, never in
+    /// `std::env::temp_dir()` - see [`prepare_shadow_index`].
     ///
-    /// This is a stronger assertion than "diffing still works with a hostile `TMPDIR`", and is
-    /// the reason no test here mutates `TMPDIR`: `std::env::set_var` is process-global, and this
-    /// test binary runs its tests in parallel threads that use `tempfile` (`TempDir::new` in
-    /// every `init_repo` call) throughout, so pointing the whole process's temp directory
-    /// somewhere unusable mid-run would corrupt unrelated tests rather than prove anything about
-    /// this one. Asserting the real parent directory proves the property directly instead.
+    /// Asserted on the parent directory rather than by pointing `TMPDIR` somewhere hostile:
+    /// `set_var` is process-global and these tests run in parallel threads that all use
+    /// `tempfile`, so that would corrupt unrelated tests instead of proving anything.
     fn transient_failure() -> Error {
         Error::GitCommand {
             args: "add --intent-to-add -A -- .".into(),
@@ -2195,10 +1763,8 @@ mod tests {
         ));
     }
 
-    /// The whole reason this retry exists: a transient antivirus-scan-holds-the-lock-file race on
-    /// Windows resolves itself within milliseconds, so a second attempt moments later succeeds
-    /// without the caller ever seeing an error - exactly the "the write is safe to redo" property
-    /// the retry's own docs claim.
+    /// A transient failure clears within milliseconds, so a second attempt succeeds without the
+    /// caller ever seeing an error.
     #[test]
     fn a_transient_failure_that_clears_on_retry_never_surfaces_to_the_caller() {
         let mut calls = 0;
@@ -2217,9 +1783,8 @@ mod tests {
         assert_eq!(calls, 2, "must have retried exactly once before succeeding");
     }
 
-    /// A failure that never clears (e.g. a genuinely locked file, or antivirus that never lets go)
-    /// must still surface as a real error once the bound is reached - this is a *bounded* retry,
-    /// not an infinite one that could hang the whole diff computation.
+    /// A failure that never clears must still surface once the bound is reached: this is a
+    /// bounded retry, not one that could hang the whole diff.
     #[test]
     fn a_transient_failure_that_never_clears_gives_up_after_the_bound() {
         let mut calls = 0;
@@ -2237,9 +1802,7 @@ mod tests {
         );
     }
 
-    /// The whole point of scoping the retry to one specific failure text: a genuinely broken
-    /// repository (or any other real `git add` failure) must never be retried or delayed - it is
-    /// not going to resolve itself, and the user needs to see it immediately.
+    /// Any other `git add` failure must not be retried or delayed: it will not resolve itself.
     #[test]
     fn a_non_transient_failure_is_never_retried() {
         let mut calls = 0;
@@ -2254,16 +1817,10 @@ mod tests {
         );
     }
 
-    /// The real, root-cause fix (not the retry, which is defense-in-depth only): `git add` must
-    /// never see an open handle on the shadow index's path when it runs, because Windows can
-    /// refuse to rename a lock file over a destination with any open handle at all (see
-    /// `prepare_shadow_index`'s own "Why the handle must be closed" docs for the exact upstream
-    /// git behavior this traces to, and the two real, unrelated repositories that hit it).
-    /// `/proc/self/fd` is a real, direct way to check this invariant on Linux even though the
-    /// failure mode itself is Windows-only: this process must hold no open file descriptor
-    /// pointing at the shadow index's path by the time [`prepare_shadow_index`] returns - if one
-    /// still exists, this test proves the regression this fix closes, regardless of which
-    /// platform is running it.
+    /// No open handle on the shadow index's path may survive [`prepare_shadow_index`], since
+    /// Windows can refuse to rename a lock file over a destination that has one.
+    ///
+    /// Checked through `/proc/self/fd`: the failure is Windows-only but the invariant is not.
     #[test]
     fn prepare_shadow_index_closes_its_own_file_handle_before_returning() {
         let repo = init_repo();
@@ -2275,9 +1832,7 @@ mod tests {
 
         let fd_dir = Path::new("/proc/self/fd");
         if !fd_dir.is_dir() {
-            // Not Linux (or no procfs) - the invariant this checks is real everywhere, but this
-            // particular check has no portable equivalent; the git-directory-placement test
-            // above and the retry-policy tests still cover this function on every platform.
+            // No procfs: this particular check has no portable equivalent.
             return;
         }
         for entry in fs::read_dir(fd_dir).expect("read /proc/self/fd") {
@@ -2324,8 +1879,7 @@ mod tests {
             "a shadow index left behind by a killed process must be recognisably ours"
         );
 
-        // Dropping it really deletes it - the `NamedTempFile` cleanup contract is unchanged by
-        // the new parent directory, so a `.git` directory doesn't slowly fill with these.
+        // Dropping it still deletes it, so a `.git` directory does not fill up with these.
         let path = shadow.to_path_buf();
         assert!(path.exists());
         drop(shadow);
@@ -2335,10 +1889,8 @@ mod tests {
         );
     }
 
-    /// A linked worktree has its *own* private git directory
-    /// (`<common-dir>/worktrees/<name>`), which is where its own index lives - the shadow index
-    /// must land there, not in the main checkout's `.git`, so the two never contend and the
-    /// same-filesystem guarantee holds for a worktree created anywhere on disk.
+    /// A linked worktree's index lives in its own `<common-dir>/worktrees/<name>`, so its shadow
+    /// index must land there rather than in the main checkout's `.git`.
     #[test]
     fn a_linked_worktrees_shadow_index_lives_in_that_worktrees_own_git_directory() {
         let repo = init_repo();
@@ -2372,22 +1924,17 @@ mod tests {
         let _ = fs::remove_dir_all(&wt_path);
     }
 
-    /// The real, reported failure's own shape: a repository with a genuine embedded git
-    /// repository (its own `.git` directory, with its own commit) sitting untracked inside the
-    /// worktree - which is exactly this app's own dogfooding checkout, where `vendor/zed` is a
-    /// real vendored clone. `git add -A` prints a loud multi-line "adding embedded git
-    /// repository" warning on stderr for it, and `compute_diff` must still succeed: that warning
-    /// is stderr noise on a *successful* command, not a failure, and nothing in the diff pipeline
-    /// may treat it as one.
+    /// An untracked embedded git repository makes `git add -A` print a multi-line "adding
+    /// embedded git repository" warning to stderr. That is noise on a *successful* command, so
+    /// nothing in the diff pipeline may treat it as a failure.
     #[test]
     fn an_embedded_git_repository_in_the_worktree_does_not_fail_the_diff() {
         let repo = init_repo();
         git(repo.path(), &["checkout", "-b", "feature"]);
         fs::write(repo.path().join("brand_new.txt"), "content nobody staged\n").expect("write");
 
-        // A real nested repository with a real commit of its own - an embedded repo with *no*
-        // commit checked out is a different case entirely (`git add` fails it outright with
-        // "does not have a commit checked out"), and is not what the report showed.
+        // Needs a commit of its own: `git add` fails an embedded repo without one outright,
+        // which is a different case.
         let embedded = repo.path().join("vendor").join("inner");
         fs::create_dir_all(&embedded).expect("create embedded repo dir");
         git(&embedded, &["init", "-b", "main"]);
@@ -2409,7 +1956,7 @@ mod tests {
             "the real untracked file must still be reported alongside the embedded repository"
         );
 
-        // And the real index is still untouched - the embedded repo is still untracked.
+        // The real index is still untouched: the embedded repo is still untracked.
         let status = Command::new("git")
             .current_dir(repo.path())
             .args(["status", "--porcelain"])

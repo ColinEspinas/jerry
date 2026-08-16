@@ -136,3 +136,80 @@ running log, explicitly not a substitute for `git log`.
 `README.md`'s `## Status` states current status directly rather than deferring to `ASSESSMENT.md`.
 Design decisions worth recording going forward get a new numbered entry above, not an appended
 paragraph in a long-running file.
+
+## 5. `gix` for reads; the `git` CLI where git's own output format is the product
+
+**Status:** Accepted.
+
+**Context:** `wt-core` has both `gix` and `std::process::Command` available to it, and the choice
+was being re-argued per function, inline, in module comments. The two are not interchangeable.
+`gix` is a library over the object database and refs; it has no formatter that reproduces
+`git diff`'s unified-diff text (hunk headers, rename and binary detection, and working-tree state
+blended in), and `gix-diff` works on tree and blob objects rather than the working tree.
+
+**Decision:** Reads that ask the object database or the ref store a structured question — resolving
+`HEAD`, finding a reference, computing a merge-base, walking commits — go through `gix`. Anything
+whose *product* is git's own text or whose semantics live in the porcelain — the unified diff,
+`ls-files`, `stash`, `worktree remove`, index manipulation — shells out to the `git` CLI, with an
+explicit argument vector (never an interpolated string) and with any config it depends on pinned
+via `-c`.
+
+**Consequences:** Reimplementing `git diff`'s output format on `gix-diff` primitives is out of
+scope, and a PR proposing it needs to argue with this entry first. Shelling out means the invocation
+owns its own correctness: pin the config the parser assumes (`diff.mnemonicPrefix`,
+`diff.noprefix`, `core.quotePath`), validate any object id reaching an argument vector as hex, and
+treat stderr on a successful command as noise rather than failure.
+
+## 6. One place answers "what does this worktree contain"
+
+**Status:** Accepted.
+
+**Context:** Two features hand-rolled worktree enumeration independently and both tripped on the
+same directory: a recursive `fs::read_dir` walk behind the search panel, and an unconditional
+`git add -A` behind review snapshots. A gitignored build directory dominates a real checkout — this
+repository's own `target/` is the large majority of its files — and a filesystem walk must open and
+`stat` all of it before discovering there was nothing to search, because ignore matching happens
+after descent. Git's happens before it.
+
+**Decision:** `wt-core::worktree_files` is the single answer, built on `git ls-files --cached
+--others --exclude-standard`. New callers use it rather than growing a third walk.
+
+**Consequences:** "Content" means what git would show: tracked paths stay listed even under a
+later-added ignore rule, and untracked paths appear only if git would offer to stage them. A caller
+that must keep working outside a git repository owns its own fallback, since this returns an error
+there rather than an empty list.
+
+## 7. Interactive rebase is driven through git's own editor hooks, not reimplemented
+
+**Status:** Accepted.
+
+**Context:** Jerry needs `git rebase --interactive`'s six todo verbs without an interactive
+terminal. The alternative to driving real git is reimplementing the todo machinery on plumbing
+(`cherry-pick`, `commit --amend`, `reset`) — which means re-deriving conflict handling, `squash`
+message combination, `REBASE_HEAD`/`stopped-sha` bookkeeping, and resume-after-restart semantics
+from scratch.
+
+**Decision:** Drive the real `git rebase -i` non-interactively through the same environment hooks
+a human's `$EDITOR` is invoked through. `GIT_SEQUENCE_EDITOR` is set to a `cp` of a
+Jerry-written todo file, replacing git's generated one. `GIT_EDITOR` is a `/bin/sh` script that
+classifies each invocation *by the content of the message file git hands it*, never by invocation
+order:
+
+1. First line `# This is a combination of ...` → a `squash` combination; accept unmodified.
+2. Contains `You are currently editing a commit` → a `reword`; pop the next slot from a persisted
+   message queue. Nothing queued means exit non-zero, which reproduces `edit`'s stop exactly.
+3. Anything else → a conflict-resumed step; accept git's pre-filled message and **do not** advance
+   the queue cursor.
+
+Case 3 is not optional. A conflict-resumed `pick` goes through git's ordinary `commit` codepath and
+does open the editor; treating that as a `reword` consumes a message meant for a later row.
+
+**Consequences:** Sidecar state (todo file, editor script, message queue, cursor, and a plan
+cross-reference) lives under `<git-dir>/ade-rebase/`, resolved per-worktree rather than in the
+shared common dir, and survives until the rebase completes or aborts — so a stop can be
+reconstructed after a process restart, including whether a row was `edit` or a message-less
+`reword`, which git alone cannot distinguish once stopped. The queue is plain files, not JSON, so
+the `sh` script needs no parser. Env var values are spliced unquoted into a shell command line by
+git, so every embedded path must be POSIX-single-quoted. The editor script is `/bin/sh`, making
+this path Unix-only; elsewhere it surfaces as an ordinary spawn failure. Conflicts are never
+auto-resolved or rolled back, matching `crate::rewrite`.

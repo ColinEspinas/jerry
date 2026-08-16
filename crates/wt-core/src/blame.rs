@@ -1,48 +1,11 @@
 //! Per-line `git blame` for a single file, plus lazy full commit-message lookup.
 //!
-//! ## Why the `git` CLI, not `gix`
+//! Shells out to `git`, since `gix` has no blame API - see `docs/architecture/decisions.md` §5.
+//! `--line-porcelain` rather than `--porcelain`, because repeating every commit's header on every
+//! line keeps this parser stateless across lines.
 //!
-//! `gix` (as of the version this workspace pins, 0.68) has no public blame API - there is no
-//! `gix::Repository::blame` or equivalent walking the same incremental-blame algorithm `git
-//! blame` itself uses. Re-implementing that algorithm (copy detection across renames, line
-//! attribution across merges, "boundary" commits in a shallow clone) on top of `gix`'s
-//! lower-level object/diff primitives would mean re-deriving `git blame`'s own, quite
-//! intricate, output from scratch. `git blame` already does this correctly, so - matching
-//! `crate::diff`'s identical call on `git diff` (see that module's own "gix vs. the git CLI"
-//! docs) - this module shells out to it instead, via a real argument vector
-//! (`std::process::Command` with `&[OsString]`, never an interpolated shell string), per this
-//! crate's own git-invocation convention.
-//!
-//! `--line-porcelain` (not plain `--porcelain`) is used deliberately: it repeats every
-//! commit's full header (author, author-time, summary, ...) on *every* line's block instead of
-//! only the first line that introduced a given commit. That makes this parser stateless across
-//! lines - no "remember the last commit's fields for a line that only prints `<sha> <line>
-//! <line>`" bookkeeping - at the cost of a larger (but still line-bounded, and this app already
-//! caps opened files at [`crate::code_surface`]'s own 2MB read limit, mirrored here by nothing
-//! extra being needed) amount of stdout to parse.
-//!
-//! ## Uncommitted lines
-//!
-//! A line whose content differs from `HEAD` (staged or not - `git blame` always blames the
-//! working tree, not the index) is attributed to a synthetic all-zero sha
-//! (`0000000000000000000000000000000000000000`) with author `"Not Committed Yet"`.
-//! [`BlameLine::is_uncommitted`] is `true` exactly for these - callers should not print the
-//! zero sha or treat it as a real commit.
-//!
-//! ## Graceful absence
-//!
-//! [`blame_file`] returns [`BlameOutcome::NotARepo`] or [`BlameOutcome::NotTracked`] - not an
-//! [`Error`] - for the two "there is nothing to show, and that's not a failure" cases this
-//! feature needs to distinguish from a real error: `worktree_path` isn't inside a git
-//! repository at all, or `relative_path` has no history in `HEAD` (a genuinely untracked file,
-//! or one that doesn't exist there). Both are real, expected outcomes a caller should render as
-//! "no blame available", never as an error toast - see `crate::code_surface::blame`'s own docs
-//! in the `app` crate for how the UI layer uses this distinction. A shallow clone is *not* a
-//! third variant: `git blame` in a shallow clone still succeeds, attributing lines whose real
-//! history is missing to the shallow boundary commit it does have (marked `boundary` in
-//! porcelain output, which this parser reads the same as any other commit) - so shallow clones
-//! need no special handling here at all, only real, always-on graceful degradation of what data
-//! is available.
+//! A line differing from `HEAD` is attributed to an all-zero sha with author
+//! `"Not Committed Yet"`; [`BlameLine::is_uncommitted`] marks exactly those.
 //!
 //! Performs blocking I/O; see the crate-level docs.
 
@@ -52,64 +15,49 @@ use std::path::Path;
 use crate::error::Error;
 use crate::{open_repo, run_git};
 
-/// One line's real blame attribution, in file order (index 0 is line 1).
+/// One line's blame attribution, in file order (index 0 is line 1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlameLine {
-    /// The full 40-character commit sha, or the synthetic all-zero sha for an uncommitted
-    /// line (see [`Self::is_uncommitted`]).
+    /// The 40-character commit sha, or the all-zero sha when [`Self::is_uncommitted`].
     pub sha: String,
-    /// The commit author's real name, as `git blame` reports it (`"Not Committed Yet"` for an
-    /// uncommitted line).
+    /// `"Not Committed Yet"` for an uncommitted line.
     pub author: String,
-    /// The commit's author-time, as seconds since the Unix epoch (UTC).
+    /// Seconds since the Unix epoch, UTC.
     pub author_time_unix: i64,
-    /// The commit's subject line (`git blame --line-porcelain`'s own `summary` field) - never
-    /// the full, possibly-multi-paragraph commit message; see [`commit_message`] for that.
+    /// The subject line only; see [`commit_message`] for the full message.
     pub summary: String,
-    /// `true` for a line whose content differs from `HEAD` (an uncommitted local
-    /// modification) - `sha` is the synthetic all-zero id and `author`/`summary` carry no real
-    /// commit information in that case.
+    /// `true` when the line differs from `HEAD`, in which case `author`/`summary` carry no
+    /// commit information.
     pub is_uncommitted: bool,
 }
 
-/// A real, computed blame of one file, one entry per line in file order.
+/// A computed blame of one file, one entry per line in file order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileBlame {
     pub lines: Vec<BlameLine>,
-    /// The full commit id `HEAD` resolved to at the moment this blame was computed - part of
-    /// this feature's cache key (see `crate::code_surface::blame`'s own docs in the `app`
-    /// crate): a cached [`FileBlame`] is only trusted while both this and the file's own
-    /// mtime/length still match.
+    /// What `HEAD` resolved to when this was computed; part of the caller's cache key.
     pub head_commit: String,
 }
 
-/// The outcome of trying to compute a file's blame - see the module docs' "Graceful absence"
-/// section for why "nothing to show" is two real, non-error variants rather than folded into
-/// [`Error`].
+/// The outcome of trying to compute a file's blame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlameOutcome {
     Blame(FileBlame),
     /// `worktree_path` is not inside a git repository at all.
     NotARepo,
-    /// `relative_path` has no history in `HEAD` - untracked, or it simply doesn't exist there
-    /// (a brand new, never-committed file).
+    /// `relative_path` has no history in `HEAD` - untracked, or absent there.
     NotTracked,
 }
 
-/// Computes the real blame of `relative_path` (resolved against `worktree_path`) via `git
-/// blame --line-porcelain`. See the module docs for the CLI-vs-`gix` choice, the uncommitted-
-/// line convention, and the two non-error "nothing to show" outcomes.
+/// Blames `relative_path`, resolved against `worktree_path`.
 ///
-/// Performs blocking I/O: opens the repository via `gix` (just to distinguish "not a repo"
-/// before ever spawning `git`) and spawns a real `git blame` child process.
+/// "Nothing to show" is [`BlameOutcome::NotARepo`]/[`BlameOutcome::NotTracked`] rather than an
+/// [`Error`]: both are expected, and a caller should render them as "no blame available".
+///
+/// Performs blocking I/O.
 pub fn blame_file(worktree_path: &Path, relative_path: &Path) -> Result<BlameOutcome, Error> {
-    // `gix::open` is the same cheap "is this even a real repository" probe `crate::diff` and
-    // `crate::list_worktrees` already use - real graceful-absence handling per the module docs,
-    // not an error path a caller has to sift out of a generic `Err`. Its resolved `HEAD` commit
-    // id also becomes this blame's real cache-key revision (see [`FileBlame::head_commit`]);
-    // `None` (an unborn `HEAD` - a brand new repository with no commits yet) degrades to
-    // [`BlameOutcome::NotTracked`] below without ever reaching `git blame` at all, since there
-    // is provably no history yet for any path to have.
+    // Probing with `gix` first distinguishes "not a repo" without spawning `git`, and resolves
+    // the `HEAD` this blame is cached against. An unborn `HEAD` has no history for any path.
     let Ok(repo) = open_repo(worktree_path) else {
         return Ok(BlameOutcome::NotARepo);
     };
@@ -130,13 +78,8 @@ pub fn blame_file(worktree_path: &Path, relative_path: &Path) -> Result<BlameOut
     ];
     let output = run_git(worktree_path, &args)?;
     if !output.status.success() {
-        // `git blame` fails with a real, non-zero exit for a path with no history in `HEAD` -
-        // both a genuinely untracked file and one that plain doesn't exist there report this
-        // the same way (`fatal: no such path '<path>' in HEAD` / `fatal: <path>: no such
-        // path in HEAD`); nothing else `blame_file` calls should ever fail this way for an
-        // otherwise-valid path, so any non-zero exit here is treated as "nothing tracked",
-        // never surfaced as an [`Error`] - matching this module's own documented "no error
-        // toast" contract for untracked files.
+        // `git blame` exits non-zero for a path with no history in `HEAD`, whether untracked or
+        // absent. Nothing else here fails that way for a valid path.
         return Ok(BlameOutcome::NotTracked);
     }
 
@@ -147,25 +90,13 @@ pub fn blame_file(worktree_path: &Path, relative_path: &Path) -> Result<BlameOut
     }))
 }
 
-/// Fetches the real, full commit message body (subject + blank line + body, exactly as `git
-/// log`'s `%B` format placeholder produces it) for `sha` - the data
-/// [`BlameLine::summary`]/[`FileBlame`] don't carry, needed for a real hover card showing "the
-/// full commit message and SHA" (GitHub issue #29). Fetched lazily, one commit at a time, by
-/// the `app` crate's own per-sha cache (`crate::code_surface::blame`'s docs) rather than eagerly
-/// for every line `blame_file` returns - a file with a long history could otherwise mean one
-/// `git log` call per distinct commit on every blame refresh for data most lines' hover never
-/// actually needs.
+/// The full commit message body for `sha`, as `git log`'s `%B` produces it.
 ///
-/// `sha` is validated as a plausible hex object id before being handed to `git` as an argument -
-/// the same defensive check `crate::diff::diff_against_base` applies to a merge-base sha before
-/// its own `git diff` call, so a future change to how a caller derives `sha` can't silently
-/// become a git-argument injection.
+/// Meant to be called lazily per sha rather than eagerly for every blamed line. `Ok(None)` for
+/// the all-zero sha, for a non-hex `sha` (which is rejected before reaching `git` as an
+/// argument), and for one `git log` does not recognize.
 ///
-/// Returns `Ok(None)` for the synthetic all-zero "uncommitted" sha (never a real commit `git
-/// log` could look up) and for a sha `git log` genuinely doesn't recognize, rather than an
-/// `Error` - both are "nothing real to show", not a failure.
-///
-/// Performs blocking I/O: spawns a real `git log` child process.
+/// Performs blocking I/O.
 pub fn commit_message(worktree_path: &Path, sha: &str) -> Result<Option<String>, Error> {
     if sha.is_empty()
         || !sha.bytes().all(|b| b.is_ascii_hexdigit())
@@ -195,17 +126,11 @@ pub fn commit_message(worktree_path: &Path, sha: &str) -> Result<Option<String>,
     }
 }
 
-/// Parses `git blame --line-porcelain`'s stdout into a [`FileBlame`] - one [`BlameLine`] per
-/// real content line, in file order. A commit header line looks like `<40-hex-sha> <orig-line>
-/// <final-line>[ <num-lines-in-group>]`; every field until the next one of those (or a `\t`-
-/// prefixed content line, which ends the current entry) is a `<key> <value>` header line for
-/// the block just started. Because `--line-porcelain` repeats every header on every line
-/// (unlike plain `--porcelain`), this never needs to remember a previous entry's fields across
-/// iterations.
+/// Parses `git blame --line-porcelain` stdout into one [`BlameLine`] per content line.
 ///
-/// A parse failure on one malformed-looking block (missing `author`/`author-time`/`summary`) is
-/// skipped rather than aborting the whole file - defensive against a future `git` version
-/// changing field names slightly; better to lose one line's attribution than the whole blame.
+/// A block runs from a `<sha> <orig-line> <final-line>` header through its `<key> <value>` fields
+/// to the `\t`-prefixed content line that ends it. One malformed block is skipped rather than
+/// aborting the file: losing a line's attribution beats losing the whole blame.
 fn parse_line_porcelain(text: &str) -> Vec<BlameLine> {
     let mut lines = Vec::new();
 
@@ -216,8 +141,7 @@ fn parse_line_porcelain(text: &str) -> Vec<BlameLine> {
 
     for raw_line in text.split('\n') {
         if raw_line.starts_with('\t') {
-            // Content line: ends the current block. Emit an entry if the header was complete
-            // enough to make sense of; either way, reset for the next block.
+            // Ends the block: emit if the header was complete, and reset either way.
             if let (Some(sha), Some(author), Some(author_time)) =
                 (current_sha.take(), author.take(), author_time.take())
             {
@@ -257,11 +181,10 @@ fn parse_line_porcelain(text: &str) -> Vec<BlameLine> {
     lines
 }
 
-/// Recognizes a `git blame --line-porcelain` commit-header line (`<40-hex-sha> <orig-line>
-/// <final-line>[ <num-lines-in-group>]`), returning the sha if `raw_line` matches. Distinguished
-/// from an ordinary `<key> <value>` header field by requiring the first token to be exactly 40
-/// hex characters (no real header key is hex-shaped and 40 characters long) followed by one or
-/// two more purely-numeric tokens.
+/// Returns the sha if `raw_line` is a commit-header line rather than a `<key> <value>` field.
+///
+/// Told apart by requiring exactly 40 hex characters followed by two or three numeric tokens; no
+/// header key is hex-shaped and 40 characters long.
 fn parse_commit_header(raw_line: &str) -> Option<String> {
     let mut parts = raw_line.split(' ');
     let sha = parts.next()?;

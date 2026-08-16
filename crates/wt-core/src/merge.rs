@@ -1,49 +1,20 @@
-//! `git merge` of a session's worktree branch into the repository's detected default
-//! ("base") branch: attempting the merge, detecting conflicts from git's own conflict
-//! markers, and resolving them (take-left/take-right/take-both) by writing content back to
-//! disk and staging it.
+//! Merging a session worktree's branch into the repository's detected base branch: attempting the
+//! merge, reading conflicts from git's own markers, and resolving them back to disk.
 //!
-//! ## Worktree-checkout collision
+//! git can only check a branch out in one worktree at a time, so the merge cannot be staged in a
+//! temporary checkout. `git merge` takes a *ref*, though, so [`attempt_merge`] instead runs it in
+//! whichever worktree already has the base branch checked out, and refuses with
+//! [`Error::MergeBaseBranchNotCheckedOut`] if none does rather than fabricating one.
 //!
-//! A git worktree has its own `HEAD`, but the *object database* (refs included) is shared
-//! across every worktree of a repository. The same branch can never be checked out in two
-//! worktrees at once - `git checkout <branch checked out elsewhere>` fails outright with
-//! `fatal: '<branch>' is already used by worktree at '<path>'`. That rules out checking out
-//! the base branch somewhere temporary (or into the session's own worktree) and merging
-//! there.
+//! `--no-commit --no-ff` together, because `--no-commit` alone still auto-commits a fast-forward.
+//! Nothing here is ever auto-committed: [`complete_merge`] is always a separate step. "Already up
+//! to date" exits 0 without creating `MERGE_HEAD`, which is why that file, not the exit status,
+//! decides the outcome.
 //!
-//! `git merge <branch-name>` merges a *ref*, not a directory, so it can instead be run from
-//! any worktree that already has the *target* branch checked out. [`attempt_merge`] finds
-//! the worktree with the detected base branch checked out (via [`crate::list_worktrees`])
-//! and runs `git -C <that worktree> merge <session-branch-name>` there - never a `git
-//! checkout`. If no worktree has the base branch checked out at all, this is refused with
-//! [`Error::MergeBaseBranchNotCheckedOut`] rather than fabricating a checkout.
+//! `merge.conflictStyle=merge` is pinned so markers are always the two-way form this parser
+//! understands, never `diff3`.
 //!
-//! ## `--no-commit --no-ff`
-//!
-//! `git merge --no-commit <branch>` still auto-commits a fast-forward merge on its own
-//! (`git-merge(1)`: "fast-forward updates ... there is no way to stop those merges with
-//! `--no-commit`"), which would defeat pausing before committing on *every* outcome so the
-//! UI can show what happened first. Adding `--no-ff` forces a real merge commit even when a
-//! fast-forward is possible, so combined with `--no-commit` nothing is ever auto-committed
-//! (verified in the tests below across fast-forwardable, three-way, and conflicting merges).
-//! The one exception is "already up to date": `git merge` exits `0` but never creates
-//! `MERGE_HEAD` at all, which is why [`attempt_merge`] checks for `MERGE_HEAD` explicitly
-//! rather than trusting exit status alone (see [`MergeOutcome::AlreadyUpToDate`]).
-//!
-//! `merge.conflictStyle=merge` is pinned via `-c` (same convention `crate::diff` uses for
-//! `git diff`), so a conflicted file's markers are always the two-way
-//! `<<<<<<</=======/>>>>>>>` form this module's parser understands, never `diff3`-style
-//! (`|||||||` base section) - regardless of the caller's own git config.
-//!
-//! ## Not auto-committing
-//!
-//! Neither a clean merge nor a fully-resolved conflicted merge is auto-committed here;
-//! [`complete_merge`] is a separate, explicit step for both, so the repository stays in a
-//! staged-but-uncommitted state until the UI shows it and the user confirms.
-//!
-//! Performs blocking I/O everywhere in this module (shells out to `git`); see the
-//! crate-level docs on offloading this to a background thread.
+//! Performs blocking I/O throughout; see the crate-level docs.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -53,19 +24,10 @@ use crate::diff::detect_default_base;
 use crate::error::{Error, GitExit};
 use crate::{check_success, format_args, git_command, is_dirty, list_worktrees, open_repo};
 
-/// Where a merge attempt happened, and against what - returned alongside [`MergeOutcome`]
-/// so a caller never has to re-derive "which worktree did this run in" or "what was the
-/// base branch" from scratch.
+/// Where a merge ran, and against what, so a caller need not re-derive it.
 ///
-/// Both entry points fill this in, with the same meaning in each: `base_branch` is always the
-/// branch that was merged **into**, `session_branch` always the branch that was merged **from**,
-/// and `base_worktree_path` always the worktree the real `git merge` ran in. For
-/// [`attempt_merge`] those are the repository's detected base branch, the session worktree's own
-/// branch, and whichever worktree has the base branch checked out; for
-/// [`attempt_merge_into_current`] they are the target worktree's own currently-checked-out
-/// branch, the caller-supplied source branch, and the target worktree itself. The field names
-/// keep [`attempt_merge`]'s original vocabulary rather than being renamed, so every existing
-/// caller reads unchanged - see each function's own docs for which is which.
+/// The same meaning from either entry point: `base_branch` was merged **into**,
+/// `session_branch` merged **from**, and `base_worktree_path` is where `git merge` ran.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeStart {
     pub base_branch: String,
@@ -73,38 +35,30 @@ pub struct MergeStart {
     pub session_branch: String,
 }
 
-/// The real result of one `git merge --no-commit --no-ff` attempt.
+/// The result of one merge attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeOutcome {
-    /// The base branch already contains every commit on the session branch; `git merge`
-    /// exited successfully but created no `MERGE_HEAD` and nothing changed on disk.
+    /// The base branch already contains every commit on the session branch; nothing changed.
     AlreadyUpToDate,
-    /// The merge completed with no conflicts and is staged, uncommitted, in the base
-    /// worktree's index and working tree - [`complete_merge`] finishes it.
+    /// Merged without conflicts, staged but uncommitted; [`complete_merge`] finishes it.
     Clean { files: Vec<PathBuf> },
-    /// The merge produced real conflicts in one or more files. `clean_files` merged without
-    /// any human input (git resolved them automatically because the edits don't overlap);
-    /// `conflicted_files` each contain real `<<<<<<</=======/>>>>>>>` markers on disk and need
-    /// [`load_conflicted_file`] + resolution before [`complete_merge`] can run.
+    /// `clean_files` git resolved on its own; `conflicted_files` carry markers on disk and need
+    /// [`load_conflicted_file`] and resolution before [`complete_merge`] can run.
     Conflicted {
         conflicted_files: Vec<PathBuf>,
         clean_files: Vec<PathBuf>,
     },
 }
 
-/// Attempt a real merge of the branch checked out in `session_worktree_path` into the
-/// repository's detected default/base branch, per this module's docs. `repo_path` is used
-/// only to open the repository and detect the base branch (any worktree path of the
-/// repository works for that); the merge itself always runs in the worktree that has the
-/// base branch checked out, which [`attempt_merge`] finds on its own.
+/// Merges the branch checked out in `session_worktree_path` into the detected base branch.
 ///
-/// Before running `git merge`, this refuses (returns [`Error::MergeTargetDirty`]) if the base
-/// worktree has any uncommitted changes at all - `git merge` itself often refuses this too,
-/// but checking first means a caller gets one consistent, structured error instead of having
-/// to parse `git`'s own stderr to tell "refused, dirty" apart from other real failures.
+/// `repo_path` only locates the repository; the merge runs in whichever worktree has the base
+/// branch checked out.
 ///
-/// Performs blocking I/O: opens the repository via `gix`, spawns `git worktree`/`git status`
-/// reads, and spawns the real `git merge` child process.
+/// Refuses with [`Error::MergeTargetDirty`] if that worktree is dirty. git often refuses too, but
+/// checking first gives callers one structured error instead of stderr to parse.
+///
+/// Performs blocking I/O.
 pub fn attempt_merge(
     repo_path: &Path,
     session_worktree_path: &Path,
@@ -148,38 +102,19 @@ pub fn attempt_merge(
     Ok((start, outcome))
 }
 
-/// Attempt a real merge of `source_branch` into whatever branch is **currently checked out** in
-/// `target_worktree_path` - the Branches panel's own branch context menu "Merge into current
-/// branch…" (GitHub issue #241), the opposite direction from [`attempt_merge`].
+/// Merges `source_branch` into whatever is checked out in `target_worktree_path` - the opposite
+/// direction from [`attempt_merge`].
 ///
-/// Simpler than [`attempt_merge`] in exactly one way: the worktree the merge runs in is given
-/// directly rather than searched for, so there is no base-branch detection and no
-/// [`Error::MergeBaseBranchNotCheckedOut`] case at all - the caller already knows which worktree
-/// it means. Everything else is identical, and deliberately shares the same code:
-/// [`run_merge`] runs the very same `git -c merge.conflictStyle=merge merge --no-commit --no-ff`
-/// invocation and derives the same [`MergeOutcome`], so the two directions can never drift into
-/// classifying a merge differently.
+/// The target worktree is given rather than searched for, so there is no base-branch detection
+/// here. Everything else runs through the same [`run_merge`], so the two directions cannot
+/// classify a merge differently.
 ///
-/// The returned [`MergeStart`] names what was really merged into what: `base_branch` is the
-/// branch that was genuinely checked out in `target_worktree_path` at the moment the merge ran
-/// (read from `HEAD`, never assumed by the caller), `session_branch` is `source_branch`, and
-/// `base_worktree_path` is `target_worktree_path`.
+/// Three preconditions are refused before `git merge` runs: a detached target
+/// ([`Error::MergeTargetDetached`]), which git would otherwise merge onto silently; a dirty target
+/// ([`Error::MergeTargetDirty`]); and merging a branch into itself
+/// ([`Error::MergeSourceIsCurrentBranch`]). A nonexistent `source_branch` is left to git.
 ///
-/// Three real preconditions are refused before `git merge` ever runs, each mirroring
-/// [`attempt_merge`]'s own for this direction:
-/// - a detached `HEAD` in the target ([`Error::MergeTargetDetached`]) - there is no branch to
-///   merge into, and git would silently merge onto a detached `HEAD` instead;
-/// - a dirty target worktree ([`Error::MergeTargetDirty`]) - see [`attempt_merge`]'s docs for why
-///   this is checked here rather than left to `git merge`'s own inconsistent refusals;
-/// - merging a branch into itself ([`Error::MergeSourceIsCurrentBranch`]) - a guaranteed
-///   "already up to date" no-op that reads as a real answer rather than a mistake.
-///
-/// A `source_branch` that doesn't exist is deliberately *not* pre-checked: git's own
-/// `merge: <name> - not something we can merge` surfaces through [`Error::GitCommand`], exactly
-/// like every other real failure in this module.
-///
-/// Performs blocking I/O: opens the repository via `gix`, spawns a `git status` dirty-check, and
-/// spawns the real `git merge` child process.
+/// Performs blocking I/O.
 pub fn attempt_merge_into_current(
     target_worktree_path: &Path,
     source_branch: &str,
@@ -211,15 +146,10 @@ pub fn attempt_merge_into_current(
     Ok((start, outcome))
 }
 
-/// The one real `git merge` invocation both [`attempt_merge`] and
-/// [`attempt_merge_into_current`] run, plus the classification of its result into a
-/// [`MergeOutcome`] - shared rather than duplicated so the `--no-commit --no-ff`/
-/// `merge.conflictStyle=merge` reasoning in this module's own docs holds for both directions,
-/// and so a change to how an outcome is derived can never apply to only one of them.
+/// The single `git merge` invocation both entry points run, and the classification of its result.
 ///
-/// `worktree_path` must already have the branch being merged *into* checked out, be clean, and
-/// not be `source_branch`'s own branch - each caller checks its own preconditions before
-/// reaching here (they differ in what they can even check; see each one's docs).
+/// `worktree_path` must already have the branch being merged *into* checked out, be clean, and not
+/// be `source_branch`'s own branch; each caller checks that itself.
 fn run_merge(worktree_path: &Path, source_branch: &str) -> Result<MergeOutcome, Error> {
     let args: Vec<OsString> = vec![
         "-c".into(),
@@ -246,9 +176,7 @@ fn run_merge(worktree_path: &Path, source_branch: &str) -> Result<MergeOutcome, 
 
     let conflicted_files = conflicted_files(worktree_path)?;
     if conflicted_files.is_empty() {
-        // A real, non-conflict failure (e.g. a merge was already in progress, or something
-        // else genuinely went wrong) - surface git's own stderr rather than misreporting an
-        // empty conflict set.
+        // A non-conflict failure: surface git's stderr rather than an empty conflict set.
         return Err(Error::GitCommand {
             args: format_args(&args),
             exit: GitExit::from_status(&output.status),
@@ -267,10 +195,8 @@ fn run_merge(worktree_path: &Path, source_branch: &str) -> Result<MergeOutcome, 
     })
 }
 
-/// The real short name of the branch checked out in `worktree_path`, or `None` if its `HEAD` is
-/// genuinely detached - read from the worktree's own `HEAD` reference via `gix`, never inferred
-/// from a caller's belief about what should be checked out there. Shared by both merge entry
-/// points, each of which turns `None` into its own direction-appropriate refusal.
+/// The short name of the branch checked out in `worktree_path`, read from `HEAD` rather than
+/// assumed. `None` when detached; each caller turns that into its own refusal.
 fn checked_out_branch(worktree_path: &Path) -> Result<Option<String>, Error> {
     let repo = open_repo(worktree_path)?;
     let head = repo
@@ -279,9 +205,7 @@ fn checked_out_branch(worktree_path: &Path) -> Result<Option<String>, Error> {
     Ok(head.referent_name().map(|name| name.shorten().to_string()))
 }
 
-/// Abort an in-progress merge (real `git merge --abort`) in `base_worktree_path`, restoring
-/// it to exactly the state it was in before [`attempt_merge`] ran: no `MERGE_HEAD`, no
-/// conflict markers, no staged changes from the merge attempt.
+/// Aborts an in-progress merge, restoring the worktree to its pre-merge state.
 ///
 /// Performs blocking I/O.
 pub fn abort_merge(base_worktree_path: &Path) -> Result<(), Error> {
@@ -295,21 +219,14 @@ pub fn abort_merge(base_worktree_path: &Path) -> Result<(), Error> {
     check_success(&args, &output)
 }
 
-/// Finish an in-progress merge in `base_worktree_path` with `git commit --no-edit`, using
-/// the merge message git already prepared in `MERGE_MSG`. Valid to call both when
-/// [`attempt_merge`] returned [`MergeOutcome::Clean`] and when every file from a
-/// [`MergeOutcome::Conflicted`] result has been resolved and staged via
-/// [`write_resolved_file`]: both leave the repository in the same "index updated,
-/// `MERGE_HEAD`/`MERGE_MSG` present, nothing committed yet" state.
+/// Commits an in-progress merge using the message git prepared in `MERGE_MSG`.
 ///
-/// Defense in depth: before running `git commit`, this re-checks git's own ground truth
-/// directly rather than trusting a caller's UI-level "is this resolved" belief -
-/// [`Error::MergeNotInProgress`] if `MERGE_HEAD` doesn't exist, and
-/// [`Error::MergeFilesStillConflicted`] if `git diff --name-only --diff-filter=U` still
-/// reports an unmerged path. This matters because a conflict-marker parser (like
-/// [`ConflictedFile::is_resolved`]) only ever sees *text* conflicts - a modify/delete or
-/// binary conflict leaves git's index unmerged with zero `<<<<<<<` markers to parse (see
-/// [`classify_conflicted_file`]'s docs).
+/// Valid after either a [`MergeOutcome::Clean`] result or a fully resolved
+/// [`MergeOutcome::Conflicted`] one; both leave the same staged-but-uncommitted state.
+///
+/// Re-checks git's own ground truth first rather than trusting the caller: a marker parser only
+/// sees *text* conflicts, while a modify/delete or binary conflict leaves the index unmerged with
+/// no markers at all.
 ///
 /// Performs blocking I/O.
 pub fn complete_merge(base_worktree_path: &Path) -> Result<(), Error> {
@@ -333,11 +250,8 @@ pub fn complete_merge(base_worktree_path: &Path) -> Result<(), Error> {
     check_success(&args, &output)
 }
 
-/// Best-effort check for whether the repository's detected base branch's worktree currently
-/// has a merge in progress (`MERGE_HEAD` present) - used to offer an `Abort merge` action
-/// after some other failure left a caller's UI in an error state, without assuming a
-/// worktree path that might not even be resolvable any more. Returns `Ok(None)`, not an
-/// error, if the base branch can't be detected or isn't checked out anywhere.
+/// Whether the base branch's worktree has a merge in progress, for offering an abort after some
+/// other failure. `Ok(None)` if no base branch is detectable or checked out anywhere.
 ///
 /// Performs blocking I/O.
 pub fn find_in_progress_merge(repo_path: &Path) -> Result<Option<PathBuf>, Error> {
@@ -355,9 +269,7 @@ pub fn find_in_progress_merge(repo_path: &Path) -> Result<Option<PathBuf>, Error
     }
 }
 
-/// Direct check for whether `worktree_path` currently has a merge in progress (`MERGE_HEAD`
-/// resolves) - `pub` so a caller that already knows a specific worktree path can check
-/// directly, without re-deriving it via [`find_in_progress_merge`].
+/// Whether `worktree_path` has a merge in progress, for a caller that already knows the path.
 ///
 /// Performs blocking I/O.
 pub fn merge_head_exists(worktree_path: &Path) -> Result<bool, Error> {
@@ -376,13 +288,10 @@ pub fn merge_head_exists(worktree_path: &Path) -> Result<bool, Error> {
     Ok(output.status.success())
 }
 
-/// Files with git-reported conflict markers still present (index has unmerged stages).
+/// Files git reports as unmerged in the index.
 ///
-/// Pins `-c core.quotePath=false`, matching `crate::diff`'s reasoning for the same pin on
-/// `git diff`: without it, a non-ASCII path (e.g. `café.txt`) comes back octal-escaped and
-/// quoted (`"caf\303\251.txt"`), and [`parse_paths`] would take that literally -
-/// `load_conflicted_file`/`write_resolved_file` would then silently look up/create a
-/// wrongly-named file instead of the real one.
+/// Pins `core.quotePath=false`: otherwise a non-ASCII path comes back octal-escaped, and
+/// [`load_conflicted_file`]/[`write_resolved_file`] would act on a wrongly-named file.
 fn conflicted_files(worktree_path: &Path) -> Result<Vec<PathBuf>, Error> {
     let args: Vec<OsString> = vec![
         "-c".into(),
@@ -429,11 +338,8 @@ fn parse_paths(stdout: &[u8]) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Find the worktree (main or linked) of the repository at `repo_path` whose checked-out
-/// branch is exactly `branch`, if any. A worktree that itself failed to describe (a corrupt
-/// entry - see [`crate::WorktreeResult`]'s docs) is skipped rather than failing this lookup
-/// outright, matching [`crate::list_worktrees`]'s own "one bad entry shouldn't hide the rest"
-/// contract.
+/// The worktree whose checked-out branch is exactly `branch`, if any. A worktree that failed to
+/// describe is skipped rather than failing the lookup.
 fn find_worktree_with_branch(repo_path: &Path, branch: &str) -> Result<Option<PathBuf>, Error> {
     let entries = list_worktrees(repo_path)?;
     for entry in entries.into_iter().flatten() {
@@ -446,49 +352,38 @@ fn find_worktree_with_branch(repo_path: &Path, branch: &str) -> Result<Option<Pa
 
 // --- Conflict marker parsing and resolution -------------------------------------------
 
-/// One real conflict block parsed out of a file's `<<<<<<</=======/>>>>>>>` markers.
+/// One conflict block parsed out of a file's `<<<<<<</=======/>>>>>>>` markers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConflictHunk {
-    /// The label git wrote after `<<<<<<< ` (typically `HEAD` - the base branch's own
-    /// content, since [`attempt_merge`] always runs `git merge` from the base worktree).
+    /// The label git wrote after `<<<<<<< `, typically `HEAD`.
     pub ours_label: String,
     pub ours: Vec<String>,
-    /// 1-indexed real line number, in the original conflicted file on disk, of `ours`' first
-    /// content line - the line immediately after the `<<<<<<< label` marker line. Meaningless
-    /// when `ours` is empty (no real first content line exists - the marker's next line is
-    /// directly `=======`, so this equals `=======`'s own line number in that case): a caller
-    /// must gate any per-line gutter rendering on `ours.is_empty()`, never print this value for
-    /// a line that was never real (the `app` crate's merge-surface renderer drives row count off
-    /// the real highlighted line count, not this field alone, for exactly this reason).
+    /// 1-indexed line of `ours`' first content line in the file on disk.
+    ///
+    /// Meaningless when `ours` is empty, where it equals the `=======` line instead, so callers
+    /// must gate gutter rendering on `ours.is_empty()`.
     pub ours_start_line: usize,
-    /// The label git wrote after `>>>>>>> ` (the merged-in branch's name).
+    /// The label git wrote after `>>>>>>> `.
     pub theirs_label: String,
     pub theirs: Vec<String>,
-    /// 1-indexed real line number of `theirs`' first content line - the line immediately after
-    /// the `=======` marker line. Same "meaningless when empty" caveat as
+    /// 1-indexed line of `theirs`' first content line, with the same caveat as
     /// [`Self::ours_start_line`].
     pub theirs_start_line: usize,
 }
 
-/// One segment of a conflicted file: either ordinary (non-conflicted) lines, or one real
-/// conflict block. A file's full real content is exactly the concatenation of every segment,
-/// in order - see [`ConflictedFile::render`].
+/// One segment of a conflicted file. Concatenating every segment reproduces the file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConflictSegment {
     Common(Vec<String>),
     Conflict(ConflictHunk),
 }
 
-/// A conflicted file's content, parsed from its actual `<<<<<<</=======/>>>>>>>` markers on
-/// disk.
+/// A conflicted file's content, parsed from its markers on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConflictedFile {
     pub relative_path: PathBuf,
     pub segments: Vec<ConflictSegment>,
-    /// Whether the file on disk ended with a trailing newline - preserved on
-    /// [`ConflictedFile::render`] so resolving conflicts never spuriously adds or removes
-    /// one. `pub` (a plain fact, not an invariant-guarded field) so callers outside this
-    /// crate (`app::merge`'s tests) can construct one directly.
+    /// Preserved through [`ConflictedFile::render`] so resolving never adds or drops one.
     pub trailing_newline: bool,
 }
 
@@ -505,10 +400,10 @@ impl ConflictedFile {
         self.remaining_conflicts() == 0
     }
 
-    /// Reconstruct the file's text content from its (possibly partially resolved) segments.
-    /// Still-conflicted hunks round-trip as conflict markers, so this is safe to call (e.g.
-    /// for a live preview) even before every hunk is resolved - only [`write_resolved_file`]
-    /// refuses an unresolved file.
+    /// Reconstructs the file's text from its possibly partly-resolved segments.
+    ///
+    /// Unresolved hunks round-trip as markers, so this is safe for a live preview; only
+    /// [`write_resolved_file`] refuses an unresolved file.
     pub fn render(&self) -> String {
         let mut lines: Vec<String> = Vec::new();
         for segment in &self.segments {
@@ -531,8 +426,7 @@ impl ConflictedFile {
     }
 }
 
-/// Read the real conflicted file at `worktree_path.join(relative_path)` from disk and parse
-/// its real conflict markers.
+/// Reads the conflicted file from disk and parses its markers.
 pub fn load_conflicted_file(
     worktree_path: &Path,
     relative_path: &Path,
@@ -551,12 +445,11 @@ pub fn load_conflicted_file(
     })
 }
 
-/// Which of a conflicted path's real `base`/`ours`/`theirs` index stages exist
-/// (`git ls-files -u`) - the real ground truth for *what kind* of conflict a path has,
-/// independent of whatever content (or lack of real conflict markers) happens to be sitting
-/// in the working tree. A normal two-sided text conflict has all three; a modify/delete
-/// conflict is always missing exactly one (whichever side deleted the file never gets a
-/// stage).
+/// Which index stages a conflicted path has, which is what decides the *kind* of conflict
+/// independently of whatever is in the working tree.
+///
+/// A two-sided text conflict has all three; a modify/delete conflict is missing whichever side
+/// deleted the file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct StagePresence {
     base: bool,
@@ -570,13 +463,11 @@ impl StagePresence {
     }
 }
 
-/// Per-path stage presence for every currently-unmerged path in `worktree_path`, via one
-/// `git ls-files -u` subprocess. [`classify_conflicted_file`] calls this fresh on every
-/// invocation, so a caller classifying multiple conflicted paths pays one subprocess per
-/// path rather than a single batched call - correctness isn't affected (each call re-reads
-/// the same current index state), just worth knowing if it shows up as measured overhead on
-/// a merge with many conflicted files. Pins `-c core.quotePath=false` - see
-/// [`conflicted_files`]'s docs for why.
+/// Stage presence for every unmerged path, from one `git ls-files -u`.
+///
+/// [`classify_conflicted_file`] calls this per path rather than batching, so a merge with many
+/// conflicts pays one subprocess each. Correct either way, but worth knowing if it shows up as
+/// overhead. Pins `core.quotePath=false`, as [`conflicted_files`] does.
 fn unmerged_stage_presence(worktree_path: &Path) -> Result<HashMap<PathBuf, StagePresence>, Error> {
     let args: Vec<OsString> = vec![
         "-c".into(),
@@ -593,7 +484,7 @@ fn unmerged_stage_presence(worktree_path: &Path) -> Result<HashMap<PathBuf, Stag
     check_success(&args, &output)?;
 
     let mut map: HashMap<PathBuf, StagePresence> = HashMap::new();
-    // Each line is `<mode> <sha> <stage>\t<path>` (`git ls-files -u` output format).
+    // Each line is `<mode> <sha> <stage>\t<path>`.
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let Some((meta, path)) = line.split_once('\t') else {
             continue;
@@ -612,35 +503,28 @@ fn unmerged_stage_presence(worktree_path: &Path) -> Result<HashMap<PathBuf, Stag
     Ok(map)
 }
 
-/// Why a conflicted path could not be represented as resolvable `<<<<<<<` text markers.
+/// Why a conflicted path has no resolvable text markers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnmergeableReason {
-    /// One side deleted the file entirely; the other modified it. `git ls-files -u` shows
-    /// only two of the three stages (whichever side deleted it has none); the working tree
-    /// is left holding the *other* side's content verbatim, with no conflict markers, and
-    /// `git status` reports `DU`/`UD`.
+    /// One side deleted the file and the other modified it, so only two stages exist and the
+    /// working tree holds the surviving side verbatim, unmarked.
     ModifyDelete,
-    /// All three stages are present (a genuine two-sided conflict), but the working tree
-    /// contains no `<<<<<<<` markers - git's binary-content heuristic (which can trigger
-    /// even for valid UTF-8, e.g. a file containing an embedded NUL byte) leaves one side's
-    /// content in the tree verbatim instead of attempting a textual merge.
+    /// All three stages exist but no markers do: git's binary-content heuristic - which can fire
+    /// on valid UTF-8 containing a NUL - left one side's content verbatim.
     Binary,
 }
 
-/// One conflicted path, classified by [`classify_conflicted_file`] into either a resolvable
-/// text conflict or one this module has no text-hunk resolution for. Deliberately *not* the
-/// same as "no `ConflictSegment::Conflict` entries were parsed" - git's own index (via
-/// [`unmerged_stage_presence`]) is the ground truth for whether a path is genuinely
-/// unmerged, not just "the parser found no markers" (see [`UnmergeableReason`]'s docs: a
-/// naive "zero parsed segments means resolved" check would wrongly treat either of those
-/// cases as already resolved).
+/// A conflicted path, classified as a resolvable text conflict or as one with no text-hunk
+/// resolution.
+///
+/// Not the same question as "did the parser find markers": git's index is the ground truth for
+/// whether a path is unmerged, and a zero-marker parse would otherwise read as already resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConflictedPath {
-    /// Parseable `<<<<<<<` markers - resolvable via [`resolve_hunk`] + [`write_resolved_file`].
+    /// Parseable markers, resolvable via [`resolve_hunk`] and [`write_resolved_file`].
     Text(ConflictedFile),
-    /// A conflict this module has no text-hunk resolution for - see [`UnmergeableReason`].
-    /// Never silently treated as resolved; there is deliberately no `is_resolved`-style
-    /// method here that could default to `true`.
+    /// Never treated as resolved; there is deliberately no `is_resolved` here to default to
+    /// `true`.
     Unmergeable {
         relative_path: PathBuf,
         reason: UnmergeableReason,
@@ -656,12 +540,11 @@ impl ConflictedPath {
     }
 }
 
-/// Classify one already-known-conflicted path (e.g. from
-/// [`MergeOutcome::Conflicted::conflicted_files`]) into a [`ConflictedPath`] - the
-/// ground-truth-checked replacement for calling [`load_conflicted_file`] directly, which has
-/// no way to tell a binary or modify/delete conflict apart from "already resolved". Always
-/// consults [`unmerged_stage_presence`] first, and only trusts a zero-marker parse as
-/// evidence of `Binary` once the stage shape confirms a genuine two-sided conflict.
+/// Classifies an already-known-conflicted path.
+///
+/// Use this rather than [`load_conflicted_file`] directly, which cannot tell a binary or
+/// modify/delete conflict from an already-resolved one. A zero-marker parse is only read as
+/// `Binary` once the stage shape confirms a two-sided conflict.
 pub fn classify_conflicted_file(
     worktree_path: &Path,
     relative_path: &Path,
@@ -680,10 +563,8 @@ pub fn classify_conflicted_file(
 
     let file = load_conflicted_file(worktree_path, relative_path)?;
     if file.remaining_conflicts() == 0 {
-        // All three real stages exist (a genuine two-sided conflict), but the parser found
-        // no real `<<<<<<<` markers on disk at all - git's own binary-content heuristic, not
-        // an already-resolved file (a merge never auto-resolves a path git itself still lists
-        // as unmerged).
+        // Two-sided but unmarked: git's binary heuristic, not an already-resolved file - a merge
+        // never auto-resolves a path git still lists as unmerged.
         return Ok(ConflictedPath::Unmergeable {
             relative_path: relative_path.to_path_buf(),
             reason: UnmergeableReason::Binary,
@@ -698,8 +579,7 @@ enum ParseState {
     Ours {
         ours_label: String,
         ours: Vec<String>,
-        /// Captured the moment this state was entered (the marker line's own number plus one) -
-        /// see [`ConflictHunk::ours_start_line`]'s docs.
+        /// Captured on entering this state; see [`ConflictHunk::ours_start_line`].
         ours_start_line: usize,
     },
     Theirs {
@@ -707,8 +587,7 @@ enum ParseState {
         ours: Vec<String>,
         ours_start_line: usize,
         theirs: Vec<String>,
-        /// Captured the moment this state was entered (the `=======` line's own number plus
-        /// one) - see [`ConflictHunk::theirs_start_line`]'s docs.
+        /// Captured on entering this state; see [`ConflictHunk::theirs_start_line`].
         theirs_start_line: usize,
     },
 }
@@ -726,7 +605,7 @@ fn parse_conflict_segments(
     };
 
     for (index, line) in text.lines().enumerate() {
-        // 1-indexed real line number of `line` itself.
+        // 1-indexed line number of `line` itself.
         let line_number = index + 1;
         state = match state {
             ParseState::Outside => {
@@ -818,7 +697,7 @@ fn parse_conflict_segments(
             }
             Ok(segments)
         }
-        // An unterminated `<<<<<<<`/`=======` block at end of file: real, but malformed.
+        // An unterminated block at end of file.
         ParseState::Ours { .. } | ParseState::Theirs { .. } => Err(malformed()),
     }
 }
@@ -831,9 +710,8 @@ pub enum ConflictChoice {
     Both,
 }
 
-/// Resolve the hunk at `hunk_index` (its position within [`ConflictedFile::segments`]) by
-/// keeping `choice`'s content, turning that segment into an ordinary, non-conflicted one.
-/// Real, in-memory only - call [`write_resolved_file`] afterward to persist it.
+/// Resolves the hunk at `hunk_index` within [`ConflictedFile::segments`] by keeping `choice`'s
+/// content. In memory only; [`write_resolved_file`] persists it.
 pub fn resolve_hunk(
     file: &mut ConflictedFile,
     hunk_index: usize,
@@ -866,11 +744,10 @@ pub fn resolve_hunk(
     Ok(())
 }
 
-/// Write a fully-resolved [`ConflictedFile`]'s content back to disk at
-/// `worktree_path.join(&file.relative_path)`, then `git add` it. Refuses
-/// ([`Error::MergeFileNotFullyResolved`]) if the file still has unresolved conflict hunks -
-/// this is the only path that ever writes a conflicted file back to disk, and it never
-/// writes one that still contains conflict markers.
+/// Writes a fully-resolved file back to disk and stages it.
+///
+/// The only path that writes a conflicted file back, and it refuses with
+/// [`Error::MergeFileNotFullyResolved`] rather than persisting remaining markers.
 pub fn write_resolved_file(worktree_path: &Path, file: &ConflictedFile) -> Result<(), Error> {
     if !file.is_resolved() {
         return Err(Error::MergeFileNotFullyResolved {
@@ -971,9 +848,8 @@ mod tests {
             .count()
     }
 
-    /// Real linked worktree, checked out on a new branch - the same idiom `crate`'s own
-    /// `lib.rs` tests use (a throwaway `TempDir` immediately dropped just to mint a fresh,
-    /// guaranteed-nonexistent path for `git worktree add` to create).
+    /// A linked worktree on a new branch. The throwaway `TempDir` is dropped immediately, purely
+    /// to mint a path `git worktree add` can create.
     fn add_worktree(repo_path: &Path, branch: &str, name: &str) -> PathBuf {
         let container = TempDir::new().expect("tempdir");
         let path = container.path().join(name);
@@ -1033,7 +909,7 @@ mod tests {
             "working tree must be clean after completing"
         );
         assert!(repo.path().join("new.txt").is_file());
-        // `--no-ff` forces a real merge commit even though this was fast-forwardable.
+        // `--no-ff` forces a merge commit even though this was fast-forwardable.
         assert_eq!(parent_count(repo.path(), "HEAD"), 2);
     }
 
@@ -1107,12 +983,12 @@ mod tests {
         assert_eq!(conflicted_files, vec![PathBuf::from("shared.txt")]);
         assert_eq!(clean_files, vec![PathBuf::from("clean.txt")]);
 
-        // The real conflict markers are genuinely on disk.
+        // The conflict markers are on disk.
         let on_disk = fs::read_to_string(repo.path().join("shared.txt")).expect("read");
         assert!(on_disk.contains("<<<<<<< HEAD"));
         assert!(on_disk.contains("======="));
         assert!(on_disk.contains(">>>>>>> feature"));
-        // The auto-merged file has real, correct content already.
+        // The auto-merged file already has the right content.
         let clean_on_disk = fs::read_to_string(repo.path().join("clean.txt")).expect("read");
         assert_eq!(clean_on_disk, "clean1\nclean2 changed by feature\n");
     }
@@ -1159,11 +1035,9 @@ mod tests {
             fs::read_to_string(repo.path().join("shared.txt")).expect("read"),
             "line1\nBASE CHANGED\nline3\n"
         );
-        // Real, correct git behavior for a take-left resolution: since the resolved content
-        // is identical to the base branch's own pre-merge `HEAD` content, `git status`
-        // reports no working-tree change for this file at all once it's staged - only that
-        // it's no longer unmerged (`UU`). Asserting "no longer UU" (rather than assuming a
-        // literal `M` line) is what's actually true here, verified empirically above.
+        // Take-left leaves content identical to the pre-merge `HEAD`, so `git status` reports no
+        // working-tree change at all once staged - only that it is no longer `UU`. Asserting that,
+        // rather than a literal `M` line, is what is actually true.
         assert!(!status(repo.path()).contains("UU shared.txt"));
 
         abort_merge(repo.path()).expect("abort_merge");
@@ -1340,7 +1214,7 @@ mod tests {
         git(&feature, &["add", "new.txt"]);
         git(&feature, &["commit", "-m", "feature commit"]);
 
-        // The base worktree (main) is now on a detached HEAD - `main` is checked out nowhere.
+        // The base worktree is detached, so `main` is checked out nowhere.
         git(repo.path(), &["checkout", "--detach", "HEAD"]);
 
         let err = attempt_merge(repo.path(), &feature)
@@ -1410,14 +1284,11 @@ mod tests {
 
     // --- `attempt_merge_into_current` ------------------------------------------------------
     //
-    // The opposite direction from `attempt_merge`'s own suite above, covered one-for-one: the
-    // target worktree is handed in directly (here always the repository's own main worktree, on
-    // `main`) and the *source* is a branch name. Every fixture below leaves the source branch
-    // checked out nowhere, which is the real shape the Branches panel's own menu produces - the
-    // branch being right-clicked is some other branch in the list, not the one you are on.
+    // The opposite direction, covered one-for-one. Every fixture leaves the source branch checked
+    // out nowhere, matching how a caller picks a branch it is not currently on.
 
-    /// Creates `branch` off the current `HEAD`, commits `file`/`contents` on it, and switches
-    /// back - leaving a real, diverged branch that is checked out nowhere.
+    /// Creates `branch` off `HEAD`, commits on it, and switches back, leaving it diverged and
+    /// checked out nowhere.
     fn branch_with_commit(dir: &Path, branch: &str, file: &str, contents: &str, message: &str) {
         let previous = String::from_utf8_lossy(
             &Command::new("git")
@@ -1473,7 +1344,7 @@ mod tests {
             "",
             "working tree must be clean after completing"
         );
-        // `--no-ff` forces a real merge commit even though this was fast-forwardable.
+        // `--no-ff` forces a merge commit even though this was fast-forwardable.
         assert_eq!(parent_count(repo.path(), "HEAD"), 2);
     }
 
@@ -1550,8 +1421,7 @@ mod tests {
         assert_eq!(conflicted_files, vec![PathBuf::from("shared.txt")]);
         assert_eq!(clean_files, vec![PathBuf::from("clean.txt")]);
 
-        // The real conflict markers are genuinely on disk, in the two-way style this module's
-        // own parser understands.
+        // The markers are on disk, in the two-way style this parser understands.
         let on_disk = fs::read_to_string(repo.path().join("shared.txt")).expect("read");
         assert!(on_disk.contains("<<<<<<< HEAD"));
         assert!(on_disk.contains("======="));
@@ -1665,8 +1535,7 @@ mod tests {
         );
     }
 
-    /// A real linked worktree on a detached `HEAD` - the same throwaway-`TempDir` path-minting
-    /// idiom [`add_worktree`] uses, without a branch.
+    /// A linked worktree on a detached `HEAD`.
     fn add_worktree_detached(repo_path: &Path, name: &str) -> PathBuf {
         let container = TempDir::new().expect("tempdir");
         let path = container.path().join(name);
@@ -1701,8 +1570,8 @@ mod tests {
         assert_eq!(hunk.ours, vec!["ours line".to_string()]);
         assert_eq!(hunk.theirs_label, "feature");
         assert_eq!(hunk.theirs, vec!["theirs line".to_string()]);
-        // Real line numbers: "before"=1, "<<<<<<< HEAD"=2, "ours line"=3, "======="=4,
-        // "theirs line"=5, ">>>>>>> feature"=6, "after"=7.
+        // "before"=1, "<<<<<<< HEAD"=2, "ours line"=3, "======="=4, "theirs line"=5,
+        // ">>>>>>> feature"=6, "after"=7.
         assert_eq!(hunk.ours_start_line, 3);
         assert_eq!(hunk.theirs_start_line, 5);
         assert_eq!(
@@ -1711,11 +1580,8 @@ mod tests {
         );
     }
 
-    /// A real, reachable case: one side is genuinely empty (base deletes the line entirely,
-    /// feature edits it - a real two-branch `git merge` produces exactly this shape). `ours` is
-    /// empty and `ours_start_line` lands on `=======`'s own line - the documented "meaningless
-    /// when empty" case on [`ConflictHunk::ours_start_line`] - real callers must gate on
-    /// `ours.is_empty()`, not print this value as if it named a real line.
+    /// One side empty - base deletes the line, feature edits it - so `ours_start_line` lands on
+    /// the `=======` line. This is the "meaningless when empty" case callers must gate on.
     #[test]
     fn parse_conflict_segments_handles_a_genuinely_empty_side() {
         let text = "<<<<<<< HEAD\n=======\ntheirs line\n>>>>>>> feature\n";
@@ -1734,9 +1600,8 @@ mod tests {
         assert_eq!(hunk.theirs_start_line, 3);
     }
 
-    /// Real position tracking across a MULTI-hunk, multi-line-per-side conflict - a single-line
-    /// hunk could pass this even with an off-by-one bug, so this fixture and its hand-verified
-    /// expected line numbers are deliberately larger.
+    /// Position tracking across a multi-hunk, multi-line-per-side conflict. A single-line hunk
+    /// would pass even with an off-by-one, so this fixture is deliberately larger.
     #[test]
     fn parse_conflict_segments_computes_real_start_lines_across_multiple_hunks() {
         let text = "line1\n\
@@ -1878,11 +1743,9 @@ line4\n";
 
     #[test]
     fn non_ascii_filename_round_trips_through_the_real_conflict_and_resolution_pipeline() {
-        // Regression test for a real, verified bug: without `-c core.quotePath=false`,
-        // `git diff --name-only` prints a non-ASCII path octal-escaped and quoted
-        // (`"caf\303\251.txt"`), which `parse_paths` would take literally - `load_conflicted_
-        // file` would fail to find the real file, and `write_resolved_file` would `fs::write`
-        // a brand new, wrongly-named file (quote marks included) into the real worktree.
+        // Without `core.quotePath=false`, a non-ASCII path comes back octal-escaped and quoted,
+        // which `parse_paths` takes literally: the load fails and the write creates a new,
+        // wrongly-named file - quote marks included - in the worktree.
         let repo = init_repo();
         fs::write(repo.path().join("café.txt"), "line1\nline2\nline3\n").expect("write");
         git(repo.path(), &["add", "café.txt"]);
@@ -1901,7 +1764,7 @@ line4\n";
         else {
             panic!("expected conflicts");
         };
-        // The real, bare, unquoted, unescaped path - not `"caf\303\251.txt"`.
+        // The bare, unquoted path - not `"caf\303\251.txt"`.
         assert_eq!(conflicted_files, vec![PathBuf::from("café.txt")]);
 
         let mut file = load_conflicted_file(repo.path(), &conflicted_files[0])
@@ -1909,13 +1772,12 @@ line4\n";
         resolve_hunk(&mut file, 1, ConflictChoice::Both).expect("resolve_hunk");
         write_resolved_file(repo.path(), &file).expect("write_resolved_file");
 
-        // The real file (real name) has the real resolved content...
+        // The correctly-named file has the resolved content...
         assert_eq!(
             fs::read_to_string(repo.path().join("café.txt")).expect("read café.txt"),
             "line1\nBASE CHANGED\nFEATURE CHANGED\nline3\n"
         );
-        // ...and no stray, wrongly-named file (e.g. a literal `"caf\303\251.txt"`) was ever
-        // created alongside it - only the real `café.txt` and `init_repo`'s own seed file.
+        // ...and no wrongly-named file was created alongside it.
         let entries: Vec<String> = fs::read_dir(repo.path())
             .expect("read_dir")
             .filter_map(|entry| entry.ok())
@@ -1945,7 +1807,7 @@ line4\n";
         // Base deletes the file...
         git(repo.path(), &["rm", "-q", "shared.txt"]);
         git(repo.path(), &["commit", "-m", "base deletes shared.txt"]);
-        // ...while feature modifies it - a real modify/delete conflict.
+        // ...while feature modifies it: a modify/delete conflict.
         fs::write(feature.join("shared.txt"), "modified by feature\n").expect("write");
         git(&feature, &["commit", "-am", "feature modifies shared.txt"]);
 
@@ -1970,8 +1832,7 @@ line4\n";
              already-resolved text file"
         );
 
-        // Real defense in depth: `complete_merge` must refuse too, even though nothing here
-        // called any (nonexistent, for this file) resolution API.
+        // `complete_merge` must refuse too, though no resolution API was called for this file.
         let err = complete_merge(repo.path())
             .expect_err("complete_merge must refuse while shared.txt is still really unmerged");
         assert!(matches!(err, Error::MergeFilesStillConflicted { .. }));
@@ -1981,11 +1842,9 @@ line4\n";
 
     #[test]
     fn binary_conflict_with_a_nul_byte_is_classified_as_unmergeable_not_falsely_resolved() {
-        // A NUL byte is itself a valid single-byte UTF-8 codepoint, so `String::from_utf8`
-        // alone can't detect this case - `git` itself still treats the file as binary (its
-        // own heuristic scans for embedded NULs) and leaves no `<<<<<<<` markers in the
-        // working tree at all, which is exactly what makes this distinct from a genuinely
-        // resolved (zero-conflict) text file.
+        // A NUL is valid UTF-8, so `String::from_utf8` cannot detect this - but git's own
+        // heuristic scans for embedded NULs, treats the file as binary, and leaves no markers.
+        // That is what makes this distinct from a resolved text file.
         let repo = init_repo();
         fs::write(repo.path().join("shared.bin"), b"line1\x00line2\n").expect("write");
         git(repo.path(), &["add", "shared.bin"]);
@@ -2005,8 +1864,7 @@ line4\n";
         };
         assert_eq!(conflicted_files, vec![PathBuf::from("shared.bin")]);
 
-        // Confirm the real premise: the on-disk content really is valid UTF-8 (so a plain
-        // `String::from_utf8` check alone would not catch this).
+        // Confirm the premise: the content is valid UTF-8, so `from_utf8` would not catch it.
         let on_disk = fs::read(repo.path().join("shared.bin")).expect("read");
         assert!(
             String::from_utf8(on_disk).is_ok(),

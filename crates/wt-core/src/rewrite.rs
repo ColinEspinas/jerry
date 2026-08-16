@@ -1,18 +1,10 @@
-//! Real git commit-rewriting operations: cherry-pick, revert, and rebase - GitHub issue #1's own
-//! acceptance criteria ("cherry pick", "revert commit", "rebase branch"). Every mutation shells
-//! out to a real `git` subprocess and surfaces git's own real stderr on failure
-//! ([`Error::GitCommand`]), exactly `crate::remote`'s own discipline.
+//! Commit-rewriting operations: cherry-pick, revert, and rebase.
 //!
-//! None of these functions resolve a real conflict themselves - a conflicting cherry-pick,
-//! revert, or rebase leaves the worktree exactly where the equivalent command-line invocation
-//! would (a real `CHERRY_PICK_HEAD`/`REVERT_HEAD`/`REBASE_HEAD` and conflict markers in the
-//! working tree), for the caller to resolve through this app's own conflict-resolution surface
-//! or a real terminal, matching [`crate::remote::pull`]'s own "surfaces whatever git reports,
-//! honestly" precedent. [`cherry_pick`]/[`revert`] run with `--no-edit`: this app has no surface
-//! for editing a commit message mid-operation, so the original commit's own message is kept
-//! unchanged rather than blocking on an editor that can never open (`crate::git_command`'s stdin
-//! is always closed). [`rebase_onto`] is deliberately never interactive for the same reason - see
-//! its own docs.
+//! None of these resolve conflicts; a conflicting operation leaves the worktree where the
+//! equivalent command line would, for the caller to resolve.
+//!
+//! [`cherry_pick`]/[`revert`] pass `--no-edit` and [`rebase_onto`] is never interactive, because
+//! `crate::git_command` always closes stdin - an editor here could never open.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -20,8 +12,7 @@ use std::path::Path;
 use crate::error::Error;
 use crate::{check_success, run_git};
 
-/// Real `git cherry-pick --no-edit <commit>` for `worktree_path`: applies `commit`'s changes as
-/// a new commit on top of the current branch.
+/// Applies `commit`'s changes as a new commit on top of the current branch.
 ///
 /// Performs blocking I/O.
 pub fn cherry_pick(worktree_path: &Path, commit: &str) -> Result<(), Error> {
@@ -30,8 +21,7 @@ pub fn cherry_pick(worktree_path: &Path, commit: &str) -> Result<(), Error> {
     check_success(&args, &output)
 }
 
-/// Real `git revert --no-edit <commit>` for `worktree_path`: creates a new commit that undoes
-/// `commit`'s changes, leaving `commit` itself in history.
+/// Commits the inverse of `commit`, leaving `commit` itself in history.
 ///
 /// Performs blocking I/O.
 pub fn revert(worktree_path: &Path, commit: &str) -> Result<(), Error> {
@@ -40,13 +30,9 @@ pub fn revert(worktree_path: &Path, commit: &str) -> Result<(), Error> {
     check_success(&args, &output)
 }
 
-/// Real `git rebase <onto>` for `worktree_path`: replays the current branch's own commits (the
-/// ones not already reachable from `onto`) on top of `onto` - the row menu's "Rebase onto this
-/// commit" (GitHub issue #1). Always git's own plain, non-interactive replay: this app has no
-/// commit-reordering/squash/edit UI yet (interactive rebase is a real, stated follow-up, not
-/// this function), and a real conflict mid-replay stops exactly where the command-line
-/// equivalent would, `--onto`-less `git rebase` needing no editor at any step (unlike
-/// `cherry_pick`/`revert`, no `--no-edit` is needed here for that reason).
+/// Replays the current branch's commits - those not already reachable from `onto` - on top of it.
+///
+/// Plain and non-interactive; a conflict stops where the command line would.
 ///
 /// Performs blocking I/O.
 pub fn rebase_onto(worktree_path: &Path, onto: &str) -> Result<(), Error> {

@@ -1,94 +1,35 @@
-//! Real command-pattern undo/redo primitives for two worktree-level actions: "keep all
-//! changes" ([`commit_all_changes`]) and "discard worktree" ([`discard_worktree`]).
+//! Undo/redo primitives for two worktree-level actions: [`commit_all_changes`] and
+//! [`discard_worktree`].
 //!
-//! Both real mutations record enough state for a caller (`app::root::worktree_history`) to
-//! genuinely undo them later - not a fake "undo" that only toggles UI state. Both undo paths
-//! carry a **mandatory identity guard**: they refuse rather than proceed if the real git state
-//! they'd be acting on has moved since the outcome/snapshot was recorded, the same
-//! "measure, don't assume, and never silently clobber something newer" discipline this
-//! project's other staleness guards use (`app::root::code_surface`'s diff-highlight cache,
-//! `app::root::completions`'s popup, `app::root::merge_flow`'s save race) - applied here to real
-//! git history and a real worktree's existence, instead of in-memory app state.
+//! Both record enough state to be genuinely undone later, and both undo paths carry a mandatory
+//! identity guard: they refuse rather than proceed when the git state they would act on has moved
+//! since the outcome was recorded.
 //!
-//! ## "Keep all changes": `git reset --soft`, not `git revert`
+//! Undo of a commit is `git reset --soft <parent>`, not `git revert`: reset restores the exact
+//! working tree and index from before the commit, matching what "undo" means, where a revert would
+//! leave the commit in history with an inverse on top. Redo is the same move back, which stays
+//! well-defined because reset never touches the object database.
 //!
-//! [`commit_all_changes`] stages and commits everything in a worktree. Undoing it
-//! ([`undo_commit_all_changes`]) runs `git reset --soft <parent>` rather than `git revert`:
-//! reset moves `HEAD` back and leaves the exact same working tree/index the worktree had right
-//! before the commit (uncommitted again, matching "undo" intuition), where a revert would
-//! instead leave the commit in history and add a new inverse commit on top - not what a user
-//! clicking "undo" on "keep all changes" would expect. Redoing
-//! ([`redo_commit_all_changes`]) is the same move in the other direction: nothing deletes the
-//! original commit object (`git reset --soft` never touches the object database), so as long as
-//! it hasn't been garbage-collected, moving `HEAD` back onto it is a real, well-defined
-//! operation - verified empirically in this module's own tests (create, undo, redo, and check
-//! the working tree ends up identical to before the undo).
+//! Discard stashes with `git stash push --include-untracked` before force-removing. Not `git stash
+//! create`, which never captures untracked files at all and silently ignores the flag that would
+//! ask it to. `refs/stash` is repository-shared, so a stash survives the removal of the worktree
+//! that pushed it.
 //!
-//! ## "Discard worktree": `git stash push --include-untracked`
+//! Two gaps this surfaces rather than papers over:
 //!
-//! [`discard_worktree`] force-removes a worktree (`remove_worktree(force: true)`), which
-//! otherwise has no recovery path at all - see `crate`'s own module docs. Before removing
-//! anything, it snapshots real uncommitted/untracked content into a real stash.
+//! - The **main worktree can never be force-removed**, so [`discard_worktree`] refuses upfront
+//!   instead of stashing and then failing - which would mutate the working tree while handing back
+//!   no snapshot to undo from. If removal fails *after* a stash for any other reason, restoring in
+//!   place is not reliable (`git worktree remove` usually deregisters the worktree before failing
+//!   on its last step), so [`Error::DiscardRemovalFailedAfterStash`] reports the stash id instead
+//!   of pretending otherwise.
+//! - A stash **never captures gitignored content**, even with `--include-untracked`, and
+//!   [`is_dirty`](crate::is_dirty) does not count it as dirty either. Rather than imply full
+//!   safety, [`DiscardSnapshot::had_ignored_content`] records it so a caller can say what was not
+//!   preserved. `git stash push --all` would capture it, at the cost of sweeping whole build
+//!   directories into a git object.
 //!
-//! An earlier version of this function used the lower-level `git stash create` + `git stash
-//! store` (create the commit object without touching the working tree, then separately record
-//! it under `refs/stash`), reasoning that removal shouldn't have to touch the working tree
-//! before the moment it's actually deleted. Live testing against a real repository (this
-//! module's own test suite) immediately falsified a hidden assumption behind that plan: `git
-//! stash create` silently **never** captures untracked files at all, with no flag that changes
-//! that (`--include-untracked`/`-u` are accepted by `git stash push`, not `create`, and pass
-//! straight through unrecognized) - a worktree with only a brand-new untracked file produced an
-//! empty stash id every time. Since [`discard_worktree`] always force-removes the worktree
-//! immediately afterward regardless of whether the working tree was already reset first, there
-//! is no real safety this function was buying by avoiding `git stash push`: it's called with
-//! `--include-untracked` instead, which real-repo testing confirms genuinely captures untracked
-//! content, and its resulting stash commit's real id is read straight off the (repository-
-//! shared, not worktree-private) `refs/stash` ref it just moved.
-//!
-//! `refs/stash` lives in the repository's shared ref store, not anything private to the
-//! worktree that pushed it - verified empirically against a real repository in this module's
-//! own tests: a stash pushed from a worktree survives that worktree's own removal and is still
-//! `git stash apply`-able from a freshly recreated worktree on the same branch.
-//!
-//! ## Two real, live-reproduced gaps this module refuses/surfaces honestly rather than papering
-//! over
-//!
-//! An audit of an earlier version of this module found both of these by direct, empirical
-//! reproduction against a real repository - not guessed at:
-//!
-//! - **The main worktree can never be force-removed.** `git worktree remove --force --force`
-//!   refuses outright on the repository's main working tree (`fatal: '<path>' is a main working
-//!   tree`) - unlike a linked worktree, there is no `--force` that overrides this. An earlier
-//!   version of [`discard_worktree`] stashed *first*, then attempted the removal - so on a main
-//!   worktree, real uncommitted content got stashed (mutating the working tree), the removal
-//!   then failed, and the function returned `Err` with **no [`DiscardSnapshot`] ever handed back
-//!   to a caller to record for `Undo`** - a real, reachable, silent-data-loss path (this app's
-//!   own default session's cwd *is* the repository's main worktree). [`discard_worktree`] now
-//!   refuses upfront with [`Error::DiscardSourceIsMainWorktree`] before touching anything at
-//!   all. For any *other* real reason `remove_worktree` might fail after a successful stash (a
-//!   permissions error, a lock `--force --force` doesn't override on some git version, ...):
-//!   trying to restore the stash back into the worktree directory in place was tried and found,
-//!   by direct empirical reproduction, not to be reliable - `git worktree remove` typically
-//!   deletes the worktree's own contents and fully deregisters it as a worktree *before* failing
-//!   only at its very last step (removing the now-empty directory entry itself), so the
-//!   directory may no longer even be a valid git worktree to restore anything into by the time
-//!   the failure is observed. [`Error::DiscardRemovalFailedAfterStash`] surfaces the real stash
-//!   id instead of pretending an in-place restore happened - the stash itself is still real,
-//!   durable, and independently recoverable by hand (`git stash apply <stash>`/`git stash list`
-//!   from any worktree of the repository) regardless of what state the directory itself is left
-//!   in.
-//! - **A stash never captures gitignored content**, even with `--include-untracked`: `.env`
-//!   files, build output, anything else `.gitignore` excludes. [`is_dirty`](crate::is_dirty)
-//!   (which gates whether a stash is even attempted) also doesn't count ignored-only content as
-//!   "dirty" at all. Rather than silently claiming full safety, [`discard_worktree`] separately
-//!   checks for real ignored content (`git status --porcelain --ignored`) and records it on
-//!   [`DiscardSnapshot::had_ignored_content`], so a caller can tell the user honestly that some
-//!   real content was *not* preserved - this module still does not capture it (a real
-//!   `git stash push --all` would sweep up potentially huge build directories into a git object,
-//!   a real cost/risk judged worse than the honest-degradation path this takes instead).
-//!
-//! Performs blocking I/O everywhere in this module (shells out to `git`); see the crate-level
-//! docs on offloading this to a background thread.
+//! Performs blocking I/O throughout; see the crate-level docs.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -99,25 +40,19 @@ use crate::{
     open_repo, remove_worktree, run_git,
 };
 
-/// The real result of a successful [`commit_all_changes`] call - enough for
-/// [`undo_commit_all_changes`]/[`redo_commit_all_changes`] to act on later, under their own
-/// mandatory identity guards.
+/// A successful commit, with enough state for undo/redo to act on it later.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitAllChangesOutcome {
-    /// The branch `HEAD` referred to at commit time, or `None` if the worktree was in a
-    /// (unusual, but real) detached-`HEAD` state. Only consulted by
-    /// [`undo_commit_all_changes`] in the (practically unreachable, but real) case where
-    /// [`Self::parent`] is also `None` - see [`Error::CommitHasNoParentAndNoBranch`].
+    /// The branch at commit time, `None` when detached. Only consulted when [`Self::parent`] is
+    /// also `None`; see [`Error::CommitHasNoParentAndNoBranch`].
     pub branch: Option<String>,
-    /// The real commit id [`commit_all_changes`] just created.
+    /// The commit that was just created.
     pub commit: String,
-    /// The commit id `HEAD` pointed at immediately before this commit, or `None` if this was
-    /// the very first commit ever made on this branch (an "unborn" branch becoming born).
+    /// What `HEAD` pointed at before, or `None` for a branch's first commit.
     pub parent: Option<String>,
 }
 
-/// Reads `worktree_path`'s current `HEAD` commit id via a real `git rev-parse HEAD`. `Err` if
-/// `HEAD` doesn't resolve to a commit at all (an unborn branch, or not a repository).
+/// Reads `HEAD`'s commit id. `Err` if it does not resolve to one.
 fn rev_parse_head(worktree_path: &Path) -> Result<String, Error> {
     let args: Vec<OsString> = vec!["rev-parse".into(), "HEAD".into()];
     let output = run_git(worktree_path, &args)?;
@@ -125,24 +60,15 @@ fn rev_parse_head(worktree_path: &Path) -> Result<String, Error> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Whether `worktree_path`'s `HEAD` currently resolves to a real commit at all - the real
-/// "is this branch still unborn" check `redo_commit_all_changes` needs for its own identity
-/// guard when [`CommitAllChangesOutcome::parent`] is `None`.
+/// Whether `HEAD` resolves to a commit - the "is this branch still unborn" identity guard.
 fn head_resolves(worktree_path: &Path) -> bool {
     rev_parse_head(worktree_path).is_ok()
 }
 
-/// Reads `commit`'s real, immutable first-parent commit id (`git rev-parse --verify -q
-/// <commit>^`), or `None` if `commit` genuinely has no parent (a true root commit - the very
-/// first commit ever made on its branch).
+/// Reads `commit`'s first parent, or `None` for a root commit.
 ///
-/// Deliberately resolves `<commit>^`, not `HEAD^`: `HEAD` can move at any point after
-/// `commit_all_changes` creates its commit (this app's whole domain is running agent CLIs
-/// inside these worktrees, and an agent process committing on top is realistic, not exotic), but
-/// a specific commit object's own parent is immutable the instant it's created - asking "what is
-/// `commit`'s parent" is always correct regardless of what `HEAD` does afterward, where asking
-/// "what is `HEAD`'s parent" would silently answer a different question if `HEAD` has already
-/// moved past `commit` by the time this runs.
+/// Resolves `<commit>^`, not `HEAD^`: an agent running in this worktree can move `HEAD` at any
+/// time, but a commit's own parent is immutable once created.
 fn rev_parse_parent_of(worktree_path: &Path, commit: &str) -> Result<Option<String>, Error> {
     let args: Vec<OsString> = vec![
         "rev-parse".into(),
@@ -159,8 +85,7 @@ fn rev_parse_parent_of(worktree_path: &Path, commit: &str) -> Result<Option<Stri
     ))
 }
 
-/// Reads `worktree_path`'s currently checked-out branch (`git symbolic-ref --quiet --short
-/// HEAD`), or `None` if `HEAD` is detached.
+/// The checked-out branch, or `None` if `HEAD` is detached.
 fn current_branch(worktree_path: &Path) -> Result<Option<String>, Error> {
     let args: Vec<OsString> = vec![
         "symbolic-ref".into(),
@@ -177,13 +102,10 @@ fn current_branch(worktree_path: &Path) -> Result<Option<String>, Error> {
     ))
 }
 
-/// Stage every change in `worktree_path` (`git add -A`: modified, deleted, and untracked files
-/// alike) and commit it with `message`.
+/// Stages everything - modified, deleted and untracked alike - and commits it.
 ///
-/// Refuses with [`Error::NothingToCommit`] if the worktree has no uncommitted changes at all -
-/// this crate's existing "check first, structured error" convention (see
-/// [`crate::merge::attempt_merge`]'s own `MergeTargetDirty` pre-check) rather than parsing
-/// `git commit`'s "nothing to commit" stderr after the fact.
+/// Refuses with [`Error::NothingToCommit`] on a clean worktree, checked up front rather than
+/// parsed out of `git commit`'s stderr afterwards.
 ///
 /// Performs blocking I/O.
 pub fn commit_all_changes(
@@ -206,14 +128,10 @@ pub fn commit_all_changes(
 
     let commit = rev_parse_head(worktree_path)?;
 
-    // Both derived from the real commit that was just made, not from a pre-commit read taken
-    // before `add`/`commit` ran (live-reproduced as a real staleness bug: anything else that
-    // commits in this worktree in that window - e.g. an agent CLI process, which this app runs
-    // inside these very worktrees - would make a pre-commit-read `parent` point at the wrong,
-    // stale end of the range, and `undo_commit_all_changes`'s `HEAD == outcome.commit` guard
-    // would not catch it, since `HEAD` genuinely is `outcome.commit` - it would just be a soft
-    // reset that silently discards the interleaved commit). See `rev_parse_parent_of`'s own docs
-    // for why this asks about `commit`'s parent specifically, not `HEAD`'s.
+    // Both read from the commit just made, not before `add`/`commit` ran: anything committing in
+    // this worktree in that window would leave `parent` at the wrong end of the range, and undo's
+    // `HEAD == outcome.commit` guard would not catch it - `HEAD` really is `outcome.commit`, so
+    // the soft reset would silently discard the interleaved commit.
     let parent = rev_parse_parent_of(worktree_path, &commit)?;
     let branch = current_branch(worktree_path)?;
 
@@ -224,35 +142,17 @@ pub fn commit_all_changes(
     })
 }
 
-/// Stage exactly `paths` (`git add -- <paths>`, never `commit_all_changes`'s `-A`) and commit
-/// them with `message` - the Changes panel commit composer's real backing (Revision R12 §5:
-/// "Commit N files" commits only the staged subset, not the whole worktree diff).
+/// Stages exactly `paths` and commits them, never [`commit_all_changes`]'s `-A`.
 ///
-/// Refuses with [`Error::NothingToCommit`] if `paths` is empty, the same "check first, structured
-/// error" convention [`commit_all_changes`] follows for a clean worktree - the composer's own
-/// primary button already disables itself with nothing staged (see
-/// `crate::sidebar::changes::commit_button_label`), so this is a defensive backstop, not the
-/// primary guard.
+/// Refuses with [`Error::NothingToCommit`] on an empty `paths`, as a backstop behind whatever the
+/// caller does.
 ///
-/// **The leading `git add -- <paths>` is a deliberate, harmless idempotent safety net, not dead
-/// weight.** The Changes panel's staging checkbox (`crate::sidebar::render::AdeApp::
-/// toggle_staged`, backed by [`crate::stage::stage_path`]/[`crate::stage::unstage_path`]) now
-/// really stages/unstages `paths` in the real index the moment each box is clicked, so by the
-/// time the composer's primary button calls this function every path it passes is normally
-/// already staged - but "normally" isn't "always": a real per-path staging failure that got
-/// silently reverted client-side (see `toggle_staged`'s own docs on that failure mode), or a
-/// worktree-switch race where `AdeApp::staged_files` hasn't yet been re-derived from a fresh
-/// `git diff --cached` when the commit fires, can both leave the app's own idea of "staged"
-/// briefly out of sync with the real index. This function's contract is "stage exactly `paths`
-/// and commit them" regardless of what state the index happens to already be in when it's
-/// called, and re-running `git add` on a path that's already staged is a real no-op - so keeping
-/// it here is what makes that contract hold unconditionally rather than only when the click-time
-/// staging already succeeded.
+/// The leading `git add` is an idempotent safety net: callers normally stage as the user clicks,
+/// but a failed toggle or a worktree-switch race can leave their idea of "staged" out of sync
+/// with the index. The contract here is "stage exactly `paths` and commit them" regardless.
 ///
-/// Returns the same [`CommitAllChangesOutcome`] shape [`commit_all_changes`] does, but this
-/// function has no `undo_commit_paths`/`redo_commit_paths` counterpart yet - a partial commit
-/// isn't wired into [`crate::undo::UndoableAction`] (a real, honest gap, not a fake "undo" that
-/// would only look like it worked).
+/// No undo counterpart yet - a partial commit is not wired into [`UndoableAction`], which is a
+/// gap rather than a fake undo.
 ///
 /// Performs blocking I/O.
 pub fn commit_paths(
@@ -271,12 +171,8 @@ pub fn commit_paths(
     let add_output = run_git(worktree_path, &add_args)?;
     check_success(&add_args, &add_output)?;
 
-    // Pathspec-limited (`-- <paths>`), never a bare `git commit`: a bare `git commit` commits
-    // the *entire* index, not just what this call just `add`ed - anything else already staged
-    // (an agent CLI running its own `git add` in this same worktree, the same interleaving
-    // hazard `commit_all_changes`'s own doc above calls out) would silently ride along into a
-    // commit this function's own doc promises is limited to `paths`. Real regression:
-    // `commit_paths_never_commits_a_path_that_was_staged_by_something_else`.
+    // Pathspec-limited, never a bare `git commit`: that commits the entire index, so anything an
+    // agent staged in this worktree would ride along into a commit promised to be just `paths`.
     let mut commit_args: Vec<OsString> =
         vec!["commit".into(), "-m".into(), message.into(), "--".into()];
     commit_args.extend(paths.iter().map(|path| path.as_os_str().to_owned()));
@@ -294,31 +190,17 @@ pub fn commit_paths(
     })
 }
 
-/// Amend `worktree_path`'s tip commit with exactly `paths`, keeping the tip's existing message -
-/// the Changes composer's `Amend last commit` menu row (GitHub issue #285).
+/// Amends the tip commit with exactly `paths`, keeping its existing message.
 ///
-/// Runs `git add -- <paths>` then `git commit --amend --no-edit --only -- <paths>`.
+/// `--only` is load-bearing: a bare `git commit --amend` folds in the entire index, so anything an
+/// agent staged in this worktree would ride along. `--no-edit` is what keeps this an amend rather
+/// than a reword.
 ///
-/// **`--only` is load-bearing, not decoration.** A bare `git commit --amend` amends the *entire*
-/// index into the tip, so anything else already staged - an agent CLI running its own `git add` in
-/// this same worktree, the exact interleaving hazard [`commit_paths`]' own docs call out - would
-/// silently ride along into a commit this function promises is limited to `paths`. `--only`
-/// restricts the amend to the named pathspec and leaves everything else staged exactly where it
-/// was. Verified against a real repository by
-/// `amend_head_with_paths_leaves_an_unrelated_staged_path_out_of_the_amended_tip`.
+/// Refuses with [`Error::NothingToCommit`] on an empty `paths`.
 ///
-/// **`--no-edit` is what makes this an amend rather than a reword.** The row's own hint says
-/// "rewrites the tip"; changing the message as well would be a second, unannounced edit, and there
-/// is nowhere in the composer for a user to have typed a replacement message for a commit that
-/// already exists.
-///
-/// Refuses with [`Error::NothingToCommit`] if `paths` is empty, the same "check first, structured
-/// error" convention [`commit_paths`] follows.
-///
-/// Returns the amended tip's [`CommitAllChangesOutcome`] - the amended commit is a **new object**
-/// with a new id, and `parent` is the same parent the pre-amend tip had. There is deliberately no
-/// undo counterpart: the pre-amend commit is unreachable from any ref afterwards, so a real undo
-/// would have to have recorded its id *before* the amend, and this module does not fake one.
+/// The amended commit is a new object with a new id, and `parent` is the pre-amend tip's parent.
+/// No undo counterpart: the pre-amend commit is unreachable afterwards, so undoing would require
+/// having recorded its id beforehand.
 ///
 /// Performs blocking I/O.
 pub fn amend_head_with_paths(
@@ -358,19 +240,15 @@ pub fn amend_head_with_paths(
     })
 }
 
-/// Stash exactly what is currently staged in `worktree_path` (`git stash push --staged`), leaving
-/// unstaged work in place - the Changes composer's `Stash staged files` menu row (GitHub issue
-/// #285), whose own hint is "keeps the worktree clean".
+/// Stashes exactly what is staged, leaving unstaged work in place.
 ///
-/// `--staged` (git 2.35+) is what makes the row's hint true: a plain `git stash push` would take
-/// the unstaged edits with it, which is not what a control sitting under a *staged* count means.
-/// A git too old to know the flag fails loudly through [`check_success`] rather than silently
-/// stashing more than was asked for.
+/// `--staged` (git 2.35+) is what makes that true; a plain `git stash push` would take the
+/// unstaged edits too. A git too old for the flag fails loudly rather than stashing more than was
+/// asked for.
 ///
-/// Returns the real stash commit id `refs/stash` now points at, read back after the push - the
-/// same way [`discard_worktree`] reads its own. `Ok(None)` would be a stash that git declined to
-/// create; instead this refuses up front with [`Error::NothingToCommit`] when nothing is staged,
-/// so a `None` return is not a state a caller has to interpret.
+/// Returns the stash commit id `refs/stash` now points at. Refuses with
+/// [`Error::NothingToCommit`] when nothing is staged, so there is no `None` for a caller to
+/// interpret.
 ///
 /// Performs blocking I/O.
 pub fn stash_staged(worktree_path: &Path, message: &str) -> Result<String, Error> {
@@ -398,13 +276,10 @@ pub fn stash_staged(worktree_path: &Path, message: &str) -> Result<String, Error
         .to_string())
 }
 
-/// Undo a [`commit_all_changes`] call: real `git reset --soft <parent>`, returning the worktree
-/// to exactly the uncommitted state it was in right before that commit - see this module's own
-/// docs for why `reset --soft`, not `revert`.
+/// Undoes a commit with `git reset --soft <parent>`, restoring the uncommitted state before it.
 ///
-/// Mandatory identity guard: refuses with [`Error::HeadMovedSinceRecorded`] unless
-/// `outcome.commit` is still genuinely `HEAD` right now - otherwise this would silently discard
-/// whatever was committed on top since.
+/// Identity guard: refuses with [`Error::HeadMovedSinceRecorded`] unless `outcome.commit` is
+/// still `HEAD`, which would otherwise discard whatever was committed on top since.
 ///
 /// Performs blocking I/O.
 pub fn undo_commit_all_changes(
@@ -427,10 +302,8 @@ pub fn undo_commit_all_changes(
             check_success(&args, &output)
         }
         None => {
-            // This was the first commit ever on this branch: there is no parent commit to
-            // reset to. `git update-ref -d <ref>` removes the branch ref itself while leaving
-            // the index/working tree untouched - the real "soft reset to before this branch
-            // existed" equivalent.
+            // A branch's first commit has no parent to reset to. Deleting the branch ref leaves
+            // the index and working tree untouched, which is the soft-reset equivalent.
             let Some(branch) = &outcome.branch else {
                 return Err(Error::CommitHasNoParentAndNoBranch {
                     path: worktree_path.to_path_buf(),
@@ -444,17 +317,13 @@ pub fn undo_commit_all_changes(
     }
 }
 
-/// Redo a [`commit_all_changes`] call previously undone by [`undo_commit_all_changes`]: moves
-/// `HEAD` forward onto `outcome.commit` again. Safe as long as that commit object is still in
-/// the repository's object database - `reset --soft` never deletes it, only
-/// [`undo_commit_all_changes`] itself moved away from it, so nothing should have collected it in
-/// the interim; if something has (e.g. an external `git gc`), this fails with a real
-/// [`Error::GitCommand`] from the underlying `git reset` rather than silently no-op'ing.
+/// Moves `HEAD` forward onto `outcome.commit` again after an undo.
 ///
-/// Mandatory identity guard, symmetric with [`undo_commit_all_changes`]'s own: refuses with
-/// [`Error::HeadMovedSinceRecorded`] unless `HEAD` is still genuinely sitting exactly where the
-/// undo left it (`outcome.parent`, or a genuinely unborn branch if `outcome.parent` is `None`) -
-/// a redo can silently discard newer work just as easily as an undo can.
+/// `reset --soft` never deletes the commit object, so this stays valid unless something else
+/// collected it - in which case `git reset` fails rather than silently no-op'ing.
+///
+/// Identity guard, symmetric with [`undo_commit_all_changes`]: refuses unless `HEAD` is still
+/// where the undo left it. A redo can discard newer work just as easily as an undo can.
 ///
 /// Performs blocking I/O.
 pub fn redo_commit_all_changes(
@@ -480,10 +349,8 @@ pub fn redo_commit_all_changes(
             check_success(&args, &output)
         }
         None => {
-            // The undo un-made the branch ref entirely (see `undo_commit_all_changes`'s `None`
-            // arm) - `HEAD` must still be genuinely unborn (`rev_parse_head` fails) for the
-            // guard to hold; anything else (including an unrelated real error resolving `HEAD`)
-            // is refused the same honest way.
+            // The undo removed the branch ref, so `HEAD` must still be unborn for the guard to
+            // hold; anything else is refused the same way.
             if head_resolves(worktree_path) {
                 return Err(Error::HeadMovedSinceRecorded {
                     path: worktree_path.to_path_buf(),
@@ -496,8 +363,8 @@ pub fn redo_commit_all_changes(
                     path: worktree_path.to_path_buf(),
                 });
             };
-            // `git update-ref` creates a ref that doesn't exist yet just as readily as it moves
-            // one that does - the real reverse of `undo_commit_all_changes`'s `update-ref -d`.
+            // `update-ref` creates a missing ref as readily as it moves one, so this is the exact
+            // reverse of the undo's `update-ref -d`.
             let ref_name = format!("refs/heads/{branch}");
             let args: Vec<OsString> = vec![
                 "update-ref".into(),
@@ -510,66 +377,45 @@ pub fn redo_commit_all_changes(
     }
 }
 
-/// A real snapshot of a worktree taken immediately before [`discard_worktree`] force-removes
-/// it - enough to recreate the worktree and (if there was anything to restore) its
-/// uncommitted/untracked content via [`undo_discard_worktree`], under that function's own
-/// mandatory identity guard.
+/// A snapshot taken immediately before [`discard_worktree`] force-removes a worktree - enough for
+/// [`undo_discard_worktree`] to recreate it and restore its content.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscardSnapshot {
-    /// The branch checked out at discard time, or `None` for an (unusual, but real)
-    /// detached-`HEAD` worktree - [`undo_discard_worktree`] falls back to recreating the
-    /// worktree directly at [`Self::commit`] (detached) in that case.
+    /// The branch at discard time, `None` when detached - in which case the undo recreates the
+    /// worktree at [`Self::commit`] directly.
     pub branch: Option<String>,
     /// `HEAD`'s commit id at discard time.
     pub commit: String,
-    /// `Some` iff the worktree had real uncommitted/untracked content worth preserving - the
-    /// real `git stash push --include-untracked` commit id for it.
+    /// The stash commit id, when there was uncommitted content worth preserving.
     pub stash: Option<String>,
-    /// Whether real gitignored content (`git status --porcelain --ignored`) was present at
-    /// discard time - `git stash push`, even with `--include-untracked`, never captures it, so
-    /// `true` here means [`Self::stash`] (if any) does *not* fully account for everything that
-    /// was really in the worktree. See this module's own top-level docs for why this is
-    /// surfaced honestly rather than either silently dropped or captured via a real
-    /// `git stash push --all` (a real cost/risk this module judged worse).
+    /// Whether gitignored content was present, which no stash captures - so `true` means
+    /// [`Self::stash`] does not account for everything that was in the worktree.
     pub had_ignored_content: bool,
 }
 
-/// What restoring from a [`DiscardSnapshot`] actually achieved. [`UndoDiscardOutcome::Restored`]
-/// is not the only success case: a stored stash can (rarely) conflict when applied back onto
-/// the recreated worktree, and callers must not claim "fully restored" for
-/// [`UndoDiscardOutcome::RestoredWithConflicts`].
+/// What restoring from a [`DiscardSnapshot`] achieved. Not a plain success/failure: a stash can
+/// conflict when applied back, and a caller must not report that as fully restored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UndoDiscardOutcome {
-    /// The worktree was recreated, and (if there was one) the stash applied with no conflicts.
+    /// Recreated, with any stash applied cleanly.
     Restored,
-    /// The worktree was recreated, but applying the stored stash left real conflict markers in
-    /// one or more files. The stash entry (`stash`) is deliberately *not* dropped in this case -
-    /// [`undo_discard_worktree`] always uses `git stash apply`, never `pop`, specifically so the
-    /// stash survives as a fallback regardless of whether the apply itself was clean.
+    /// Recreated, but the stash left conflict markers. The stash entry is not dropped: the undo
+    /// always uses `apply`, never `pop`, so it survives as a fallback.
     RestoredWithConflicts { stash: String },
 }
 
-/// Force-remove the worktree at `worktree_path`, first taking a real [`DiscardSnapshot`] of it -
-/// unlike a bare `remove_worktree(force: true)` call, which permanently destroys
-/// uncommitted/untracked content with no recovery path at all.
+/// Force-removes a worktree, taking a [`DiscardSnapshot`] first - unlike a bare
+/// `remove_worktree(force: true)`, which destroys uncommitted content with no recovery path.
 ///
-/// Refuses with [`Error::DiscardSourceIsMainWorktree`] if `worktree_path` is the repository's
-/// main worktree - `git worktree remove --force --force` can never remove it (git itself always
-/// refuses), so proceeding would stash real content, fail to remove anything, and leave that
-/// content stashed with no [`DiscardSnapshot`] ever returned to record it for `Undo` - a real,
-/// reachable data-loss path this refuses upfront instead (see this module's own top-level docs).
+/// Refusals, all before anything is touched: [`Error::DiscardSourceIsMainWorktree`], since git can
+/// never remove it and stashing first would strand the content; and
+/// [`Error::DiscardSourceUnborn`], since `git stash` has nothing to diff against.
 ///
-/// Refuses with [`Error::DiscardSourceUnborn`] if the worktree has no commits yet at all (`git
-/// stash` itself has nothing to diff against in that case). If the worktree is clean
-/// ([`crate::is_dirty`] is `false`), no stash is created - there is nothing to lose, so
-/// [`DiscardSnapshot::stash`] is `None`. If the worktree is dirty but `git stash push` itself
-/// fails or produces no real output, this refuses with [`Error::DiscardSnapshotFailed`] rather
-/// than forcing the removal through uncaptured. [`DiscardSnapshot::had_ignored_content`] is
-/// always populated, independent of whether a stash was taken (see its own docs).
+/// A clean worktree gets no stash. A dirty one whose stash fails refuses with
+/// [`Error::DiscardSnapshotFailed`] rather than forcing the removal through uncaptured.
+/// [`DiscardSnapshot::had_ignored_content`] is populated either way.
 ///
-/// If a stash was taken but the removal itself then fails for any other real reason, this
-/// returns [`Error::DiscardRemovalFailedAfterStash`] (see its own docs and this module's
-/// top-level docs for why an in-place restore isn't attempted).
+/// A removal that fails *after* a stash returns [`Error::DiscardRemovalFailedAfterStash`].
 ///
 /// Performs blocking I/O.
 pub fn discard_worktree(repo_path: &Path, worktree_path: &Path) -> Result<DiscardSnapshot, Error> {
@@ -597,12 +443,9 @@ pub fn discard_worktree(repo_path: &Path, worktree_path: &Path) -> Result<Discar
     };
 
     if let Err(err) = remove_worktree(repo_path, worktree_path, true) {
-        // Live-reproduced: attempting to restore the stash back into `worktree_path` in place
-        // here is not reliable - `git worktree remove` typically deletes the worktree's own
-        // contents and deregisters it *before* failing only at the final, now-empty directory
-        // entry's own removal, so `worktree_path` may no longer even be a valid git worktree by
-        // this point. The stash is still real and durable regardless (`refs/stash`, never
-        // dropped), so this surfaces its id rather than pretending an in-place restore happened.
+        // Restoring in place is not reliable here: `git worktree remove` usually empties and
+        // deregisters the worktree before failing on the final directory entry, so this path may
+        // no longer be a git worktree at all. The stash is durable, so surface its id instead.
         return Err(match stash {
             Some(stash_id) => Error::DiscardRemovalFailedAfterStash {
                 path: worktree_path.to_path_buf(),
@@ -621,12 +464,9 @@ pub fn discard_worktree(repo_path: &Path, worktree_path: &Path) -> Result<Discar
     })
 }
 
-/// Whether `worktree_path` is the repository's main worktree (the one `git init`/`git clone`
-/// creates, as opposed to a linked one from `git worktree add`) - reuses the exact same
-/// `gix::Repository::main_repo`/`work_dir` real-worktree-location lookup [`crate::list_worktrees`]
-/// itself uses for the same determination, rather than a second, independent way of answering
-/// the same question. Canonicalizes both sides before comparing so a relative or symlinked
-/// `worktree_path` still matches correctly.
+/// Whether `worktree_path` is the repository's main worktree, via the same lookup
+/// [`crate::list_worktrees`] uses. Both sides are canonicalized, so a relative or symlinked path
+/// still matches.
 fn is_main_worktree(worktree_path: &Path) -> Result<bool, Error> {
     let repo = open_repo(worktree_path)?;
     let main_repo = repo.main_repo().map_err(|source| Error::Open {
@@ -634,8 +474,7 @@ fn is_main_worktree(worktree_path: &Path) -> Result<bool, Error> {
         source: Box::new(source),
     })?;
     let Some(main_path) = main_repo.work_dir() else {
-        // A bare repository has no main worktree at all - see `crate::list_worktrees`'s own
-        // docs for the same fact.
+        // A bare repository has no main worktree at all.
         return Ok(false);
     };
     let main_canon = std::fs::canonicalize(main_path).unwrap_or_else(|_| main_path.to_path_buf());
@@ -644,10 +483,8 @@ fn is_main_worktree(worktree_path: &Path) -> Result<bool, Error> {
     Ok(main_canon == target_canon)
 }
 
-/// Whether `worktree_dir` contains any real gitignored content right now (`git status
-/// --porcelain --ignored`, filtering to the `!!`-prefixed ignored entries specifically, so
-/// ordinary tracked/untracked changes - already covered by [`crate::is_dirty`]/the real stash -
-/// never false-positive this).
+/// Whether `worktree_dir` holds any gitignored content, matching only `!!` entries so ordinary
+/// changes - already covered by the stash - cannot false-positive.
 fn has_ignored_content(worktree_dir: &Path) -> Result<bool, Error> {
     let args: Vec<OsString> = vec!["status".into(), "--porcelain".into(), "--ignored".into()];
     let output = run_git(worktree_dir, &args)?;
@@ -657,9 +494,7 @@ fn has_ignored_content(worktree_dir: &Path) -> Result<bool, Error> {
         .any(|line| line.starts_with("!!")))
 }
 
-/// Reads `refs/stash`'s current commit id, or `None` if it doesn't resolve at all (no stash has
-/// ever been pushed in this repository yet) - `git rev-parse --verify -q` exits non-zero for
-/// exactly that "doesn't exist yet" case, which this tolerates rather than treating as an error.
+/// Reads `refs/stash`, or `None` when no stash has ever been pushed here.
 fn read_stash_ref(worktree_path: &Path) -> Result<Option<String>, Error> {
     let rev_args: Vec<OsString> = vec![
         "rev-parse".into(),
@@ -678,25 +513,16 @@ fn read_stash_ref(worktree_path: &Path) -> Result<Option<String>, Error> {
     ))
 }
 
-/// The real `git stash push --include-untracked` this module's own docs describe - factored out
-/// so [`discard_worktree`] reads as the real, linear "snapshot, then remove" it is.
+/// Pushes a stash and returns the commit id it actually created.
 ///
-/// Live-reproduced (an earlier version of this function trusted `refs/stash` unconditionally
-/// after the push, and was falsified by direct testing): `git stash push` can exit `0` and print
-/// "No local changes to save" **without pushing anything at all**, even when
-/// [`crate::is_dirty`] correctly reports the worktree as dirty - a dirty submodule pointer
-/// (`M <submodule>` in `git status --porcelain`) is real, uncommitted state that `git stash
-/// push` cannot capture at all, with no flag that changes that. When this happens, `refs/stash`
-/// is left pointing at whatever it already pointed at before this call (nothing ever drops old
-/// stash entries), which can easily be a completely unrelated stash from a prior, unrelated
-/// operation in this same shared repository. Trusting that value as "the stash for *this*
-/// snapshot" would hand back a real but wrong sha - [`discard_worktree`] would then force-remove
-/// the real worktree believing its content was captured, and a later undo would restore the
-/// *wrong* content while claiming success. To catch this, `refs/stash` is read (via
-/// [`read_stash_ref`]) both **before** and **after** the push; the post-push value is only
-/// trusted as this snapshot's stash if it both resolves to something real *and* differs from the
-/// pre-push value - otherwise this returns [`Error::DiscardSnapshotFailed`] instead, so the
-/// caller never proceeds to remove anything.
+/// `git stash push` can exit 0 printing "No local changes to save" without pushing anything, even
+/// on a worktree [`crate::is_dirty`] correctly calls dirty - a dirty submodule pointer is
+/// uncommitted state no flag makes it capture. `refs/stash` is then left on some unrelated
+/// earlier stash, and trusting it would let [`discard_worktree`] remove a worktree believing its
+/// content was captured, then restore the wrong content later.
+///
+/// So `refs/stash` is read before and after, and the result is only trusted if it resolves *and*
+/// differs. Otherwise this returns [`Error::DiscardSnapshotFailed`] and nothing is removed.
 fn push_and_capture_stash(worktree_path: &Path) -> Result<String, Error> {
     let before_stash = read_stash_ref(worktree_path)?;
 
@@ -710,11 +536,8 @@ fn push_and_capture_stash(worktree_path: &Path) -> Result<String, Error> {
     let push_output = run_git(worktree_path, &push_args)?;
     check_success(&push_args, &push_output)?;
 
-    // `refs/stash` should now point at the stash `push` just created (`stash@{0}`) - read its
-    // real id directly rather than relying on the relative `stash@{0}` name, which would
-    // silently shift if anything else pushed another stash before this snapshot is ever undone.
-    // But a successful exit alone doesn't prove anything was actually pushed (see this
-    // function's own docs) - only accept it if it's both present and genuinely new.
+    // The absolute id, not the relative `stash@{0}` name, which shifts if anything else pushes a
+    // stash before this snapshot is undone. A successful exit alone proves nothing was pushed.
     let after_stash = read_stash_ref(worktree_path)?;
     match after_stash {
         Some(after) if Some(&after) != before_stash.as_ref() => Ok(after),
@@ -724,17 +547,12 @@ fn push_and_capture_stash(worktree_path: &Path) -> Result<String, Error> {
     }
 }
 
-/// Undo a [`discard_worktree`] call: recreate the worktree at its original path on its original
-/// branch/commit, then (if the snapshot captured one) restore the stash on top.
+/// Recreates a discarded worktree at its original path and branch, then restores any stash.
 ///
-/// Mandatory identity guard, checked before touching anything: refuses with
-/// [`Error::DiscardWorktreePathReoccupied`] if a worktree (or any other directory) already
-/// occupies `worktree_path`, or with [`Error::DiscardBranchMovedOrReoccupied`] if the recorded
-/// branch no longer exists, is checked out in a different worktree already, or its tip commit is
-/// no longer `snapshot.commit` - real evidence something else touched it since the discard. Any
-/// of these means blindly recreating would either silently clobber whatever now occupies that
-/// name, or resurrect stale content on top of real newer work - both refused honestly rather
-/// than forced through.
+/// Identity guards, checked before anything is touched: [`Error::DiscardWorktreePathReoccupied`]
+/// if something already occupies the path, and [`Error::DiscardBranchMovedOrReoccupied`] if the
+/// branch is gone, checked out elsewhere, or no longer at `snapshot.commit`. Recreating anyway
+/// would clobber whatever now holds that name, or resurrect stale content over newer work.
 ///
 /// Performs blocking I/O.
 pub fn undo_discard_worktree(
@@ -795,25 +613,13 @@ pub fn undo_discard_worktree(
     apply_stash(worktree_path, stash)
 }
 
-/// Runs `git stash apply <stash>` (never `pop` - see this module's own docs on
-/// [`UndoDiscardOutcome::RestoredWithConflicts`] for why) and classifies the real outcome:
-/// [`UndoDiscardOutcome::Restored`] on a clean apply, or
-/// [`UndoDiscardOutcome::RestoredWithConflicts`] - not an [`Err`] - if `git` reports real
-/// conflict markers instead.
+/// Applies `stash` - never `pop`, so it survives - and classifies the outcome.
 ///
-/// A non-zero exit from `git stash apply` is genuinely ambiguous: git uses it both for a real
-/// merge conflict (a real partial success - most content did land, just with `<<<<<<<` markers
-/// in some files) *and* for a genuine failure with nothing restored at all (e.g. `stash` no
-/// longer resolves to anything real - live-reproducible by running `git stash drop`/`clear` in a
-/// terminal between [`discard_worktree`] and [`undo_discard_worktree`], which this app's own
-/// real terminal sessions make entirely possible). Collapsing both into
-/// `RestoredWithConflicts` would be a real, false "something was restored" claim for the second
-/// case. `git diff --name-only --diff-filter=U` is git's own real, authoritative "is there an
-/// actual unresolved-merge conflict right now" signal, so it disambiguates the two: a non-empty
-/// result really did land conflicting content (this deliberately doesn't route that case through
-/// [`check_success`]/[`Error::GitCommand`], since it's git's well-known, non-exceptional way of
-/// reporting a conflict, not a failure to run the command); an empty result means nothing real
-/// landed at all, surfaced as a real [`Error::GitCommand`] instead.
+/// A non-zero exit from `git stash apply` is ambiguous: git uses it both for a conflict, where
+/// most content did land, and for an outright failure with nothing restored, such as a stash
+/// dropped from a terminal in between. Reporting both as `RestoredWithConflicts` would falsely
+/// claim something was restored in the second case, so `git diff --diff-filter=U` disambiguates:
+/// non-empty means conflicting content landed, empty means nothing did and this errors.
 fn apply_stash(worktree_path: &Path, stash: &str) -> Result<UndoDiscardOutcome, Error> {
     let apply_args: Vec<OsString> = vec!["stash".into(), "apply".into(), stash.into()];
     let apply_output = run_git(worktree_path, &apply_args)?;
@@ -891,8 +697,7 @@ mod tests {
         dir
     }
 
-    /// A session worktree on branch `name`, checked out from `main`'s current tip - mirrors how
-    /// `app::root` actually creates session worktrees (`add_worktree` with `-b`).
+    /// A session worktree on branch `name`, checked out from `main`'s tip.
     fn add_session_worktree(repo: &Path, path: &Path, branch: &str) {
         git(
             repo,
@@ -913,8 +718,7 @@ mod tests {
         let repo = init_repo();
         fs::write(repo.path().join("file.txt"), "changed\n").expect("modify");
         fs::write(repo.path().join("new.txt"), "new\n").expect("new file");
-        // A second tracked file, committed first so it has real history, then deleted - covers
-        // the "deleted tracked file" case in the same `commit_all_changes` call.
+        // Committed first so it has history, then deleted: covers the deleted-tracked-file case.
         fs::write(repo.path().join("to-delete.txt"), "bye\n").expect("write");
         git(repo.path(), &["add", "to-delete.txt"]);
         git(repo.path(), &["commit", "-m", "add to-delete.txt"]);
@@ -973,7 +777,7 @@ mod tests {
         // The committed file is clean...
         let status = git_output(repo.path(), &["status", "--porcelain", "file.txt"]);
         assert_eq!(status, "", "file.txt must be committed, not left staged");
-        // ...but the other real change is genuinely untouched - still there, still uncommitted.
+        // ...but the other change is untouched: still there, still uncommitted.
         let untouched_status = git_output(repo.path(), &["status", "--porcelain", "untouched.txt"]);
         assert!(
             untouched_status.contains("untouched.txt"),
@@ -982,24 +786,16 @@ mod tests {
         assert!(is_dirty(repo.path()).expect("is_dirty"));
     }
 
-    /// A real regression test for a real bug: a bare `git commit` (no pathspec) commits the
-    /// *entire* index, not just whatever this call's own `git add -- <paths>` just staged. The
-    /// previous `commit_paths_commits_only_the_given_paths_leaving_other_changes_uncommitted`
-    /// test above never actually exercised that failure mode - it only ever `write`s
-    /// `untouched.txt` to disk without `git add`ing it, so it was never in the index for a bare
-    /// `git commit` to sweep up in the first place. This test pre-stages the other file for
-    /// real (mirroring an agent CLI running its own `git add` in this same worktree, the exact
-    /// interleaving hazard `commit_all_changes`'s own doc calls out above), so it genuinely
-    /// fails against a bare `git commit` and genuinely passes only once the commit itself is
-    /// pathspec-limited (`-- <paths>`).
+    /// The sibling test above never stages `untouched.txt`, so a bare `git commit` has nothing to
+    /// sweep up and the failure mode goes unexercised. This one pre-stages another file, so it
+    /// passes only once the commit itself is pathspec-limited.
     #[test]
     fn commit_paths_never_commits_a_path_that_was_staged_by_something_else() {
         let repo = init_repo();
         fs::write(repo.path().join("file.txt"), "changed\n").expect("modify");
         fs::write(repo.path().join("also-staged.txt"), "staged elsewhere\n")
             .expect("write also-staged.txt");
-        // Simulates something else in this worktree (an agent CLI, a manual `git add`) already
-        // having staged a different file before the composer's own commit runs.
+        // Something else in this worktree staged a different file first.
         git(repo.path(), &["add", "also-staged.txt"]);
 
         commit_paths(
@@ -1087,15 +883,14 @@ mod tests {
         let outcome =
             commit_all_changes(repo.path(), "ade: keep all changes").expect("commit_all_changes");
 
-        // Something else committed on top after the "keep" - the identity guard must refuse
-        // rather than silently discard it.
+        // Something committed on top afterwards; the guard must refuse rather than discard it.
         fs::write(repo.path().join("file.txt"), "changed again\n").expect("modify again");
         git(repo.path(), &["add", "file.txt"]);
         git(repo.path(), &["commit", "-m", "a later, unrelated commit"]);
 
         let err = undo_commit_all_changes(repo.path(), &outcome).unwrap_err();
         assert!(matches!(err, Error::HeadMovedSinceRecorded { .. }));
-        // Nothing must have been touched - the later commit is still real HEAD.
+        // Nothing was touched: the later commit is still `HEAD`.
         assert_eq!(
             fs::read_to_string(repo.path().join("file.txt")).expect("read"),
             "changed again\n"
@@ -1116,8 +911,7 @@ mod tests {
             git_output(repo.path(), &["rev-parse", "HEAD"]),
             outcome.commit
         );
-        // A soft reset never touches the working tree, so content is still "changed" - the same
-        // as it was the whole time, undo included.
+        // A soft reset never touches the working tree, so the content is unchanged throughout.
         assert_eq!(
             fs::read_to_string(repo.path().join("file.txt")).expect("read"),
             "changed\n"
@@ -1150,29 +944,17 @@ mod tests {
 
     #[test]
     fn commit_all_changes_records_the_real_interleaved_parent_not_a_stale_pre_commit_read() {
-        // Live-reproduced staleness bug: an earlier version of `commit_all_changes` read
-        // `HEAD` (via `describe_worktree`) *before* running `git add -A`/`git commit`, and used
-        // that pre-commit read as `parent`. If anything else commits in this worktree in the
-        // window between that read and the real commit - this app's whole domain is running
-        // agent CLIs inside these worktrees, so an agent process committing there is realistic,
-        // not exotic - the real graph becomes `A <- B(interleaved) <- C(ours)`, but `parent`
-        // would be stale-recorded as `A`. `undo_commit_all_changes`'s `HEAD == outcome.commit`
-        // guard would not catch this (`HEAD` genuinely *is* `C`), so it would run
-        // `git reset --soft A` and silently discard the real interleaved commit `B`.
+        // Reading `HEAD` before the commit rather than the commit's own parent afterwards makes
+        // `parent` stale whenever something else commits in the window: the graph becomes
+        // `A <- B <- C`, `parent` records `A`, and the `HEAD == outcome.commit` guard cannot see
+        // it - `HEAD` really is `C` - so the undo resets to `A` and discards `B`.
         //
-        // This can't be reproduced by literally racing a second thread against
-        // `commit_all_changes` (it's a single, sequential blocking call), but the fix is
-        // structural: `parent` must always be derived from the real commit's own immutable
-        // parent (`<commit>^`), never from a pre-commit snapshot. This test proves that
-        // invariant directly: a real second commit interleaves *before* `commit_all_changes`
-        // ever runs (standing in for the vulnerable window an earlier implementation had), and
-        // `commit_all_changes`'s own recorded `parent` must be that real interleaved commit, not
-        // the one further back - and undoing must preserve it, never silently drop it.
+        // The race itself is not reproducible against a sequential blocking call, so this pins
+        // the invariant instead: an interleaved commit lands first, and `parent` must record it.
         let repo = init_repo();
         let commit_a = git_output(repo.path(), &["rev-parse", "HEAD"]);
 
-        // A real, interleaved commit lands on top of `A` - standing in for a concurrent agent
-        // process committing in this same worktree.
+        // An interleaved commit lands on top of `A`.
         fs::write(
             repo.path().join("interleaved.txt"),
             "from another process\n",
@@ -1183,7 +965,7 @@ mod tests {
         let commit_b = git_output(repo.path(), &["rev-parse", "HEAD"]);
         assert_ne!(commit_a, commit_b);
 
-        // Now the real "keep all changes" commit runs on top of that.
+        // The "keep all changes" commit runs on top of that.
         fs::write(repo.path().join("file.txt"), "changed by keep-all\n").expect("modify");
         let outcome =
             commit_all_changes(repo.path(), "ade: keep all changes").expect("commit_all_changes");
@@ -1194,7 +976,7 @@ mod tests {
             "parent must be the real interleaved commit B, not the stale commit A further back"
         );
 
-        // Undoing must preserve the interleaved commit - never silently discard it.
+        // Undoing must preserve the interleaved commit.
         undo_commit_all_changes(repo.path(), &outcome).expect("undo");
         assert_eq!(
             git_output(repo.path(), &["rev-parse", "HEAD"]),
@@ -1205,7 +987,7 @@ mod tests {
             repo.path().join("interleaved.txt").exists(),
             "the real interleaved commit's content must survive the undo"
         );
-        // And the commit itself must still be a real, reachable commit object - not discarded.
+        // And the commit object itself is still reachable.
         assert_eq!(
             git_output(repo.path(), &["log", "--format=%H", "-1", &commit_b]),
             commit_b
@@ -1286,10 +1068,8 @@ mod tests {
 
     #[test]
     fn a_stash_created_and_stored_from_a_worktree_survives_that_worktrees_own_removal() {
-        // Direct, empirical verification of this module's own core claim (see its module docs):
-        // `refs/stash` (which `git stash push` moves) lives in the *repository's* shared refs,
-        // not inside the worktree's own private files, so it is genuinely still there - and
-        // still `git stash apply`-able - after the worktree that created it is gone.
+        // `refs/stash` lives in the repository's shared refs, not the worktree's private files,
+        // so it survives - and stays appliable - after that worktree is gone.
         let repo = init_repo();
         let wt_path = repo.path().join("session-b");
         add_session_worktree(repo.path(), &wt_path, "session-b");
@@ -1299,8 +1079,7 @@ mod tests {
         let stash = snapshot.stash.clone().expect("dirty worktree must stash");
 
         assert!(!wt_path.exists());
-        // `git stash apply` from the *main* worktree (a completely different working directory
-        // than the one that created the stash) must still find it and apply real content.
+        // Applying from the main worktree - a different directory entirely - must still work.
         git(repo.path(), &["stash", "apply", &stash]);
         assert_eq!(
             fs::read_to_string(repo.path().join("scratch.txt")).expect("read restored file"),
@@ -1359,8 +1138,7 @@ mod tests {
         add_session_worktree(repo.path(), &wt_path, "session-d");
         let snapshot = discard_worktree(repo.path(), &wt_path).expect("discard_worktree");
 
-        // Something else now occupies the exact same path - just a plain directory is enough to
-        // prove the guard, real or not.
+        // A plain directory is enough to occupy the path and trip the guard.
         fs::create_dir_all(&wt_path).expect("recreate the path with something unrelated");
 
         let err = undo_discard_worktree(repo.path(), &wt_path, &snapshot).unwrap_err();
@@ -1374,12 +1152,9 @@ mod tests {
         add_session_worktree(repo.path(), &wt_path, "session-e");
         let snapshot = discard_worktree(repo.path(), &wt_path).expect("discard_worktree");
 
-        // Something else committed on the branch after the discard (possible even though the
-        // worktree is gone - the branch itself still exists and can be advanced, e.g. via a
-        // `git commit` in another checkout of it). A real, distinct new commit is built
-        // directly via `commit-tree` (same tree/parent, different message, so it gets a real,
-        // different sha) and the branch ref moved onto it - a bare `update-ref ... HEAD` would
-        // be a no-op here, since `session-e` was branched from `HEAD` with no divergence yet.
+        // The branch outlives its worktree and can still be advanced. `commit-tree` builds a
+        // distinct commit (same tree and parent, different message) and the ref moves onto it; a
+        // bare `update-ref ... HEAD` would be a no-op, the branch having not yet diverged.
         let tree = git_output(repo.path(), &["rev-parse", "HEAD^{tree}"]);
         let parent = git_output(repo.path(), &["rev-parse", "HEAD"]);
         let moved_commit = git_output(
@@ -1430,8 +1205,8 @@ mod tests {
 
     #[test]
     fn discard_worktree_refuses_on_an_unborn_worktree() {
-        // A worktree checked out at a commit still has real history behind it in this crate's
-        // model (`add_worktree` always checks out an existing branch/commit); the only real way
+        // A worktree checked out at a commit still has history behind it in this crate's model;
+        // the only way
         // to reach "no HEAD commit at all" is the main worktree of a repository that was
         // `git init`'d but never committed to.
         let dir = TempDir::new().expect("tempdir");
@@ -1445,22 +1220,13 @@ mod tests {
 
     #[test]
     fn a_stash_apply_conflict_is_reported_honestly_not_as_an_error_and_the_stash_survives() {
-        // `undo_discard_worktree`'s own mandatory identity guard makes a real conflict
-        // essentially unreachable through the full guarded flow (see this module's own docs):
-        // if the branch tip still matches exactly what was recorded, the freshly recreated
-        // worktree's content is guaranteed identical to what existed when the stash was taken,
-        // so the stash's diff always applies cleanly against it. `apply_stash` itself, however,
-        // must still handle a real conflict honestly rather than assuming its caller's guard
-        // makes one impossible.
+        // The undo's identity guard makes a conflict essentially unreachable through the full
+        // flow, but `apply_stash` must still handle one rather than assume its caller's guard.
         //
-        // An earlier version of this test used a real *uncommitted* conflicting edit to trigger
-        // this - live-reproduced as the wrong scenario during an audit: `git stash apply`
-        // refuses outright ("Your local changes ... would be overwritten by merge") rather than
-        // attempting a merge at all when the working tree already has uncommitted changes to the
-        // same file, which is a real *non-restore failure* (case for a genuine `Err`, not
-        // `RestoredWithConflicts` - nothing was restored), not a real conflict. A genuine
-        // conflict-with-markers instead needs the working tree *clean* but `HEAD` moved: a new,
-        // real *committed* change to the same line the stash's own base diverges from.
+        // An *uncommitted* conflicting edit is the wrong setup: `git stash apply` refuses
+        // outright ("local changes would be overwritten") without attempting a merge, which is a
+        // non-restore failure and belongs in `Err`. Producing real markers needs a clean working
+        // tree with `HEAD` moved - a committed change to the line the stash diverges from.
         let repo = init_repo();
         fs::write(repo.path().join("file.txt"), "stash content\n").expect("edit for stash");
         let stash = push_and_capture_stash(repo.path()).expect("push_and_capture_stash");
