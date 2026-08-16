@@ -1284,11 +1284,12 @@ impl AdeApp {
         let is_open = entry.is_dir && self.expanded_dirs.contains(&entry.path);
         let mark = marks.get(&entry.path).copied();
         // GitHub issue #127: the row-selection highlight (README's Zone 3 "Selected row bg
-        // `#1a1e21`") and the ancestor-chain indent-guide highlight just below both used to key
-        // purely off `Self::selected_tree_path` - the last-opened path, set by `Self::
-        // open_file_view`/`Self::open_palette_file_result` - with no check against real keyboard
-        // focus at all. That left the row looking selected/focused indefinitely after focus
-        // genuinely moved to the editor, a terminal, or the Changes panel.
+        // `#1a1e21`") used to key purely off `Self::selected_tree_path` - the last-opened path,
+        // set by `Self::open_file_view`/`Self::open_palette_file_result` - with no check against
+        // real keyboard focus at all. That left the row looking selected/focused indefinitely
+        // after focus genuinely moved to the editor, a terminal, or the Changes panel. (The
+        // indent guides just below this used to have their own ancestor-chain highlight built on
+        // the same idea; GitHub issue #406 removed that entirely - see the guides' own comment.)
         //
         // Two genuinely different things were being conflated under one field, though: "this row
         // is what the centre pane is actually showing" (should stay lit no matter where focus
@@ -1365,53 +1366,38 @@ impl AdeApp {
         // Drawn as this row's *own* absolutely-positioned children rather than as one overlay
         // across the list, which is what makes them correct under `uniform_list`'s
         // virtualization for free: a guide is a pure function of the row it belongs to
-        // (`entry.depth`, plus the selected path for the active-chain highlight), so a recycled
-        // row can only ever draw the guides that genuinely belong to whatever row it now shows.
-        // An overlay would instead have to track the visible range and scroll offset itself and
-        // stay in step with them - the real source of the "gaps or misaligned segments as rows
-        // recycle" failure the issue calls out. Each guide spans the row's full 22px height with
-        // no gap or inset, so consecutive rows' segments meet exactly and read as one continuous
-        // line down the subtree.
-        // GitHub issue #127: highlights the open file's own ancestor chain regardless of focus
-        // (same reasoning as `is_open_file` above - it helps find the open file in a deep,
-        // collapsed tree), falling back to the focus-gated tree cursor otherwise.
-        let active_chain_target = open_change_path.as_deref().or_else(|| {
-            tree_focused
-                .then_some(self.selected_tree_path.as_deref())
-                .flatten()
-        });
-        let active_levels =
-            file_tree::active_guide_levels(&self.file_tree_root, &entry.path, active_chain_target);
+        // (just `entry.depth`), so a recycled row can only ever draw the guides that genuinely
+        // belong to whatever row it now shows. An overlay would instead have to track the
+        // visible range and scroll offset itself and stay in step with them - the real source of
+        // the "gaps or misaligned segments as rows recycle" failure the issue calls out. Each
+        // guide spans the row's full 22px height with no gap or inset, so consecutive rows'
+        // segments meet exactly and read as one continuous line down the subtree.
+        //
+        // Always the resting `theme::tree::INDENT_GUIDE` colour, regardless of selection, focus,
+        // or which file is open (GitHub issue #406) - a guide is pure tree structure, not a
+        // "this leads to something" marker. This used to also highlight the open file's own
+        // ancestor chain in an accent colour (`theme::tree::INDENT_GUIDE_ACTIVE`, added for
+        // GitHub issue #127), via `file_tree::active_guide_levels`. That branch is deliberately
+        // gone rather than disabled: reported as a visual bug against a clear product
+        // preference ("don't color the lines in the file explorer, let them neutral color like
+        // not selected"), not a case of the feature merely being wrong under some states - so
+        // there's nothing left here that can recolour a guide.
         for level in 0..entry.depth {
-            let active = level < active_levels;
             row = row.child(
                 div()
                     // Test-only (a no-op outside test builds, like the row's own selector
                     // above): the only way a real render test can prove a guide painted at the
                     // right x, at the right height, on the right row - including after
-                    // `uniform_list` has recycled that row's element. The `active`/`idle` half
-                    // is what makes the ancestor-chain highlight testable at all: the colour
-                    // itself isn't observable from a test, but which of the two branches a given
-                    // row took is. Keyed on `entry.name` like the row selector above, so two
-                    // same-named files in different folders would collide - every test using
-                    // these gives its fixtures unique names.
-                    .debug_selector(|| {
-                        format!(
-                            "file-tree-guide-{}-{}-{level}",
-                            if active { "active" } else { "idle" },
-                            entry.name
-                        )
-                    })
+                    // `uniform_list` has recycled that row's element. Keyed on `entry.name` like
+                    // the row selector above, so two same-named files in different folders would
+                    // collide - every test using these gives its fixtures unique names.
+                    .debug_selector(|| format!("file-tree-guide-{}-{level}", entry.name))
                     .absolute()
                     .top_0()
                     .h_full()
                     .w(px(1.0))
                     .left(px(file_tree::indent_guide_x(level)))
-                    .bg(if active {
-                        theme::tree::INDENT_GUIDE_ACTIVE
-                    } else {
-                        theme::tree::INDENT_GUIDE
-                    }),
+                    .bg(theme::tree::INDENT_GUIDE),
             );
         }
 
@@ -5764,15 +5750,21 @@ mod indent_guide_tests {
         (app, cx)
     }
 
-    /// GitHub issue #127: the *open* file's own ancestor-chain highlight must stay lit regardless
-    /// of where keyboard focus is - `Self::open_file_view` moves focus to the editor (not the
-    /// tree), and the highlight must survive that exactly like VS Code keeps its explorer's open-
-    /// file highlight lit while you're typing. A first draft of this fix instead cleared the
-    /// highlight the moment focus left the tree at all, hiding which file was open the instant
-    /// you started editing it - caught by manual review, not a test, since every prior test here
-    /// only ever checked a *mere selection* (a directory click), never a genuinely open file.
+    /// GitHub issue #406 (regression): indent guides must render in the neutral resting colour
+    /// regardless of selection, focus, or which file is open - reported with a screenshot of an
+    /// expanded folder ("work_surface") whose children's connecting guide painted accent-blue
+    /// even though nothing in that subtree was selected or hovered. "don't color the lines in
+    /// the file explorer, let them neutral color like not selected."
+    ///
+    /// This used to be a real, deliberate feature: guides along the *open* file's own ancestor
+    /// chain painted `theme::tree::INDENT_GUIDE_ACTIVE` (GitHub issue #127), surviving even when
+    /// focus left the tree entirely (`Self::open_file_view` moves focus to the editor, not the
+    /// tree) - exactly the scenario this test reproduces, since that's precisely the state a real
+    /// user hits just by opening a file and starting to edit it. The fix removed that branch
+    /// outright rather than merely disabling it, so there is only ever one guide selector now -
+    /// no `-active-`/`-idle-` distinction to regress back into.
     #[gpui::test]
-    fn the_open_files_ancestor_chain_highlight_survives_focus_leaving_the_tree(
+    fn indent_guides_stay_neutral_even_when_a_descendant_file_is_open_and_focus_leaves_the_tree(
         cx: &mut TestAppContext,
     ) {
         let repo = TempDir::new().expect("tempdir");
@@ -5788,68 +5780,38 @@ mod indent_guide_tests {
                 "premise: opening a file via the normal path focuses the editor, not the tree"
             );
         });
-        assert!(
-            cx.debug_bounds("file-tree-guide-active-deep.txt-0")
+        for level in 0..3 {
+            assert!(
+                cx.debug_bounds(match level {
+                    0 => "file-tree-guide-deep.txt-0",
+                    1 => "file-tree-guide-deep.txt-1",
+                    _ => "file-tree-guide-deep.txt-2",
+                })
                 .is_some(),
-            "the open file's own chain must stay lit even with the editor (not the tree) focused"
-        );
-        assert!(
-            cx.debug_bounds("file-tree-guide-idle-deep.txt-0").is_none(),
-            "and must not also render idle"
-        );
-
-        app.update_in(cx, |app, window, cx| {
-            app.focus_file_tree(window, cx);
-        });
-        cx.run_until_parked();
-        assert!(
-            cx.debug_bounds("file-tree-guide-active-deep.txt-0")
-                .is_some(),
-            "and must stay lit once the tree regains focus too"
-        );
-    }
-
-    /// The counterpart to the test above: a row that was merely *selected* in the tree (a
-    /// directory click, which never opens anything - `Self::open_change` stays `None`) is a real,
-    /// live keyboard-navigation cursor, not a standing "this is open" marker, so *its* chain must
-    /// go idle the instant real focus leaves the tree - the original GitHub issue #127 report: a
-    /// stale highlight glowing over whatever was last clicked long after focus moved away.
-    #[gpui::test]
-    fn a_merely_selected_directorys_ancestor_chain_highlight_clears_once_focus_leaves_the_tree(
-        cx: &mut TestAppContext,
-    ) {
-        let repo = TempDir::new().expect("tempdir");
-        let (app, cx) = open_deep_tree(cx, &repo);
-
-        app.update_in(cx, |app, window, cx| {
-            app.selected_tree_path = Some(repo.path().join("a/b/c"));
-            app.focus_file_tree(window, cx);
-        });
-        cx.run_until_parked();
-        assert!(
-            cx.debug_bounds("file-tree-guide-active-deep.txt-0")
-                .is_some(),
-            "premise: with the tree focused, the selected directory's own chain renders active \
-             (deep.txt sits inside it, at the deepest level the chain reaches)"
-        );
-
-        app.update_in(cx, |app, window, cx| {
-            app.agents.focus_active(window, cx);
-        });
-        cx.run_until_parked();
-        assert!(
-            app.read_with(cx, |app, _| app.open_change.is_none()),
-            "premise: focusing a terminal agent never opens a file tab"
-        );
-        assert!(
-            cx.debug_bounds("file-tree-guide-idle-deep.txt-0").is_some(),
-            "a mere selection - nothing was ever opened - must go idle once focus genuinely \
-             leaves the tree"
-        );
+                "the open file's own ancestor guides must still render at level {level} - just \
+                 never in a distinct colour"
+            );
+        }
         assert!(
             cx.debug_bounds("file-tree-guide-active-deep.txt-0")
                 .is_none(),
-            "and must not also render active"
+            "no guide may ever render under the old accent-colour selector, even for the open \
+             file's own chain, with focus on the editor"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.focus_file_tree(window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("file-tree-guide-active-deep.txt-0")
+                .is_none(),
+            "and still none once the tree regains focus - selecting/focusing the open file's own \
+             row must not recolour its ancestor guides either"
+        );
+        assert!(
+            cx.debug_bounds("file-tree-guide-deep.txt-0").is_some(),
+            "the guide itself must still be there, just neutral"
         );
     }
 
@@ -5863,7 +5825,7 @@ mod indent_guide_tests {
         let (_app, cx) = open_deep_tree(cx, &repo);
 
         assert!(
-            cx.debug_bounds("file-tree-guide-idle-a-0").is_none(),
+            cx.debug_bounds("file-tree-guide-a-0").is_none(),
             "a root-level row has no ancestors, so it must draw no guide at all"
         );
 
@@ -5872,9 +5834,9 @@ mod indent_guide_tests {
             .expect("the deepest row must paint");
         // Literal selectors, not `format!`: `debug_bounds` takes a `&'static str`.
         for (level, selector) in [
-            (0usize, "file-tree-guide-idle-deep.txt-0"),
-            (1, "file-tree-guide-idle-deep.txt-1"),
-            (2, "file-tree-guide-idle-deep.txt-2"),
+            (0usize, "file-tree-guide-deep.txt-0"),
+            (1, "file-tree-guide-deep.txt-1"),
+            (2, "file-tree-guide-deep.txt-2"),
         ] {
             let guide = cx
                 .debug_bounds(selector)
@@ -5891,7 +5853,7 @@ mod indent_guide_tests {
             );
         }
         assert!(
-            cx.debug_bounds("file-tree-guide-idle-deep.txt-3").is_none(),
+            cx.debug_bounds("file-tree-guide-deep.txt-3").is_none(),
             "a depth-3 row must not draw a fourth guide"
         );
     }
@@ -5907,9 +5869,9 @@ mod indent_guide_tests {
         // The three consecutive rows `c`, `deep.txt`, `mid.txt` (in that render order - `c`'s
         // own child comes between it and its sibling), all of which draw a level-1 guide.
         let segments: Vec<gpui::Bounds<Pixels>> = [
-            "file-tree-guide-idle-c-1",
-            "file-tree-guide-idle-deep.txt-1",
-            "file-tree-guide-idle-mid.txt-1",
+            "file-tree-guide-c-1",
+            "file-tree-guide-deep.txt-1",
+            "file-tree-guide-mid.txt-1",
         ]
         .into_iter()
         .map(|selector| {
@@ -5991,15 +5953,14 @@ mod indent_guide_tests {
             .debug_bounds("file-tree-row-f-299.txt")
             .expect("the last row must materialize after scrolling");
         assert!(
-            cx.debug_bounds("file-tree-guide-idle-f-000.txt-0")
-                .is_none(),
+            cx.debug_bounds("file-tree-guide-f-000.txt-0").is_none(),
             "the row that scrolled out of view must take its guides with it - a leftover guide \
              here would be a segment painted over an unrelated row"
         );
 
         for (level, selector) in [
-            (0usize, "file-tree-guide-idle-f-299.txt-0"),
-            (1, "file-tree-guide-idle-f-299.txt-1"),
+            (0usize, "file-tree-guide-f-299.txt-0"),
+            (1, "file-tree-guide-f-299.txt-1"),
         ] {
             let guide = cx
                 .debug_bounds(selector)
@@ -6025,15 +5986,16 @@ mod indent_guide_tests {
         }
     }
 
-    /// The optional half of §3: the guides along the selected file's ancestor chain are drawn in
-    /// the highlighted colour, and only those. The colour itself isn't observable from a test,
-    /// so this asserts on which of the two real branches each guide took (see the guide's own
-    /// `debug_selector`) - which is what would actually break if the condition were inverted.
+    /// GitHub issue #406 (regression): no row's guides ever pick up a distinct colour, whether or
+    /// not that row shares an ancestor with the currently open/selected/focused file. Before the
+    /// fix, `elsewhere.txt`'s shared `a` ancestor guide would have painted accent-coloured (it's
+    /// on the open file's chain) while its own `a/other` guide stayed neutral - exactly the kind
+    /// of partially-coloured subtree the original report showed a screenshot of.
     #[gpui::test]
-    fn only_the_selected_files_ancestor_chain_is_highlighted(cx: &mut TestAppContext) {
+    fn no_rows_guides_are_ever_recoloured_by_a_sibling_subtrees_open_file(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
-        // A second branch at the same depth as `a/b`, so there is a row whose guides must stay
-        // idle while the selection's chain is active.
+        // A second branch at the same depth as `a/b`, so there is a row that shares only a
+        // partial ancestor chain with the file that ends up open.
         fs::create_dir_all(repo.path().join("a/other")).expect("mkdir");
         fs::write(repo.path().join("a/other/elsewhere.txt"), "x\n").expect("write");
         let (app, cx) = open_deep_tree(cx, &repo);
@@ -6043,46 +6005,40 @@ mod indent_guide_tests {
         cx.run_until_parked();
 
         assert!(
-            cx.debug_bounds("file-tree-guide-idle-deep.txt-0").is_some(),
-            "precondition: with nothing selected every guide is idle"
+            cx.debug_bounds("file-tree-guide-deep.txt-0").is_some(),
+            "precondition: with nothing selected the guide still renders"
         );
 
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(repo.path().join("a/b/c/deep.txt"), window, cx);
-            // GitHub issue #127: the ancestor-chain highlight now also requires the tree to be
-            // genuinely focused, not just a real selected path - `open_file_view` moves focus to
-            // the editor, so this test's premise needs a real tree focus afterward too.
             app.focus_file_tree(window, cx);
         });
         cx.run_until_parked();
 
         for selector in [
-            "file-tree-guide-active-deep.txt-0",
-            "file-tree-guide-active-deep.txt-1",
-            "file-tree-guide-active-deep.txt-2",
+            "file-tree-guide-deep.txt-0",
+            "file-tree-guide-deep.txt-1",
+            "file-tree-guide-deep.txt-2",
+            "file-tree-guide-elsewhere.txt-0",
+            "file-tree-guide-elsewhere.txt-1",
         ] {
             assert!(
                 cx.debug_bounds(selector).is_some(),
-                "{selector}: every guide on the selected file's own row is part of its \
-                 ancestor chain"
+                "{selector}: every guide still renders - just always in the one neutral colour"
             );
         }
-        // `a/other/elsewhere.txt` shares only `a` with the selection.
-        assert!(
-            cx.debug_bounds("file-tree-guide-active-elsewhere.txt-0")
-                .is_some(),
-            "the shared `a` ancestor is on the chain"
-        );
-        assert!(
-            cx.debug_bounds("file-tree-guide-idle-elsewhere.txt-1")
-                .is_some(),
-            "`a/other` is not on the selected file's chain, so its guide stays idle"
-        );
-        assert!(
-            cx.debug_bounds("file-tree-guide-active-elsewhere.txt-1")
-                .is_none(),
-            "and it must not also be drawn as active"
-        );
+        for selector in [
+            "file-tree-guide-active-deep.txt-0",
+            "file-tree-guide-active-deep.txt-1",
+            "file-tree-guide-active-deep.txt-2",
+            "file-tree-guide-active-elsewhere.txt-0",
+            "file-tree-guide-active-elsewhere.txt-1",
+        ] {
+            assert!(
+                cx.debug_bounds(selector).is_none(),
+                "{selector}: no guide may ever render under the old accent-colour selector"
+            );
+        }
     }
 
     /// Collapsing a folder removes its children's guides along with their rows - the guides are
@@ -6092,7 +6048,7 @@ mod indent_guide_tests {
     fn collapsing_removes_the_hidden_rows_guides_too(cx: &mut TestAppContext) {
         let repo = TempDir::new().expect("tempdir");
         let (app, cx) = open_deep_tree(cx, &repo);
-        assert!(cx.debug_bounds("file-tree-guide-idle-deep.txt-2").is_some());
+        assert!(cx.debug_bounds("file-tree-guide-deep.txt-2").is_some());
 
         app.update(cx, |app, cx| {
             app.toggle_dir_expanded(repo.path().join("a/b"), cx);
@@ -6101,11 +6057,11 @@ mod indent_guide_tests {
 
         assert!(cx.debug_bounds("file-tree-row-deep.txt").is_none());
         assert!(
-            cx.debug_bounds("file-tree-guide-idle-deep.txt-2").is_none(),
+            cx.debug_bounds("file-tree-guide-deep.txt-2").is_none(),
             "a hidden row's guides must be gone with it"
         );
         assert!(
-            cx.debug_bounds("file-tree-guide-idle-b-0").is_some(),
+            cx.debug_bounds("file-tree-guide-b-0").is_some(),
             "the still-visible `b` row keeps its own level-0 guide"
         );
     }

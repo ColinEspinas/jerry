@@ -357,31 +357,6 @@ pub fn indent_guide_x(level: usize) -> f32 {
 /// `render_tree_caret`'s real width - see [`indent_guide_x`].
 const CARET_WIDTH: f32 = 8.0;
 
-/// How many of a row's indent guides belong to the selected file's own ancestor chain, and so
-/// should be drawn in the highlighted colour (issue #18 §3's optional "highlight the active
-/// guide"). Always a prefix of the row's levels: two paths share a *prefix* of ancestors, never a
-/// gap in the middle, so this is one count rather than a per-level set.
-///
-/// Returns `0` (nothing highlighted) when nothing is selected, when the selection isn't inside
-/// this tree's root, or when the two paths diverge immediately - the common case for most rows.
-pub fn active_guide_levels(root: &Path, entry: &Path, selected: Option<&Path>) -> usize {
-    let Some(selected) = selected else {
-        return 0;
-    };
-    let (Ok(entry_relative), Ok(selected_relative)) =
-        (entry.strip_prefix(root), selected.strip_prefix(root))
-    else {
-        return 0;
-    };
-    let depth = entry_relative.components().count().saturating_sub(1);
-    let shared = entry_relative
-        .components()
-        .zip(selected_relative.components())
-        .take_while(|(a, b)| a == b)
-        .count();
-    shared.min(depth)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -782,70 +757,5 @@ mod tests {
         assert_eq!(indent_guide_x(0), 12.0);
         assert_eq!(indent_guide_x(1), 25.0);
         assert_eq!(indent_guide_x(2), 38.0);
-    }
-
-    #[test]
-    fn no_selection_means_no_active_guides() {
-        let root = Path::new("/repo");
-        assert_eq!(
-            active_guide_levels(root, &root.join("src/app/main.rs"), None),
-            0
-        );
-    }
-
-    #[test]
-    fn the_selected_files_whole_ancestor_chain_is_active() {
-        let root = Path::new("/repo");
-        let selected = root.join("src/app/main.rs");
-        // The selected row itself: both of its guides (for `src` and `src/app`) are active.
-        assert_eq!(
-            active_guide_levels(root, &selected, Some(&selected)),
-            2,
-            "the selected file's own ancestor guides are the active chain"
-        );
-        // A sibling of the selected file shares the same two ancestors.
-        assert_eq!(
-            active_guide_levels(root, &root.join("src/app/other.rs"), Some(&selected)),
-            2
-        );
-        // A row in a different subtree shares only `src`.
-        assert_eq!(
-            active_guide_levels(root, &root.join("src/other/thing.rs"), Some(&selected)),
-            1
-        );
-        // A row that diverges immediately shares nothing.
-        assert_eq!(
-            active_guide_levels(root, &root.join("docs/readme.md"), Some(&selected)),
-            0
-        );
-    }
-
-    /// A row can never highlight more guides than it draws - `min(shared, depth)` is what stops
-    /// a deeper selected path from claiming a guide level this row doesn't have.
-    #[test]
-    fn active_guides_never_exceed_a_rows_own_depth() {
-        let root = Path::new("/repo");
-        let selected = root.join("src/app/deep/main.rs");
-        assert_eq!(
-            active_guide_levels(root, &root.join("src"), Some(&selected)),
-            0
-        );
-        assert_eq!(
-            active_guide_levels(root, &root.join("src/app"), Some(&selected)),
-            1
-        );
-    }
-
-    #[test]
-    fn a_selection_outside_the_tree_root_highlights_nothing() {
-        let root = Path::new("/repo");
-        assert_eq!(
-            active_guide_levels(
-                root,
-                &root.join("src/main.rs"),
-                Some(Path::new("/elsewhere/src/main.rs"))
-            ),
-            0
-        );
     }
 }
