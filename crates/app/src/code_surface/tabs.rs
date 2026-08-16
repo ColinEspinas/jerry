@@ -35,6 +35,13 @@ impl AdeApp {
     /// see [`Self::dirty_files`]' own docs). It is reset to `None` ("not known yet") synchronously
     /// here rather than left holding the outgoing diff's answer, so a stale set can never outlive
     /// the diff it described.
+    ///
+    /// This is the entry point for every caller whose `root` is a worktree being switched **to**
+    /// (a new window, `Self::select_worktree`, a vanished-worktree recovery). A caller that wants
+    /// the exact same real reload for the worktree *already* showing - `crate::sidebar::render::
+    /// AdeApp::set_right_sidebar_view`'s "switching into Changes always recomputes" - wants
+    /// [`Self::refresh_diff`] instead: see its own docs for why blanking the screen first is
+    /// correct here and wrong there.
     pub(crate) fn load_diff(&mut self, root: PathBuf, cx: &mut Context<Self>) {
         self.diff_root = root.clone();
         self.diff_state = DiffLoadState::Loading;
@@ -51,7 +58,47 @@ impl AdeApp {
         self.diff_totals = None;
         self.dirty_files = None;
         cx.notify();
-        let task = cx.spawn(async move |this, cx| {
+        self._load_diff_task = Some(self.spawn_diff_reload(root, cx));
+    }
+
+    /// Re-runs exactly the same real git reload [`Self::load_diff`] does, for the *same* worktree
+    /// [`Self::diff_root`] already names - GitHub issue #399. The one difference is what it does
+    /// **not** do: unlike `load_diff`, this never blanks [`Self::diff_state`]/
+    /// [`Self::uncommitted_diff`]/[`Self::branch_commits`] to `Loading` first, so whatever the
+    /// Changes panel is already showing keeps rendering, undisturbed, for the real duration of the
+    /// reload - only flipping once the fresh answer actually lands.
+    ///
+    /// That is safe here in a way it is *not* safe for `load_diff`'s own callers: every one of
+    /// those names a worktree that is being switched **to**, so whatever was on screen before
+    /// belongs to a different checkout and showing it a frame longer would be the real cross-
+    /// worktree leak `Self::reset_repo_scoped_state`'s own docs guard against. This method's one
+    /// caller (`crate::sidebar::render::AdeApp::set_right_sidebar_view`) never changes
+    /// `Self::diff_root` at all - it re-reads the *same* worktree that was already showing, so the
+    /// stale-but-still-displayed data is, at worst, a few seconds old for the checkout genuinely on
+    /// screen, never another one's.
+    ///
+    /// This is the same "don't blank a still-good cache while a refresh is in flight" idiom
+    /// `crate::code_surface::state::FileLoadState`'s own docs describe for [`Self::file_view_cache`],
+    /// applied to an always-unconditional refresh rather than a freshness-gated skip, since (unlike
+    /// a single file's mtime) there is no cheap way to tell in advance whether any of these five git
+    /// queries would actually come back different. The live report this fixes: "when going to the
+    /// changes pane it is first empty and then fills up" - `set_right_sidebar_view`'s docs already
+    /// explain *why* every switch into Changes must recompute rather than trust a snapshot (an agent
+    /// may have changed files while the panel wasn't showing); recomputing was never the defect,
+    /// unconditionally blanking the screen to do it was.
+    pub(crate) fn refresh_diff(&mut self, cx: &mut Context<Self>) {
+        let root = self.diff_root.clone();
+        self._load_diff_task = Some(self.spawn_diff_reload(root, cx));
+    }
+
+    /// The real background git reload both [`Self::load_diff`] and [`Self::refresh_diff`] run -
+    /// the five real `wt_core` queries (`diff_against_base`, `staged_paths`, `dirty_paths`,
+    /// `diff_against_head`, `commits_since_base`), off the foreground thread, folded into exactly
+    /// the same completion write-back either caller wants. The two callers differ only in what
+    /// they do *before* this runs (see [`Self::refresh_diff`]'s own docs), never in what happens
+    /// once the real answer comes back.
+    fn spawn_diff_reload(&mut self, root: PathBuf, cx: &mut Context<Self>) -> gpui::Task<()> {
+        cx.spawn(async move |this, cx| {
             let (diff_result, staged_result, dirty_result, uncommitted_result, commits_result) = cx
                 .background_executor()
                 .spawn({
@@ -106,10 +153,12 @@ impl AdeApp {
                 if let Ok(staged) = staged_result {
                     this.staged_files = staged;
                 }
-                // A failed `dirty_paths` query leaves `dirty_files` at the `None` this method
-                // already set synchronously - "not known", so every Changes row falls back to the
-                // ordinary stageable presentation rather than silently declaring every file
-                // committed-clean off the back of an answer git never actually gave.
+                // A failed `dirty_paths` query leaves `dirty_files` exactly as it was - `None`
+                // ("not known") for a `Self::load_diff` caller, which reset it synchronously
+                // before this task started, or the last real answer for a `Self::refresh_diff`
+                // caller, which did not. Either way every Changes row falls back to the ordinary
+                // stageable presentation (or the last real one) rather than silently declaring
+                // every file committed-clean off the back of an answer git never actually gave.
                 if let Ok(dirty) = dirty_result {
                     this.dirty_files = Some(dirty);
                 }
@@ -139,8 +188,7 @@ impl AdeApp {
                 this.rebuild_change_set();
                 cx.notify();
             });
-        });
-        self._load_diff_task = Some(task);
+        })
     }
 
     /// Appends `path` to [`Self::open_files`] if not already present. The shared entry point for
