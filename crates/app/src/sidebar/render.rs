@@ -49,9 +49,18 @@ fn short_sha(sha: &str) -> String {
 
 impl AdeApp {
     /// Switches which data source the right sidebar shows. Switching *to* the Changes view
-    /// always recomputes the diff (`load_diff`, not just `cx.notify()`) rather than showing
-    /// whatever was last loaded - a stale snapshot from when the worktree was first selected
-    /// would silently hide changes an agent just made.
+    /// always recomputes the diff (`Self::refresh_diff`, not just `cx.notify()`) rather than
+    /// showing whatever was last loaded - a stale snapshot from when the worktree was first
+    /// selected would silently hide changes an agent just made.
+    ///
+    /// `refresh_diff`, not `load_diff`: a live report ("when going to the changes pane it is
+    /// first empty and then fills up") traced to exactly this call unconditionally resetting
+    /// `Self::diff_state`/`Self::uncommitted_diff`/`Self::branch_commits` to `Loading` before
+    /// every single switch into Changes, even when the worktree hadn't changed and the panel's
+    /// last real answer was still perfectly good to keep showing while a fresh one loaded.
+    /// `refresh_diff` runs the identical real background reload without that synchronous blank -
+    /// see its own docs for why that is safe specifically because this call site never changes
+    /// `Self::diff_root`.
     pub(crate) fn set_right_sidebar_view(
         &mut self,
         view: RightSidebarView,
@@ -124,10 +133,16 @@ impl AdeApp {
         }
         self.right_sidebar_view = view;
         if view == RightSidebarView::Changes {
-            self.load_diff(self.diff_root.clone(), cx);
-        } else {
-            cx.notify();
+            self.refresh_diff(cx);
         }
+        // `refresh_diff` (unlike `load_diff`) never touches any field the render path reads
+        // synchronously - it only writes once its background task lands, so it never calls
+        // `cx.notify()` itself. `self.right_sidebar_view` above did change, though, and every
+        // other branch this function takes (the `Files`/`Search` unrender blocks, the `else`
+        // this used to be) needs the same repaint - so this now unconditionally notifies once,
+        // rather than one call in the `Changes` arm (via `load_diff`) and a second, separate one
+        // in every other arm.
+        cx.notify();
     }
 
     /// Toggles a directory's expanded state - `crate::sidebar::file_tree::visible_entries` does
@@ -7175,6 +7190,127 @@ mod commit_composer_tests {
             cx.debug_bounds("commit-menu-popover").is_none(),
             "returning to Changes must not resurrect a popover the user never reopened"
         );
+    }
+
+    /// Live report ("when going to the changes pane it is first empty and then fills up"), traced
+    /// to `set_right_sidebar_view` unconditionally resetting `Self::uncommitted_diff`/
+    /// `Self::branch_commits`/`Self::diff_state` to `Loading` on **every** switch into Changes -
+    /// even a second switch to a worktree that never changed, whose diff was already fully
+    /// loaded. GitHub issue #399's fix: `Self::refresh_diff` reruns the same real background
+    /// reload without that synchronous blank, so a re-entry into an already-loaded Changes view
+    /// keeps showing the real data it already had, undisturbed, for the whole real duration of
+    /// the (still genuinely unconditional) background refresh.
+    ///
+    /// This is a synchronous check, deliberately made *before* `cx.run_until_parked()` drains the
+    /// refresh - the exact window the live report is about. A test that only asserted the
+    /// post-`run_until_parked` state would pass whether or not the blank ever happened in
+    /// between, since the refresh always lands on the same real data either way.
+    #[gpui::test]
+    fn returning_to_an_already_loaded_changes_view_never_blanks_it(cx: &mut TestAppContext) {
+        let repo = changes_test_repo();
+        let (app, cx) = open_changes_view(cx, &repo);
+
+        // Premise: the first load already landed, so every scope really is `Loaded`.
+        app.read_with(cx, |app, _| {
+            assert!(
+                matches!(
+                    app.diff_state,
+                    crate::code_surface::state::DiffLoadState::Loaded(_)
+                ),
+                "premise: diff_state must already be Loaded before this test's real assertion"
+            );
+            assert!(
+                app.uncommitted_diff.loaded().is_some(),
+                "premise: uncommitted_diff must already be Loaded"
+            );
+            assert!(
+                app.branch_commits.loaded().is_some(),
+                "premise: branch_commits must already be Loaded"
+            );
+        });
+
+        // Leave Changes, then switch back into it - the exact gesture the live report names.
+        app.update_in(cx, |app, window, cx| {
+            app.set_right_sidebar_view(RightSidebarView::Files, window, cx);
+        });
+        cx.run_until_parked();
+        app.update_in(cx, |app, window, cx| {
+            app.set_right_sidebar_view(RightSidebarView::Changes, window, cx);
+        });
+
+        // Right here - synchronously, before the refresh this call just dispatched has had any
+        // chance to run - every scope must still read as the real, already-loaded data it was a
+        // moment ago, not `Loading`/empty.
+        app.read_with(cx, |app, _| {
+            assert!(
+                matches!(
+                    app.diff_state,
+                    crate::code_surface::state::DiffLoadState::Loaded(_)
+                ),
+                "diff_state must not be reset to Loading just for re-entering an already-loaded \
+                 Changes view - that is the exact empty-then-fills-up flash the live report \
+                 named"
+            );
+            assert!(
+                app.uncommitted_diff.loaded().is_some(),
+                "uncommitted_diff must keep showing its last real answer through the refresh, \
+                 not blank to Loading first"
+            );
+            assert!(
+                app.branch_commits.loaded().is_some(),
+                "branch_commits must keep showing its last real answer through the refresh, not \
+                 blank to Loading first"
+            );
+        });
+
+        // The refresh itself still genuinely ran (freshness is preserved, not abandoned) - once
+        // it lands, every scope is still Loaded, just from the fresh query rather than the stale
+        // one skipped ahead of it.
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(matches!(
+                app.diff_state,
+                crate::code_surface::state::DiffLoadState::Loaded(_)
+            ));
+            assert!(app.uncommitted_diff.loaded().is_some());
+            assert!(app.branch_commits.loaded().is_some());
+        });
+    }
+
+    /// The mirror image of the test above: a real worktree switch (as opposed to a same-worktree
+    /// re-entry into the Changes view) is a genuinely different checkout, so `Self::load_diff`
+    /// must keep blanking every scope to `Loading` synchronously - showing the *previous*
+    /// worktree's already-loaded diff a frame longer would be the real cross-worktree data leak
+    /// `Self::reset_repo_scoped_state`'s own docs guard against, not a flash worth avoiding.
+    #[gpui::test]
+    fn switching_worktrees_still_blanks_the_changes_view_synchronously(cx: &mut TestAppContext) {
+        let repo_a = changes_test_repo();
+        let repo_b = changes_test_repo();
+        let (app, cx) = open_changes_view(cx, &repo_a);
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.uncommitted_diff.loaded().is_some(),
+                "premise: the first worktree's diff must already be loaded"
+            );
+        });
+
+        app.update_in(cx, |app, window, cx| {
+            app.load_diff(repo_b.path().to_path_buf(), cx);
+            let _ = window;
+        });
+
+        // Synchronously - before the new worktree's own background reload has run at all - the
+        // panel must not still be showing the *previous* worktree's data.
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.uncommitted_diff.loaded().is_none(),
+                "a real worktree switch must blank the previous worktree's diff synchronously, \
+                 rather than leaving it on screen while the new worktree's own answer loads"
+            );
+        });
+
+        cx.run_until_parked();
     }
 
     /// The reported "2 context menus open at the same time", for this pair, end to end through a
