@@ -1622,7 +1622,7 @@ pub mod syntax {
     /// force-fittable onto an existing bucket - see this module's own fallback-chain docs above),
     /// so they get their own honestly-named [`crate::code_surface::code_view::HighlightKind`]
     /// variants and real, distinct hues rather than a confusing reuse of e.g. `KEYWORD` for a
-    /// heading. Verified in a real rendered window - see `docs/screenshots/jerry-dark-markdown.png`.
+    /// heading. Verified in a real rendered window.
     pub const HEADING: ColorToken = token("syntax.heading", 0xc7a356);
     /// `text.uri`/`text.reference` (a link's destination and its visible label/text) - reuses
     /// [`FUNCTION`]'s own blue as its default, the conventional "this is a link" hue in most
@@ -5306,9 +5306,9 @@ mod syntax_color_math {
 
     /// CIE-Lab, the space this crate's *distinctness* checks are stated in. Deliberately kept
     /// alongside the OKLCH maths rather than replaced by it: the ΔE figures recorded in this
-    /// module's docs and in THEME.md are Lab ΔE, the familiar "~2.3 is a just-noticeable
-    /// difference" scale, and restating them in OKLab units would make every historical number in
-    /// those docs unreadable against the new ones.
+    /// module's docs and in `docs/theme-palette-design.md` are Lab ΔE, the familiar "~2.3 is a
+    /// just-noticeable difference" scale, and restating them in OKLab units would make every
+    /// historical number in those docs unreadable against the new ones.
     pub(super) fn lab(color: Rgba) -> (f32, f32, f32) {
         fn linear(component: f32) -> f32 {
             if component <= 0.04045 {

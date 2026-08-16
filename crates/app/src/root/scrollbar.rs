@@ -61,8 +61,8 @@
 //! not new data invented for the scrollbar. A "search matches" mark is deliberately **not**
 //! implemented: this app has no find-in-file feature anywhere yet (`grep -r "SearchMatch\|
 //! find_in_file" crates/app/src` turns up nothing), and inventing a fake match set to paint marks
-//! for would be exactly the "no simulated output" violation `CONTRIBUTING.md` warns against - see
-//! `BUILD-LOG.md`'s entry for this issue for the honestly-documented gap.
+//! for would be exactly the "no simulated output" violation `CLAUDE.md` warns against, so it
+//! stays an honestly-documented gap instead.
 //!
 //! ## Audited but not wired up (honest gaps, not oversights)
 //!

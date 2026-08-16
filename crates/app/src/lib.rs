@@ -8,6 +8,11 @@
 //! and `crate::terminal::grid` for the interesting design decisions (entity/state model,
 //! blocking-call offloading, terminal grid rendering).
 
+// `.expect()`/`.unwrap()` are the documented, accepted pattern in test modules (see
+// `CLAUDE.md`'s Rust standards) - only production code is held to `clippy::unwrap_used`/
+// `expect_used`.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod budget;
 pub mod code_surface;
 pub mod env_info;

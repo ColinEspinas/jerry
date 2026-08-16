@@ -12,9 +12,24 @@ edition = "2021"
 publish = false
 license = "MIT OR Apache-2.0"
 
+# CLAUDE.md's Rust standards, made executable. Everything here is `warn`/`deny` rather than
+# `forbid`: `cargo clippy --workspace --all-targets -- -D warnings` (the pre-commit gate; see
+# `/check`) is what actually turns these into build failures, and `deny` (unlike `forbid`)
+# still lets each documented FFI `unsafe` block (see CLAUDE.md's Rust standards) carry a local
+# `#[allow(unsafe_code)]` with its own justification. Test modules are exempted per crate root,
+# not here - see each crate's `#![cfg_attr(test, allow(...))]`, matching the documented
+# "expect() is fine in tests" convention.
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+dbg_macro = "warn"
+
 [workspace.dependencies]
 # Pinned to the exact zed-industries/zed commit this workspace was built and verified
-# against (see BUILD-LOG.md). Bump only deliberately, together with re-running the full
+# against. Bump only deliberately, together with re-running the full
 # test/build/clippy suite - GPUI's API surface is not stable across arbitrary upstream
 # commits.
 gpui = { git = "https://github.com/zed-industries/zed", rev = "7b030b500810b04cf5fb4aa5973be99a502d9f36" }

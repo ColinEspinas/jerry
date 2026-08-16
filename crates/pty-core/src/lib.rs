@@ -33,7 +33,7 @@
 //! own no-`unsafe` rule rules out here). That means a killed child's own grandchildren (e.g. a
 //! subprocess an agent CLI spawned) can survive as real orphans on Windows - a genuine,
 //! tracked regression relative to the unix path, not fixed here (see [`PtySession::kill`]'s
-//! `#[cfg(windows)]` docs and BUILD-LOG.md's R11 entry).
+//! `#[cfg(windows)]` docs).
 //!
 //! The reader thread also can't be proactively interrupted the way `#[cfg(unix)]`'s self-pipe
 //! does: `filedescriptor` 0.8.3's Windows `poll_impl` is backed by `WSAPoll`, which only
@@ -148,6 +148,11 @@
 //! `std::env::current_dir()` when [`SpawnOptions::cwd`] is unset, and validates any
 //! caller-supplied cwd is an existing directory before handing it to `CommandBuilder`,
 //! returning [`PtyError::InvalidCwd`] otherwise.
+
+// `.expect()`/`.unwrap()` are the documented, accepted pattern in test modules (see
+// `CLAUDE.md`'s Rust standards) - only production code is held to `clippy::unwrap_used`/
+// `expect_used`.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 #[cfg(unix)]
@@ -773,7 +778,7 @@ impl PtySession {
     /// started) is NOT terminated by this and can survive as a real orphan. Windows has no
     /// signal-based process-group equivalent without job objects, a distinct `unsafe`-FFI-heavy
     /// API surface this project's own no-`unsafe` rule deliberately rules out adding. Tracked as
-    /// a real, named follow-up in BUILD-LOG.md's R11 entry rather than fixed here.
+    /// a real, named follow-up rather than fixed here.
     #[cfg(windows)]
     pub fn kill(&mut self) -> Result<(), PtyError> {
         if self.exited.is_some() {
@@ -988,8 +993,8 @@ impl Drop for PtySession {
             // Windows: no process-tree concept (see the crate-level "Platform scope" docs)
             // - `child.kill()` below is the direct-child-only equivalent, and (like
             // `Self::kill`'s Windows twin) leaves any grandchild the killed process itself
-            // spawned as a real, un-terminated orphan - see that function's docs and
-            // BUILD-LOG.md's R11 entry for this tracked, real gap.
+            // spawned as a real, un-terminated orphan - see that function's docs for this
+            // tracked, real gap.
             #[cfg(windows)]
             if let Some(child) = self.child.as_mut() {
                 let _ = child.kill();

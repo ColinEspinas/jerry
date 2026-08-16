@@ -611,6 +611,8 @@ fn sweep_stale_directories(parent: &Path) {
 /// real, it simply belongs to another user, which is a case that genuinely occurs on a shared
 /// `/tmp` and must not be read as "dead, delete its files".
 #[cfg(unix)]
+// SAFETY of the FFI call below is justified at its own call site.
+#[allow(unsafe_code)]
 fn process_is_alive(pid: u32) -> bool {
     // SAFETY: `kill` with signal 0 performs only an existence/permission check. It has no effect
     // on the target process, and takes no pointers, so there is nothing to invalidate.
@@ -670,6 +672,8 @@ fn process_is_alive(pid: u32) -> bool {
 /// designing against, and recycling can only push this the safe way: a reused pid belongs to a
 /// live process, which reads as alive and simply leaves the directory for a later sweep.
 #[cfg(windows)]
+// SAFETY of each FFI call below is justified at its own call site.
+#[allow(unsafe_code)]
 fn process_is_alive(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0};
     use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
@@ -1640,6 +1644,11 @@ mod tests {
     }
 
     #[test]
+    // Flaky under the full parallel suite: GitHub issue #320 (ETXTBSY - another test's
+    // Command::spawn can fork while this test's stand-in script is still open for writing).
+    // Ignored here so `cargo test --workspace` in CI is a trustworthy gate; run directly with
+    // `cargo test -p app the_generated_windows_command_tokenizes -- --ignored` to exercise it.
+    #[ignore]
     fn the_generated_windows_command_tokenizes_identically_under_a_real_posix_shell() {
         // The module docs claim the Windows command string is deliberately *also* a valid Git Bash
         // command line, as insurance against a Claude Code that ignores the `shell` field. That is

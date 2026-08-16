@@ -8,7 +8,9 @@ target/
 # snapshot, and now the Search panel's `git ls-files --exclude-standard` walk - silently treats
 # an unignored build directory as real, searchable/stageable content instead.
 .shared-target/
+vendor/
 .claude/scratch/
+.claude/settings.local.json
 # Windows/WSL alternate-data-stream marker files left behind by files downloaded/copied
 # from a Windows filesystem.
 *:Zone.Identifier

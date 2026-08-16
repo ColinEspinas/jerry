@@ -55,7 +55,7 @@ impl AdeApp {
     /// documents as a no-op while the window is already in full-screen mode - so the old code
     /// could enter fullscreen (via the real, OS-drawn traffic light underneath, before this dot
     /// existed) but this dot itself could never leave it again: a real, reproduced dead end,
-    /// found running this app on macOS for the first time (see BUILD-LOG.md).
+    /// found running this app on macOS for the first time.
     ///
     /// The wrapping row stops left-click propagation on mouse-down so pressing a dot can never
     /// also arm [`Self::render_title_bar`]'s window-move drag.
@@ -717,8 +717,8 @@ mod macos_dot_cluster_tests {
     /// ways - into fullscreen, and back out again. Before this module's fix, the second click
     /// called `Window::zoom_window` (AppKit's `zoom(_:)`), which Apple documents as a no-op while
     /// already fullscreen: the window would have stayed stuck in fullscreen exactly as it did
-    /// running this app on macOS for the first time (see BUILD-LOG.md) - this test would have
-    /// caught that regression by failing its second assertion.
+    /// running this app on macOS for the first time - this test would have caught that
+    /// regression by failing its second assertion.
     #[gpui::test]
     fn clicking_the_macos_maximize_dot_toggles_fullscreen_both_ways(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");

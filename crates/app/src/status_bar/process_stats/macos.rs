@@ -85,6 +85,11 @@
 //! what actually exercises the code below on a real Apple Silicon runner. Without it, "CI covers
 //! this" would have been an empty claim.
 
+// This module exists entirely to call libc/Mach FFI (`proc_pid_rusage`, `mach_timebase_info`) -
+// every call site below carries its own `SAFETY` comment; see CLAUDE.md's Rust standards for
+// the project-wide "unsafe only for justified FFI" rule this module is the macOS half of.
+#![allow(unsafe_code)]
+
 use super::ProcessSampler;
 use std::time::Duration;
 

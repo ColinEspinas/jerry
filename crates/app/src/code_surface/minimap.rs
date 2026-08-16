@@ -56,7 +56,7 @@
 //!
 //! ## Not off the main thread, honestly
 //!
-//! `BUILD-LOG.md`'s original scoping-out of the minimap cited GPUI's own single foreground-thread
+//! This module's original scoping-out cited GPUI's own single foreground-thread
 //! rendering architecture as the reason a real minimap *paint* can never genuinely run off the
 //! main thread - only the highlighting step could (and already does, via
 //! `AdeApp::spawn_file_load`/`Self::schedule_rehighlight`, unrelated to this module). That
@@ -68,8 +68,8 @@
 //! per-render work the compression/rect-building step (`build_line_rects`) can ever do, so a real
 //! render ships now instead of staying deferred - but this was not verified against a real
 //! `gpui::FrameTiming` measurement the way this codebase's own terminal-poll-cadence and
-//! file-tree-virtualization work was (see `BUILD-LOG.md`'s entries for those). That is a real,
-//! disclosed gap in this change's own rigor, not a claim of a benchmark that wasn't actually run.
+//! file-tree-virtualization work was. That is a real, disclosed gap in this change's own rigor,
+//! not a claim of a benchmark that wasn't actually run.
 //!
 //! ## One more disclosed, established-pattern gap: a one-frame bounds lag
 //!

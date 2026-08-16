@@ -1,0 +1,14 @@
+# Matches `rust-toolchain.toml`'s pinned channel, so clippy's version-gated suggestions target
+# the Rust actually used to build this workspace.
+msrv = "1.95.0"
+
+# `disallowed-methods` is deliberately empty, not populated with `std::process::Command::new`
+# to enforce ADR 0003 (render.rs must dispatch a Command/Query, never call an adapter or shell
+# out directly): that method has other, legitimate call sites in this crate today (opening a
+# path in the OS file manager, relaunching the updater) that a blanket disallow would also
+# flag, and clippy.toml has no way to scope a disallowed method to specific files. A type-aware
+# version of this check needs the glob-import cleanup ADR 0003 itself names as the prerequisite.
+# In the meantime, `.claude/hooks/check-conventions.sh` enforces a coarser but real textual
+# ratchet on the same rule (and on new `use super::*` globs) - it needs no glob cleanup first,
+# runs in the pre-commit hook and in CI, and is documented in docs/architecture/decisions.md (§3).
+disallowed-methods = []

@@ -2224,13 +2224,9 @@ impl AdeApp {
             self.find_bar_focus_handle.clone(),
         ));
         self.refresh_find_bar();
-        let handle = self
-            .find_bar
-            .as_ref()
-            .expect("just created above")
-            .focus_handle
-            .clone();
-        window.focus(&handle, cx);
+        // Same handle `FindBar::new` above just cloned into `focus_handle` - no need to read it
+        // back out of `self.find_bar`.
+        window.focus(&self.find_bar_focus_handle, cx);
         self.reset_caret_blink(cx);
         cx.notify();
     }

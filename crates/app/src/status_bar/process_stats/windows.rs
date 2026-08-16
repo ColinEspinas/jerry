@@ -51,6 +51,12 @@
 //! what actually exercises the code below on a real Windows runner. Without it, "CI covers this"
 //! would have been an empty claim.
 
+// This module exists entirely to call Win32 FFI (`OpenProcess`, `GetProcessTimes`,
+// `GetProcessMemoryInfo`, `GlobalMemoryStatusEx`) - every call site below carries its own
+// `SAFETY` comment; see CLAUDE.md's Rust standards for the project-wide "unsafe only for
+// justified FFI" rule this module is the Windows half of.
+#![allow(unsafe_code)]
+
 use super::ProcessSampler;
 use std::time::Duration;
 use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};

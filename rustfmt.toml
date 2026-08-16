@@ -1,0 +1,5 @@
+# Matches `rust-toolchain.toml`'s pinned channel/edition. The whole workspace already formats
+# clean under rustfmt's defaults (`cargo fmt --all -- --check` passes as of this file's
+# addition) - this file exists so that stays pinned and explicit rather than silently
+# inheriting whatever a future rustfmt version changes its defaults to.
+edition = "2021"

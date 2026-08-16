@@ -181,6 +181,7 @@ fn contrast_per_hundred(a: Rgba, b: Rgba) -> u32 {
 /// entirely instead of approximating around it: a key this palette doesn't name is now a key that
 /// really does render as `crate::theme::ColorToken::default`, so reading that default here is the
 /// exact truth rather than a stand-in for it.
+#[allow(clippy::expect_used)] // every `key` here is a real registered token
 pub fn check_palette_readability(palette: &theme::Palette) -> Result<(), ThemeFileError> {
     let resolved = |key: &str| -> Rgba {
         let token = theme::token_for_key(key).expect("a real registered token");
@@ -584,6 +585,7 @@ impl CustomTheme {
     /// differs from the fully-compiled truth is a partial hand-authored theme that inherits one of
     /// those five keys from a non-Jerry-Dark base - which is exactly what the explicit `preview`
     /// field exists for.
+    #[allow(clippy::expect_used)] // every `key` in PREVIEW_KEYS is a real registered token
     pub fn preview_swatches(&self) -> [u32; 5] {
         if let Some(preview) = self.preview {
             return preview;
@@ -602,6 +604,7 @@ impl CustomTheme {
     /// This theme's own real window background - what `crate::theme::theme_is_light` is asked
     /// about for `Settings.theme.last_dark_theme` bookkeeping. Same "own entry, else the compiled
     /// default" resolution (and same honest limitation) as [`Self::preview_swatches`].
+    #[allow(clippy::expect_used)] // "surface.window" is a real registered token
     pub fn window_background(&self) -> Rgba {
         let token = theme::token_for_key("surface.window").expect("a real registered token");
         self.overrides
@@ -753,6 +756,7 @@ pub fn compile_palette_by_name(
 /// parses, validates, and reproduces its intended palette exactly - a failure here could only mean
 /// a real, committed asset went bad, which should fail loudly rather than silently reducing the
 /// Themes page below six cards.
+#[allow(clippy::expect_used)] // panics only on a corrupt built-in asset - see doc comment above
 pub(crate) fn parse_builtin_theme_file_str(contents: &str) -> CustomTheme {
     let file = CustomThemeFile::from_toml_str(contents)
         .expect("a built-in theme file under assets/themes/ failed to parse as TOML");

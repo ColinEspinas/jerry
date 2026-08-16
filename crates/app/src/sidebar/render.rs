@@ -1455,6 +1455,7 @@ impl AdeApp {
             });
         }
         if entry.is_dir {
+            #[allow(clippy::expect_used)]
             let drop_path = AdeApp::tree_drop_target_dir(&entry.path, true)
                 .expect("a directory's own path is always its own drop target");
             let hover_path = entry.path.clone();

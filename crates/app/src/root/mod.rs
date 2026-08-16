@@ -3759,7 +3759,7 @@ impl AdeApp {
 /// must always end by moving `Window::focus` onto the overlay's own handle, and its `close_*`
 /// must always end by calling [`restore_focus`] to move focus back onto something still
 /// rendered, never leave it pointing at the now-unrendered overlay handle. This project has hit
-/// the "close_* forgot to restore" version of this bug repeatedly (see BUILD-LOG.md); this type
+/// the "close_* forgot to restore" version of this bug repeatedly; this type
 /// and [`restore_focus`] are the single consolidated fix - every overlay's open/close pair
 /// should route through them rather than hand-rolling capture/restore again.
 #[derive(Default)]

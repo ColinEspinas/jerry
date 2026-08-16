@@ -270,6 +270,7 @@ pub fn file_tree_key_context(inline_edit: bool) -> &'static str {
     }
 }
 
+#[allow(clippy::expect_used)] // every `part` is a real, parseable key context literal
 fn parsed_context_stacks() -> Vec<Vec<gpui::KeyContext>> {
     real_context_stacks()
         .into_iter()

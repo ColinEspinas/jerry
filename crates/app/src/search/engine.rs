@@ -238,7 +238,12 @@ impl Matcher {
         let mut last = 0usize;
         let mut count = 0usize;
         for captures in self.regex.captures_iter(text) {
-            let whole = captures.get(0).expect("group 0 always exists");
+            // `regex`'s own contract: group 0 is the whole match and is always present on a
+            // yielded `Captures` - but this stays a graceful skip rather than an `expect()`, since
+            // nothing here depends on that invariant holding to stay safe.
+            let Some(whole) = captures.get(0) else {
+                continue;
+            };
             if whole.start() == whole.end() {
                 continue;
             }

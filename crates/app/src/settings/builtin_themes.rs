@@ -134,6 +134,7 @@ pub fn generated_theme_file(
 /// (`crate::theme::ColorToken::default`), so its file names no colours at all - only its identity
 /// and its card preview. Writing out 270 lines that restate the defaults would be redundant, and
 /// worse, would mean two places to change if a default is ever retuned.
+#[allow(clippy::expect_used)] // a generated theme file must be valid by construction
 pub fn generate_builtin_theme_toml(source: &BuiltinThemeSource) -> String {
     let is_jerry_dark = source.swatches == jerry_dark_swatches();
     let file = if is_jerry_dark {
