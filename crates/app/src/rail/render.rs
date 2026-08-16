@@ -5549,7 +5549,7 @@ mod rail_filter_selection_tests {
         app.read_with(cx, |app, _| {
             let (bounds, shaped) = app
                 .simple_input_layout
-                .get(&gpui::SharedString::from("rail-filter-text"))
+                .get(&gpui::SharedString::from("rail-filter-caret"))
                 .expect("the filter row's own overlay must really have painted");
             gpui::point(
                 bounds.origin.x + shaped.x_for_index(offset),
@@ -5825,7 +5825,7 @@ mod rail_filter_selection_tests {
         cx.simulate_keystrokes(&secondary("a"));
         cx.run_until_parked();
 
-        let key = gpui::SharedString::from("rail-filter-text");
+        let key = gpui::SharedString::from("rail-filter-caret");
         let (start_x, end_x, width) = app.read_with(cx, |app, _| {
             let (_, shaped) = app.simple_input_layout.get(&key).expect(
                 "the filter row's own overlay must really have painted and recorded its \

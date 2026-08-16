@@ -701,7 +701,7 @@ impl AdeApp {
                 });
         }
         row.child(self.simple_input_overlay(
-            text_selector.clone(),
+            caret_selector.clone(),
             text,
             &selection,
             focus_handle,
@@ -712,7 +712,7 @@ impl AdeApp {
             cx,
         ))
         .when_some(field, |el, field| {
-            self.wire_simple_input_mouse(el, text_selector, focus_handle.cloned(), field, cx)
+            self.wire_simple_input_mouse(el, caret_selector, focus_handle.cloned(), field, cx)
         })
     }
 
@@ -1140,12 +1140,18 @@ impl Default for SimpleInputCaret {
 pub(crate) struct SimpleInput<'a> {
     /// The caret element's own `debug_selector`, so a render test can assert *where* it painted.
     /// A [`SharedString`] for the same reason [`Self::text_selector`] is one.
+    ///
+    /// Doubles as this row's key into `AdeApp::simple_input_layout` (GitHub issue #336) - the
+    /// `(bounds, ShapedLine)` pair its own overlay records every frame for click hit-testing and
+    /// for the selection quad. Keyed off *this* selector rather than [`Self::text_selector`]
+    /// specifically because a caret selector is stable for the life of a field while a text one
+    /// need not be: the commit composer's own text selector embeds the message being typed
+    /// (`commit-composer-message-{message}`, so a render test can read the painted text back),
+    /// which as a map key would add a fresh, immediately-stale entry on every keystroke.
     pub caret_selector: gpui::SharedString,
     /// The text element's `debug_selector`, for the same reason. A [`SharedString`] rather than a
     /// `&'static str` because a field that is a *row of a list* has one selector per row.
     ///
-    /// Doubles as this row's key into `AdeApp::simple_input_layout` (GitHub issue #336), which is
-    /// exactly the uniqueness this field already had to have.
     pub text_selector: gpui::SharedString,
     /// The handle the caret watches - it paints only while this one is really focused. `None`
     /// draws no caret at all, which is what a read-only row of an otherwise-editable list is.

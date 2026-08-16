@@ -1351,14 +1351,14 @@ pub struct AdeApp {
     /// inputs (GitHub issue #336): every `widgets::render_simple_input_row` captures its own real
     /// painted bounds and shaped line here each frame, and its click/drag handlers read them back
     /// to hit-test a pointer x into a real byte offset (`gpui::LineLayout::closest_index_for_x`).
-    /// Keyed by the row's own `widgets::SimpleInput::text_selector`, which is already unique per
-    /// field (per *row* for the fields that are rows of a list). Transient/best-effort in exactly
+    /// Keyed by the row's own `widgets::SimpleInput::caret_selector` - see that field's own docs
+    /// for why the caret selector rather than the text one. Transient/best-effort in exactly
     /// the same way: an entry for a field no longer on screen is simply never refreshed, and can
     /// never be read because it can't be clicked.
     pub(crate) simple_input_layout:
         HashMap<gpui::SharedString, (gpui::Bounds<Pixels>, gpui::ShapedLine)>,
     /// Which single-line input a real click-drag selection is currently in progress in - the
-    /// `text_selector` key of [`Self::simple_input_layout`], or `None` when no button is down.
+    /// `caret_selector` key of [`Self::simple_input_layout`], or `None` when no button is down.
     ///
     /// Needed because the drag has to keep extending the selection while the pointer is *outside*
     /// the field (dragging past its right edge is how a user selects to the end of a query that
