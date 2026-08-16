@@ -57,14 +57,21 @@ pty-core = { path = "../pty-core" }
 # fn canonicalize(path) { fs::canonicalize(path) }`), so this is zero behavioral change there.
 dunce = "1.0.5"
 
-# Process-tree kill (SIGTERM-then-SIGKILL, plus a `/proc` descendant sweep so a `cargo
-# check`/`rustc` child rust-analyzer spawned while indexing doesn't survive as an orphan) -
-# unix-only, mirroring `pty-core`'s own kill implementation (see `src/client.rs`'s module
-# docs for the differences: SIGTERM instead of SIGHUP, no process-group/`setsid` handling
-# since rust-analyzer is spawned as a plain `std::process::Command` child, not a pty session
-# leader). Pinned to the exact version `pty-core/Cargo.toml` already pins.
+# Process-tree kill (SIGTERM-then-SIGKILL, plus a descendant sweep so a `cargo check`/`rustc`
+# child rust-analyzer spawned while indexing doesn't survive as an orphan, and `kill(pid, 0)`
+# as the liveness check the grace loop polls) - unix-only, mirroring `pty-core`'s own kill
+# implementation (see `src/client.rs`'s module docs for the differences: SIGTERM instead of
+# SIGHUP, no process-group/`setsid` handling since rust-analyzer is spawned as a plain
+# `std::process::Command` child, not a pty session leader). Pinned to the exact version
+# `pty-core/Cargo.toml` already pins.
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.28", default-features = false, features = ["fs", "poll", "signal"] }
+
+# macOS only, and for the exact same reason as `pty-core/Cargo.toml`'s own entry: `/proc` does
+# not exist there, so `crate::proc::child_pids_of`'s descendant walk goes through `libproc`'s
+# `proc_listchildpids` instead. Already resolved in this workspace's lock file.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
