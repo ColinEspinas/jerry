@@ -1187,10 +1187,16 @@ fn terminate_process_tree(root_pid: u32, grace: Duration) {
 }
 
 #[cfg(test)]
-mod tests {
+mod pty_session_tests {
     use super::*;
     use std::sync::mpsc::RecvTimeoutError;
     use std::time::{Duration, Instant};
+
+    /// How long a real child process is given to reach a state before a test calls it a
+    /// failure. Generous: it has to survive a full-suite run where other tests' own child
+    /// processes are competing for the same cores. `test_support::wait_until` returns as soon as
+    /// the condition holds, so an idle machine pays none of it.
+    const TEARDOWN_DEADLINE: Duration = Duration::from_secs(5);
 
     /// Reads from `session.output()` until `needle` appears in the accumulated (lossy
     /// UTF-8) output or `timeout` elapses, returning whatever was collected either way.
@@ -1311,8 +1317,10 @@ mod tests {
                 Ok(chunk) => {
                     collected.extend_from_slice(&chunk);
                     received += 1;
-                    // See the doc comment: this pause is what makes the channel actually fill
-                    // and the reader thread actually block, which is the path under test.
+                    // Not a wait, so `docs/testing.md`'s no-sleep rule does not reach it:
+                    // this is the test's *stimulus*. Stalling the consumer is the only way to
+                    // make the bounded channel actually fill and the reader thread actually
+                    // block in `send`, which is the path under test.
                     if received.is_multiple_of(OUTPUT_CHANNEL_CAPACITY) {
                         std::thread::sleep(Duration::from_millis(5));
                     }
@@ -1358,12 +1366,16 @@ mod tests {
             "this very test process is unambiguously alive"
         );
 
-        let mut child = std::process::Command::new("true")
+        // `ChildGuard` even though this child is expected to exit on its own and is reaped
+        // explicitly below: if the assertion above ever fails, the unwind must still not leave a
+        // process behind (`docs/testing.md`'s teardown rule).
+        let mut command = std::process::Command::new("true");
+        command
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawning `true` should succeed");
+            .stderr(std::process::Stdio::null());
+        let mut child =
+            test_support::ChildGuard::spawn(&mut command).expect("spawning `true` should succeed");
         let pid = child.id();
         child.wait().expect("reaping `true` should succeed");
 
@@ -1392,15 +1404,11 @@ mod tests {
 
         drop(session);
 
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while pid_exists(pid) {
-            assert!(
-                Instant::now() < deadline,
-                "child pid {pid} was still alive {:?} after PtySession was dropped - orphaned process",
-                deadline.elapsed()
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        assert!(
+            test_support::wait_until(TEARDOWN_DEADLINE, || !pid_exists(pid)),
+            "child pid {pid} was still alive {TEARDOWN_DEADLINE:?} after PtySession was dropped \
+             - orphaned process"
+        );
     }
 
     // unix-only: uses pid_exists/is_executable directly, which are #[cfg(unix)]
@@ -1453,15 +1461,12 @@ mod tests {
 
         drop(session);
 
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while pid_exists(direct_pid) || pid_exists(grandchild_pid) {
-            assert!(
-                Instant::now() < deadline,
-                "direct child ({direct_pid}) or its escaped grandchild ({grandchild_pid}) was \
-                 still alive after PtySession was dropped - orphaned process"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        assert!(
+            test_support::wait_until(TEARDOWN_DEADLINE, || !pid_exists(direct_pid)
+                && !pid_exists(grandchild_pid)),
+            "direct child ({direct_pid}) or its escaped grandchild ({grandchild_pid}) was still \
+             alive {TEARDOWN_DEADLINE:?} after PtySession was dropped - orphaned process"
+        );
     }
 
     // unix-only: uses pid_exists/is_executable directly, which are #[cfg(unix)]
@@ -1507,46 +1512,34 @@ mod tests {
             .process_id()
             .expect("a spawned unix child should report a pid");
 
+        let steady = |pid| {
+            let state = proc_state(pid);
+            state.starts_with('S') || state.starts_with('R')
+        };
+
         // Give the kernel a moment to settle the freshly spawned process into a steady
         // running/sleeping state before asserting anything about it.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !proc_state(pid).starts_with('S') && !proc_state(pid).starts_with('R') {
-            assert!(
-                Instant::now() < deadline,
-                "process never reached a steady state"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        assert!(
+            test_support::wait_until(TEARDOWN_DEADLINE, || steady(pid)),
+            "process {pid} never reached a steady state - last observed state: {:?}",
+            proc_state(pid)
+        );
 
         session.pause().expect("pause should succeed");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let state = proc_state(pid);
-            if state.starts_with('T') {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "process {pid} never reached the real kernel-reported stopped state \
-                 (State: T) after pause() - last observed state: {state:?}"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        assert!(
+            test_support::wait_until(TEARDOWN_DEADLINE, || proc_state(pid).starts_with('T')),
+            "process {pid} never reached the real kernel-reported stopped state (State: T) after \
+             pause() - last observed state: {:?}",
+            proc_state(pid)
+        );
 
         session.resume().expect("resume should succeed");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let state = proc_state(pid);
-            if state.starts_with('S') || state.starts_with('R') {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "process {pid} never left the real kernel-reported stopped state after \
-                 resume() - last observed state: {state:?}"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        assert!(
+            test_support::wait_until(TEARDOWN_DEADLINE, || steady(pid)),
+            "process {pid} never left the real kernel-reported stopped state after resume() - \
+             last observed state: {:?}",
+            proc_state(pid)
+        );
     }
 
     /// GitHub issue #242 phase B fix: an earlier version of `pause`/`resume` sent a plain
@@ -1570,18 +1563,11 @@ mod tests {
         }
 
         fn wait_for_state(pid: u32, prefix: char, what: &str) {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                let state = proc_state(pid);
-                if state.starts_with(prefix) {
-                    return;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "process {pid} never reached {what} - last observed state: {state:?}"
-                );
-                std::thread::sleep(Duration::from_millis(20));
-            }
+            assert!(
+                test_support::wait_until(TEARDOWN_DEADLINE, || proc_state(pid).starts_with(prefix)),
+                "process {pid} never reached {what} - last observed state: {:?}",
+                proc_state(pid)
+            );
         }
 
         let session = spawn(
@@ -1623,15 +1609,13 @@ mod tests {
     #[test]
     fn pause_and_resume_are_a_harmless_no_op_once_the_child_has_already_exited() {
         let mut session = spawn(SpawnOptions::new("true")).expect("spawning `true`");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while session
-            .try_wait()
-            .expect("try_wait should not error")
-            .is_none()
-        {
-            assert!(Instant::now() < deadline, "`true` never exited");
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        assert!(
+            test_support::wait_until(TEARDOWN_DEADLINE, || session
+                .try_wait()
+                .expect("try_wait should not error")
+                .is_some()),
+            "`true` never exited"
+        );
         session
             .pause()
             .expect("pause on an already-exited child must be a harmless no-op");
@@ -1696,15 +1680,17 @@ mod tests {
         // thread blocks in `send` once the channel fills, which backpressures its
         // `read`, which fills the kernel pty buffer, which blocks `yes`'s `write` - so
         // growth should stay small and bounded.
-        std::thread::sleep(Duration::from_millis(500));
-        let rss_after = read_self_rss_kb();
-
-        let growth_kb = rss_after.saturating_sub(rss_before);
+        //
+        // `stays_false` rather than a bare sleep-then-measure: it holds the same 500ms window
+        // open while asserting the bound *continuously*, so a transient spike is caught too.
         assert!(
-            growth_kb < 20_000,
-            "RSS grew by {growth_kb} kB while an undrained `yes` pipe ran for 500ms - \
-             the output channel does not appear to be backpressuring (expected growth \
-             bounded by the channel capacity, well under 20MB)"
+            test_support::stays_false(Duration::from_millis(500), || {
+                read_self_rss_kb().saturating_sub(rss_before) >= 20_000
+            }),
+            "RSS grew by {} kB while an undrained `yes` pipe ran for 500ms - the output channel \
+             does not appear to be backpressuring (expected growth bounded by the channel \
+             capacity, well under 20MB)",
+            read_self_rss_kb().saturating_sub(rss_before)
         );
     }
 

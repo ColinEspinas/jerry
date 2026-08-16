@@ -212,7 +212,7 @@ impl OscWatcher {
 }
 
 #[cfg(test)]
-mod tests {
+mod osc_signal_tests {
     use super::*;
 
     fn watch(bytes: &[u8]) -> OscWatcher {
@@ -221,77 +221,80 @@ mod tests {
         watcher
     }
 
+    /// Every real spelling of "the agent wants the human", and the near-misses that share its
+    /// prefix. OSC can be terminated by BEL *or* by ST (`ESC \`) - real senders use both - and
+    /// OSC 777 carries non-notification sub-commands only one of which is an attention request.
     #[test]
-    fn a_bare_osc_9_notification_pings_for_attention_once() {
-        let mut watcher = watch(b"\x1b]9;Claude needs your permission\x07");
-        assert!(watcher.take_attention_ping());
-        assert!(
-            !watcher.take_attention_ping(),
-            "the ping is a point-in-time event and must not re-fire on a second read"
-        );
+    fn only_a_real_attention_request_pings_and_it_pings_exactly_once() {
+        for (bytes, expected) in [
+            (b"\x1b]9;Claude needs your permission\x07".as_slice(), true),
+            (b"\x1b]9;done\x1b\\".as_slice(), true),
+            (
+                b"\x1b]777;notify;Gemini;waiting on you\x07".as_slice(),
+                true,
+            ),
+            (b"\x1b]777;precmd;0\x07".as_slice(), false),
+            (b"\x1b]9\x07".as_slice(), false),
+            (b"\x1b]9;4;1;42\x07".as_slice(), false),
+        ] {
+            let mut watcher = watch(bytes);
+            assert_eq!(
+                watcher.take_attention_ping(),
+                expected,
+                "{bytes:?} must {}ping for attention",
+                if expected { "" } else { "not " }
+            );
+            assert!(
+                !watcher.take_attention_ping(),
+                "the ping is a point-in-time event and must not re-fire on a second read"
+            );
+        }
     }
 
+    /// The OSC 9;4 progress vocabulary, whole: each documented state, the percentage rules, and
+    /// the reports that define no progress at all.
     #[test]
-    fn an_st_terminated_osc_9_also_pings() {
-        // OSC can be terminated by BEL *or* by ST (`ESC \`); real senders use both.
-        let mut watcher = watch(b"\x1b]9;done\x1b\\");
-        assert!(watcher.take_attention_ping());
-    }
-
-    #[test]
-    fn osc_777_notify_pings_but_other_777_subcommands_do_not() {
-        let mut watcher = watch(b"\x1b]777;notify;Gemini;waiting on you\x07");
-        assert!(watcher.take_attention_ping());
-
-        let mut watcher = watch(b"\x1b]777;precmd;0\x07");
-        assert!(
-            !watcher.take_attention_ping(),
-            "OSC 777 has non-notification sub-commands; only `notify` is an attention request"
-        );
-    }
-
-    #[test]
-    fn osc_9_4_is_progress_not_a_notification() {
-        let mut watcher = watch(b"\x1b]9;4;1;42\x07");
-        assert_eq!(
-            watcher.progress(),
+    fn every_progress_report_parses_to_its_documented_meaning() {
+        let normal = |percent| {
             Some(Progress {
                 state: ProgressState::Normal,
-                percent: Some(42)
+                percent,
             })
-        );
-        assert!(
-            !watcher.take_attention_ping(),
-            "a progress report is not a request for the human's attention"
-        );
-    }
-
-    #[test]
-    fn every_progress_state_parses_to_its_documented_meaning() {
-        assert_eq!(watch(b"\x1b]9;4;0;0\x07").progress(), None);
-        assert_eq!(
-            watch(b"\x1b]9;4;2;80\x07").progress(),
-            Some(Progress {
-                state: ProgressState::Error,
-                percent: Some(80)
-            })
-        );
-        assert_eq!(
-            watch(b"\x1b]9;4;3;0\x07").progress(),
-            Some(Progress {
-                state: ProgressState::Indeterminate,
-                percent: None
-            }),
-            "indeterminate defines no percentage - reporting the sender's filler 0 as \"0% done\" \
-             would be inventing a fact"
-        );
-        assert_eq!(
-            watch(b"\x1b]9;4;4;33\x07").progress(),
-            Some(Progress {
-                state: ProgressState::Paused,
-                percent: Some(33)
-            })
-        );
+        };
+        for (bytes, expected) in [
+            (b"\x1b]9;4;1;42\x07".as_slice(), normal(Some(42))),
+            // Clamped, and an unparseable percentage is absent rather than zero.
+            (b"\x1b]9;4;1;999\x07".as_slice(), normal(Some(100))),
+            (b"\x1b]9;4;1;abc\x07".as_slice(), normal(None)),
+            (
+                b"\x1b]9;4;2;80\x07".as_slice(),
+                Some(Progress {
+                    state: ProgressState::Error,
+                    percent: Some(80),
+                }),
+            ),
+            // Indeterminate defines no percentage - reporting the sender's filler 0 as "0% done"
+            // would be inventing a fact.
+            (
+                b"\x1b]9;4;3;0\x07".as_slice(),
+                Some(Progress {
+                    state: ProgressState::Indeterminate,
+                    percent: None,
+                }),
+            ),
+            (
+                b"\x1b]9;4;4;33\x07".as_slice(),
+                Some(Progress {
+                    state: ProgressState::Paused,
+                    percent: Some(33),
+                }),
+            ),
+            (b"\x1b]9;4;0;0\x07".as_slice(), None),
+            (b"\x1b]9;4;7;50\x07".as_slice(), None),
+            (b"\x1b]9;4\x07".as_slice(), None),
+        ] {
+            assert_eq!(watch(bytes).progress(), expected, "parsing {bytes:?}");
+        }
     }
 
     #[test]
@@ -302,40 +305,17 @@ mod tests {
         assert!(!ProgressState::Paused.is_active());
     }
 
+    /// Progress is live state, not an append-only log: a later report replaces an earlier one,
+    /// and a clear report really clears it.
     #[test]
-    fn a_clear_report_clears_an_earlier_progress() {
-        let mut watcher = OscWatcher::default();
-        watcher.feed(b"\x1b]9;4;1;50\x07");
-        assert!(watcher.progress().is_some());
-        watcher.feed(b"\x1b]9;4;0\x07");
-        assert_eq!(watcher.progress(), None);
-    }
-
-    #[test]
-    fn a_later_progress_report_supersedes_an_earlier_one() {
+    fn a_later_progress_report_supersedes_an_earlier_one_and_a_clear_wipes_it() {
         let mut watcher = OscWatcher::default();
         watcher.feed(b"\x1b]9;4;1;10\x07");
         watcher.feed(b"\x1b]9;4;1;90\x07");
         assert_eq!(watcher.progress().and_then(|p| p.percent), Some(90));
-    }
 
-    #[test]
-    fn a_percentage_above_100_is_clamped_and_a_junk_one_is_dropped() {
-        assert_eq!(
-            watch(b"\x1b]9;4;1;999\x07").progress().unwrap().percent,
-            Some(100)
-        );
-        assert_eq!(
-            watch(b"\x1b]9;4;1;abc\x07").progress().unwrap().percent,
-            None,
-            "an unparseable percentage is absent, not zero"
-        );
-    }
-
-    #[test]
-    fn an_out_of_range_progress_state_is_ignored_entirely() {
-        assert_eq!(watch(b"\x1b]9;4;7;50\x07").progress(), None);
-        assert_eq!(watch(b"\x1b]9;4\x07").progress(), None);
+        watcher.feed(b"\x1b]9;4;0\x07");
+        assert_eq!(watcher.progress(), None);
     }
 
     #[test]
@@ -363,11 +343,5 @@ mod tests {
             watcher.feed(chunk);
         }
         assert_eq!(watcher.progress().and_then(|p| p.percent), Some(77));
-    }
-
-    #[test]
-    fn a_bare_osc_9_with_no_message_is_not_a_notification() {
-        let mut watcher = watch(b"\x1b]9\x07");
-        assert!(!watcher.take_attention_ping());
     }
 }
