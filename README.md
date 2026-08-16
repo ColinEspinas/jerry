@@ -178,8 +178,7 @@ actually done. Rebase interactively when you want to tidy up before merging.
 
 Jerry runs the CLI **you** installed, in the session's worktree — your auth, your config, your
 version. It doesn't bundle, wrap or proxy anything, and **Settings › Agents** tells you whether each
-one is on your `PATH`. Claude Code goes further than the rest: it reports its own state, and past
-conversations can be resumed from where they stopped.
+one is on your `PATH`.
 
 **More are coming.** Any coding agent that runs in a terminal fits this model, and the goal is to
 work with all of them. If yours is missing, [open an issue](../../issues/new) — that's how it gets
