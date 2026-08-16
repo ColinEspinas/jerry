@@ -1993,31 +1993,35 @@ mod search_virtualization_tests {
 /// `SimpleInput` row, the same three-state count. GitHub issue #162's own instruction for the
 /// unspecced half: "match the panel's vocabulary rather than inventing a new one."
 impl AdeApp {
-    /// `mod+F` - opens the bar over the focused file view and puts the caret in it, or, if it is
-    /// already open, re-focuses it (the same "press it again to get back to the field" behaviour
-    /// every editor's find has).
+    /// `mod+F` - a real toggle, same idiom as [`Self::handle_toggle_palette_action`]: opens the
+    /// bar over the focused file view and puts the caret in it if it is closed, closes it (same
+    /// as `Escape`) if it is already open. GitHub issue #379 - the first cut only ever opened
+    /// (or re-focused) it, so a second `mod+F` press could not close it the way every other
+    /// toggle shortcut in this app does.
     pub(crate) fn handle_find_in_file_action(
         &mut self,
         _: &FindInFile,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.find_bar.is_some() {
+            self.close_find_bar(window, cx);
+            return;
+        }
         // Only over a real editable File view. There is no honest subject otherwise: the Diff
         // view is two files side by side, and a bar claiming to find "in this file" over it would
         // have to pick one silently.
         if self.active_editable_path().is_none() {
             return;
         }
-        if self.find_bar.is_none() {
-            self.find_bar = Some(crate::search::in_file::FindBar::new(
-                self.find_bar_focus_handle.clone(),
-            ));
-        }
+        self.find_bar = Some(crate::search::in_file::FindBar::new(
+            self.find_bar_focus_handle.clone(),
+        ));
         self.refresh_find_bar();
         let handle = self
             .find_bar
             .as_ref()
-            .expect("just created or already present")
+            .expect("just created above")
             .focus_handle
             .clone();
         window.focus(&handle, cx);
@@ -2296,6 +2300,23 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         let keystroke = &event.keystroke;
+        // `mod+F` toggles the bar closed from right inside its own field. It can't be caught by
+        // the normal `FindInFile` action/keybinding dispatch the way a second press over the
+        // editor is (`Self::handle_find_in_file_action`): this node deliberately sits outside the
+        // `"file-editor"` context that binding is scoped to (see
+        // `crate::code_surface::render`'s `render_code_surface` for the sibling-not-child docs
+        // explaining why), so `secondary-f` typed into the field never reaches that binding at
+        // all - it has to be caught here, the same way `Escape` already is, and closed through
+        // the same `close_find_bar`.
+        if keystroke.modifiers.secondary()
+            && !keystroke.modifiers.alt
+            && !keystroke.modifiers.shift
+            && keystroke.key == "f"
+        {
+            self.close_find_bar(window, cx);
+            cx.stop_propagation();
+            return;
+        }
         if keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.alt {
             return;
         }
@@ -2387,6 +2408,61 @@ mod find_bar_tests {
             (window.focused(cx), app.find_bar_focus_handle.clone())
         });
         assert_eq!(focused.as_ref(), Some(&handle));
+    }
+
+    /// `crate::default_key_bindings`' own `"secondary-f"` (GitHub issue #162), resolved the same
+    /// way `crate::root::focus::tabless_window_keybinding_tests::SECONDARY_P` resolves its own
+    /// binding.
+    const SECONDARY_F: &str = if cfg!(target_os = "macos") {
+        "cmd-f"
+    } else {
+        "ctrl-f"
+    };
+
+    /// GitHub issue #379: the first cut only ever opened (or re-focused) the bar, so a second
+    /// `mod+F` press could not close it - unlike every other toggle shortcut in this app (e.g.
+    /// `secondary-p` / `TogglePalette`). Drives the real keybinding, not `FindInFile` dispatched
+    /// directly, for the same reason `tabless_window_keybinding_tests` does: a direct dispatch
+    /// would miss a bug in which *keystroke* the action is actually reachable by.
+    #[gpui::test]
+    fn mod_f_toggles_the_bar_closed_on_a_second_press(cx: &mut TestAppContext) {
+        let (_repo, app, cx) = repo_with_open_file(cx);
+        cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
+        assert!(
+            cx.debug_bounds("find-bar").is_none(),
+            "premise: the bar is closed before the first press"
+        );
+
+        cx.simulate_keystrokes(SECONDARY_F);
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("find-bar").is_some(),
+            "the first press must really open it"
+        );
+        app.read_with(cx, |app, _| assert!(app.find_bar.is_some()));
+
+        cx.simulate_keystrokes(SECONDARY_F);
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.find_bar.is_none(),
+                "a second mod+F press over an already-open bar must close it - the same toggle \
+                 idiom TogglePalette already uses"
+            )
+        });
+        assert!(
+            cx.debug_bounds("find-bar").is_none(),
+            "closed in state but still painted is not really closed"
+        );
+        let (focused, code_handle) = app.update_in(cx, |app, window, cx| {
+            (window.focused(cx), app.code_focus_handle.clone())
+        });
+        assert_eq!(
+            focused.as_ref(),
+            Some(&code_handle),
+            "closing via the toggle must hand focus back to the editor, same as Escape"
+        );
     }
 
     #[gpui::test]
