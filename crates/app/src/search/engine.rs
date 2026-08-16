@@ -1507,9 +1507,9 @@ mod worktree_tests {
 
     #[test]
     fn a_symlink_is_never_followed_so_a_loop_cannot_make_the_walk_unbounded() {
-        let dir = fixture();
         #[cfg(unix)]
         {
+            let dir = fixture();
             std::os::unix::fs::symlink(dir.path(), dir.path().join("loop"))
                 .expect("a real symlink back to the root");
             let outcome = run(
