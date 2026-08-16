@@ -248,6 +248,53 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
         gpui::KeyBinding::new("secondary-z", root::TextUndo, Some("text-input")),
         gpui::KeyBinding::new("secondary-shift-z", root::TextRedo, Some("text-input")),
         gpui::KeyBinding::new("ctrl-y", root::TextRedo, Some("text-input")),
+        // GitHub issue #336 ("Text inputs do not have selection and standard copy/paste/cut"),
+        // scoped `Some("text-input")` for exactly the reasons `TextUndo`/`TextRedo` above already
+        // are - the one shared context tag every real single-line input in this app carries, and
+        // nothing else does.
+        //
+        // Deliberately *not* `None`: `secondary-c`/`secondary-x`/`secondary-v` at global scope
+        // would claim the control bytes `crate::terminal::pane::keystroke_to_bytes` hands a
+        // focused shell (Ctrl+C is SIGINT - binding it globally would risk making it impossible to
+        // interrupt a running agent CLI), the exact bug class this list's own file-tree entries
+        // below already document at length.
+        //
+        // `&& !file-editor && !merge-editor` is load-bearing, and is the same `&& !` discipline
+        // `"file-editor && !completions"` and `"diff && !file-editor"` above already established.
+        // The code surface and the merge hand-edit surface both carry `"text-input"` *in the same
+        // context frame* as their own tag (`crate::keymap_overrides::real_context_stacks`'
+        // `"diff file-editor text-input"` and `"merge-editor text-input"`) - deliberately, so
+        // `TextUndo`/`TextRedo` above reach their real `EditBuffer` history. Without these two
+        // exclusions, `secondary-c` on those stacks would match `EditorCopy` *and* `TextCopy` at
+        // exactly the same predicate depth, leaving which one actually fires to registration
+        // order - precisely the "keystroke reaches the wrong handler" bug class this list's own
+        // docs count seven-plus instances of. Those two surfaces already have real, richer
+        // clipboard handling of their own (`crate::code_surface::editing`'s `Editor*` actions over
+        // a full `EditBuffer`), so the exclusion loses nothing.
+        //
+        // `undo_scoping_matrix_tests::secondary_c_reaches_text_copy_in_exactly_the_simple_input_
+        // contexts` asserts that as predicate logic against every real context stack, rather than
+        // leaving it as a claim here.
+        gpui::KeyBinding::new(
+            "secondary-c",
+            root::TextCopy,
+            Some("text-input && !file-editor && !merge-editor"),
+        ),
+        gpui::KeyBinding::new(
+            "secondary-x",
+            root::TextCut,
+            Some("text-input && !file-editor && !merge-editor"),
+        ),
+        gpui::KeyBinding::new(
+            "secondary-v",
+            root::TextPaste,
+            Some("text-input && !file-editor && !merge-editor"),
+        ),
+        gpui::KeyBinding::new(
+            "secondary-a",
+            root::TextSelectAll,
+            Some("text-input && !file-editor && !merge-editor"),
+        ),
         gpui::KeyBinding::new("f12", root::GotoDefinition, None),
         gpui::KeyBinding::new("ctrl-shift-t", root::NewTerminal, None),
         gpui::KeyBinding::new("secondary-shift-n", root::NewAgentPane, None),

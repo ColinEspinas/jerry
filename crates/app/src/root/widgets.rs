@@ -1,4 +1,7 @@
 use super::*;
+use std::ops::Range;
+use std::rc::Rc;
+
 use crate::icon_pack;
 use crate::work_surface::agents::ProcessKind;
 
@@ -439,6 +442,17 @@ impl AdeApp {
     /// surrounding `render_*` call chain's own signatures carry. Mirrors `caret_paint_quad`'s own
     /// rule exactly (GitHub issue #107): focused *and* blink-visible paints solid, anything else -
     /// focused-but-blinked-off, or simply unfocused - paints nothing at all.
+    ///
+    /// GitHub issue #336 made the bar **zero-width in flow**: a `w(px(0.))` `relative()` anchor
+    /// holding an `absolute()` 1.5px child. That is a real fix, not a stylistic change. As an
+    /// ordinary `flex_none().w(px(1.5))` flex item between the text before and after it, the bar
+    /// displaced the trailing half of a line 1.5px to the right whenever the caret was in the
+    /// middle of it - visible as the text jittering sideways while arrowing through it, and, once
+    /// #336 added real click-to-position hit-testing, a systematic ~1.5px disagreement between
+    /// where the glyphs are painted and where the `gpui::ShapedLine` the row hit-tests against
+    /// says they are. Out of flow, the text is one contiguous run again, exactly as that shaping
+    /// assumes - and the anchor still sits at precisely the caret's own boundary, so every
+    /// existing `debug_bounds` caret-position test measures the same x it always did.
     pub(crate) fn render_simple_input_caret(
         &self,
         selector: impl Into<gpui::SharedString>,
@@ -454,24 +468,38 @@ impl AdeApp {
         let selector = selector.into();
         div()
             .flex_none()
-            .w(px(1.5))
+            .w(px(0.0))
             .h(px(14.0))
-            .debug_selector(move || selector.to_string())
+            .relative()
             .child(
-                gpui::canvas(
-                    move |bounds, window, _cx| {
-                        let is_focused = focus_handle.is_focused(window);
-                        simple_input_caret_opacity(is_focused, caret_blink_visible).map(|opacity| {
-                            gpui::fill(bounds, theme::term::CURSOR.resolve().opacity(opacity))
-                        })
-                    },
-                    |_bounds, quad, window, _cx| {
-                        if let Some(quad) = quad {
-                            window.paint_quad(quad);
-                        }
-                    },
-                )
-                .size_full(),
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .w(px(1.5))
+                    .h(px(14.0))
+                    .debug_selector(move || selector.to_string())
+                    .child(
+                        gpui::canvas(
+                            move |bounds, window, _cx| {
+                                let is_focused = focus_handle.is_focused(window);
+                                simple_input_caret_opacity(is_focused, caret_blink_visible).map(
+                                    |opacity| {
+                                        gpui::fill(
+                                            bounds,
+                                            theme::term::CURSOR.resolve().opacity(opacity),
+                                        )
+                                    },
+                                )
+                            },
+                            |_bounds, quad, window, _cx| {
+                                if let Some(quad) = quad {
+                                    window.paint_quad(quad);
+                                }
+                            },
+                        )
+                        .size_full(),
+                    ),
             )
     }
 
@@ -517,38 +545,80 @@ impl AdeApp {
     /// right edge", and a wrapper containing the caret would enclose it and make that assertion
     /// unsatisfiable by construction.
     ///
+    /// ## Selection, and the two shapes this row really has (GitHub issue #336)
+    ///
+    /// With [`SimpleInput::selection`] collapsed - every field's ordinary state - the structure is
+    /// exactly the one described above: a leading span, the caret, a trailing span. With a real,
+    /// non-collapsed selection there is **no caret at all** and the text is **one** span, with the
+    /// selected range painted as a real quad behind it by the same `gpui::canvas` overlay that
+    /// does this row's hit-testing. That is not two ways of doing the same thing, it is what makes
+    /// both correct:
+    ///
+    /// - The selection quad's edges come from `gpui::ShapedLine::x_for_index` over the whole line
+    ///   shaped **once**. That is only pixel-accurate if the visible glyphs really are one
+    ///   contiguous run, which is why the selected state does not split the text into spans -
+    ///   GitHub issue #170's own measured lesson, that independently-shaped adjacent text elements
+    ///   drift, applied to this row.
+    /// - The caret's position, in the collapsed state, comes from real flex layout rather than
+    ///   from that shaping - pixel-exact by construction, and unchanged from the structure every
+    ///   existing caret-position test in this app already measures.
+    ///
+    /// Hiding the caret while a selection is up is also simply what every real text input does,
+    /// and matches both `vendor/zed/crates/gpui/examples/input.rs` (`if selected_range.is_empty()`
+    /// gates its own cursor quad) and this app's own
+    /// `crate::code_surface::edit_buffer::EditBuffer::cursor_within_line`.
+    ///
+    /// ## Mouse
+    ///
+    /// Passing a [`SimpleInput::field`] handle is what turns the row into a really *pointer*-
+    /// editable one: click to place the caret, drag to select, double-click to select the word,
+    /// Shift+click to extend. It is optional because a genuinely read-only row (a pinned note card
+    /// that is not the one being typed into) must not respond to any of that; those pass `None`,
+    /// exactly as they already pass `focus_handle: None` to suppress the caret.
+    ///
     /// The caller still owns the box *around* this row - its border, padding, height and
     /// background - because that genuinely differs per field. What it no longer owns is the part
     /// that was never supposed to differ.
-    pub(crate) fn render_simple_input_row(&self, input: SimpleInput<'_>) -> impl IntoElement {
+    pub(crate) fn render_simple_input_row(
+        &self,
+        input: SimpleInput<'_>,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let SimpleInput {
             caret_selector,
             text_selector,
             focus_handle,
             text,
             caret_offset,
+            selection,
             placeholder,
             font: font_name,
             text_size,
             text_color,
             placeholder_color,
+            field,
         } = input;
         // "Blank" by the same rule every caller used: nothing typed at all. A field holding only
         // spaces is holding real text and shows it, with the caret after it.
         let is_blank = text.is_empty();
-        // Clamped and re-aligned to a real `char` boundary here as well as in `TextField`: this
-        // helper also serves callers that pass an offset from somewhere else, and slicing a
-        // `&str` mid-character panics.
-        let split_at = (0..=text.len())
-            .rev()
-            .find(|offset| *offset <= caret_offset && text.is_char_boundary(*offset))
-            .unwrap_or(0);
-        let (before_caret, after_caret) = text.split_at(split_at);
-        let leading = if is_blank {
-            placeholder.to_string()
-        } else {
-            before_caret.to_string()
+        // Clamped and re-aligned to real `char` boundaries here as well as in `TextField`: this
+        // helper also serves callers that pass offsets from somewhere else, and slicing a `&str`
+        // mid-character panics.
+        let clamp = |offset: usize| -> usize {
+            (0..=text.len())
+                .rev()
+                .find(|candidate| *candidate <= offset && text.is_char_boundary(*candidate))
+                .unwrap_or(0)
         };
+        let selection = clamp(selection.start)..clamp(selection.end);
+        let selection = if selection.start <= selection.end {
+            selection
+        } else {
+            selection.end..selection.start
+        };
+        let has_selection = !selection.is_empty();
+        let split_at = clamp(caret_offset);
+        let (before_caret, after_caret) = text.split_at(split_at);
         // `None` is a genuinely read-only row - a pinned note card that is not the one being
         // typed into, say. It cannot be expressed by passing a handle that happens to be
         // unfocused: several of these rows can be on screen sharing *one* focus handle (only one
@@ -575,31 +645,448 @@ impl AdeApp {
                 .text_color(color)
                 .child(content)
         };
-        div()
-            // On the wrapper, which is the whole point - see this method's own docs.
+        let mut row = div()
+            // On the wrapper, which is the whole point - see this method's own docs. `.relative()`
+            // is what the `.absolute()` hit-test/selection overlay below positions against.
+            .relative()
             .flex_1()
             .min_w_0()
             .flex()
-            .items_center()
-            .when(is_blank, caret)
-            .child(
-                span(
-                    leading,
-                    if is_blank {
-                        placeholder_color
-                    } else {
-                        text_color
-                    },
+            .items_center();
+        if has_selection {
+            // One span, so the shaped line the overlay measures the selection quad from really
+            // does describe the glyphs on screen - see this method's own docs.
+            row = row.child(
+                span(text.to_string(), text_color)
+                    .debug_selector({
+                        let selector = text_selector.clone();
+                        move || selector.to_string()
+                    }),
+            );
+        } else {
+            let leading = if is_blank {
+                placeholder.to_string()
+            } else {
+                before_caret.to_string()
+            };
+            row = row
+                .when(is_blank, caret)
+                .child(
+                    span(
+                        leading,
+                        if is_blank {
+                            placeholder_color
+                        } else {
+                            text_color
+                        },
+                    )
+                    .debug_selector({
+                        let selector = text_selector.clone();
+                        move || selector.to_string()
+                    }),
                 )
-                .debug_selector(move || text_selector.to_string()),
-            )
-            .when(!is_blank, caret)
-            // Only when there really is text after the caret, so a field with the caret at its end
-            // paints the exact element tree it painted before this method knew about carets.
-            .when(!is_blank && !after_caret.is_empty(), |el| {
-                el.child(span(after_caret.to_string(), text_color))
-            })
+                .when(!is_blank, caret)
+                // Only when there really is text after the caret, so a field with the caret at its
+                // end paints the exact element tree it painted before this method knew about
+                // carets.
+                .when(!is_blank && !after_caret.is_empty(), |el| {
+                    el.child(span(after_caret.to_string(), text_color))
+                });
+        }
+        row.child(self.simple_input_overlay(
+            text_selector.clone(),
+            text,
+            &selection,
+            focus_handle,
+            font_name,
+            text_size,
+            text_color,
+            field.clone(),
+            cx,
+        ))
+        .when_some(field, |el, field| {
+            self.wire_simple_input_mouse(el, text_selector, focus_handle.cloned(), field, cx)
+        })
     }
+
+    /// This row's real measurement/paint overlay: shapes the visible line **once**, paints the
+    /// selection quad from it, records `(bounds, ShapedLine)` into
+    /// [`AdeApp::simple_input_layout`] for the click handlers to hit-test against, and (while a
+    /// drag is live) registers the window-wide move/up listeners that keep extending it.
+    ///
+    /// `.absolute().size_full()` inside the `.relative()` row, the same proven idiom
+    /// `crate::code_surface::editing::render_editable_file_view_line`'s own cursor overlay uses: a
+    /// `gpui::canvas` contributes no intrinsic content size to GPUI's layout pass, so it must never
+    /// be the thing that sizes a row - as an absolutely-positioned child it simply fills whatever
+    /// box the real, in-flow text already resolved to.
+    #[allow(clippy::too_many_arguments)]
+    fn simple_input_overlay(
+        &self,
+        layout_key: gpui::SharedString,
+        text: &str,
+        selection: &Range<usize>,
+        focus_handle: Option<&FocusHandle>,
+        font_name: &'static str,
+        text_size: Pixels,
+        text_color: theme::ColorToken,
+        field: Option<TextFieldHandle>,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let entity = cx.entity();
+        let shaped_text: gpui::SharedString = text.to_string().into();
+        let run_font = font(font_name);
+        let selection = selection.clone();
+        let focus_handle = focus_handle.cloned();
+        let paint_key = layout_key.clone();
+        gpui::canvas(
+            move |bounds, window, _cx| {
+                // One run covering the whole line: these rows paint their text in a single colour
+                // (no syntax highlighting), so a single run is not a simplification - it is
+                // exactly what the visible spans above are. `TextRun::len` must cover every byte
+                // or `shape_line` silently shapes only the prefix and `x_for_index` answers with
+                // the short line's width for everything past it (see
+                // `crate::code_surface::editing::force_runs_to_cover`'s own docs).
+                let run = gpui::TextRun {
+                    len: shaped_text.len(),
+                    font: run_font.clone(),
+                    color: text_color.resolve().into(),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let shaped =
+                    window
+                        .text_system()
+                        .shape_line(shaped_text.clone(), text_size, &[run], None);
+                // GitHub issue #27's "selection remains visible (dimmed) when the editor loses
+                // focus", read from the same real, live focus check the caret uses - the same two
+                // tokens `crate::code_surface::editing` already paints a selection with, rather
+                // than a second, independently-chosen colour for the same concept.
+                let is_focused = focus_handle
+                    .as_ref()
+                    .is_some_and(|handle| handle.is_focused(window));
+                let quad = (!selection.is_empty()).then(|| {
+                    let opacity = if is_focused {
+                        theme::editor::SELECTION_OPACITY
+                    } else {
+                        theme::editor::SELECTION_INACTIVE_OPACITY
+                    };
+                    gpui::fill(
+                        gpui::Bounds::from_corners(
+                            gpui::point(
+                                bounds.left() + shaped.x_for_index(selection.start),
+                                bounds.top(),
+                            ),
+                            gpui::point(
+                                bounds.left() + shaped.x_for_index(selection.end),
+                                bounds.bottom(),
+                            ),
+                        ),
+                        theme::editor::SELECTION.resolve().opacity(opacity),
+                    )
+                });
+                (shaped, quad)
+            },
+            move |bounds, (shaped, quad), window, cx| {
+                if let Some(quad) = quad {
+                    window.paint_quad(quad);
+                }
+                entity.update(cx, |this, _cx| {
+                    this.simple_input_layout
+                        .insert(paint_key.clone(), (bounds, shaped));
+                });
+                let Some(field) = field else {
+                    return;
+                };
+                // Registered window-wide rather than as `on_mouse_move`/`on_mouse_up` handlers on
+                // the row itself, and this is the whole reason this overlay paints at all rather
+                // than only measuring: GPUI's own `on_mouse_move` listener is gated on
+                // `hitbox.is_hovered(window)` (`vendor/zed/crates/gpui/src/elements/div.rs`), so a
+                // drag would stop extending the moment the pointer left the field - which is
+                // exactly the gesture that matters, since dragging past a field's right edge is
+                // how a user selects to the end of a query that overflows its box. Zed's own
+                // editor element drives its drag selection through this same
+                // `gpui::Window::on_mouse_event` mechanism. `Window::on_mouse_event` may only be
+                // called during paint, which is where this closure runs, and the listeners it
+                // registers are per-frame - so they exist exactly while this field is on screen.
+                let move_entity = entity.clone();
+                let move_key = paint_key.clone();
+                let move_field = field.clone();
+                window.on_mouse_event(
+                    move |event: &gpui::MouseMoveEvent, phase, _window, cx| {
+                        if phase != gpui::DispatchPhase::Bubble
+                            || event.pressed_button != Some(MouseButton::Left)
+                        {
+                            return;
+                        }
+                        move_entity.update(cx, |this, cx| {
+                            if this.simple_input_drag.as_ref() != Some(&move_key) {
+                                return;
+                            }
+                            let Some(offset) = this.simple_input_offset_at(&move_key, event.position)
+                            else {
+                                return;
+                            };
+                            if move_field.with(this, |field| field.select_to(offset)) == Some(true) {
+                                move_field.changed(this, cx);
+                                cx.notify();
+                            }
+                        });
+                    },
+                );
+                let up_entity = entity.clone();
+                let up_key = paint_key.clone();
+                window.on_mouse_event(move |_: &gpui::MouseUpEvent, phase, _window, cx| {
+                    if phase != gpui::DispatchPhase::Bubble {
+                        return;
+                    }
+                    up_entity.update(cx, |this, _cx| {
+                        if this.simple_input_drag.as_ref() == Some(&up_key) {
+                            this.simple_input_drag = None;
+                        }
+                    });
+                });
+            },
+        )
+        .absolute()
+        .size_full()
+    }
+
+    /// The row's own `mouse down`: focus the field, then place/extend/word-select at the real
+    /// hit-tested byte offset, and arm the drag [`Self::simple_input_overlay`]'s window-wide
+    /// listeners extend.
+    ///
+    /// Deliberately does **not** `cx.stop_propagation()`: several of these rows sit inside a
+    /// larger clickable container whose own handler is what focuses the surface, opens the row for
+    /// editing, or selects the list item the field belongs to, and swallowing the click here would
+    /// silently break those. Everything this handler does is idempotent with a parent that also
+    /// focuses the same field.
+    fn wire_simple_input_mouse<E: InteractiveElement>(
+        &self,
+        el: E,
+        layout_key: gpui::SharedString,
+        focus_handle: Option<FocusHandle>,
+        field: TextFieldHandle,
+        cx: &Context<Self>,
+    ) -> E {
+        el.on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                let Some(offset) = this.simple_input_offset_at(&layout_key, event.position) else {
+                    return;
+                };
+                if let Some(handle) = focus_handle.as_ref() {
+                    window.focus(handle, cx);
+                }
+                // GPUI's own `MouseDownEvent::click_count` already counts consecutive same-place
+                // clicks, so this needs no double-click timing of its own - the same real reading
+                // `crate::code_surface::editing`'s own row click handler does. `>= 2` rather than
+                // `== 2` so a third rapid click keeps re-selecting the word (a single-line field
+                // has no "select the line" step above it - `Ctrl/Cmd+A` is that) instead of
+                // dropping back to a plain caret.
+                let changed = field.with(this, |field| {
+                    if event.click_count >= 2 {
+                        field.select_word_at(offset)
+                    } else if event.modifiers.shift {
+                        field.select_to(offset)
+                    } else {
+                        field.move_to(offset)
+                    }
+                });
+                this.simple_input_drag = Some(layout_key.clone());
+                this.reset_caret_blink(cx);
+                if changed == Some(true) {
+                    field.changed(this, cx);
+                }
+                cx.notify();
+            }),
+        )
+    }
+
+    /// Hit-tests a real window-space pointer position into a byte offset in the field keyed by
+    /// `layout_key`, using the [`gpui::ShapedLine`] that field's own overlay recorded when it last
+    /// painted. `None` when the field has never painted (so there is nothing to hit-test against).
+    ///
+    /// `x` is clamped to the field's own left edge rather than rejected: a drag that has travelled
+    /// left of the field means "select to the start", and `gpui::LineLayout::closest_index_for_x`
+    /// already clamps the other end for us by returning the line's real length for any `x` past
+    /// its last glyph.
+    pub(crate) fn simple_input_offset_at(
+        &self,
+        layout_key: &gpui::SharedString,
+        position: gpui::Point<Pixels>,
+    ) -> Option<usize> {
+        let (bounds, shaped) = self.simple_input_layout.get(layout_key)?;
+        let local_x = (position.x - bounds.left()).max(px(0.0));
+        Some(shaped.closest_index_for_x(local_x))
+    }
+
+    /// Registers the four real clipboard/select-all actions (GitHub issue #336) on one input's own
+    /// `key_context("text-input")` node, for the [`TextFieldHandle`] that node's field is behind.
+    ///
+    /// One helper rather than four hand-written handlers per call site for the same reason
+    /// [`Self::render_simple_input_row`] exists at all: this app has thirteen `"text-input"` nodes,
+    /// and fifty-two hand-copied action handlers is fifty-two chances for one of them to
+    /// coalesce an undo group differently or forget to re-run its surface's own
+    /// `on_changed` work.
+    pub(crate) fn wire_text_input_actions<E: InteractiveElement>(
+        &self,
+        el: E,
+        field: TextFieldHandle,
+        cx: &Context<Self>,
+    ) -> E {
+        let copy = field.clone();
+        let cut = field.clone();
+        let paste = field.clone();
+        let select_all = field;
+        el.on_action(cx.listener(
+            move |this, _: &crate::root::TextCopy, _window, cx: &mut Context<Self>| {
+                if let Some(Some(text)) = copy.read(this, |field| field.copy()) {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                }
+            },
+        ))
+        .on_action(cx.listener(
+            move |this, _: &crate::root::TextCut, _window, cx: &mut Context<Self>| {
+                let Some(Some(text)) = cut.with(this, |field| field.cut(Instant::now())) else {
+                    return;
+                };
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                cut.changed(this, cx);
+                this.reset_caret_blink(cx);
+                cx.notify();
+            },
+        ))
+        .on_action(cx.listener(
+            move |this, _: &crate::root::TextPaste, _window, cx: &mut Context<Self>| {
+                let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+                    return;
+                };
+                if paste.with(this, |field| field.paste(&text, Instant::now())) != Some(true) {
+                    return;
+                }
+                paste.changed(this, cx);
+                this.reset_caret_blink(cx);
+                cx.notify();
+            },
+        ))
+        .on_action(cx.listener(
+            move |this, _: &crate::root::TextSelectAll, _window, cx: &mut Context<Self>| {
+                if select_all.with(this, |field| field.select_all()) == Some(true) {
+                    this.reset_caret_blink(cx);
+                    cx.notify();
+                }
+            },
+        ))
+    }
+}
+
+/// How the shared input plumbing reaches one real [`text_history::TextField`], and what its owning
+/// surface has to re-run once that field changes.
+///
+/// A closure rather than, say, an enum of every field in the app: the fields these rows edit are
+/// not all plain `AdeApp` members. Several live behind an `Option` that may have closed
+/// (`AdeApp::new_file_input`, `AdeApp::tree_inline_edit`), and some are one *row* of a list
+/// (a rebase plan's per-row `reword` message, a review note card), reachable only by looking the
+/// row up by id. Only the call site knows how to get there, so only the call site can say.
+///
+/// [`Self::on_changed`] exists because "the text changed" genuinely means different work per
+/// surface - the Search panel has to restart its debounced worktree search, the rail has to drop
+/// its armed confirmations - and a paste or a cut has to do exactly the same work an ordinary
+/// keystroke into that field already does. Leaving it out is how a pasted query would sit in the
+/// box showing stale results.
+#[derive(Clone)]
+pub(crate) struct TextFieldHandle {
+    access: Rc<dyn for<'a> Fn(&'a mut AdeApp) -> Option<&'a mut text_history::TextField>>,
+    on_changed: Option<Rc<dyn Fn(&mut AdeApp, &mut Context<AdeApp>)>>,
+}
+
+impl TextFieldHandle {
+    pub(crate) fn new(
+        access: impl for<'a> Fn(&'a mut AdeApp) -> Option<&'a mut text_history::TextField> + 'static,
+    ) -> Self {
+        Self {
+            access: Rc::new(access),
+            on_changed: None,
+        }
+    }
+
+    /// The work this field's own surface does whenever its text really changes - the same work its
+    /// key handler already does for an ordinary keystroke.
+    pub(crate) fn on_changed(
+        mut self,
+        on_changed: impl Fn(&mut AdeApp, &mut Context<AdeApp>) + 'static,
+    ) -> Self {
+        self.on_changed = Some(Rc::new(on_changed));
+        self
+    }
+
+    /// Runs `f` against the real field, or returns `None` when it no longer exists (the prompt was
+    /// dismissed, the row was removed) - which every caller treats as "this gesture did nothing",
+    /// never as a reason to panic.
+    pub(crate) fn with<R>(
+        &self,
+        app: &mut AdeApp,
+        f: impl FnOnce(&mut text_history::TextField) -> R,
+    ) -> Option<R> {
+        (self.access)(app).map(f)
+    }
+
+    /// [`Self::with`] for a caller that only reads. Still takes `&mut AdeApp`, since the accessor
+    /// itself is the mutable one - there is no second, read-only accessor to maintain alongside it.
+    pub(crate) fn read<R>(
+        &self,
+        app: &mut AdeApp,
+        f: impl FnOnce(&text_history::TextField) -> R,
+    ) -> Option<R> {
+        (self.access)(app).map(|field| f(field))
+    }
+
+    pub(crate) fn changed(&self, app: &mut AdeApp, cx: &mut Context<AdeApp>) {
+        if let Some(on_changed) = self.on_changed.clone() {
+            on_changed(app, cx);
+        }
+    }
+}
+
+/// Translates one real keystroke's modifier set into [`text_history::EditingModifiers`], or `None`
+/// when this keystroke is not text editing at all and the field must let it keep propagating to
+/// whatever application binding owns it.
+///
+/// The platform decision lives here rather than in `crate::text_history` (which is deliberately
+/// GPUI-free): **word-wise movement is Alt+Arrow on macOS and Ctrl+Arrow everywhere else**, which
+/// is what the platforms' own text fields do, and the *other* of those two modifiers is always an
+/// application shortcut. `platform` (Cmd) is always an application shortcut too - `TextCopy`/
+/// `TextCut`/`TextPaste`/`TextSelectAll` are real bound actions, not keystrokes this function
+/// should be claiming.
+///
+/// Shift is never a reason to refuse: it is either the extend-selection modifier (on a movement
+/// key) or simply how a capital letter is typed, and `gpui::Keystroke::key_char` has already
+/// resolved the latter.
+pub(crate) fn text_editing_modifiers(
+    key: &str,
+    modifiers: &gpui::Modifiers,
+) -> Option<text_history::EditingModifiers> {
+    if modifiers.platform || modifiers.function {
+        return None;
+    }
+    let (word_modifier, foreign_modifier) = if cfg!(target_os = "macos") {
+        (modifiers.alt, modifiers.control)
+    } else {
+        (modifiers.control, modifiers.alt)
+    };
+    if foreign_modifier {
+        return None;
+    }
+    // The word modifier only ever means anything on a horizontal movement key; on anything else
+    // it is a modified keystroke some real binding owns, and claiming it here would swallow it.
+    if word_modifier && !matches!(key, "left" | "right") {
+        return None;
+    }
+    Some(text_history::EditingModifiers {
+        extend: modifiers.shift,
+        word: word_modifier,
+    })
 }
 
 /// One [`AdeApp::render_simple_input_row`] field: what it holds, what it says while empty, and
@@ -614,6 +1101,9 @@ pub(crate) struct SimpleInput<'a> {
     pub caret_selector: gpui::SharedString,
     /// The text element's `debug_selector`, for the same reason. A [`SharedString`] rather than a
     /// `&'static str` because a field that is a *row of a list* has one selector per row.
+    ///
+    /// Doubles as this row's key into `AdeApp::simple_input_layout` (GitHub issue #336), which is
+    /// exactly the uniqueness this field already had to have.
     pub text_selector: gpui::SharedString,
     /// The handle the caret watches - it paints only while this one is really focused. `None`
     /// draws no caret at all, which is what a read-only row of an otherwise-editable list is.
@@ -625,6 +1115,10 @@ pub(crate) struct SimpleInput<'a> {
     /// the renderer, so an out-of-range or mid-character value degrades to the nearest real one
     /// rather than panicking.
     pub caret_offset: usize,
+    /// The really-selected byte range - `crate::text_history::TextField::selection`. Collapsed
+    /// (empty) means "just a caret", which is every field's ordinary state and renders exactly the
+    /// element tree this row rendered before selection existed.
+    pub selection: Range<usize>,
     /// What it says while that is empty.
     pub placeholder: &'a str,
     /// The font family, as a `crate::theme::font` name.
@@ -635,6 +1129,9 @@ pub(crate) struct SimpleInput<'a> {
     pub text_color: theme::ColorToken,
     /// The (usually dimmer) colour of the placeholder.
     pub placeholder_color: theme::ColorToken,
+    /// How to reach the real field behind this row, for click/drag/double-click selection. `None`
+    /// is a genuinely read-only row - see [`AdeApp::render_simple_input_row`]'s own docs.
+    pub field: Option<TextFieldHandle>,
 }
 
 /// [`AdeApp::render_simple_input_caret`]'s paint decision, pulled out as a pure function so it's

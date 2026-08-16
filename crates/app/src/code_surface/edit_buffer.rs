@@ -186,32 +186,7 @@ use crate::code_surface::fold;
 use crate::code_surface::indent;
 use crate::code_surface::symbols;
 use crate::language::HighlighterFn;
-use crate::text_history::{self, EditKind, SelectionSnapshot, TextEdit, TextHistory};
-
-/// A character's real class for word-wise caret movement/selection (GitHub issue #27) - see
-/// [`EditBuffer::previous_word_boundary`]'s own docs for why this app hand-classifies rather
-/// than using `unicode_segmentation`'s UAX #29 word boundaries for this.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WordClass {
-    Whitespace,
-    /// A letter, digit, or underscore - grouped together so `foo_bar123` is one real word, not
-    /// three.
-    Word,
-    /// Anything else (`.`, `(`, `)`, `-`, ...) - a real code editor's own word-navigation stops
-    /// at these individually from surrounding word text, but groups a *run* of them together
-    /// (`()` is one hop, not two), matching this app's own real test coverage.
-    Punctuation,
-}
-
-fn word_class(ch: char) -> WordClass {
-    if ch.is_whitespace() {
-        WordClass::Whitespace
-    } else if ch.is_alphanumeric() || ch == '_' {
-        WordClass::Word
-    } else {
-        WordClass::Punctuation
-    }
-}
+use crate::text_history::{self, word_class, EditKind, SelectionSnapshot, TextEdit, TextHistory, WordClass};
 
 /// Longest common byte prefix of `a`/`b`, clamped to a real UTF-8 char boundary in both -
 /// `EditBuffer::stale_spans_for_region`'s own real "which text didn't change" test (GitHub issue

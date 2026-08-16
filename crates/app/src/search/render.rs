@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use gpui::{div, font, prelude::*, px, ClickEvent, Context, KeyDownEvent, SharedString, Window};
 
 use crate::icons::{Icon, IconRow, IconSize};
-use crate::root::widgets::{text_tooltip, SimpleInput};
+use crate::root::widgets::{self, text_tooltip, SimpleInput, TextFieldHandle};
 use crate::root::{plural, scrollbar, AdeApp, FindInFile, SearchInWorktree, TextRedo, TextUndo};
 use crate::search::engine::{
     self, Matcher, PathFilter, ReplaceOutcome, SearchOutcome, SearchRequest,
@@ -110,7 +110,7 @@ impl AdeApp {
                 self.search_input_row(SearchField::Query, cx)
                     .h(theme::band::FILTER_ROW)
                     .child(render_search_row_mark("/", self.ui_text_size(10.0)))
-                    .child(self.render_search_field(SearchField::Query, "search this worktree"))
+                    .child(self.render_search_field(SearchField::Query, "search this worktree", cx))
                     .children(
                         SearchModifier::ALL
                             .into_iter()
@@ -125,7 +125,7 @@ impl AdeApp {
                         .border_color(theme::border::ROW)
                         .child(render_search_row_mark("\u{21c4}", self.ui_text_size(10.0)))
                         .child(
-                            self.render_search_field(SearchField::Replace, "replace with\u{2026}"),
+                            self.render_search_field(SearchField::Replace, "replace with\u{2026}", cx),
                         )
                         // `REVISION-2026-08-14.md` §7 rule 2: a control that acts on results does
                         // not exist when there are none.
@@ -169,7 +169,7 @@ impl AdeApp {
                     .text_color(theme::text::GHOST)
                     .child(label),
             )
-            .child(self.render_search_field(field, placeholder))
+            .child(self.render_search_field(field, placeholder, cx))
     }
 
     /// The shared shell every one of the four input rows is built on: the focus handle it tracks,
@@ -184,7 +184,7 @@ impl AdeApp {
         field: SearchField,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        div()
+        let row = div()
             .id(SharedString::from(format!(
                 "search-row-{}",
                 field_key(field)
@@ -205,7 +205,12 @@ impl AdeApp {
             }))
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                 this.handle_search_key_down(field, event, window, cx);
-            }))
+            }));
+        // GitHub issue #336's four clipboard/select-all actions, on the same node and for the same
+        // structural-routing reason the two undo actions above are - and carrying the same
+        // `on_search_input_changed` follow-up work every other edit to these fields does, so a
+        // pasted or cut query really re-runs the search instead of leaving stale results up.
+        self.wire_text_input_actions(row, search_field_handle(field), cx)
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 this.focus_search_field(field, window, cx);
             }))
@@ -218,28 +223,38 @@ impl AdeApp {
     }
 
     /// One field's caret+text pair, through the one helper that owns that structure.
-    fn render_search_field(&self, field: SearchField, placeholder: &str) -> impl IntoElement {
+    fn render_search_field(
+        &self,
+        field: SearchField,
+        placeholder: &str,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let key = field_key(field);
         let (text_size, text_color) = match field {
             SearchField::Query => (11.0, theme::text::SELECTED),
             SearchField::Replace => (11.0, theme::text::STRONG),
             SearchField::Include | SearchField::Exclude => (10.0, theme::text::STRONG),
         };
-        self.render_simple_input_row(SimpleInput {
-            caret_selector: SharedString::from(format!("search-{key}-caret")),
-            text_selector: SharedString::from(format!("search-{key}-text")),
-            focus_handle: Some(self.search.focus_handle(field)),
-            text: self.search.field(field).as_str(),
-            caret_offset: self.search.field(field).caret(),
-            placeholder,
-            font: theme::font::MONO,
-            text_size: self.ui_text_size(text_size),
-            text_color,
-            // GitHub issue #162 / §4w: the mock's browser-default placeholder "was brighter than
-            // either dim-text token and absent from the palette". This is the design's own
-            // `#4e545a`, through the theme layer.
-            placeholder_color: theme::text::GHOST,
-        })
+        self.render_simple_input_row(
+            SimpleInput {
+                caret_selector: SharedString::from(format!("search-{key}-caret")),
+                text_selector: SharedString::from(format!("search-{key}-text")),
+                focus_handle: Some(self.search.focus_handle(field)),
+                text: self.search.field(field).as_str(),
+                caret_offset: self.search.field(field).caret(),
+                selection: self.search.field(field).selection(),
+                placeholder,
+                font: theme::font::MONO,
+                text_size: self.ui_text_size(text_size),
+                text_color,
+                // GitHub issue #162 / §4w: the mock's browser-default placeholder "was brighter than
+                // either dim-text token and absent from the palette". This is the design's own
+                // `#4e545a`, through the theme layer.
+                placeholder_color: theme::text::GHOST,
+                field: Some(search_field_handle(field)),
+            },
+            cx,
+        )
     }
 
     /// One 17x17 modifier button - `Aa` / `ab` / `.*`.
@@ -956,6 +971,30 @@ fn render_search_caret(open: bool, text_size: gpui::Pixels) -> impl IntoElement 
 }
 
 /// A field's stable slug, for element ids and debug selectors.
+/// One search field's own [`TextFieldHandle`] - what click/drag selection and GitHub issue #336's
+/// four clipboard/select-all actions act on.
+///
+/// Carries [`AdeApp::on_search_input_changed`] as its `on_changed`, which is exactly what
+/// [`AdeApp::handle_search_key_down`] already runs after an ordinary keystroke: a paste or a cut
+/// changes what the search would return just as much as typing does, and without this the panel
+/// would sit showing results for a query that is no longer in the box.
+/// The in-file find bar's own field handle - the same shape [`search_field_handle`] has, with the
+/// bar's own "the query changed, so re-run the match set and reveal the current hit" follow-up
+/// (exactly what `AdeApp::handle_find_bar_key_down` runs after a keystroke). `None` whenever the
+/// bar is closed, which is the case [`TextFieldHandle`]'s own `Option` exists for.
+fn find_bar_query_handle() -> TextFieldHandle {
+    TextFieldHandle::new(|app: &mut AdeApp| app.find_bar.as_mut().map(|bar| &mut bar.query))
+        .on_changed(|app: &mut AdeApp, cx| {
+            app.refresh_find_bar();
+            app.reveal_current_find_hit(cx);
+        })
+}
+
+fn search_field_handle(field: SearchField) -> TextFieldHandle {
+    TextFieldHandle::new(move |app: &mut AdeApp| Some(app.search.field_mut(field)))
+        .on_changed(|app: &mut AdeApp, cx| app.on_search_input_changed(cx))
+}
+
 fn field_key(field: SearchField) -> &'static str {
     match field {
         SearchField::Query => "query",
@@ -1014,9 +1053,12 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         let keystroke = &event.keystroke;
-        if keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.alt {
+        // GitHub issue #336: `widgets::text_editing_modifiers` rather than a flat "any modifier
+        // means not ours" - see `crate::rail::render::AdeApp::handle_filter_key_down`'s own note.
+        let Some(modifiers) = widgets::text_editing_modifiers(&keystroke.key, &keystroke.modifiers)
+        else {
             return;
-        }
+        };
         self.reset_caret_blink(cx);
         match keystroke.key.as_str() {
             // Walks only the rows that are really on screen - see
@@ -1042,6 +1084,7 @@ impl AdeApp {
         if self.search.field_mut(field).handle_editing_key(
             keystroke.key.as_str(),
             keystroke.key_char.as_deref(),
+            modifiers,
             Instant::now(),
         ) {
             self.on_search_input_changed(cx);
@@ -2245,12 +2288,13 @@ impl AdeApp {
         let has_results = bar.has_results();
         let count = bar.count_label();
         let invalid = bar.notice().is_some();
+        let bar_row = div()
+            .id("find-bar")
+            .debug_selector(|| "find-bar".to_string())
+            .track_focus(&bar.focus_handle)
+            .key_context("text-input");
         Some(
-            div()
-                .id("find-bar")
-                .debug_selector(|| "find-bar".to_string())
-                .track_focus(&bar.focus_handle)
-                .key_context("text-input")
+            self.wire_text_input_actions(bar_row, find_bar_query_handle(), cx)
                 .on_action(cx.listener(|this, _: &TextUndo, _window, cx| {
                     if this.find_bar.as_mut().is_some_and(|bar| bar.query.undo()) {
                         this.refresh_find_bar();
@@ -2283,18 +2327,23 @@ impl AdeApp {
                 .border_b_1()
                 .border_color(theme::border::ROW)
                 .child(render_search_row_mark("/", self.ui_text_size(10.0)))
-                .child(self.render_simple_input_row(SimpleInput {
-                    caret_selector: "find-bar-caret".into(),
-                    text_selector: "find-bar-text".into(),
-                    focus_handle: Some(&bar.focus_handle),
-                    text: bar.query.as_str(),
-                    caret_offset: bar.query.caret(),
-                    placeholder: "find in this file",
-                    font: theme::font::MONO,
-                    text_size: self.ui_text_size(11.0),
-                    text_color: theme::text::SELECTED,
-                    placeholder_color: theme::text::GHOST,
-                }))
+                .child(self.render_simple_input_row(
+                    SimpleInput {
+                        caret_selector: "find-bar-caret".into(),
+                        text_selector: "find-bar-text".into(),
+                        focus_handle: Some(&bar.focus_handle),
+                        text: bar.query.as_str(),
+                        caret_offset: bar.query.caret(),
+                        selection: bar.query.selection(),
+                        placeholder: "find in this file",
+                        font: theme::font::MONO,
+                        text_size: self.ui_text_size(11.0),
+                        text_color: theme::text::SELECTED,
+                        placeholder_color: theme::text::GHOST,
+                        field: Some(find_bar_query_handle()),
+                    },
+                    cx,
+                ))
                 .child(
                     div()
                         .id("find-bar-count")
@@ -2473,9 +2522,12 @@ impl AdeApp {
             cx.stop_propagation();
             return;
         }
-        if keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.alt {
+        // GitHub issue #336: `widgets::text_editing_modifiers` rather than a flat "any modifier
+        // means not ours" - see `crate::rail::render::AdeApp::handle_filter_key_down`'s own note.
+        let Some(modifiers) = widgets::text_editing_modifiers(&keystroke.key, &keystroke.modifiers)
+        else {
             return;
-        }
+        };
         match keystroke.key.as_str() {
             // Esc closes rather than clearing: the bar is a transient surface over a file, and
             // the field's own contents are what the user would want back if they reopen it.
@@ -2497,6 +2549,7 @@ impl AdeApp {
             bar.query.handle_editing_key(
                 keystroke.key.as_str(),
                 keystroke.key_char.as_deref(),
+                modifiers,
                 Instant::now(),
             )
         });

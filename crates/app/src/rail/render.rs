@@ -255,9 +255,14 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         let keystroke = &event.keystroke;
-        if keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.alt {
+        // GitHub issue #336: the modifier check is `widgets::text_editing_modifiers`' now, not a
+        // flat "any of Ctrl/Alt/Cmd means not ours" - word-wise Ctrl+Left/Right (Alt on macOS) is
+        // real text editing that this used to refuse, and Shift is the extend-selection modifier
+        // rather than something to ignore.
+        let Some(modifiers) = widgets::text_editing_modifiers(&keystroke.key, &keystroke.modifiers)
+        else {
             return;
-        }
+        };
         // GitHub issue #27's "solid mid-keystroke" - see `crate::palette::render::AdeApp::
         // handle_palette_key_down`'s identical reasoning.
         self.reset_caret_blink(cx);
@@ -268,6 +273,7 @@ impl AdeApp {
             key => self.filter_query.handle_editing_key(
                 key,
                 keystroke.key_char.as_deref(),
+                modifiers,
                 Instant::now(),
             ),
         };
@@ -936,7 +942,7 @@ impl AdeApp {
         view: rail_strip::SidebarView,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        div()
+        let row = div()
             .id("rail-filter-row")
             .track_focus(&self.filter_focus_handle)
             // See `crate::default_key_bindings`' `TextUndo`/`TextRedo` docs for why the tag and
@@ -944,7 +950,10 @@ impl AdeApp {
             .key_context("text-input")
             .on_action(cx.listener(Self::handle_filter_text_undo))
             .on_action(cx.listener(Self::handle_filter_text_redo))
-            .on_key_down(cx.listener(Self::handle_filter_key_down))
+            .on_key_down(cx.listener(Self::handle_filter_key_down));
+        // GitHub issue #336's four clipboard/select-all actions, on the same node and for the same
+        // structural-routing reason the two undo actions above are.
+        self.wire_text_input_actions(row, Self::filter_query_handle(), cx)
             .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
                 window.focus(&this.filter_focus_handle, cx);
             }))
@@ -964,22 +973,39 @@ impl AdeApp {
                     .text_color(theme::text::GHOST)
                     .child("/"),
             )
-            .child(self.render_simple_input_row(SimpleInput {
-                caret_selector: "rail-filter-caret".into(),
-                text_selector: "rail-filter-text".into(),
-                focus_handle: Some(&self.filter_focus_handle),
-                text: self.filter_query.as_str(),
-                caret_offset: self.filter_query.caret(),
-                placeholder: match view {
-                    rail_strip::SidebarView::Worktrees => "filter worktrees and agents",
-                    rail_strip::SidebarView::Problems => "filter problems",
-                    rail_strip::SidebarView::History => "filter runs",
+            .child(self.render_simple_input_row(
+                SimpleInput {
+                    caret_selector: "rail-filter-caret".into(),
+                    text_selector: "rail-filter-text".into(),
+                    focus_handle: Some(&self.filter_focus_handle),
+                    text: self.filter_query.as_str(),
+                    caret_offset: self.filter_query.caret(),
+                    selection: self.filter_query.selection(),
+                    placeholder: match view {
+                        rail_strip::SidebarView::Worktrees => "filter worktrees and agents",
+                        rail_strip::SidebarView::Problems => "filter problems",
+                        rail_strip::SidebarView::History => "filter runs",
+                    },
+                    font: theme::font::MONO,
+                    text_size: self.ui_text_size(10.5),
+                    text_color: theme::text::DIM,
+                    placeholder_color: theme::text::GHOST,
+                    field: Some(Self::filter_query_handle()),
                 },
-                font: theme::font::MONO,
-                text_size: self.ui_text_size(10.5),
-                text_color: theme::text::DIM,
-                placeholder_color: theme::text::GHOST,
-            }))
+                cx,
+            ))
+    }
+
+    /// The rail filter's own field handle - what click/drag selection and the four clipboard
+    /// actions act on, and the same "an edit disarms the pending confirmations" work
+    /// [`Self::handle_filter_key_down`] does for an ordinary keystroke.
+    fn filter_query_handle() -> widgets::TextFieldHandle {
+        widgets::TextFieldHandle::new(|app: &mut AdeApp| Some(&mut app.filter_query)).on_changed(
+            |app: &mut AdeApp, _cx| {
+                app.prune_confirm_armed = false;
+                app.discard_confirm_armed = None;
+            },
+        )
     }
 
     /// Builds this rail's repo groups fresh from live state every render (cheap: no I/O, just

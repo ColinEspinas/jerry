@@ -526,6 +526,8 @@ impl AdeApp {
             _blame_message_tasks: HashMap::new(),
             edit_buffers: HashMap::new(),
             file_view_row_layout: HashMap::new(),
+            simple_input_layout: HashMap::new(),
+            simple_input_drag: None,
             file_view_folds: HashMap::new(),
             file_view_last_layout: None,
             file_view_last_bounds: None,
@@ -1890,6 +1892,8 @@ impl AdeApp {
         // free-function signature - are reset directly here for the same reason. Dropping the
         // task maps cancels every in-flight debounced re-highlight/save for whatever was left.
         self.file_view_row_layout = HashMap::new();
+        self.simple_input_layout = HashMap::new();
+        self.simple_input_drag = None;
         self.file_view_last_layout = None;
         self.file_view_last_bounds = None;
         self.file_view_last_layout_for = None;
