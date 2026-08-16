@@ -2437,4 +2437,423 @@ mod tests {
         }
         assert_eq!(text, "one\ntwo\nthree\n");
     }
+
+    // GitHub issue #336: a real selection. Before this, `TextField` carried exactly one
+    // `caret: usize` and its own docs said selection was "deliberately not implemented".
+
+    fn shift() -> EditingModifiers {
+        EditingModifiers {
+            extend: true,
+            word: false,
+        }
+    }
+
+    fn word() -> EditingModifiers {
+        EditingModifiers {
+            extend: false,
+            word: true,
+        }
+    }
+
+    fn word_shift() -> EditingModifiers {
+        EditingModifiers {
+            extend: true,
+            word: true,
+        }
+    }
+
+    #[test]
+    fn a_fresh_field_has_a_collapsed_selection_which_is_just_a_caret() {
+        let mut field = TextField::new();
+        type_into(&mut field, "origin/main", t0());
+        assert!(!field.has_selection());
+        assert_eq!(field.selection(), field.caret()..field.caret());
+        assert_eq!(field.selected_text(), "");
+        assert_eq!(field.copy(), None, "nothing selected means nothing to copy");
+    }
+
+    #[test]
+    fn shift_right_extends_and_shift_left_shrinks_the_same_selection() {
+        let mut field = TextField::new();
+        let now = t0();
+        type_into(&mut field, "origin/main", now);
+        field.move_to_start();
+
+        assert!(field.select_right());
+        assert!(field.select_right());
+        assert!(field.select_right());
+        assert_eq!(field.selected_text(), "ori");
+        assert_eq!(field.caret(), 3, "the caret is the moving end");
+        assert_eq!(
+            field.anchor(),
+            0,
+            "the anchor stayed where the selection began"
+        );
+        assert!(!field.selection_reversed());
+
+        assert!(field.select_left());
+        assert_eq!(
+            field.selected_text(),
+            "or",
+            "shrinking back is the same one primitive, not a separate case"
+        );
+    }
+
+    #[test]
+    fn a_selection_built_leftward_is_really_reversed_and_crosses_over_cleanly() {
+        let mut field = TextField::new();
+        let now = t0();
+        type_into(&mut field, "origin/main", now);
+        field.move_to(6);
+
+        assert!(field.select_left());
+        assert!(field.select_left());
+        assert_eq!(field.selected_text(), "in");
+        assert!(
+            field.selection_reversed(),
+            "extended leftward, so the caret is on the range's start"
+        );
+        assert_eq!(field.caret(), 4);
+        assert_eq!(field.anchor(), 6);
+
+        // ...and dragging back past the anchor flips it rather than producing an inverted range:
+        // the anchor (6) stays put and the caret crosses to the far side of it.
+        field.select_to(9);
+        assert_eq!(field.selected_text(), "/ma");
+        assert!(!field.selection_reversed());
+        assert_eq!(field.caret(), 9);
+        assert_eq!(field.anchor(), 6);
+    }
+
+    #[test]
+    fn a_plain_arrow_key_collapses_a_selection_to_its_near_edge_rather_than_moving() {
+        let mut field = TextField::new();
+        let now = t0();
+        type_into(&mut field, "origin/main", now);
+        field.move_to(2);
+        field.select_to(6);
+        assert_eq!(field.selected_text(), "igin");
+
+        // Left collapses to the *start*, and lands exactly there - not one grapheme further left,
+        // which is what a naive "collapse then move" would do and what no real text input does.
+        assert!(field.move_left());
+        assert!(!field.has_selection());
+        assert_eq!(field.caret(), 2);
+
+        field.select_to(6);
+        assert!(field.move_right());
+        assert!(!field.has_selection());
+        assert_eq!(field.caret(), 6, "Right collapses to the end");
+    }
+
+    #[test]
+    fn select_all_selects_the_whole_field_and_a_plain_key_replaces_it() {
+        let mut field = TextField::new();
+        let now = t0();
+        type_into(&mut field, "origin/main", now);
+        assert!(field.select_all());
+        assert_eq!(field.selected_text(), "origin/main");
+        assert!(
+            !field.select_all(),
+            "selecting all twice is a real no-op, so a caller can stop propagating honestly"
+        );
+
+        assert!(field.insert_str("x", now));
+        assert_eq!(
+            field.as_str(),
+            "x",
+            "typing over a selection replaces it, it does not splice beside it"
+        );
+        assert_eq!(field.caret(), 1);
+        assert!(!field.has_selection());
+    }
+
+    #[test]
+    fn backspace_and_delete_with_a_selection_remove_the_whole_range() {
+        let now = t0();
+        let mut backspaced = TextField::new();
+        type_into(&mut backspaced, "origin/main", now);
+        backspaced.move_to(0);
+        backspaced.select_to(7);
+        assert!(backspaced.backspace(now));
+        assert_eq!(backspaced.as_str(), "main");
+        assert_eq!(backspaced.caret(), 0);
+
+        let mut deleted = TextField::new();
+        type_into(&mut deleted, "origin/main", now);
+        deleted.move_to(0);
+        deleted.select_to(7);
+        assert!(deleted.delete_forward(now));
+        assert_eq!(
+            deleted.as_str(),
+            "main",
+            "Delete with a selection removes the selection, not the character after it"
+        );
+    }
+
+    #[test]
+    fn a_double_click_selects_the_word_under_the_pointer_and_nothing_in_whitespace() {
+        let mut field = TextField::new();
+        let now = t0();
+        type_into(&mut field, "fix the flaky test", now);
+
+        assert!(field.select_word_at(5));
+        assert_eq!(field.selected_text(), "the");
+
+        // `.`/`/` are punctuation, which is its own class - `foo.bar` is two words, matching the
+        // code editor's own `word_class` (this is literally the same function).
+        let mut path = TextField::new();
+        type_into(&mut path, "src/app/main.rs", now);
+        assert!(path.select_word_at(9));
+        assert_eq!(path.selected_text(), "main");
+
+        // A double-click on whitespace selects nothing and just places a caret.
+        assert!(field.select_word_at(3));
+        assert!(!field.has_selection());
+        assert_eq!(field.caret(), 3);
+    }
+
+    #[test]
+    fn word_wise_movement_hops_whole_words_and_shift_extends_over_them() {
+        let mut field = TextField::new();
+        let now = t0();
+        type_into(&mut field, "origin/feature-branch", now);
+        field.move_to_end();
+
+        assert!(field.move_word_left());
+        assert_eq!(field.caret(), "origin/feature-".len(), "back over `branch`");
+        assert!(field.move_word_left());
+        assert_eq!(
+            field.caret(),
+            "origin/feature".len(),
+            "a run of punctuation is its own hop - `word_class`'s own documented rule, shared \
+             verbatim with the code editor"
+        );
+        assert!(field.move_word_left());
+        assert_eq!(field.caret(), "origin/".len(), "back over `feature`");
+
+        field.move_to_start();
+        assert!(field.select_word_right());
+        assert_eq!(
+            field.selected_text(),
+            "origin",
+            "Ctrl+Shift+Right extends over a whole word rather than one grapheme"
+        );
+    }
+
+    #[test]
+    fn copy_leaves_the_field_alone_and_cut_removes_exactly_the_selected_range() {
+        let now = t0();
+        let mut field = TextField::new();
+        type_into(&mut field, "origin/main", now);
+        field.move_to(0);
+        field.select_to(6);
+
+        assert_eq!(field.copy().as_deref(), Some("origin"));
+        assert_eq!(field.as_str(), "origin/main", "copy never edits");
+        assert!(
+            field.has_selection(),
+            "...and never collapses the selection"
+        );
+
+        assert_eq!(field.cut(now).as_deref(), Some("origin"));
+        assert_eq!(field.as_str(), "/main");
+        assert_eq!(field.caret(), 0);
+        assert!(!field.has_selection());
+        assert_eq!(field.cut(now), None, "nothing selected, nothing cut");
+    }
+
+    #[test]
+    fn paste_replaces_a_selection_and_a_copy_then_paste_round_trips_the_same_text() {
+        let now = t0();
+        let mut field = TextField::new();
+        type_into(&mut field, "origin/main", now);
+        field.move_to(0);
+        field.select_to(6);
+        let copied = field.copy().expect("a real selection was copied");
+
+        // Paste over a *different* selection: the whole range goes, the clipboard text lands.
+        field.move_to(7);
+        field.select_to(11);
+        assert!(field.paste(&copied, now));
+        assert_eq!(field.as_str(), "origin/origin");
+        assert_eq!(field.caret(), "origin/origin".len());
+
+        // ...and a collapsed paste inserts at the caret.
+        field.move_to(0);
+        assert!(field.paste("upstream-", now));
+        assert_eq!(field.as_str(), "upstream-origin/origin");
+    }
+
+    #[test]
+    fn a_pasted_newline_becomes_a_space_rather_than_an_unpaintable_line_break() {
+        let mut field = TextField::new();
+        assert!(field.paste("first\nsecond\r\nthird", t0()));
+        assert_eq!(
+            field.as_str(),
+            "first second  third",
+            "these are one-line fields; a real `\\n` in one would corrupt every offset the row's \
+             own hit-testing derives from it"
+        );
+    }
+
+    #[test]
+    fn undo_after_typing_over_a_selection_restores_the_selection_itself_not_just_a_caret() {
+        let now = t0();
+        let mut field = TextField::new();
+        type_into(&mut field, "origin/main", now);
+        field.move_to(0);
+        field.select_to(6);
+        assert!(field.insert_str("upstream", now));
+        assert_eq!(field.as_str(), "upstream/main");
+
+        assert!(field.undo());
+        assert_eq!(field.as_str(), "origin/main");
+        assert_eq!(
+            field.selection(),
+            0..6,
+            "the whole selection comes back, which is what makes a second Ctrl+Z land where the \
+             user expects rather than at a bare caret"
+        );
+        assert_eq!(field.selected_text(), "origin");
+
+        assert!(field.redo());
+        assert_eq!(field.as_str(), "upstream/main");
+        assert_eq!(
+            field.selection(),
+            8..8,
+            "redo restores the collapsed caret the edit really left behind"
+        );
+    }
+
+    #[test]
+    fn undo_after_a_cut_puts_the_cut_text_and_its_selection_back() {
+        let now = t0();
+        let mut field = TextField::new();
+        type_into(&mut field, "origin/main", now);
+        field.move_to(7);
+        field.select_to(11);
+        assert_eq!(field.cut(now).as_deref(), Some("main"));
+        assert_eq!(field.as_str(), "origin/");
+
+        assert!(field.undo());
+        assert_eq!(field.as_str(), "origin/main");
+        assert_eq!(field.selection(), 7..11);
+    }
+
+    #[test]
+    fn a_paste_is_its_own_undo_step_on_both_sides_of_a_typing_burst() {
+        let now = t0();
+        let mut field = TextField::new();
+        type_into(&mut field, "abc", now);
+        assert_eq!(field.history_len(), 1);
+        assert!(field.paste("XY", now));
+        assert_eq!(
+            field.history_len(),
+            2,
+            "a paste never joins the burst before it"
+        );
+        type_into(&mut field, "def", now);
+        assert_eq!(
+            field.history_len(),
+            3,
+            "...and the burst after it never joins the paste"
+        );
+        assert!(field.undo());
+        assert_eq!(field.as_str(), "abcXY");
+        assert!(field.undo());
+        assert_eq!(field.as_str(), "abc");
+    }
+
+    #[test]
+    fn a_selection_change_between_two_keystrokes_starts_a_new_undo_step() {
+        let now = t0();
+        let mut field = TextField::new();
+        type_into(&mut field, "abc", now);
+        assert_eq!(field.history_len(), 1);
+        // No text edit at all here - only the selection moved.
+        assert!(field.select_left());
+        type_into(&mut field, "d", now);
+        assert_eq!(
+            field.history_len(),
+            2,
+            "the module's own 'a caret jump is a group boundary' rule covers selection changes \
+             for free, because the check is full-snapshot equality"
+        );
+    }
+
+    #[test]
+    fn handle_editing_key_routes_shift_and_word_modifiers_to_the_right_primitive() {
+        let now = t0();
+        let mut field = TextField::new();
+        type_into(&mut field, "origin/main", now);
+
+        field.move_to_start();
+        assert!(field.handle_editing_key("right", None, shift(), now));
+        assert_eq!(field.selected_text(), "o");
+        assert!(field.handle_editing_key("end", None, shift(), now));
+        assert_eq!(field.selected_text(), "origin/main");
+        assert!(field.handle_editing_key("home", None, shift(), now));
+        assert!(
+            !field.has_selection(),
+            "Shift+Home from a selection anchored at 0 collapses it back onto that anchor"
+        );
+
+        field.move_to_end();
+        assert!(field.handle_editing_key("left", None, word(), now));
+        assert_eq!(field.caret(), "origin/".len());
+        assert!(field.handle_editing_key("left", None, word_shift(), now));
+        assert_eq!(field.selected_text(), "/");
+
+        // A word-modified letter is an application shortcut, never text to insert.
+        let before = field.as_str().to_string();
+        assert!(!field.handle_editing_key("a", Some("a"), word(), now));
+        assert_eq!(field.as_str(), before);
+    }
+
+    #[test]
+    fn every_selection_edge_lands_on_a_real_grapheme_boundary() {
+        let now = t0();
+        let mut field = TextField::new();
+        // A flag is one grapheme cluster made of two 4-byte scalars.
+        type_into(&mut field, "caf\u{e9}\u{1f1eb}\u{1f1f7}x", now);
+        field.move_to_start();
+        assert!(field.select_right());
+        assert!(field.select_right());
+        assert!(field.select_right());
+        assert!(field.select_right());
+        assert_eq!(field.selected_text(), "caf\u{e9}");
+        assert!(field.select_right());
+        assert_eq!(
+            field.selected_text(),
+            "caf\u{e9}\u{1f1eb}\u{1f1f7}",
+            "one Shift+Right crosses the whole flag cluster, never half of it"
+        );
+
+        // An out-of-range or mid-cluster offset from a click hit-test is clamped, never a panic.
+        field.move_to(usize::MAX);
+        assert_eq!(field.caret(), field.as_str().len());
+        field.move_to(0);
+        field.select_to(5);
+        assert!(field.as_str().is_char_boundary(field.selection().end));
+    }
+
+    #[test]
+    fn seeded_and_set_both_leave_a_collapsed_selection_at_the_end() {
+        let seeded = TextField::seeded("main.rs");
+        assert!(!seeded.has_selection());
+        assert_eq!(seeded.caret(), "main.rs".len());
+
+        let mut field = TextField::new();
+        let now = t0();
+        type_into(&mut field, "abc", now);
+        field.select_all();
+        assert!(field.set("xyz", now));
+        assert!(
+            !field.has_selection(),
+            "a programmatic replacement leaves a caret, not a selection over text the user \
+             never selected"
+        );
+        assert_eq!(field.caret(), 3);
+    }
 }

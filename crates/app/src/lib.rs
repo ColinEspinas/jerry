@@ -1387,6 +1387,164 @@ mod undo_scoping_matrix_tests {
         }
     }
 
+    /// GitHub issue #336's own scoping claim, in exactly the same shape as `TextUndo`'s above:
+    /// `TextCopy`/`TextCut`/`TextPaste`/`TextSelectAll` are live in every real *simple* text-input
+    /// context and nowhere else - specifically **not** on the code surface or the merge hand-edit
+    /// surface, where the `Editor*` actions already own `secondary-c`/`x`/`v`/`a` and would
+    /// otherwise tie with these at exactly the same predicate depth.
+    ///
+    /// A live `simulate_keystrokes` test can only ever observe whichever binding won that tie, so
+    /// it would pass just as happily with the ambiguity in place. This asserts the predicate logic
+    /// itself, which is the thing that actually has to hold.
+    #[test]
+    fn the_text_clipboard_actions_are_live_in_exactly_the_simple_input_contexts() {
+        let cases = [
+            (
+                "app::TextCopy",
+                if cfg!(target_os = "macos") {
+                    "cmd-c"
+                } else {
+                    "ctrl-c"
+                },
+            ),
+            (
+                "app::TextCut",
+                if cfg!(target_os = "macos") {
+                    "cmd-x"
+                } else {
+                    "ctrl-x"
+                },
+            ),
+            (
+                "app::TextPaste",
+                if cfg!(target_os = "macos") {
+                    "cmd-v"
+                } else {
+                    "ctrl-v"
+                },
+            ),
+            (
+                "app::TextSelectAll",
+                if cfg!(target_os = "macos") {
+                    "cmd-a"
+                } else {
+                    "ctrl-a"
+                },
+            ),
+        ];
+        // Index-aligned with `real_context_stacks()`/`stack_descriptions()`. Identical to
+        // `TextUndo`'s own expectations above except for the two editor rows, which are `false`
+        // here and `true` there - deliberately, and the whole point of this test.
+        let expectations: Vec<bool> = vec![
+            false, // a dangling focus handle
+            false, // no key context of its own
+            false, // a focused terminal
+            false, // the read-only Diff view
+            false, // the editable File view - `EditorCopy`/`EditorCut`/`EditorPaste` own these
+            false, // ...with completions open
+            false, // the merge hand-edit surface - likewise
+            true,  // a focused single-line text input
+            false, // the rebase plan surface itself
+            true,  // ...with a reword message field focused
+            false, // the review-notes surface itself
+            true,  // ...with a pinned note card focused
+            false, // the file tree with no editor open
+            true,  // ...with its inline name editor open
+        ];
+        assert_eq!(expectations.len(), real_context_stacks().len());
+
+        for (action, keystroke) in cases {
+            let bindings = bindings_for(action, keystroke);
+            assert_eq!(bindings.len(), 1, "exactly one real {action} binding");
+            for ((description, parts), wants) in stack_descriptions()
+                .into_iter()
+                .zip(real_context_stacks())
+                .zip(expectations.iter().copied())
+            {
+                let contexts = stack(&parts);
+                assert_eq!(
+                    enabled(&bindings[0], &contexts),
+                    wants,
+                    "{action} enablement for {description}"
+                );
+            }
+        }
+    }
+
+    /// The other half of the same claim: on the two editor surfaces the `Editor*` actions really
+    /// are still the only live owner of those four keystrokes, so nothing was taken away from them
+    /// by GitHub issue #336's additions.
+    #[test]
+    fn the_editor_surfaces_keep_sole_ownership_of_their_own_clipboard_keystrokes() {
+        let pairs = [
+            (
+                "app::EditorCopy",
+                "app::TextCopy",
+                if cfg!(target_os = "macos") {
+                    "cmd-c"
+                } else {
+                    "ctrl-c"
+                },
+            ),
+            (
+                "app::EditorCut",
+                "app::TextCut",
+                if cfg!(target_os = "macos") {
+                    "cmd-x"
+                } else {
+                    "ctrl-x"
+                },
+            ),
+            (
+                "app::EditorPaste",
+                "app::TextPaste",
+                if cfg!(target_os = "macos") {
+                    "cmd-v"
+                } else {
+                    "ctrl-v"
+                },
+            ),
+            (
+                "app::EditorSelectAll",
+                "app::TextSelectAll",
+                if cfg!(target_os = "macos") {
+                    "cmd-a"
+                } else {
+                    "ctrl-a"
+                },
+            ),
+        ];
+        for parts in real_context_stacks() {
+            let joined = parts.join(" ");
+            if !joined.contains("file-editor") && !joined.contains("merge-editor") {
+                continue;
+            }
+            let contexts = stack(&parts);
+            for (editor_action, text_action, keystroke) in pairs {
+                let editor_live = crate::default_key_bindings()
+                    .into_iter()
+                    .filter(|binding| {
+                        binding.action().name() == editor_action && enabled(binding, &contexts)
+                    })
+                    .count();
+                assert_eq!(
+                    editor_live, 1,
+                    "exactly one real {editor_action} binding must stay live on `{joined}`"
+                );
+                let text_live = bindings_for(text_action, keystroke)
+                    .into_iter()
+                    .filter(|binding| enabled(binding, &contexts))
+                    .count();
+                assert_eq!(
+                    text_live, 0,
+                    "{text_action} must be dead on `{joined}` - two live bindings for \
+                     `{keystroke}` at the same predicate depth is exactly the ambiguity this \
+                     scoping exists to rule out"
+                );
+            }
+        }
+    }
+
     /// GitHub issue #158's root cause, asserted directly: before the fix there was **no**
     /// binding of any kind that reached an action while a terminal had focus for either copy or
     /// paste, so both keystrokes fell through to `crate::terminal::pane::keystroke_to_bytes`
