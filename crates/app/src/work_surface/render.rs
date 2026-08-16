@@ -985,14 +985,14 @@ impl AdeApp {
     /// which ones repeat - but two tabs genuinely showing the same thing now honestly render the
     /// same label, exactly as any real terminal emulator's tabs do.
     ///
-    /// GitHub issue #354: the tabs themselves (plus the `+` button right after them) are wrapped
-    /// in their own `#tab-strip-scroll` child - `.flex_1().min_w_0().overflow_x_scroll()`,
-    /// tracked by [`Self::tab_strip_scroll_handle`] - rather than laid out directly in `#tab-strip`
-    /// itself. Before this, the outer row carried no `overflow_x_scroll()`/clip of any kind, so
-    /// once the real tabs (each `flex_none`, i.e. sized to its own content) outgrew the strip's
-    /// available width, the excess simply painted past the pane's own right edge with no way to
-    /// reach it - no scroll-wheel handling (nothing was listening), no drag, and no overflow
-    /// menu either. `.overflow_x_scroll()` alone gives real, live scroll-wheel handling for free
+    /// GitHub issue #354: the tabs themselves are wrapped in their own `#tab-strip-scroll` child,
+    /// `.flex_initial().min_w_0().overflow_x_scroll()`, tracked by
+    /// [`Self::tab_strip_scroll_handle`], rather than laid out directly in `#tab-strip` itself.
+    /// Before this, the outer row carried no `overflow_x_scroll()`/clip of any kind, so once the
+    /// real tabs (each `flex_none`, i.e. sized to its own content) outgrew the strip's available
+    /// width, the excess simply painted past the pane's own right edge with no way to reach it -
+    /// no scroll-wheel handling (nothing was listening), no drag, and no overflow menu either.
+    /// `.overflow_x_scroll()` alone gives real, live scroll-wheel handling for free
     /// (`vendor/zed/crates/gpui/src/elements/div.rs`'s own `paint_scroll_listener`, verified
     /// directly: a plain vertical wheel delta is translated into horizontal `delta_x` whenever
     /// `overflow.x == Scroll` and `overflow.y` is not also `Scroll`, exactly the "trackpad/wheel
@@ -1004,19 +1004,24 @@ impl AdeApp {
     /// own intrinsic size, so the scroll region would just grow to fit every tab instead of
     /// staying clipped to the space actually available.
     ///
-    /// The `+` button rides inside the same scrollable region, immediately after the last tab
-    /// (exactly where it already sits when nothing overflows), so reaching it when tabs overflow
-    /// is the same one scroll gesture that reaches the last tab - not a second, independently
-    /// reachable control.
+    /// GitHub issue #399: the scroller is deliberately `.flex_initial()` (shrink, never grow),
+    /// not `.flex_1()`, since a flex-1 scroller consumed every leftover pixel of the strip even
+    /// when its own tabs didn't need it, leaving a wide dead gap of bare, unpainted chrome
+    /// between the last tab and the strip's real right edge (see [`Self::render_tab_strip`]'s own
+    /// top docs for the live repro this was filed against). The `+` button now rides just after
+    /// the scroller, not inside it - see the growing pusher between them, immediately below.
     ///
     /// A trailing chrome spacer stays **outside** the scrollable region, as `#tab-strip`'s own
     /// direct child alongside the scroller: always visible/pinned, not part of what can be
     /// scrolled through. It used to carry a real right-aligned agent-jump keycap hint, removed
     /// per a direct product-owner request (see [`Self::render_tab_strip`]'s own top docs) - a
-    /// bare 12px bordered spacer is kept in its place, both to give the strip's trailing edge the
-    /// same breathing room every other 12px chrome margin in this bar gets (rather than leaving
-    /// the `+` button flush against the window's edge), and to keep carrying its own slice of
-    /// §4v's bottom rule (`.border_b_1()`) exactly as it did with the hint still in it.
+    /// bare 12px bordered spacer is kept in its place, to give the strip's trailing edge the same
+    /// breathing room every other 12px chrome margin in this bar gets, and to keep carrying its
+    /// own slice of §4v's bottom rule (`.border_b_1()`) exactly as it did with the hint still in
+    /// it. What actually pins that spacer (and the `+` button before it) flush against the
+    /// strip's real right edge, rather than leaving them wherever the tabs happen to end, is the
+    /// growing pusher between the scroller and the `+` button - see its own docs, right where
+    /// it's built, for why that job could not simply stay the scroller's.
     pub(in crate::work_surface) fn render_tab_strip(
         &self,
         cx: &mut Context<Self>,
@@ -1030,8 +1035,8 @@ impl AdeApp {
         // it. ... A child cannot paint over its parent's border - the parent's border sits outside
         // the child's box - so the container cannot own the edge if any child needs to cut it.
         // **The tabs own it.**" Every child below therefore carries the rule itself, the `+`, the
-        // spacer and the counter cluster included, "without which the rule stopped at the last tab
-        // and 398px of the window's top edge was simply missing".
+        // growing pusher and the trailing spacer included, "without which the rule stopped at the
+        // last tab and 398px of the window's top edge was simply missing".
         let bar = div()
             .id("tab-strip")
             // Lets a real test measure this column header's own painted box - §4v's
@@ -1047,15 +1052,28 @@ impl AdeApp {
         let order = self.combined_tab_order();
 
         // GitHub issue #354: the real scrollable region - see this method's own top docs. It is
-        // `flex_1().min_w_0()` (bounded to whatever width the strip actually has left, never
-        // grown past it by its children's own content) and carries the column rule itself
-        // (`.border_b_1()`) so that rule still reaches this region's own right edge when the
-        // tabs don't fill it, exactly like the plain spacer this replaces used to.
+        // `.flex_initial().min_w_0()` - shrinks (and clips/scrolls) when the tabs are wider than
+        // the strip has room for, exactly as `flex_1()` did before it, but - unlike `flex_1()` -
+        // never *grows* past its own tabs' real content width when they don't fill the strip.
+        //
+        // GitHub issue #399: `flex_1()` here used to mean "always consume every leftover pixel
+        // of the strip's width," so a handful of short tab labels left a wide, dead stretch of
+        // bare chrome between the last tab and the `+` button, with nothing painted in it - the
+        // scroller grew to the strip's full width regardless of whether its children needed it.
+        // That dead stretch used to be visually masked by the real content the trailing
+        // agent-jump cluster still carried past it (see `Self::render_tab_strip`'s own docs);
+        // once GitHub issue #397 deleted that cluster's content, the same pre-existing dead
+        // stretch became the strip's *entire* trailing edge - "the tab strip does not go all the
+        // way, there is a strange margin right" is this scroller quietly reserving pixels its
+        // own children never asked for, not the trailing spacer (which is still just 12px and
+        // always was). [`Self::render_tab_strip`]'s own trailing flex spacer, immediately below,
+        // is what now actually owns that leftover width - and pushes the `+` button flush
+        // against it, rather than leaving the leftover as a dead gap nothing else claims.
         let mut scroller = div()
             .id("tab-strip-scroll")
             .debug_selector(|| "tab-strip-scroll".to_string())
             .flex()
-            .flex_1()
+            .flex_initial()
             .min_w_0()
             .items_stretch()
             .overflow_x_scroll()
@@ -1097,15 +1115,34 @@ impl AdeApp {
             }
         }
 
-        scroller = scroller.child(self.render_tab_strip_plus(cx));
+        // GitHub issue #399: the growing pusher between the (now shrink-only) scroller and the
+        // `+` button - the strip's real "leftover space" owner. When the tabs fill the strip,
+        // this collapses to zero width and the `+` sits directly after the last tab, exactly as
+        // it always visually has. When they don't, this - not the scroller above, and not the
+        // fixed 12px spacer below - is what expands to soak up the difference, so the `+` (and
+        // its own trailing breathing room) stays pinned to the strip's real right edge instead of
+        // floating in the middle of a dead gap. Carries the column rule itself for the same
+        // reason every other child in this row does (`Self::render_tab_strip`'s own top docs,
+        // §4v: "an edge has one owner - if anything needs to cut it, the owner is the children").
+        let pusher = div()
+            .id("tab-strip-pusher")
+            .debug_selector(|| "tab-strip-pusher".to_string())
+            .flex_1()
+            .border_b_1()
+            .border_color(theme::border::RAIL_INNER);
 
-        bar.child(scroller).child(
-            div()
-                .flex_none()
-                .w(px(12.0))
-                .border_b_1()
-                .border_color(theme::border::RAIL_INNER),
-        )
+        bar.child(scroller)
+            .child(pusher)
+            .child(self.render_tab_strip_plus(cx))
+            .child(
+                div()
+                    .id("tab-strip-trailing-spacer")
+                    .debug_selector(|| "tab-strip-trailing-spacer".to_string())
+                    .flex_none()
+                    .w(px(12.0))
+                    .border_b_1()
+                    .border_color(theme::border::RAIL_INNER),
+            )
     }
 
     /// Every tab kind's own `×` close hit box - identical id-suffixing, size, hover, and styling
@@ -6550,6 +6587,120 @@ mod tab_strip_overflow_scroll_tests {
             "a real click on the previously-overflowing tab, now scrolled into view, must \
              genuinely activate it - the concrete case GitHub issue #354 reports: \"tabs are not \
              accessible once overflowing\""
+        );
+    }
+}
+
+#[cfg(test)]
+mod tab_strip_trailing_margin_tests {
+    use super::*;
+    use crate::root::focus::palette_focus_tests;
+    use gpui::TestAppContext;
+
+    /// GitHub issue #399: a handful of short file tabs - real, live user report, screenshotted -
+    /// left "a strange margin right": the tab strip visibly stopped short of the pane's own right
+    /// edge, with nothing painted in the gap. Traced to PR #398 (GitHub issue #397): `#tab-strip-
+    /// scroll` was `.flex_1()`, which unconditionally grows to consume every leftover pixel of
+    /// the strip's width regardless of whether its own tabs need it, so the `+` button (the
+    /// scroller's last child, back then) ended up stranded wherever the tabs happened to stop,
+    /// with the leftover width as a dead, unpainted gap *after* it and before the strip's real
+    /// edge - a gap #398's own trailing agent-jump keycap hint used to visually paper over by
+    /// sitting flush against that same real edge. Deleting that hint's content (the issue #397
+    /// fix) didn't create the underlying gap; it just stopped masking it.
+    ///
+    /// The real, measured regression: before the fix (`app.plus_button_bounds` reflects
+    /// `#tab-strip-scroll`'s pre-fix `flex_1()`), six short tabs in a comfortably wide strip left
+    /// well over 100px of dead space between the `+` button and the strip's right edge. After the
+    /// fix, the `+` button ends within the trailing 12px chrome margin's own width of that edge -
+    /// the same "breathing room, not a void" every other 12px chrome margin in this bar gets,
+    /// which is the explicit design intent PR #398's own docs already stated but never actually
+    /// achieved (`Self::render_tab_strip`'s own top docs, and the growing pusher's own docs where
+    /// it's built, cover why `#tab-strip-scroll` alone could never deliver that).
+    ///
+    /// Asserted against `Self::plus_button_bounds` and `"tab-strip"`'s own painted bounds - both
+    /// existed before PR #398 too - so this genuinely fails against the pre-fix tree rather than
+    /// merely asserting today's implementation detail back at itself.
+    #[gpui::test]
+    fn a_few_short_tabs_leave_the_plus_button_flush_against_the_strips_real_edge(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        // Six short-ish file names, matching the live report's own screenshot closely enough to
+        // reproduce it: nowhere near enough real content to fill a default test window's tab
+        // strip, which is exactly the precondition the bug needs.
+        let names = [
+            "a.rs",
+            "state.rs",
+            "tab_order_state.rs",
+            "keymap_overrides.rs",
+            "lib.rs",
+            "persisted_state_lots_of_chars.rs",
+        ];
+        for name in names {
+            std::fs::write(repo.path().join(name), "// x\n").expect("write");
+        }
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            for name in names {
+                app.open_file_view(repo.path().join(name), window, cx);
+            }
+        });
+        cx.run_until_parked();
+
+        let bar = cx
+            .debug_bounds("tab-strip")
+            .expect("the tab strip must paint");
+        let plus = app.read_with(cx, |app, _| app.plus_button_bounds);
+        let bar_right = f32::from(bar.origin.x) + f32::from(bar.size.width);
+        let plus_right = f32::from(plus.origin.x) + f32::from(plus.size.width);
+
+        assert!(
+            plus.size.width > gpui::px(0.0),
+            "premise: the `+` button must have really painted"
+        );
+        // 12px is the trailing spacer's own deliberate width (`Self::render_tab_strip`'s own
+        // docs); a couple more px of slack absorbs the `+` button's own internal padding without
+        // hard-coding its layout. Anything past that is exactly the unaccounted dead gap the live
+        // report shows: on the pre-fix tree this was well over 150px, not a rounding error.
+        assert!(
+            bar_right - plus_right <= 15.0,
+            "the `+` button must end within the strip's own trailing 12px breathing room of the \
+             real right edge, not stranded with a dead gap after it - strip ends at {bar_right}, \
+             `+` ends at {plus_right}, a gap of {}",
+            bar_right - plus_right
+        );
+    }
+
+    /// The mirror image of the assertion above, proven directly against the scroller rather than
+    /// inferred from the `+` button: `#tab-strip-scroll` must never grow past what its own tabs
+    /// need. `.flex_1()` (the pre-fix behaviour) would make this fail identically to the test
+    /// above; `.flex_initial()` (the fix) shrinks-or-fits instead of always consuming every
+    /// leftover pixel.
+    #[gpui::test]
+    fn the_scroller_never_grows_past_its_own_tabs_real_content_width(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::write(repo.path().join("a.rs"), "// a\n").expect("write");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let a_ref = work_surface::TabRef::File(PathBuf::from("a.rs"));
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(repo.path().join("a.rs"), window, cx);
+        });
+        cx.run_until_parked();
+
+        let scroller = cx
+            .debug_bounds("tab-strip-scroll")
+            .expect("the scroller must paint");
+        let last_tab = app
+            .read_with(cx, |app, _| app.tab_bounds.get(&a_ref).copied())
+            .expect("a.rs must have painted a tab");
+        let scroller_right = f32::from(scroller.origin.x) + f32::from(scroller.size.width);
+        let last_tab_right = f32::from(last_tab.origin.x) + f32::from(last_tab.size.width);
+
+        assert!(
+            scroller_right - last_tab_right <= 2.0,
+            "with only one real tab open (a shell tab plus a.rs), `#tab-strip-scroll` must end \
+             right where its own content does, not grow to consume the strip's whole remaining \
+             width - scroller ends at {scroller_right}, last real tab ends at {last_tab_right}"
         );
     }
 }
