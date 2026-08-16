@@ -46,7 +46,6 @@ pub struct CommitAllChangesOutcome {
     /// The branch at commit time, `None` when detached. Only consulted when [`Self::parent`] is
     /// also `None`; see [`Error::CommitHasNoParentAndNoBranch`].
     pub branch: Option<String>,
-    /// The commit that was just created.
     pub commit: String,
     /// What `HEAD` pointed at before, or `None` for a branch's first commit.
     pub parent: Option<String>,
@@ -384,7 +383,6 @@ pub struct DiscardSnapshot {
     /// The branch at discard time, `None` when detached - in which case the undo recreates the
     /// worktree at [`Self::commit`] directly.
     pub branch: Option<String>,
-    /// `HEAD`'s commit id at discard time.
     pub commit: String,
     /// The stash commit id, when there was uncommitted content worth preserving.
     pub stash: Option<String>,

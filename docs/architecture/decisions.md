@@ -213,3 +213,44 @@ the `sh` script needs no parser. Env var values are spliced unquoted into a shel
 git, so every embedded path must be POSIX-single-quoted. The editor script is `/bin/sh`, making
 this path Unix-only; elsewhere it surfaces as an ordinary spawn failure. Conflicts are never
 auto-resolved or rolled back, matching `crate::rewrite`.
+
+## 8. `pty-core` owns spawning only; `alacritty_terminal` stays in `crates/app`
+
+**Status:** Accepted.
+
+**Context:** Upstream Zed drives `alacritty_terminal::tty::Pty` directly and lets its `EventLoop`
+own a thread that both pumps bytes and feeds the `Term` grid parser — one composition, not
+separable into a standalone spawn primitive.
+
+**Decision:** `pty-core` owns spawn, raw-byte output, resize and kill via `portable-pty`, and knows
+nothing about ANSI escapes or grid state. `crates/app` owns the `Term` grid, driven by the bytes
+this crate streams.
+
+**Consequences, all load-bearing:**
+
+- **The output channel is bounded.** An undrained unbounded channel is an unbounded leak —
+  measured at ~40MB/s of RSS growth against a `yes` pipe. A full `sync_channel` blocks the reader's
+  `send`, so it stops calling `read`, the kernel pty buffer fills, and the child's `write` blocks:
+  ordinary terminal backpressure.
+- **Shutdown is a self-pipe, not a dropped master fd.** `try_clone_reader()` hands back an
+  independently `dup`'d fd, so dropping `master` does not unblock the reader. An earlier version
+  only appeared to work because `take_writer()`'s `Drop` writes `\n` + EOT, which local echo bounced
+  back and incidentally woke the read — with `stty -echo`, the thread leaked for the process's life.
+- **Kill signals the process group *and* a `/proc` descendant walk.** `portable-pty` calls `setsid`,
+  so `killpg` reaches ordinary descendants, but anything calling `setsid` itself escapes it. The
+  descendant set is snapshotted *before* signalling, because reading it afterwards races the kernel
+  reparenting a dying process's children.
+- **`Drop` never blocks; `shutdown()` is the deterministic one.** `Drop` signals and does one
+  non-blocking `try_wait`, handing any unreaped child to a detached thread — a multi-hundred-ms
+  freeze here would freeze the GPUI thread. `shutdown()` blocks until the tree is dead and reaped.
+- **Input goes through a writer thread.** A full pty write buffer would otherwise block whichever
+  thread called `write_input`, plausibly a key handler on the main thread.
+
+**Windows is narrower, and untested on real hardware** (reasoned from `portable-pty` 0.9.0 and
+`filedescriptor` 0.8.3 sources plus `cargo check --target x86_64-pc-windows-gnu`). `kill()`
+terminates the direct child only — job objects are the only alternative and need `unsafe` FFI, so
+grandchildren can survive as orphans. There is no self-pipe either: `WSAPoll` accepts only sockets
+and a ConPTY master is a named pipe, so the reader blocks until `master` itself drops, *not* when
+the child is reaped. Callers must therefore poll `try_wait` rather than wait for the output channel
+to disconnect. These paths are `#[cfg(windows)]`, never `#[cfg(not(unix))]`, so an unsupported
+non-unix target fails to compile instead of silently inheriting Windows semantics.

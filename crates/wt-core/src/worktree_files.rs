@@ -21,7 +21,6 @@ use crate::error::Error;
 /// caps on top. This one only bounds memory against an enormous repository.
 pub const MAX_LIST_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 
-/// The result of [`list_worktree_files`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorktreeFileList {
     /// Worktree-relative, `/`-separated paths, in git's own path format.

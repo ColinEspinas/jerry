@@ -35,7 +35,6 @@ pub struct MergeStart {
     pub session_branch: String,
 }
 
-/// The result of one merge attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeOutcome {
     /// The base branch already contains every commit on the session branch; nothing changed.
@@ -388,7 +387,6 @@ pub struct ConflictedFile {
 }
 
 impl ConflictedFile {
-    /// How many conflict hunks in this file still need resolving.
     pub fn remaining_conflicts(&self) -> usize {
         self.segments
             .iter()
