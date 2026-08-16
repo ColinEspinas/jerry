@@ -47,12 +47,20 @@ impl AdeApp {
     /// its worktree, anchored under its own `refs/jerry/review/*` ref, recorded in memory and
     /// persisted.
     ///
-    /// Called from `crate::work_surface::render::AdeApp::new_agent` - the caller of
-    /// `Agents::spawn`, not `Agents::spawn` itself, mirroring how `load_diff` is triggered by a
-    /// caller rather than baked into a lower-level type. `Agents` has no business knowing about
-    /// git snapshots. Called unconditionally after every spawn, [`ProcessKind::Shell`] included -
-    /// the kind check below is what makes that safe rather than something every caller has to
-    /// remember.
+    /// Called from the *callers* of `Agents::spawn`, not from `Agents::spawn` itself, mirroring
+    /// how `load_diff` is triggered by a caller rather than baked into a lower-level type -
+    /// `Agents` has no business knowing about git snapshots. Called unconditionally after every
+    /// spawn, [`ProcessKind::Shell`] included - the kind check below is what makes that safe
+    /// rather than something every caller has to remember.
+    ///
+    /// **Every** real spawn door must call it, and that is the one thing this arrangement cannot
+    /// enforce for itself. The full set: `crate::work_surface::render::AdeApp::new_agent`,
+    /// `::new_agent_pane` and `::respawn_agent`, `crate::work_surface::session::AdeApp::
+    /// restore_worktree_session`'s two arms, `crate::hooks::flow::AdeApp::resume_past_agent`, and
+    /// `crate::root::AdeApp::select_worktree`'s startup tab. The middle two were missing it until
+    /// GitHub issue #381 - `new_agent_pane` in particular is `ctrl-shift-N`, the title bar's
+    /// `New Agent Pane` row and the empty pane's own `Start an agent` CTA, i.e. how most agents
+    /// in this app are really started, and none of them could ever open a review surface.
     ///
     /// ## The accepted race
     ///

@@ -1187,6 +1187,79 @@ mod review_flow_tests {
         });
     }
 
+    /// **Every real spawn door captures a baseline**, not just `new_agent`.
+    ///
+    /// Found by driving the running app while verifying GitHub issue #381: `new_agent_pane`
+    /// (`ctrl-shift-N`, the title bar's `New Agent Pane` row, and the empty pane's own
+    /// `Start an agent` CTA) and `respawn_agent` (`Retry`/`Resume`) both spawned a real agent and
+    /// never captured one, so no agent started through them could ever open a review surface -
+    /// and `new_agent_pane` is how most agents in this app are actually started. `respawn_agent`
+    /// is the worse of the two: its own `close_agent` has already *released* the previous
+    /// agent's ref, so a retried agent was left with neither.
+    ///
+    /// Asserted through `AdeApp::agent_reviews` (a real captured baseline with a real
+    /// `refs/jerry/review/*` ref behind it), not merely through `review_available_for`, so this
+    /// can't pass on the single-agent gate alone.
+    #[gpui::test]
+    fn every_spawn_door_captures_a_review_baseline(cx: &mut TestAppContext) {
+        let repo = diverged_repo();
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        // `new_agent_pane` resolves the first agent CLI really installed on `$PATH` in the
+        // background before it spawns, so this needs a real parked run to land.
+        app.update(cx, |app, cx| app.new_agent_pane(cx));
+        cx.run_until_parked();
+        let from_pane_door = app.read_with(cx, |app, _| {
+            app.agents
+                .active_id()
+                .expect("new_agent_pane spawned a tab")
+        });
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.agents
+                    .iter()
+                    .find(|agent| agent.id == from_pane_door)
+                    .is_some_and(|agent| agent.kind.is_agent_session()),
+                "sanity check: this door spawns a real agent session, not a shell"
+            );
+            let review = app
+                .agent_reviews
+                .get(&from_pane_door)
+                .expect("`New Agent Pane` must capture a review baseline like every other door");
+            assert!(
+                !review.baseline.tree_id.is_empty(),
+                "and a real snapshot behind it, not an empty placeholder"
+            );
+            assert_eq!(
+                git_stdout(repo.path(), &["rev-parse", &review.baseline.ref_name]).trim(),
+                review.baseline.tree_id,
+                "the real ref must point at that snapshot"
+            );
+        });
+
+        // `Retry`/`Resume`: closes the tab (releasing its ref) and spawns a fresh agent.
+        app.update_in(cx, |app, window, cx| {
+            app.respawn_agent(from_pane_door, window, cx)
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            let respawned = app.agents.active_id().expect("respawn_agent spawned a tab");
+            assert_ne!(
+                respawned, from_pane_door,
+                "sanity check: a respawn is a genuinely new agent, not the old one revived"
+            );
+            let review = app.agent_reviews.get(&respawned).expect(
+                "a retried agent must get its own baseline - its predecessor's ref was just \
+                 released, so without one it has nothing at all to review against",
+            );
+            assert_eq!(
+                git_stdout(repo.path(), &["rev-parse", &review.baseline.ref_name]).trim(),
+                review.baseline.tree_id
+            );
+        });
+    }
+
     /// Closing an agent releases its baseline ref (so `git gc` can reclaim the objects) but
     /// deliberately keeps the persisted metadata entry - the groundwork GitHub issue #227 needs.
     #[gpui::test]

@@ -569,7 +569,7 @@ impl AdeApp {
         // real hook injection - otherwise "Retry" would silently produce an agent whose status
         // fell back to the quiescence heuristic.
         let hook_injection = self.hook_injection_for(kind);
-        self.agents.spawn(
+        let respawned = self.agents.spawn(
             kind,
             cwd,
             self.settings.appearance.terminal_font_size,
@@ -578,6 +578,13 @@ impl AdeApp {
             window,
             cx,
         );
+        // ...and a freshly spawned agent's other half: its own review baseline. The close above
+        // has already released the *previous* agent's ref (`release_review_baseline`), so without
+        // this a retried agent could never have a review at all - a real gap found while
+        // verifying GitHub issue #381 against the running app, in the same "an agent-only
+        // capability quietly isn't there" family as that issue's own findings. A no-op for a
+        // `Shell`, like every other call to it.
+        self.capture_review_baseline(respawned, cx);
         self.focus_newly_spawned_agent(window, cx);
         // The close above and the spawn here are two real session changes; both are recorded, so a
         // relaunch reopens the retried agent's slot rather than the one it replaced.
@@ -1685,7 +1692,7 @@ impl AdeApp {
             let _ = this.update_in(cx, |this, window, cx| {
                 let kind = installed.unwrap_or(settings::AGENT_KINDS[0]);
                 let hook_injection = this.hook_injection_for(ProcessKind::Agent(kind));
-                this.agents.spawn(
+                let id = this.agents.spawn(
                     ProcessKind::Agent(kind),
                     cwd,
                     this.settings.appearance.terminal_font_size,
@@ -1694,6 +1701,13 @@ impl AdeApp {
                     window,
                     cx,
                 );
+                // See `Self::new_agent`'s own identical call. Missing here until GitHub issue
+                // #381's live verification tripped over it: this door (`ctrl-shift-N`, the title
+                // bar's `New Agent Pane` row, and the empty pane's own `Start an agent` CTA) is
+                // how most agents in this app are actually started, and every one of them was
+                // spawned without a review baseline - so the whole #225 review surface could
+                // never open for it, no matter how many agents shared the worktree.
+                this.capture_review_baseline(id, cx);
                 this.focus_newly_spawned_agent(window, cx);
                 // See `Self::new_agent`'s own identical call - this is the same real new tab,
                 // reached through the `+` menu's background `$PATH` search instead.
