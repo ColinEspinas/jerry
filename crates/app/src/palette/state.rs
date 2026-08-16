@@ -617,10 +617,20 @@ pub fn build_language_server_groups(
 }
 
 /// Builds the palette's result groups for the current `scope`/`query`. Group order is always
-/// Agents, Commands, Files; a group with zero matches is omitted entirely rather than shown as
-/// an empty header.
+/// Agents, Terminals, Commands, Files; a group with zero matches is omitted entirely rather than
+/// shown as an empty header.
 ///
-/// Agents only appear in [`PaletteScope::All`] - there is no dedicated Agents segment in the
+/// **`Agents` and `Terminals` are two groups, not one** (GitHub issue #381). Both are open panes
+/// and both are worth switching to by name, but a plain `ProcessKind::Shell` is not an agent -
+/// `Jerry.dc.html` has never counted the terminal among a worktree's `agents`, and filing a shell
+/// under a heading that reads `Agents` told the user the opposite of what the rest of the app
+/// (the rail, which gives a shell no agent row at all; the pane chrome, which draws a shell a
+/// different bottom bar) tells them. Splitting rather than filtering is deliberate: the palette
+/// is the keyboard route to a pane, and dropping shells out of it would have made a terminal tab
+/// mouse-reachable only - a real loss, and an unnecessary one, since the honest fix is just to
+/// stop calling it an agent.
+///
+/// Both groups only appear in [`PaletteScope::All`] - there is no dedicated Agents segment in the
 /// scope control. For an empty query in a scope that shows files, the file candidates are first
 /// narrowed to changed files (`FileCandidate::changed.is_some()`) under a `"Recent Files"`
 /// label: this app has no file-access/mtime history to rank true recency by, so "recent" is
@@ -637,10 +647,23 @@ pub fn build_groups(
     let mut groups = Vec::new();
 
     if scope == PaletteScope::All {
-        let entries = filter_agents(agents, query);
+        let (sessions, shells): (Vec<_>, Vec<_>) = agents
+            .iter()
+            .cloned()
+            .partition(|candidate| candidate.kind.is_agent_session());
+
+        let entries = filter_agents(&sessions, query);
         if !entries.is_empty() {
             groups.push(PaletteGroup {
                 label: "Agents",
+                entries,
+            });
+        }
+
+        let entries = filter_agents(&shells, query);
+        if !entries.is_empty() {
+            groups.push(PaletteGroup {
+                label: "Terminals",
                 entries,
             });
         }
@@ -1157,6 +1180,65 @@ mod tests {
         assert_eq!(
             flat[1].target,
             EntryTarget::Command(PaletteCommand::NewShell)
+        );
+    }
+
+    /// GitHub issue #381: a plain [`ProcessKind::Shell`] is not an agent, so it does not appear
+    /// under a heading that says `Agents` - it gets its own `Terminals` group instead, in the
+    /// same palette, so it stays fully keyboard-reachable while being named honestly.
+    #[test]
+    fn a_shell_is_listed_under_terminals_never_under_agents() {
+        let candidates = vec![
+            agent(1, "Fix rate limiter", Some("fix/rl"), Status::Run),
+            AgentCandidate {
+                id: 2,
+                kind: ProcessKind::Shell,
+                title: "scratch".to_string(),
+                branch: Some("fix/rl".to_string()),
+                status: Status::Idle,
+            },
+        ];
+
+        let groups = build_groups(PaletteScope::All, "", &candidates, &[], &[]);
+
+        let labels: Vec<&str> = groups.iter().map(|g| g.label).collect();
+        assert_eq!(
+            labels,
+            vec!["Agents", "Terminals"],
+            "two separate groups, agents first"
+        );
+        let agents_group = groups.iter().find(|g| g.label == "Agents").unwrap();
+        assert_eq!(
+            agents_group
+                .entries
+                .iter()
+                .map(|entry| entry.target.clone())
+                .collect::<Vec<_>>(),
+            vec![EntryTarget::Agent(1)],
+            "only the real agent session may be filed under `Agents`"
+        );
+        let terminals_group = groups.iter().find(|g| g.label == "Terminals").unwrap();
+        assert_eq!(
+            terminals_group
+                .entries
+                .iter()
+                .map(|entry| entry.target.clone())
+                .collect::<Vec<_>>(),
+            vec![EntryTarget::Agent(2)],
+            "the shell is still a real, selectable row - just not an agent"
+        );
+    }
+
+    /// A group with no members is omitted entirely, exactly like every other palette group -
+    /// splitting agents from terminals must not add a permanently-empty `Terminals` header to
+    /// every window that has no shell open.
+    #[test]
+    fn the_terminals_group_is_absent_when_no_shell_is_open() {
+        let candidates = vec![agent(1, "Fix rate limiter", Some("fix/rl"), Status::Run)];
+        let groups = build_groups(PaletteScope::All, "", &candidates, &[], &[]);
+        assert_eq!(
+            groups.iter().map(|g| g.label).collect::<Vec<_>>(),
+            vec!["Agents"]
         );
     }
 
