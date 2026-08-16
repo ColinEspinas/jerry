@@ -2,7 +2,12 @@
 
 `dot-full.png`, `dot-partial.png` and `dot-planned.png` are permanent: the support-level dots on the
 README's agent chips, in Jerry Dark's own swatch colours (`#5cb87f`, `#e2a336`, and a muted grey).
-Leave them alone.
+
+**Their transparent bottom padding is deliberate — don't crop it.** Each is a 28px circle in a
+32×42 canvas. GitHub strips `style` attributes, so `valign="middle"` is the only alignment control
+available, and it centres a dot on the baseline plus half the x-height. The labels beside these dots
+have no descenders, so their real optical centre is ~1.4px higher than that. The padding shifts the
+visible circle up by exactly that much. Crop it and the dots sit low again.
 
 **Every other file here is a generated placeholder**, not a real capture — a flat wireframe in the
 same palette, captioned "screenshot pending". They exist so the product README renders cleanly
