@@ -21,3 +21,8 @@ tempfile = "3"
 # outright. Already present in this workspace's lockfile via other dependencies, so this adds no
 # new crate to the build graph.
 sha2 = "0.10"
+
+[dev-dependencies]
+# Shared fixtures (real seeded repositories, argv-only `git`) - see `docs/testing.md`. Usable
+# here precisely because it carries no `gpui` (docs/architecture/decisions.md §1).
+test-support = { path = "../test-support" }

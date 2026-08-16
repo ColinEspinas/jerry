@@ -125,10 +125,13 @@ what this rule would have flagged.
 
 ## Testing
 
-`#[gpui::test]` + `TestAppContext`/`VisualTestContext` for anything touching a `Render`/`Entity` —
-not a snapshot of stdout, which doesn't cover a retained-mode GPU UI. Name test modules by concern
-(`mod change_row_selection_tests`, not `mod tests`) — the existing 175-name convention is good,
-keep it. Fixtures live under a sibling `testdata/` directory, not inlined as string literals.
+Every test is one of three tiers: `unit` (plain `#[test]`, pure logic or a tempdir, < 10 ms), `ui`
+(`#[gpui::test]` + `TestAppContext`/`VisualTestContext` for anything touching a `Render`/`Entity`,
+< 2 s), or `external` (`#[ignore = "external: <binary>; …"]`, a real language server or agent
+process, its own CI job and never the PR gate). Shared fixtures — argv-only `git`, seeded
+repositories, `wait_until`, `ChildGuard` — come from `crates/test-support`, which stays `gpui`-free;
+GPUI ones from `crates/app/src/test_support.rs`. What deserves a test, what gets deleted and why,
+and the no-`thread::sleep` rule: [`docs/testing.md`](docs/testing.md).
 
 ## Workflow
 
