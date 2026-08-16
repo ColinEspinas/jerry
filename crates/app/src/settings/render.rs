@@ -3198,10 +3198,12 @@ impl AdeApp {
             })
     }
 
-    /// *Editor* - the one real row on this page is the minimap (GitHub issue #30,
-    /// `crate::code_surface::minimap`) - see `crate::settings::state`'s own module docs on why
-    /// the rest of this page (indentation/soft-wrap/whitespace-display) still has no real
-    /// backing and stays left off entirely, rather than shown as an inert control.
+    /// *Editor* - the minimap (GitHub issue #30, `crate::code_surface::minimap`), completions,
+    /// and now Search's own gitignore toggle (GitHub issue #394 -
+    /// `crate::settings::store::EditorSettings::respect_gitignore`) are this page's real rows -
+    /// see `crate::settings::state`'s own module docs on why the rest of this page
+    /// (indentation/soft-wrap/whitespace-display) still has no real backing and stays left off
+    /// entirely, rather than shown as an inert control.
     pub(in crate::settings) fn render_settings_editor_page(
         &self,
         cx: &mut Context<Self>,
@@ -3266,6 +3268,19 @@ impl AdeApp {
                 },
             ),
         );
+        let respect_gitignore_row = self.render_settings_row(
+            "Use .gitignore in search",
+            "The Search panel always skips target/, node_modules/, .git and a handful of other \
+             common build/dependency directories by name, regardless of this setting. On top of \
+             that, additionally hide whatever the active worktree's own .gitignore hides. Off \
+             scopes search independently of git entirely - only the built-in list above applies.",
+            self.render_toggle_control(
+                "settings-editor-respect-gitignore",
+                self.settings.editor.respect_gitignore,
+                cx,
+                |this, cx| this.toggle_respect_gitignore(cx),
+            ),
+        );
 
         div()
             .flex()
@@ -3295,6 +3310,17 @@ impl AdeApp {
             )
             .child(suggest_auto_imports_row)
             .child(auto_import_row)
+            .child(
+                div()
+                    .pt(px(20.0))
+                    .pb(px(4.0))
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_size(px(9.5))
+                    .text_color(theme::palette::GROUP_HEADER)
+                    .child("Search"),
+            )
+            .child(respect_gitignore_row)
             .child(self.render_snippet_block(settings_store::ConfigPage::Editor))
     }
 
@@ -4084,6 +4110,18 @@ impl AdeApp {
     /// accept. See `settings_store::EditorSettings::auto_import`.
     fn toggle_auto_import(&mut self, cx: &mut Context<Self>) {
         self.settings.editor.auto_import = !self.settings.editor.auto_import;
+        self.persist_settings(cx);
+        cx.notify();
+    }
+
+    /// The Editor page's Search-group "Use .gitignore in search" toggle (GitHub issue #394) -
+    /// `crate::search::render::AdeApp::start_search` reads
+    /// `self.settings.editor.respect_gitignore` fresh on every real search, so a toggle here
+    /// takes effect on the very next query with no restart needed. See
+    /// `settings_store::EditorSettings::respect_gitignore`'s own docs for exactly how this
+    /// composes with the always-on explicit exclude list underneath it.
+    fn toggle_respect_gitignore(&mut self, cx: &mut Context<Self>) {
+        self.settings.editor.respect_gitignore = !self.settings.editor.respect_gitignore;
         self.persist_settings(cx);
         cx.notify();
     }
