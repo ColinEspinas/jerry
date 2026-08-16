@@ -3,12 +3,14 @@
 
 use super::zoom::zoom_scoped;
 use super::*;
-use crate::review_notes::{NoteAnchor, NoteMark};
 #[cfg(test)]
-use crate::root::focus::palette_focus_tests;
+use crate::code_surface::fixtures::temp_repo;
+use crate::review_notes::{NoteAnchor, NoteMark};
 use crate::root::plural;
 use crate::root::scrollbar;
 use crate::root::widgets::render_sidebar_message;
+#[cfg(test)]
+use crate::test_support::open_test_app;
 use std::rc::Rc;
 
 /// Every row of the Diff view's virtualized list, in the flat order it scrolls in - built once
@@ -1121,22 +1123,7 @@ pub(in crate::code_surface) struct DiffLineChrome<'a> {
 mod diff_render_tests {
     use super::*;
     use gpui::TestAppContext;
-
-    fn git(dir: &std::path::Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    use test_support::git;
 
     /// Renders a real diff of a real `.rs` file (one line changed - a real, git-produced
     /// context/removed/added hunk) and checks real things about the result: every row really
@@ -1145,10 +1132,8 @@ mod diff_render_tests {
     /// keyword and the changed integer literal - not flat, uncoloured text.
     #[gpui::test]
     fn opening_a_real_diff_renders_real_syntax_highlighted_rows(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        git(repo.path(), &["init", "-b", "main"]);
-        git(repo.path(), &["config", "user.email", "test@example.com"]);
-        git(repo.path(), &["config", "user.name", "Test User"]);
+        let repo = temp_repo();
+        test_support::seed_empty_repo_at(repo.path());
         std::fs::write(
             repo.path().join("sample.rs"),
             "fn add(x: i32) -> i32 {\n    x + 1\n}\n",
@@ -1163,7 +1148,7 @@ mod diff_render_tests {
         )
         .expect("rewrite sample.rs");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         app.update_in(cx, |app, window, cx| {
@@ -1224,10 +1209,8 @@ mod diff_render_tests {
     fn repeated_refreshes_of_the_same_open_diff_reuse_the_cached_highlighting(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        git(repo.path(), &["init", "-b", "main"]);
-        git(repo.path(), &["config", "user.email", "test@example.com"]);
-        git(repo.path(), &["config", "user.name", "Test User"]);
+        let repo = temp_repo();
+        test_support::seed_empty_repo_at(repo.path());
         std::fs::write(
             repo.path().join("sample.rs"),
             "fn add() -> i32 {\n    1\n}\n",
@@ -1242,7 +1225,7 @@ mod diff_render_tests {
         )
         .expect("rewrite sample.rs");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
         app.update_in(cx, |app, window, cx| {
             app.open_change_diff(PathBuf::from("sample.rs"), window, cx);
@@ -1282,10 +1265,8 @@ mod diff_render_tests {
     fn switching_the_open_diff_to_a_different_file_recomputes_the_highlight_cache(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        git(repo.path(), &["init", "-b", "main"]);
-        git(repo.path(), &["config", "user.email", "test@example.com"]);
-        git(repo.path(), &["config", "user.name", "Test User"]);
+        let repo = temp_repo();
+        test_support::seed_empty_repo_at(repo.path());
         std::fs::write(repo.path().join("a.rs"), "fn a() -> i32 {\n    1\n}\n")
             .expect("write a.rs");
         std::fs::write(repo.path().join("b.py"), "def b():\n    return 1\n").expect("write b.py");
@@ -1296,7 +1277,7 @@ mod diff_render_tests {
             .expect("rewrite a.rs");
         std::fs::write(repo.path().join("b.py"), "def b():\n    return 2\n").expect("rewrite b.py");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
         app.update_in(cx, |app, window, cx| {
             app.open_change_diff(PathBuf::from("a.rs"), window, cx);
@@ -1356,10 +1337,8 @@ mod diff_render_tests {
     fn a_diff_past_the_rendered_line_cap_still_highlights_every_line_it_actually_renders(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        git(repo.path(), &["init", "-b", "main"]);
-        git(repo.path(), &["config", "user.email", "test@example.com"]);
-        git(repo.path(), &["config", "user.name", "Test User"]);
+        let repo = temp_repo();
+        test_support::seed_empty_repo_at(repo.path());
         std::fs::write(repo.path().join("big.rs"), "fn noop() {}\n").expect("write big.rs");
         git(repo.path(), &["add", "."]);
         git(repo.path(), &["commit", "-m", "initial"]);
@@ -1371,7 +1350,7 @@ mod diff_render_tests {
         }
         std::fs::write(repo.path().join("big.rs"), &content).expect("rewrite big.rs");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
         app.update_in(cx, |app, window, cx| {
             app.open_change_diff(PathBuf::from("big.rs"), window, cx);
@@ -1814,27 +1793,7 @@ mod diff_row_plan_tests {
 mod diff_virtualization_tests {
     use super::*;
     use gpui::{Entity, TestAppContext};
-
-    fn git(dir: &std::path::Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn init_repo(dir: &std::path::Path) {
-        git(dir, &["init", "-b", "main"]);
-        git(dir, &["config", "user.email", "test@example.com"]);
-        git(dir, &["config", "user.name", "Test User"]);
-    }
+    use test_support::git;
 
     /// A real repository whose working tree differs from its committed base by `added` brand-new
     /// lines in one file - a single real git hunk, `added` lines long.
@@ -1844,7 +1803,7 @@ mod diff_virtualization_tests {
     /// `rems(1.6)` row height (about 21px at the default editor font size) only on the order of
     /// 50 rows can be on screen at once - far fewer than either number.
     fn seed_big_diff(dir: &std::path::Path, added: usize) {
-        init_repo(dir);
+        test_support::seed_empty_repo_at(dir);
         std::fs::write(dir.join("big.rs"), "fn noop() {}\n").expect("write big.rs");
         git(dir, &["add", "."]);
         git(dir, &["commit", "-m", "initial"]);
@@ -1860,7 +1819,7 @@ mod diff_virtualization_tests {
     /// of a 60-line file - two real git hunks with a real unchanged span between them, which is
     /// what makes `changes::fold_gap_between` produce a genuine `⋯ N unchanged lines` row.
     fn seed_two_hunk_diff(dir: &std::path::Path) {
-        init_repo(dir);
+        test_support::seed_empty_repo_at(dir);
         let original: String = (1..=60).map(|n| format!("fn f{n}() {{ {n} }}\n")).collect();
         std::fs::write(dir.join("two.rs"), &original).expect("write two.rs");
         git(dir, &["add", "."]);
@@ -1883,7 +1842,7 @@ mod diff_virtualization_tests {
         repo: &std::path::Path,
         path: &str,
     ) -> (Entity<AdeApp>, &'a mut gpui::VisualTestContext) {
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.to_path_buf());
         cx.run_until_parked();
         let path = PathBuf::from(path);
         app.update_in(cx, |app, window, cx| {
@@ -1907,7 +1866,7 @@ mod diff_virtualization_tests {
 
     #[gpui::test]
     fn a_diff_line_far_below_the_viewport_is_never_painted(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         seed_big_diff(repo.path(), 350);
         let (_app, cx) = open_diff_on(cx, repo.path(), "big.rs");
 
@@ -1933,7 +1892,7 @@ mod diff_virtualization_tests {
     fn scrolling_the_virtualized_diff_materializes_a_row_that_was_not_painted(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         seed_big_diff(repo.path(), 350);
         let (_app, cx) = open_diff_on(cx, repo.path(), "big.rs");
 
@@ -1968,7 +1927,7 @@ mod diff_virtualization_tests {
     /// warning.
     #[gpui::test]
     fn hunk_headers_and_fold_markers_paint_at_the_shared_row_height(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         seed_two_hunk_diff(repo.path());
         let (app, cx) = open_diff_on(cx, repo.path(), "two.rs");
 
@@ -2037,7 +1996,7 @@ mod diff_virtualization_tests {
     fn the_truncation_notice_is_the_last_item_of_the_list_at_the_shared_row_height(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         seed_big_diff(repo.path(), 350);
         let (_app, cx) = open_diff_on(cx, repo.path(), "big.rs");
 
@@ -2078,7 +2037,7 @@ mod diff_virtualization_tests {
     /// must still get none, so this can't pass by drawing a scrollbar unconditionally.
     #[gpui::test]
     fn the_overlay_scrollbar_still_tracks_the_virtualized_list(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         seed_big_diff(repo.path(), 350);
         let (app, cx) = open_diff_on(cx, repo.path(), "big.rs");
         // The scrollbar is built from the geometry the *previous* frame's layout wrote onto the
@@ -2094,8 +2053,8 @@ mod diff_virtualization_tests {
         );
 
         // A diff that genuinely fits must still get no scrollbar at all.
-        let small = tempfile::tempdir().expect("tempdir");
-        init_repo(small.path());
+        let small = temp_repo();
+        test_support::seed_empty_repo_at(small.path());
         std::fs::write(small.path().join("small.rs"), "fn a() -> i32 {\n    1\n}\n")
             .expect("write small.rs");
         git(small.path(), &["add", "."]);
@@ -2133,7 +2092,7 @@ mod diff_virtualization_tests {
     fn every_virtualized_row_resolves_its_own_line_through_the_identity_guard(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         seed_two_hunk_diff(repo.path());
         let (app, cx) = open_diff_on(cx, repo.path(), "two.rs");
 

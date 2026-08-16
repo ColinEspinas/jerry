@@ -3006,23 +3006,18 @@ impl QueryBuilder {
         assert_eq!(buf.content, "    a;\n    \nb;\n\n");
     }
 
+    /// The three positions worth pinning: an empty buffer's only offset, the very last byte, and
+    /// a line boundary (which resolves to the *start of the next* line, not the end of the
+    /// previous one).
     #[test]
-    fn line_col_for_offset_at_the_very_start_of_an_empty_file_is_zero_zero() {
-        let buf = buffer("");
-        assert_eq!(buf.line_col_for_offset(0), (0, 0));
-    }
+    fn line_col_for_offset_resolves_the_documented_edge_positions() {
+        assert_eq!(buffer("").line_col_for_offset(0), (0, 0));
 
-    #[test]
-    fn line_col_for_offset_at_the_very_end_of_the_file() {
-        let buf = buffer("abc\ndef");
-        assert_eq!(buf.line_col_for_offset(7), (1, 3));
-    }
-
-    #[test]
-    fn line_col_for_offset_exactly_on_a_line_boundary_is_the_start_of_the_next_line() {
         let buf = buffer("abc\ndef");
         // Byte 4 is 'd', the first byte of line 1.
-        assert_eq!(buf.line_col_for_offset(4), (1, 0));
+        for (offset, expected) in [(4usize, (1usize, 0usize)), (7, (1, 3))] {
+            assert_eq!(buf.line_col_for_offset(offset), expected, "offset {offset}");
+        }
     }
 
     #[test]

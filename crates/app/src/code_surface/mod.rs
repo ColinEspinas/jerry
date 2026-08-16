@@ -78,6 +78,8 @@ pub(crate) mod blame_view;
 pub(crate) mod diff_view;
 pub(crate) mod editing;
 pub(crate) mod file_view;
+#[cfg(test)]
+pub(crate) mod fixtures;
 pub(crate) mod lsp_ui;
 pub(crate) mod markdown_preview;
 pub(crate) mod minimap;

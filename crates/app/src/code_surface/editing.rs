@@ -55,6 +55,8 @@ use crate::code_surface::blame;
 use crate::code_surface::blame_view::render_inline_blame_span;
 use crate::code_surface::code_view;
 use crate::code_surface::edit_buffer::EditBuffer;
+#[cfg(test)]
+use crate::code_surface::fixtures::temp_repo;
 use crate::code_surface::indent;
 use crate::code_surface::lsp_ui::{
     diagnostic_row_bg, diagnostic_underline_color, render_inline_diagnostic_message,
@@ -71,6 +73,8 @@ use crate::root::{
     EditorSkipOccurrence, EditorUp, EditorWordLeft, EditorWordRight, TextRedo, TextUndo,
 };
 use crate::settings::store as settings_store;
+#[cfg(test)]
+use crate::test_support::open_test_app;
 use crate::theme;
 
 /// How long after the last keystroke [`AdeApp::schedule_rehighlight`] waits before running a real
@@ -2532,7 +2536,6 @@ mod caret_paint_quad_tests {
 mod editing_tests {
     use super::*;
     use crate::code_surface::{DiffBase, DiffLoadState};
-    use crate::root::focus::palette_focus_tests;
     use gpui::TestAppContext;
 
     fn write_file(repo: &std::path::Path, name: &str, content: &str) -> PathBuf {
@@ -2583,9 +2586,9 @@ mod editing_tests {
     fn typing_changes_real_content_and_updates_syntax_highlighting_after_the_debounce(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.rs", "foo(x: i32) {}\n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         let relative = PathBuf::from("sample.rs");
 
@@ -2690,9 +2693,9 @@ mod editing_tests {
     /// driven through the real, bound `EditorRight` keystroke, not a direct method call.
     #[gpui::test]
     fn arrow_keys_move_the_real_caret_and_cross_a_real_line_boundary(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.txt", "ab\ncd\n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         bind_real_keys(cx);
         let relative = PathBuf::from("sample.txt");
@@ -2733,9 +2736,9 @@ mod editing_tests {
     /// `EditorSelectRight` keystroke.
     #[gpui::test]
     fn shift_arrow_extends_a_real_selection_through_the_real_key_bindings(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.txt", "hello\n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         bind_real_keys(cx);
         let relative = PathBuf::from("sample.txt");
@@ -2760,9 +2763,9 @@ mod editing_tests {
     fn ctrl_shift_arrow_extends_a_real_selection_word_wise_through_the_real_key_bindings(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.txt", "hello world\n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         bind_real_keys(cx);
         let relative = PathBuf::from("sample.txt");
@@ -2810,9 +2813,9 @@ mod editing_tests {
     fn double_click_selects_the_real_word_and_triple_click_selects_the_real_line(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.txt", "hello world\nsecond line\n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         let relative = PathBuf::from("sample.txt");
 
@@ -2869,9 +2872,9 @@ mod editing_tests {
     /// functionality" rule targets).
     #[gpui::test]
     fn an_indented_lines_indent_guide_paints_when_the_setting_is_on(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.rs", "fn main() {\n    let x = 1;\n}\n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         assert!(
             app.read_with(cx, |app, _| app.settings.appearance.show_indent_guides),
             "sanity check: the real default is guides on"
@@ -2890,9 +2893,9 @@ mod editing_tests {
     /// setting *could* gate it.
     #[gpui::test]
     fn no_indent_guide_paints_when_the_setting_is_off(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.rs", "fn main() {\n    let x = 1;\n}\n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update(cx, |app, _cx| {
             app.settings.appearance.show_indent_guides = false;
         });
@@ -2921,10 +2924,10 @@ mod editing_tests {
     fn selection_survives_a_row_scrolling_out_of_the_virtualized_range_and_back(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let many_lines: String = (0..500).map(|n| format!("line {n}\n")).collect();
         let file_path = write_file(repo.path(), "sample.txt", &many_lines);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         let relative = PathBuf::from("sample.txt");
 
@@ -3000,9 +3003,9 @@ mod editing_tests {
     fn ctrl_d_through_real_key_bindings_adds_a_cursor_and_typing_fans_out_to_both(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.txt", "value + value\n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         bind_real_keys(cx);
         let relative = PathBuf::from("sample.txt");
@@ -3048,9 +3051,9 @@ mod editing_tests {
     /// `EditorSelectAllOccurrences` keystroke selects every real occurrence at once.
     #[gpui::test]
     fn ctrl_shift_l_through_real_key_bindings_selects_every_occurrence(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.txt", "value + value + value\n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         bind_real_keys(cx);
         let relative = PathBuf::from("sample.txt");
@@ -3078,9 +3081,9 @@ mod editing_tests {
     fn ctrl_k_ctrl_d_through_real_key_bindings_skips_without_adding_a_cursor(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.txt", "value + value\n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         bind_real_keys(cx);
         let relative = PathBuf::from("sample.txt");
@@ -3105,9 +3108,9 @@ mod editing_tests {
     /// `EditorCollapseCursors` keystroke collapses back to a single cursor.
     #[gpui::test]
     fn escape_through_real_key_bindings_collapses_multi_cursor_state(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.txt", "value + value\n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         bind_real_keys(cx);
         let relative = PathBuf::from("sample.txt");
@@ -3143,9 +3146,9 @@ mod editing_tests {
     fn backspace_and_delete_remove_real_text_through_the_real_key_bindings(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.txt", "abc\n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         bind_real_keys(cx);
         let relative = PathBuf::from("sample.txt");
@@ -3180,9 +3183,9 @@ mod editing_tests {
     /// the real dirty flag - driven through the real, bound `EditorSave` keystroke.
     #[gpui::test]
     fn editor_save_writes_real_content_to_disk_and_clears_the_dirty_flag(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.txt", "hello\n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         bind_real_keys(cx);
         let relative = PathBuf::from("sample.txt");
@@ -3222,9 +3225,9 @@ mod editing_tests {
     fn external_change_while_dirty_is_detected_and_blocks_save_without_overwriting_either_version(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.txt", "original\n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         let relative = PathBuf::from("sample.txt");
 
@@ -3236,7 +3239,11 @@ mod editing_tests {
         // A real external change, bypassing this app entirely.
         std::fs::write(&file_path, "changed on disk, a completely different size\n")
             .expect("external rewrite");
-        std::thread::sleep(crate::root::FILE_FRESHNESS_CHECK_INTERVAL + Duration::from_millis(50));
+        // Force the throttled freshness check to run now, instead of waiting out its real
+        // wall-clock interval.
+        app.update(cx, |app, _| {
+            app.file_view_last_freshness_check = None;
+        });
 
         app.update(cx, |app, cx| {
             app.render_center_pane(cx);
@@ -3274,9 +3281,9 @@ mod editing_tests {
     fn a_save_with_no_external_interference_is_not_falsely_flagged_as_a_conflict(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.txt", "hello\n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         let relative = PathBuf::from("sample.txt");
 
@@ -3296,22 +3303,6 @@ mod editing_tests {
         assert_eq!(on_disk, "well hello\n");
     }
 
-    /// `.output()`, not `.status()` - see `crate::sidebar::render::virtualization_tests::git`'s
-    /// own comment for why (a 40-line "create mode 100644" dump would otherwise land in every
-    /// test run's output here too).
-    fn git(dir: &std::path::Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
     /// GitHub issue #89 ("Changes not showing in editor and file tree"): saving a file never
     /// called `AdeApp::load_diff`, so `AdeApp::diff_state` - the one thing both the file tree's
     /// "M"/"A" marks (`crate::sidebar::render::tree_change_marks`) and the Changes/diff view
@@ -3325,17 +3316,15 @@ mod editing_tests {
     /// reloaded `diff_state` reports the file as changed without any other trigger in between.
     #[gpui::test]
     fn saving_a_file_immediately_refreshes_diff_state_for_issue_89(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        git(repo.path(), &["init", "-b", "main"]);
-        git(repo.path(), &["config", "user.email", "test@example.com"]);
-        git(repo.path(), &["config", "user.name", "Test User"]);
+        let repo = temp_repo();
+        test_support::seed_empty_repo_at(repo.path());
         let file_path = write_file(repo.path(), "sample.txt", "one\ntwo\nthree\n");
-        git(repo.path(), &["add", "."]);
-        git(repo.path(), &["commit", "-m", "initial"]);
-        git(repo.path(), &["checkout", "-b", "feature"]);
+        test_support::git(repo.path(), &["add", "."]);
+        test_support::git(repo.path(), &["commit", "-m", "initial"]);
+        test_support::git(repo.path(), &["checkout", "-b", "feature"]);
         let relative = PathBuf::from("sample.txt");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         let changed_before_edit = app.read_with(cx, |app, _| match &app.diff_state {
@@ -3392,9 +3381,9 @@ mod editing_tests {
     fn the_conflict_flag_does_not_self_clear_once_file_view_cache_catches_up_while_still_dirty(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.txt", "original\n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         let relative = PathBuf::from("sample.txt");
 
@@ -3403,7 +3392,11 @@ mod editing_tests {
         });
 
         std::fs::write(&file_path, "changed on disk\n").expect("external rewrite");
-        std::thread::sleep(crate::root::FILE_FRESHNESS_CHECK_INTERVAL + Duration::from_millis(50));
+        // Force the throttled freshness check to run now, instead of waiting out its real
+        // wall-clock interval.
+        app.update(cx, |app, _| {
+            app.file_view_last_freshness_check = None;
+        });
 
         // First real freshness check: detects the conflict, and dispatches (then resolves) a
         // real background reload that catches `file_view_cache` up to the new disk content.
@@ -3419,7 +3412,11 @@ mod editing_tests {
         // A second full throttle interval, with the buffer still dirty and disk still not
         // matching the buffer's own load-time snapshot - `file_view_cache` is now fresh (it
         // caught up above), but the real conflict has not actually been resolved.
-        std::thread::sleep(crate::root::FILE_FRESHNESS_CHECK_INTERVAL + Duration::from_millis(50));
+        // Force the throttled freshness check to run now, instead of waiting out its real
+        // wall-clock interval.
+        app.update(cx, |app, _| {
+            app.file_view_last_freshness_check = None;
+        });
         app.update(cx, |app, cx| {
             app.render_center_pane(cx);
         });
@@ -3443,9 +3440,9 @@ mod editing_tests {
     fn replace_and_mark_text_in_range_records_a_real_composition_and_unmark_clears_it(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.txt", "ab\n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         let relative = PathBuf::from("sample.txt");
 
@@ -3488,33 +3485,15 @@ mod editing_tests {
     /// actions to the `"file-editor"` key context rather than binding them globally.
     #[gpui::test]
     fn editor_actions_are_a_safe_no_op_while_the_diff_view_is_active(cx: &mut TestAppContext) {
-        fn git(dir: &std::path::Path, args: &[&str]) {
-            let output = std::process::Command::new("git")
-                .current_dir(dir)
-                .args(args)
-                .output()
-                .expect("failed to spawn git");
-            assert!(
-                output.status.success(),
-                "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-                args,
-                dir,
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-
-        let repo = tempfile::tempdir().expect("tempdir");
-        git(repo.path(), &["init", "-b", "main"]);
-        git(repo.path(), &["config", "user.email", "test@example.com"]);
-        git(repo.path(), &["config", "user.name", "Test User"]);
+        let repo = temp_repo();
+        test_support::seed_empty_repo_at(repo.path());
         write_file(repo.path(), "sample.rs", "fn add() -> i32 {\n    1\n}\n");
-        git(repo.path(), &["add", "."]);
-        git(repo.path(), &["commit", "-m", "initial"]);
-        git(repo.path(), &["checkout", "-b", "feature"]);
+        test_support::git(repo.path(), &["add", "."]);
+        test_support::git(repo.path(), &["commit", "-m", "initial"]);
+        test_support::git(repo.path(), &["checkout", "-b", "feature"]);
         write_file(repo.path(), "sample.rs", "fn add() -> i32 {\n    2\n}\n");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
         app.update_in(cx, |app, window, cx| {
             app.open_change_diff(PathBuf::from("sample.rs"), window, cx);
@@ -3571,13 +3550,13 @@ mod editing_tests {
     fn clicking_a_real_editable_row_places_the_real_cursor_without_panicking(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(
             repo.path(),
             "sample.txt",
             "a short line\nworld, a longer real line of text\n",
         );
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         let relative = PathBuf::from("sample.txt");
 
@@ -3637,13 +3616,13 @@ mod editing_tests {
     fn clicking_past_the_end_of_a_short_line_places_the_cursor_at_the_end_of_that_line(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(
             repo.path(),
             "sample.txt",
             "a short line\nworld, a longer real line of text that runs on for a while\n",
         );
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         let relative = PathBuf::from("sample.txt");
 
@@ -3687,9 +3666,9 @@ mod editing_tests {
     /// anywhere but the very first pixel column to hit-test against.
     #[gpui::test]
     fn clicking_on_a_real_blank_line_places_the_cursor_there(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.txt", "first\n\nthird\n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         let relative = PathBuf::from("sample.txt");
 
@@ -3727,9 +3706,9 @@ mod editing_tests {
     fn clicking_below_the_last_line_places_the_cursor_at_the_end_of_the_buffer(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.txt", "one\ntwo\nthree");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         let relative = PathBuf::from("sample.txt");
 
@@ -3777,12 +3756,12 @@ mod editing_tests {
     /// truncated file.
     #[gpui::test]
     fn a_file_with_invalid_utf8_bytes_does_not_get_a_real_edit_buffer(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = repo.path().join("binary.txt");
         // A lone UTF-8 continuation byte (0x80) is never valid on its own - real, genuinely
         // invalid UTF-8, not a contrived edge case.
         std::fs::write(&file_path, [b'h', b'i', 0x80, b'\n']).expect("write invalid-utf8 file");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         let relative = PathBuf::from("binary.txt");
 
@@ -3809,9 +3788,9 @@ mod editing_tests {
     /// the real, explicit, opt-in escape hatch this fixes it with.
     #[gpui::test]
     fn editor_save_anyway_resolves_a_real_permanently_stuck_conflict(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.txt", "original\n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         bind_real_keys(cx);
         let relative = PathBuf::from("sample.txt");
@@ -3821,7 +3800,11 @@ mod editing_tests {
         });
 
         std::fs::write(&file_path, "changed on disk\n").expect("external rewrite");
-        std::thread::sleep(crate::root::FILE_FRESHNESS_CHECK_INTERVAL + Duration::from_millis(50));
+        // Force the throttled freshness check to run now, instead of waiting out its real
+        // wall-clock interval.
+        app.update(cx, |app, _| {
+            app.file_view_last_freshness_check = None;
+        });
         app.update(cx, |app, cx| {
             app.render_center_pane(cx);
         });
@@ -3896,9 +3879,9 @@ mod editing_tests {
     /// write and bump the file's real mtime for no reason.
     #[gpui::test]
     fn force_save_active_file_is_a_real_no_op_on_an_already_clean_buffer(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.txt", "hello\n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         let relative = PathBuf::from("sample.txt");
 
@@ -3938,9 +3921,9 @@ mod editing_tests {
     fn a_pending_save_whose_buffer_vanished_before_the_writer_loop_checked_it_does_not_leak_file_save_running(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.txt", "hello\n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         let relative = PathBuf::from("sample.txt");
 
@@ -4006,9 +3989,9 @@ mod editing_tests {
     fn real_cjk_ime_composition_with_a_non_default_caret_does_not_corrupt_the_selection_or_panic_on_the_next_keystroke(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.txt", "prefix ok\n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         let relative = PathBuf::from("sample.txt");
 
@@ -4072,9 +4055,9 @@ mod editing_tests {
     fn a_literal_right_bracket_keystroke_reaches_the_real_edit_buffer_while_the_file_view_is_editing(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.rs", "abc\n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         bind_real_keys(cx);
         let relative = PathBuf::from("sample.rs");
@@ -4115,9 +4098,9 @@ mod editing_tests {
     fn completions_keybindings_are_correctly_scoped_in_both_the_open_and_closed_state(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.rs", "ab\ncd\n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         bind_real_keys(cx);
         let relative = PathBuf::from("sample.rs");
@@ -4335,9 +4318,9 @@ mod editing_tests {
     /// round trips is precisely what the issue asks for.
     #[gpui::test]
     fn typing_past_the_trigger_point_narrows_the_real_completions_list(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.rs", "let x = \n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         bind_real_keys(cx);
         let relative = PathBuf::from("sample.rs");
@@ -4400,9 +4383,9 @@ mod editing_tests {
     /// so this isn't passing by simply matching everything.
     #[gpui::test]
     fn a_real_non_contiguous_typed_prefix_still_matches_the_right_item(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.rs", "let x = \n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         bind_real_keys(cx);
         let relative = PathBuf::from("sample.rs");
@@ -4434,9 +4417,9 @@ mod editing_tests {
     fn keyboard_selection_stays_aligned_with_the_filtered_completions_view(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.rs", "let x = \n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         bind_real_keys(cx);
         let relative = PathBuf::from("sample.rs");
@@ -4493,85 +4476,23 @@ mod editing_tests {
         );
     }
 
-    /// GitHub issue #121, test (a): pressing a real `Enter` keystroke after an indented line
-    /// carries that exact same real leading whitespace over to the new line, through the real,
-    /// bound `EditorEnter` keystroke (not a direct handler call) - matching this file's own
-    /// established "simulate the real keystroke" precedent for `Enter` regression coverage (see
-    /// `completions_keybindings_are_correctly_scoped_in_both_the_open_and_closed_state` just
-    /// above).
-    #[gpui::test]
-    fn enter_carries_the_real_leading_whitespace_of_the_previous_line_over(
-        cx: &mut TestAppContext,
-    ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let file_path = write_file(repo.path(), "sample.rs", "fn main() {\n    let x = 1;\n}\n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        open_file_for_editing(&app, cx, file_path.clone());
-        bind_real_keys(cx);
-        let relative = PathBuf::from("sample.rs");
-
-        app.update(cx, |app, cx| {
-            // Right after the `;`, before that line's own trailing newline.
-            app.edit_buffer_mut(&relative)
-                .unwrap()
-                .move_to("fn main() {\n    let x = 1;".len());
-            cx.notify();
-        });
-
-        cx.simulate_keystrokes("enter");
-
-        assert_eq!(
-            app.read_with(cx, |app, _| app
-                .edit_buffer(&relative)
-                .unwrap()
-                .content
-                .clone()),
-            "fn main() {\n    let x = 1;\n    \n}\n",
-            "the new line must start with the exact same real 4-space indentation the line \
-             above it had, read from the real buffer content"
-        );
-    }
-
-    /// GitHub issue #121, test (b): pressing `Enter` on a real column-0 line (no leading
-    /// whitespace at all) inserts a bare newline - no whitespace fabricated out of nowhere.
-    #[gpui::test]
-    fn enter_adds_no_whitespace_after_a_column_zero_line(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let file_path = write_file(repo.path(), "sample.rs", "foo();\nbar();\n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        open_file_for_editing(&app, cx, file_path.clone());
-        bind_real_keys(cx);
-        let relative = PathBuf::from("sample.rs");
-
-        app.update(cx, |app, cx| {
-            app.edit_buffer_mut(&relative).unwrap().move_to(6); // end of "foo();"
-            cx.notify();
-        });
-
-        cx.simulate_keystrokes("enter");
-
-        assert_eq!(
-            app.read_with(cx, |app, _| app
-                .edit_buffer(&relative)
-                .unwrap()
-                .content
-                .clone()),
-            "foo();\n\nbar();\n",
-            "a column-0 line must not gain any real indentation it never had"
-        );
-    }
-
     /// GitHub issue #121, test (c) - stretch goal: `Enter` right after a real opening bracket
     /// adds one more real indent unit on top of the carried-over whitespace, using the exact same
     /// real indent-unit resolution (tabs/spaces/width) `Self::handle_editor_indent_action`'s own
     /// `Tab` uses - proven here by checking the inserted whitespace is real 4 literal spaces (the
     /// default `EditorSettings::tab_width`/`insert_spaces`, not a hardcoded `"    "` this test
     /// would pass even if the production code had a different, wrong hardcoded width).
+    ///
+    /// This is the *only* `Enter` test at this layer, deliberately: the individual auto-indent
+    /// rules (carry-over, column zero, Python's `:` header) are covered directly against
+    /// `EditBuffer::insert_newline_with_auto_indent`, and what a keystroke test adds over those
+    /// is the wiring - the bound `EditorEnter` reaching the handler with the real, settings-
+    /// derived indent unit, which the `tab_width = 2` half below is what actually proves.
     #[gpui::test]
     fn enter_adds_one_extra_real_indent_level_after_an_opening_bracket(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.rs", "fn main() {\n}\n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         bind_real_keys(cx);
         let relative = PathBuf::from("sample.rs");
@@ -4615,40 +4536,6 @@ mod editing_tests {
         );
     }
 
-    /// GitHub issue #121, PR #136 review (Colin Espinas: "Missing indent when no opening
-    /// character is there like when we use ':' in python"): a real Python file's block header
-    /// ending in `:` (no opening bracket at all) must still get one extra real indent level,
-    /// the same way an opening bracket already does for every language.
-    #[gpui::test]
-    fn enter_adds_one_extra_real_indent_level_after_a_python_colon_header(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let file_path = write_file(repo.path(), "sample.py", "if True:\n    pass\n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        open_file_for_editing(&app, cx, file_path.clone());
-        bind_real_keys(cx);
-        let relative = PathBuf::from("sample.py");
-
-        app.update(cx, |app, cx| {
-            app.edit_buffer_mut(&relative)
-                .unwrap()
-                .move_to("if True:".len());
-            cx.notify();
-        });
-
-        cx.simulate_keystrokes("enter");
-
-        assert_eq!(
-            app.read_with(cx, |app, _| app
-                .edit_buffer(&relative)
-                .unwrap()
-                .content
-                .clone()),
-            "if True:\n    \n    pass\n",
-            "a Python block header ending in ':' must add one real indent unit, exactly like \
-             an opening bracket does"
-        );
-    }
-
     /// Revision R8.5b audit finding 1's direct regression test: the sixth instance of this
     /// project's recurring "a keystroke gets swallowed" bug class. Before this fix, `Self::
     /// completions_open_for_active_path` returned `true` for *any* real [`CompletionsEntry`],
@@ -4664,9 +4551,9 @@ mod editing_tests {
     fn enter_and_down_are_not_swallowed_while_completions_are_merely_loading_or_failed(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.rs", "ab\ncd\n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         bind_real_keys(cx);
         let relative = PathBuf::from("sample.rs");
@@ -4789,9 +4676,9 @@ mod editing_tests {
     fn a_real_typing_burst_undoes_and_redoes_as_one_step_through_the_real_key_bindings(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.txt", "ab\ncd\n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         bind_real_keys(cx);
         let relative = PathBuf::from("sample.txt");
@@ -4840,9 +4727,9 @@ mod editing_tests {
     fn a_real_space_typed_into_the_file_view_is_text_not_the_stage_binding(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.txt", "ab\n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         bind_real_keys(cx);
         let relative = PathBuf::from("sample.txt");
@@ -4864,9 +4751,9 @@ mod editing_tests {
     /// explicitly, and it is a literal `Ctrl` on every OS (see `crate::default_key_bindings`).
     #[gpui::test]
     fn ctrl_y_really_redoes_in_the_code_editor(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.txt", "ab\n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         bind_real_keys(cx);
         let relative = PathBuf::from("sample.txt");
@@ -4883,9 +4770,9 @@ mod editing_tests {
     /// undo.
     #[gpui::test]
     fn secondary_z_in_the_code_editor_reaches_text_undo(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.txt", "ab\n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         bind_real_keys(cx);
         let relative = PathBuf::from("sample.txt");
@@ -4913,9 +4800,9 @@ mod editing_tests {
     fn secondary_z_still_reaches_text_undo_while_the_completions_popup_is_open(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.rs", "ab\n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         bind_real_keys(cx);
         let relative = PathBuf::from("sample.rs");
@@ -4958,10 +4845,10 @@ mod editing_tests {
     /// real tab-activation path rather than by poking `edit_buffers` directly.
     #[gpui::test]
     fn a_files_undo_history_survives_switching_to_another_tab_and_back(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let first = write_file(repo.path(), "first.txt", "one\n");
         let second = write_file(repo.path(), "second.txt", "two\n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, first.clone());
         bind_real_keys(cx);
         let first_relative = PathBuf::from("first.txt");
@@ -5002,9 +4889,9 @@ mod editing_tests {
     /// real undo step with the pre-reload history still behind it.
     #[gpui::test]
     fn an_external_rewrite_of_a_clean_buffer_reloads_as_one_undoable_step(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.txt", "original\n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         bind_real_keys(cx);
         let relative = PathBuf::from("sample.txt");
@@ -5023,8 +4910,9 @@ mod editing_tests {
             "sanity check: the buffer must really be clean before the external rewrite"
         );
 
-        // A real external writer rewrites the file, with a genuinely newer mtime.
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        // A real external writer rewrites the file. No wait for a newer mtime is needed:
+        // `code_view::cache_is_fresh` compares length as well, and this content is a different
+        // length from what the buffer was loaded with.
         std::fs::write(&file_path, "rewritten by an agent\n").expect("external rewrite");
         // Force the throttled freshness check to run, then let the load it dispatches resolve.
         app.update(cx, |app, _| {
@@ -5066,9 +4954,9 @@ mod editing_tests {
     fn an_external_rewrite_of_a_dirty_buffer_leaves_the_buffer_and_its_history_untouched(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.txt", "original\n");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
         bind_real_keys(cx);
         let relative = PathBuf::from("sample.txt");
@@ -5076,7 +4964,8 @@ mod editing_tests {
         cx.simulate_input("MINE");
         assert!(app.read_with(cx, |app, _| app.edit_buffer(&relative).unwrap().is_dirty()));
 
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        // A different length from the loaded content, so the freshness check below sees the
+        // rewrite without this test having to wait for a coarser mtime to tick over.
         std::fs::write(&file_path, "theirs\n").expect("external rewrite");
         app.update(cx, |app, _| {
             app.file_view_last_freshness_check = None;
@@ -5120,15 +5009,15 @@ mod editing_tests {
     fn switching_worktrees_and_back_preserves_unsaved_edits_without_cross_worktree_collision(
         cx: &mut TestAppContext,
     ) {
-        let repo_a = tempfile::tempdir().expect("tempdir a");
-        let repo_b = tempfile::tempdir().expect("tempdir b");
+        let repo_a = temp_repo();
+        let repo_b = temp_repo();
         // Deliberately the *same* relative path in both worktrees - the real collision risk this
         // test exists to rule out.
         let file_a = write_file(repo_a.path(), "sample.txt", "worktree a original\n");
         let file_b = write_file(repo_b.path(), "sample.txt", "worktree b original\n");
         let relative = PathBuf::from("sample.txt");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo_a.path().to_path_buf());
         app.update(cx, |app, _cx| {
             app.worktrees = vec![
                 crate::rail::worktrees::WorktreeItem {
@@ -5244,13 +5133,13 @@ mod editing_tests {
     fn toggling_bracket_pair_colorization_re_highlights_an_already_open_buffer(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(
             repo.path(),
             "sample.rs",
             "fn main() { let v = vec![(1, 2)]; }\n",
         );
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
 
         let relative = PathBuf::from("sample.rs");
@@ -5333,14 +5222,14 @@ let last = 5;
     fn open_foldable_file(
         cx: &mut TestAppContext,
     ) -> (Entity<AdeApp>, &mut gpui::VisualTestContext, PathBuf) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let repo_path = repo.path().to_path_buf();
         // The tempdir must outlive the test body; every other test in this module keeps it in a
         // local, but these need the app *and* the context back, so it is leaked deliberately -
         // the process exits at the end of the test binary anyway.
         std::mem::forget(repo);
         let file_path = write_file(&repo_path, "sample.rs", FOLDABLE_SOURCE);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_path);
+        let (app, cx) = open_test_app(cx, repo_path);
         open_file_for_editing(&app, cx, file_path.clone());
         (app, cx, file_path)
     }
@@ -5631,10 +5520,10 @@ let last = 5;
     /// file opened in between is entirely unaffected.
     #[gpui::test]
     fn fold_state_is_per_file(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let folded_file = write_file(repo.path(), "sample.rs", FOLDABLE_SOURCE);
         let other_file = write_file(repo.path(), "other.rs", FOLDABLE_SOURCE);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
         open_file_for_editing(&app, cx, folded_file.clone());
         click_fold_chevron(cx, 1);
@@ -5677,9 +5566,9 @@ let last = 5;
     /// silently do nothing at all.
     #[gpui::test]
     fn clicking_below_a_folded_files_content_still_reveals_the_caret_row(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.rs", LAST_LINE_FOLD_SOURCE);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
 
         click_fold_chevron(cx, 2);
@@ -5728,9 +5617,9 @@ let last = 5;
     /// expand it back into view.
     #[gpui::test]
     fn a_real_external_rewrite_clears_stale_fold_state_for_that_file(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_file(repo.path(), "sample.rs", FOLDABLE_SOURCE);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_file_for_editing(&app, cx, file_path.clone());
 
         click_fold_chevron(cx, 1);
@@ -5755,9 +5644,11 @@ let last = 5;
             "fn alpha() {\n    let a = 1;\n    let b = 2;\n    let c = 3;\n}\n",
         )
         .expect("rewrite sample.rs");
-        std::thread::sleep(
-            crate::root::FILE_FRESHNESS_CHECK_INTERVAL + std::time::Duration::from_millis(50),
-        );
+        // Force the throttled freshness check to run now, instead of waiting out its real
+        // wall-clock interval.
+        app.update(cx, |app, _| {
+            app.file_view_last_freshness_check = None;
+        });
         app.update(cx, |app, cx| {
             app.render_center_pane(cx);
         });
@@ -5823,7 +5714,6 @@ let last = 5;
 #[cfg(test)]
 mod caret_alignment_tests {
     use super::*;
-    use crate::root::focus::palette_focus_tests;
     use gpui::TestAppContext;
 
     /// A deliberately dense single line: `tree-sitter` splits it into dozens of real runs
@@ -5840,12 +5730,13 @@ mod caret_alignment_tests {
         Entity<AdeApp>,
         &mut gpui::VisualTestContext,
         PathBuf,
-        tempfile::TempDir,
+        crate::code_surface::fixtures::TempRepo,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let file_path = repo.path().join("dense.rs");
+        let repo = temp_repo();
+        let root = repo.path().canonicalize().expect("canonical tempdir");
+        let file_path = root.join("dense.rs");
         std::fs::write(&file_path, format!("fn main() {{\n{DENSE_LINE}\n}}\n")).expect("write");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, root.clone());
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(file_path, window, cx);
         });
@@ -5936,13 +5827,13 @@ mod caret_alignment_tests {
     fn painted_code_text_matches_the_caret_shaping_for_real_multi_byte_text(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         // 2-byte Latin-1 accents, 3-byte CJK and a 4-byte emoji, all inside real Rust string
         // literals so `tree-sitter` still splits the line into several runs around them.
         let line = "    let s = \"café\" ; let t = \"日本語\" ; let u = \"🙂\" ;";
         let file_path = repo.path().join("unicode.rs");
         std::fs::write(&file_path, format!("fn main() {{\n{line}\n}}\n")).expect("write");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(file_path, window, cx);
         });

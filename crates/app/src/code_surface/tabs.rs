@@ -5,7 +5,9 @@
 
 use super::*;
 #[cfg(test)]
-use crate::root::focus::palette_focus_tests;
+use crate::code_surface::fixtures::temp_repo;
+#[cfg(test)]
+use crate::test_support::open_test_app;
 
 impl AdeApp {
     /// Loads (or reloads) the diff of `root` against its detected base branch. Runs on
@@ -992,7 +994,7 @@ mod code_view_cache_tests {
     /// `.rs` fixture. (It was `root/code_surface.rs` before that file was split into this folder.)
     #[gpui::test]
     fn opening_a_large_real_file_does_not_block_render_on_the_full_parse(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = repo.path().join("large.rs");
         let source =
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lsp/client.rs"))
@@ -1004,7 +1006,7 @@ mod code_view_cache_tests {
         code_view::load_file(&file_path).expect("load_file baseline");
         let baseline_duration = baseline_start.elapsed();
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(file_path.clone(), window, cx);
         });
@@ -1050,7 +1052,7 @@ mod code_view_cache_tests {
     /// `load_file` call would allocate a new `Vec`.
     #[gpui::test]
     fn repeated_renders_of_the_same_open_file_reuse_the_cached_parse(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = repo.path().join("sample.rs");
         std::fs::write(
             &file_path,
@@ -1058,7 +1060,7 @@ mod code_view_cache_tests {
         )
         .expect("write sample.rs");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(file_path.clone(), window, cx);
@@ -1106,16 +1108,16 @@ mod code_view_cache_tests {
     }
 
     /// A content change (different mtime/len) must invalidate the cache - confirms this isn't a
-    /// cache that never refreshes. Sleeps past [`FILE_FRESHNESS_CHECK_INTERVAL`] first, since the
+    /// cache that never refreshes. Clears the throttle rather than waiting it out, since the
     /// throttle window itself is covered separately by
     /// `renders_within_the_throttle_window_do_not_pick_up_a_fresh_on_disk_change` below.
     #[gpui::test]
     fn a_real_on_disk_change_to_the_open_file_invalidates_the_cache(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = repo.path().join("sample.rs");
         std::fs::write(&file_path, "fn add() -> i32 {\n    1\n}\n").expect("write sample.rs");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(file_path.clone(), window, cx);
         });
@@ -1141,8 +1143,11 @@ mod code_view_cache_tests {
         )
         .expect("rewrite sample.rs");
 
-        // Past the throttle window, so the next freshness check isn't skipped.
-        std::thread::sleep(FILE_FRESHNESS_CHECK_INTERVAL + std::time::Duration::from_millis(50));
+        // Clear the throttle so the next freshness check runs, rather than waiting out its
+        // real wall-clock interval.
+        app.update(cx, |app, _| {
+            app.file_view_last_freshness_check = None;
+        });
 
         app.update(cx, |app, cx| {
             app.render_center_pane(cx);
@@ -1167,17 +1172,17 @@ mod code_view_cache_tests {
     }
 
     /// Proves [`AdeApp::file_view_last_freshness_check`]'s throttling: a change made within
-    /// [`FILE_FRESHNESS_CHECK_INTERVAL`] of the last check isn't picked up yet, but the same
-    /// change is picked up once the window passes.
+    /// `FILE_FRESHNESS_CHECK_INTERVAL` of the last check isn't picked up yet, but the same
+    /// change is picked up once that record is cleared.
     #[gpui::test]
     fn renders_within_the_throttle_window_do_not_pick_up_a_fresh_on_disk_change(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = repo.path().join("sample.rs");
         std::fs::write(&file_path, "fn add() -> i32 {\n    1\n}\n").expect("write sample.rs");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(file_path.clone(), window, cx);
         });
@@ -1227,8 +1232,10 @@ mod code_view_cache_tests {
             "no reload should have been dispatched while the freshness check was throttled"
         );
 
-        // Past the throttle window - the change is now observed.
-        std::thread::sleep(FILE_FRESHNESS_CHECK_INTERVAL + std::time::Duration::from_millis(50));
+        // Clear the throttle - the change is now observed.
+        app.update(cx, |app, _| {
+            app.file_view_last_freshness_check = None;
+        });
         app.update(cx, |app, cx| {
             app.render_center_pane(cx);
         });
@@ -1264,13 +1271,13 @@ mod cross_file_navigation_tests {
     fn navigating_to_an_uncached_file_then_opening_a_different_file_first_does_not_leak_the_cursor(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_b = repo.path().join("b.txt");
         let file_c = repo.path().join("c.txt");
         std::fs::write(&file_b, "one\ntwo\nthree\nfour\nfive\n").expect("write b.txt");
         std::fs::write(&file_c, "hello\nworld\n").expect("write c.txt");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
         // Landing on B's line 5 - B isn't cached yet, so this sets `pending_cursor_line` rather
         // than `code_cursor` directly.
@@ -1336,12 +1343,12 @@ mod unreadable_file_tests {
     fn an_unreadable_file_settles_into_a_stable_error_state_without_respawning(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         // A deterministic, cross-platform read failure: no such path exists, so `load_file`'s
         // `fs::metadata`/`fs::read` fail every time, with no platform-specific setup needed.
         let missing_path = repo.path().join("does-not-exist.rs");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(missing_path.clone(), window, cx);
@@ -1431,7 +1438,7 @@ mod reopened_file_caret_tests {
     /// lie about where the next keystroke will land, in the one widget that exists to say so.
     #[gpui::test]
     fn reopening_a_file_reports_its_restored_caret_line_not_line_one(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let target = repo.path().join("many.txt");
         // Long enough that the caret's row genuinely cannot be on screen at scroll offset 0 -
         // otherwise "the view scrolled to the caret" and "the view never moved" look identical.
@@ -1440,8 +1447,7 @@ mod reopened_file_caret_tests {
         let other = repo.path().join("other.txt");
         std::fs::write(&other, "x\n").expect("write");
 
-        let (app, cx) =
-            crate::root::focus::palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_and_settle(&app, cx, target.clone());
         let relative = PathBuf::from("many.txt");
 
@@ -1532,12 +1538,11 @@ mod reopened_file_caret_tests {
     /// buffer's caret" would break if the buffer were ever seeded at a non-zero offset.
     #[gpui::test]
     fn a_first_open_is_caret_at_line_one(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let target = repo.path().join("fresh.txt");
         std::fs::write(&target, "a\nb\nc\n").expect("write");
 
-        let (app, cx) =
-            crate::root::focus::palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         open_and_settle(&app, cx, target);
 
         app.read_with(cx, |app, _| {
@@ -1581,9 +1586,9 @@ mod multi_file_tab_tests {
     /// real no-duplicate rule.
     #[gpui::test]
     fn opening_the_same_file_twice_does_not_duplicate_its_tab(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let ((a, _b, _c), (a_rel, _, _)) = write_three_files(repo.path());
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(a.clone(), window, cx);
@@ -1611,9 +1616,9 @@ mod multi_file_tab_tests {
     /// active agent" order.
     #[gpui::test]
     fn closing_the_active_tab_activates_the_tab_that_was_to_its_right(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let ((a, b, c), (a_rel, b_rel, c_rel)) = write_three_files(repo.path());
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
         for path in [a, b, c] {
             app.update_in(cx, |app, window, cx| {
@@ -1673,9 +1678,9 @@ mod multi_file_tab_tests {
     /// other real half of [`AdeApp::close_file_tab`]'s contract.
     #[gpui::test]
     fn closing_a_non_active_tab_does_not_change_what_is_active(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let ((a, b, _c), (a_rel, b_rel, _)) = write_three_files(repo.path());
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(a, window, cx);
@@ -1711,9 +1716,9 @@ mod multi_file_tab_tests {
     /// browser tab doesn't close it.
     #[gpui::test]
     fn selecting_a_agent_deactivates_the_open_file_tab_without_closing_it(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let ((a, _b, _c), (a_rel, _, _)) = write_three_files(repo.path());
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
         let agent_id = app.read_with(cx, |app, _| {
             app.agents
@@ -1759,37 +1764,19 @@ mod multi_file_tab_tests {
     fn next_changed_file_advances_through_every_changed_file_and_wraps_around(
         cx: &mut TestAppContext,
     ) {
-        fn git(dir: &std::path::Path, args: &[&str]) {
-            let output = std::process::Command::new("git")
-                .current_dir(dir)
-                .args(args)
-                .output()
-                .expect("failed to spawn git");
-            assert!(
-                output.status.success(),
-                "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-                args,
-                dir,
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-
-        let repo = tempfile::tempdir().expect("tempdir");
-        git(repo.path(), &["init", "-b", "main"]);
-        git(repo.path(), &["config", "user.email", "test@example.com"]);
-        git(repo.path(), &["config", "user.name", "Test User"]);
+        let repo = temp_repo();
+        test_support::seed_empty_repo_at(repo.path());
         std::fs::write(repo.path().join("a.txt"), "1\n").expect("write a.txt");
         std::fs::write(repo.path().join("b.txt"), "1\n").expect("write b.txt");
         std::fs::write(repo.path().join("c.txt"), "1\n").expect("write c.txt");
-        git(repo.path(), &["add", "."]);
-        git(repo.path(), &["commit", "-m", "initial"]);
-        git(repo.path(), &["checkout", "-b", "feature"]);
+        test_support::git(repo.path(), &["add", "."]);
+        test_support::git(repo.path(), &["commit", "-m", "initial"]);
+        test_support::git(repo.path(), &["checkout", "-b", "feature"]);
         std::fs::write(repo.path().join("a.txt"), "1\nchanged\n").expect("rewrite a.txt");
         std::fs::write(repo.path().join("b.txt"), "1\nchanged\n").expect("rewrite b.txt");
         std::fs::write(repo.path().join("c.txt"), "1\nchanged\n").expect("rewrite c.txt");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         let order: Vec<PathBuf> = app.read_with(cx, |app, _| {
@@ -1843,22 +1830,6 @@ mod multi_file_tab_tests {
         );
     }
 
-    fn git_repo(dir: &std::path::Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
     /// Regression test for "switching tabs shows the wrong Diff/File view": `code_view` is a
     /// single global field, not per-tab, so switching from a tab left in `File` view to a
     /// different tab with a diff used to incorrectly stay in `File` view instead of forcing
@@ -1867,19 +1838,17 @@ mod multi_file_tab_tests {
     fn switching_to_a_tab_with_a_real_diff_shows_the_diff_not_the_last_view_mode(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        git_repo(repo.path(), &["init", "-b", "main"]);
-        git_repo(repo.path(), &["config", "user.email", "test@example.com"]);
-        git_repo(repo.path(), &["config", "user.name", "Test User"]);
+        let repo = temp_repo();
+        test_support::seed_empty_repo_at(repo.path());
         std::fs::write(repo.path().join("changed.txt"), "1\n").expect("write changed.txt");
         std::fs::write(repo.path().join("plain.txt"), "plain\n").expect("write plain.txt");
-        git_repo(repo.path(), &["add", "."]);
-        git_repo(repo.path(), &["commit", "-m", "initial"]);
-        git_repo(repo.path(), &["checkout", "-b", "feature"]);
+        test_support::git(repo.path(), &["add", "."]);
+        test_support::git(repo.path(), &["commit", "-m", "initial"]);
+        test_support::git(repo.path(), &["checkout", "-b", "feature"]);
         std::fs::write(repo.path().join("changed.txt"), "1\nchanged\n")
             .expect("rewrite changed.txt");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         let changed_rel = PathBuf::from("changed.txt");
@@ -1929,17 +1898,15 @@ mod multi_file_tab_tests {
     /// `open_change`, so re-clicking such a tab did nothing.
     #[gpui::test]
     fn reactivating_a_tab_whose_diff_disappeared_shows_real_content_again(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        git_repo(repo.path(), &["init", "-b", "main"]);
-        git_repo(repo.path(), &["config", "user.email", "test@example.com"]);
-        git_repo(repo.path(), &["config", "user.name", "Test User"]);
+        let repo = temp_repo();
+        test_support::seed_empty_repo_at(repo.path());
         std::fs::write(repo.path().join("a.txt"), "1\n").expect("write a.txt");
-        git_repo(repo.path(), &["add", "."]);
-        git_repo(repo.path(), &["commit", "-m", "initial"]);
-        git_repo(repo.path(), &["checkout", "-b", "feature"]);
+        test_support::git(repo.path(), &["add", "."]);
+        test_support::git(repo.path(), &["commit", "-m", "initial"]);
+        test_support::git(repo.path(), &["checkout", "-b", "feature"]);
         std::fs::write(repo.path().join("a.txt"), "1\nchanged\n").expect("rewrite a.txt");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         let rel = PathBuf::from("a.txt");
@@ -1994,14 +1961,14 @@ mod multi_file_tab_tests {
     fn switching_worktrees_and_back_preserves_each_worktree_s_open_file_tabs(
         cx: &mut TestAppContext,
     ) {
-        let repo_a = tempfile::tempdir().expect("tempdir a");
-        let repo_b = tempfile::tempdir().expect("tempdir b");
+        let repo_a = temp_repo();
+        let repo_b = temp_repo();
         let ((a1, a2, _), (a1_rel, a2_rel, _)) = write_three_files(repo_a.path());
         let b1 = repo_b.path().join("notes.txt");
         std::fs::write(&b1, "notes\n").expect("write notes.txt");
         let b1_rel = PathBuf::from("notes.txt");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo_a.path().to_path_buf());
         app.update(cx, |app, _cx| {
             app.worktrees = vec![
                 crate::rail::worktrees::WorktreeItem {
@@ -2143,9 +2110,9 @@ mod stale_completions_popup_tests {
     fn switching_tabs_away_and_back_does_not_resurrect_a_stale_completions_popup(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let ((a, b), (a_rel, b_rel)) = write_two_files(repo.path());
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
         for path in [a, b] {
             app.update_in(cx, |app, window, cx| {
@@ -2199,9 +2166,9 @@ mod stale_completions_popup_tests {
     fn closing_a_tab_with_an_open_popup_never_lets_it_resurface_for_another_file(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let ((a, b), (a_rel, _b_rel)) = write_two_files(repo.path());
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
         for path in [a.clone(), b] {
             app.update_in(cx, |app, window, cx| {
@@ -2313,11 +2280,11 @@ mod terminal_link_click_tests {
 
     #[gpui::test]
     fn mod_click_on_a_detected_link_opens_the_real_file_tab(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         std::fs::create_dir_all(repo.path().join("src")).expect("mkdir src");
         std::fs::write(repo.path().join("src/main.rs"), "fn main() {}\n").expect("write");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         let (bounds, cell_size) = inject_link_row_and_measure(&app, cx);
 
         cx.simulate_click(
@@ -2346,11 +2313,11 @@ mod terminal_link_click_tests {
     /// an ordinary click inside the terminal is never silently hijacked into a file navigation.
     #[gpui::test]
     fn a_bare_click_on_a_detected_link_does_not_open_anything(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         std::fs::create_dir_all(repo.path().join("src")).expect("mkdir src");
         std::fs::write(repo.path().join("src/main.rs"), "fn main() {}\n").expect("write");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         let (bounds, cell_size) = inject_link_row_and_measure(&app, cx);
 
         cx.simulate_click(link_click_position(bounds, cell_size), Modifiers::none());
@@ -2376,11 +2343,11 @@ mod terminal_link_click_tests {
     /// same modifiers for both) to hold the modifier only at mouse-down.
     #[gpui::test]
     fn mod_held_only_during_mouse_down_still_opens_the_real_file_tab(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         std::fs::create_dir_all(repo.path().join("src")).expect("mkdir src");
         std::fs::write(repo.path().join("src/main.rs"), "fn main() {}\n").expect("write");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         let (bounds, cell_size) = inject_link_row_and_measure(&app, cx);
         let position = link_click_position(bounds, cell_size);
 
@@ -2404,10 +2371,10 @@ mod terminal_link_click_tests {
     /// refuse it, not open a permanent junk tab.
     #[gpui::test]
     fn mod_click_on_a_link_to_a_nonexistent_path_does_not_open_a_tab(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         // Deliberately never created: `src/` itself doesn't exist in this repo at all.
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         let (bounds, cell_size) = inject_link_row_and_measure(&app, cx);
 
         cx.simulate_click(

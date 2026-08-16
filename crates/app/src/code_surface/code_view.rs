@@ -3076,21 +3076,21 @@ mod tests {
     }
 
     #[test]
-    fn detects_lf_from_real_bytes() {
-        assert_eq!(detect_line_ending(b"fn main() {\n}\n"), LineEnding::Lf);
-    }
-
-    #[test]
-    fn detects_crlf_from_real_bytes() {
-        assert_eq!(
-            detect_line_ending(b"fn main() {\r\n}\r\n"),
-            LineEnding::Crlf
-        );
-    }
-
-    #[test]
-    fn a_file_with_no_newline_at_all_defaults_to_lf() {
-        assert_eq!(detect_line_ending(b"no newline here"), LineEnding::Lf);
+    fn detect_line_ending_reads_the_real_bytes_and_defaults_to_lf() {
+        let cases: &[(&[u8], LineEnding)] = &[
+            (b"fn main() {\n}\n", LineEnding::Lf),
+            (b"fn main() {\r\n}\r\n", LineEnding::Crlf),
+            // Nothing to read: a file with no newline at all is LF, not "unknown".
+            (b"no newline here", LineEnding::Lf),
+        ];
+        for (bytes, expected) in cases {
+            assert_eq!(
+                detect_line_ending(bytes),
+                *expected,
+                "{:?}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
     }
 
     fn plain_line(text: &str) -> RenderedLine {
@@ -3100,116 +3100,69 @@ mod tests {
         }
     }
 
+    /// Every shape `detect_indent_width` has to get right, in one table. The two "one-off" rows
+    /// are the audit's own reproductions: a C-style block-comment header's single leading space
+    /// and a hanging-indent continuation line must each lose to the file's real, repeated indent
+    /// unit rather than being picked just for appearing first.
     #[test]
-    fn detect_indent_width_finds_the_first_real_space_indented_line() {
-        let lines: Vec<RenderedLine> = ["fn main() {", "    let x = 1;", "}"]
-            .iter()
-            .map(|text| plain_line(text))
-            .collect();
-        assert_eq!(detect_indent_width(&lines), Some(4));
-    }
-
-    #[test]
-    fn detect_indent_width_skips_tab_indented_lines() {
-        let lines: Vec<RenderedLine> = ["fn main() {", "\tlet x = 1;", "  let y = 2;"]
-            .iter()
-            .map(|text| plain_line(text))
-            .collect();
-        assert_eq!(
-            detect_indent_width(&lines),
-            Some(2),
-            "a tab-indented line has no single \"N spaces\" answer - keep scanning for a real \
-             space-indented one"
-        );
-    }
-
-    #[test]
-    fn detect_indent_width_skips_whitespace_only_lines() {
-        let lines: Vec<RenderedLine> = ["fn main() {", "    ", "      let x = 1;"]
-            .iter()
-            .map(|text| plain_line(text))
-            .collect();
-        assert_eq!(
-            detect_indent_width(&lines),
-            Some(6),
-            "a blank/whitespace-only line says nothing about the real indent unit"
-        );
-    }
-
-    #[test]
-    fn detect_indent_width_with_no_indentation_anywhere_is_none() {
-        let lines: Vec<RenderedLine> = ["fn main() {", "}"]
-            .iter()
-            .map(|text| plain_line(text))
-            .collect();
-        assert_eq!(detect_indent_width(&lines), None);
-    }
-
-    #[test]
-    fn detect_indent_width_on_an_empty_file_is_none() {
-        assert_eq!(detect_indent_width(&[]), None);
-    }
-
-    /// The audit's exact reproduction: a C-style block-comment header's single leading space
-    /// must not be naively picked as "the" indent width just for appearing before the file's
-    /// real, repeated 4-space body indent.
-    #[test]
-    fn detect_indent_width_is_not_fooled_by_a_single_block_comment_header_line() {
-        let lines: Vec<RenderedLine> = [
-            "/**",
-            " * Copyright 2024 Example Corp.",
-            " */",
-            "fn main() {",
-            "    let x = 1;",
-            "    let y = 2;",
-            "    let z = 3;",
-            "}",
-        ]
-        .iter()
-        .map(|text| plain_line(text))
-        .collect();
-        assert_eq!(
-            detect_indent_width(&lines),
-            Some(4),
-            "the real, repeated 4-space body indent should win over a one-off single leading \
-             space from a C-style block comment header"
-        );
-    }
-
-    /// The audit's other exact reproduction: a one-off hanging-indent continuation line must not
-    /// out-vote the file's real, repeated indent unit.
-    #[test]
-    fn detect_indent_width_is_not_fooled_by_a_single_hanging_indent_continuation_line() {
-        let lines: Vec<RenderedLine> = [
-            "let long_name =",
-            "  some_call(a, b);",
-            "fn main() {",
-            "    let x = 1;",
-            "    let y = 2;",
-            "}",
-        ]
-        .iter()
-        .map(|text| plain_line(text))
-        .collect();
-        assert_eq!(
-            detect_indent_width(&lines),
-            Some(4),
-            "a one-off 2-space hanging-indent continuation line must not out-vote the file's \
-             real, repeated 4-space indent"
-        );
-    }
-
-    #[test]
-    fn detect_indent_width_breaks_a_tie_toward_the_smaller_width() {
-        let lines: Vec<RenderedLine> = ["  two spaces", "    four spaces"]
-            .iter()
-            .map(|text| plain_line(text))
-            .collect();
-        assert_eq!(
-            detect_indent_width(&lines),
-            Some(2),
-            "an exact tie in occurrence count should prefer the smaller, more conventional width"
-        );
+    fn detect_indent_width_picks_the_files_real_repeated_indent_unit() {
+        let cases: &[(&str, &[&str], Option<usize>)] = &[
+            (
+                "plain space indent",
+                &["fn main() {", "    let x = 1;", "}"],
+                Some(4),
+            ),
+            // A tab-indented line has no single "N spaces" answer - keep scanning.
+            (
+                "tab lines skipped",
+                &["fn main() {", "\tlet x = 1;", "  let y = 2;"],
+                Some(2),
+            ),
+            // A blank/whitespace-only line says nothing about the real indent unit.
+            (
+                "blank lines skipped",
+                &["fn main() {", "    ", "      let x = 1;"],
+                Some(6),
+            ),
+            ("no indentation at all", &["fn main() {", "}"], None),
+            ("empty file", &[], None),
+            (
+                "block comment header",
+                &[
+                    "/**",
+                    " * Copyright 2024 Example Corp.",
+                    " */",
+                    "fn main() {",
+                    "    let x = 1;",
+                    "    let y = 2;",
+                    "    let z = 3;",
+                    "}",
+                ],
+                Some(4),
+            ),
+            (
+                "hanging indent continuation",
+                &[
+                    "let long_name =",
+                    "  some_call(a, b);",
+                    "fn main() {",
+                    "    let x = 1;",
+                    "    let y = 2;",
+                    "}",
+                ],
+                Some(4),
+            ),
+            // An exact tie in occurrence count prefers the smaller, more conventional width.
+            (
+                "tie breaks smaller",
+                &["  two spaces", "    four spaces"],
+                Some(2),
+            ),
+        ];
+        for (label, texts, expected) in cases {
+            let lines: Vec<RenderedLine> = texts.iter().map(|text| plain_line(text)).collect();
+            assert_eq!(detect_indent_width(&lines), *expected, "{label}");
+        }
     }
 
     #[test]
@@ -3259,183 +3212,428 @@ mod tests {
     const SAMPLE_RUST: &str =
         "/// Adds one.\nfn add(left: i32) -> i32 {\n    let name = \"x\";\n    left + 1\n}\n";
 
-    #[test]
-    fn fn_keyword_is_classified_as_keyword() {
-        let spans = highlight_rust(SAMPLE_RUST);
-        let span = find_span(&spans, SAMPLE_RUST, "fn").expect("fn span");
-        assert_eq!(span.kind, HighlightKind::Keyword);
-    }
-
-    #[test]
-    fn a_string_literal_is_classified_as_string() {
-        let spans = highlight_rust(SAMPLE_RUST);
-        let span = find_span(&spans, SAMPLE_RUST, "\"x\"").expect("string literal span");
-        assert_eq!(span.kind, HighlightKind::String);
-    }
-
-    #[test]
-    fn a_function_name_is_classified_as_function() {
-        let spans = highlight_rust(SAMPLE_RUST);
-        let span = find_span(&spans, SAMPLE_RUST, "add").expect("function name span");
-        assert_eq!(span.kind, HighlightKind::FunctionDefinition);
-    }
-
-    #[test]
-    fn a_primitive_type_identifier_is_classified_as_type_builtin() {
-        let spans = highlight_rust(SAMPLE_RUST);
-        // "i32" appears twice (parameter type, return type); just confirm at least one
-        // occurrence was classified as TypeBuiltin - `i32` is a real `(primitive_type)` node in
-        // `tree-sitter-rust`'s own grammar, captured `@type.builtin`, not the plain `@type` a
-        // user-defined type name would get.
-        let type_spans: Vec<_> = spans
-            .iter()
-            .filter(|span| SAMPLE_RUST[span.start..span.end] == *"i32")
-            .collect();
-        assert!(!type_spans.is_empty());
-        assert!(type_spans
-            .iter()
-            .all(|span| span.kind == HighlightKind::TypeBuiltin));
-    }
-
-    #[test]
-    fn a_doc_comment_is_classified_as_comment_doc() {
-        let spans = highlight_rust(SAMPLE_RUST);
-        // The `line_comment` node's byte range includes its trailing newline; it's treated as
-        // one span rather than recursed into, since its children are just lexical pieces, not
-        // separately-colourable syntax. `///` is a real `(doc_comment)` child node, captured
-        // `@comment.documentation` - its own dedicated bucket since GitHub issue #31, not the
-        // plain `Comment` an ordinary `//` line gets.
-        let span = find_span(&spans, SAMPLE_RUST, "/// Adds one.\n").expect("doc comment span");
-        assert_eq!(span.kind, HighlightKind::CommentDoc);
-    }
-
-    #[test]
-    fn self_is_classified_as_variable_builtin_not_keyword() {
-        let source = "impl Foo {\n    fn bar(&self) -> i32 {\n        self.value\n    }\n}\n";
-        let spans = highlight_rust(source);
-        let span = find_span(&spans, source, "self").expect("self span");
-        assert_eq!(span.kind, HighlightKind::VariableBuiltin);
-    }
-
-    #[test]
-    fn highlighting_invalid_rust_still_returns_a_real_non_empty_span_list() {
-        // Tree-sitter produces a best-effort tree for malformed input rather than failing
-        // outright - confirm this doesn't panic and still classifies the keyword token present.
-        let spans = highlight_rust("fn (((( broken");
-        assert!(spans.iter().any(|span| span.kind == HighlightKind::Keyword));
-    }
-
     // Real TypeScript highlighting coverage - mirrors `highlight_rust`'s own test shape above.
     // Before this fix, none of `highlight_typescript`'s real, common-case behavior had any test
     // coverage at all.
 
     const SAMPLE_TYPESCRIPT: &str = "/** Adds one. */\nfunction add(left: number): number {\n    const name = \"x\";\n    return left + 1;\n}\n";
 
+    /// One row per real token this module's docs claim a bucket for, across every grammar - the
+    /// table form of what used to be one `#[test]` per row.
+    ///
+    /// Each row asks exactly what the renderer asks: which [`HighlightKind`] covers this token's
+    /// first byte ([`kind_at`]). Behaviour that is *not* a single token -> single bucket lookup
+    /// (definition vs. call site, casing sweeps, injected fences, bracket rings) keeps its own
+    /// test below; this table is only for the flat ones.
     #[test]
-    fn typescript_function_keyword_is_classified_as_keyword() {
-        let spans = highlight_typescript(SAMPLE_TYPESCRIPT, false);
-        let span = find_span(&spans, SAMPLE_TYPESCRIPT, "function").expect("function span");
-        assert_eq!(span.kind, HighlightKind::Keyword);
+    fn every_documented_token_lands_in_its_documented_bucket() {
+        let cases: &[(
+            &str,
+            crate::language::HighlighterFn,
+            &str,
+            &str,
+            HighlightKind,
+        )] = &[
+            (
+                "rust",
+                highlight_rust,
+                SAMPLE_RUST,
+                "fn",
+                HighlightKind::Keyword,
+            ),
+            (
+                "rust",
+                highlight_rust,
+                SAMPLE_RUST,
+                "add",
+                HighlightKind::FunctionDefinition,
+            ),
+            (
+                "rust",
+                highlight_rust,
+                SAMPLE_RUST,
+                "\"x\"",
+                HighlightKind::String,
+            ),
+            (
+                "rust",
+                highlight_rust,
+                SAMPLE_RUST,
+                "i32",
+                HighlightKind::TypeBuiltin,
+            ),
+            (
+                "rust",
+                highlight_rust,
+                SAMPLE_RUST,
+                "/// Adds one.",
+                HighlightKind::CommentDoc,
+            ),
+            (
+                "ts",
+                highlight_ts,
+                SAMPLE_TYPESCRIPT,
+                "function",
+                HighlightKind::Keyword,
+            ),
+            (
+                "ts",
+                highlight_ts,
+                SAMPLE_TYPESCRIPT,
+                "add",
+                HighlightKind::FunctionDefinition,
+            ),
+            (
+                "ts",
+                highlight_ts,
+                SAMPLE_TYPESCRIPT,
+                "\"x\"",
+                HighlightKind::String,
+            ),
+            (
+                "ts",
+                highlight_ts,
+                SAMPLE_TYPESCRIPT,
+                "number",
+                HighlightKind::TypeBuiltin,
+            ),
+            (
+                "ts",
+                highlight_ts,
+                SAMPLE_TYPESCRIPT,
+                "/** Adds one. */",
+                HighlightKind::Comment,
+            ),
+            // `(regex) @string.special`, its own bucket since GitHub issue #183 - it used to
+            // fall through to the plain `"string"` entry and read as an ordinary string.
+            (
+                "ts",
+                highlight_ts,
+                "const pattern = /^[a-z]+$/;\n",
+                "^[a-z]+$",
+                HighlightKind::StringSpecial,
+            ),
+            // The three `name`-field collisions that all used to come out `Function`: a
+            // `const` binding, an `interface` member, and a class method (which really is one).
+            (
+                "ts",
+                highlight_ts,
+                "const s: string = \"hi\";\n",
+                "s: string",
+                HighlightKind::Variable,
+            ),
+            (
+                "ts",
+                highlight_ts,
+                "interface Point { x: number }\n",
+                "x: number",
+                HighlightKind::Property,
+            ),
+            (
+                "ts",
+                highlight_ts,
+                "class Point {\n    length() {\n        return 0;\n    }\n}\n",
+                "length",
+                HighlightKind::FunctionDefinition,
+            ),
+            // A TSX tag name is the same collision once more, and gets its own `Tag` bucket.
+            (
+                "tsx",
+                highlight_tsx,
+                "const el = <div />;\n",
+                "div",
+                HighlightKind::Tag,
+            ),
+            (
+                "python",
+                highlight_python,
+                SAMPLE_PYTHON,
+                "def",
+                HighlightKind::Keyword,
+            ),
+            (
+                "python",
+                highlight_python,
+                SAMPLE_PYTHON,
+                "add",
+                HighlightKind::FunctionDefinition,
+            ),
+            (
+                "python",
+                highlight_python,
+                SAMPLE_PYTHON,
+                "\"x\"",
+                HighlightKind::String,
+            ),
+            (
+                "python",
+                highlight_python,
+                SAMPLE_PYTHON,
+                "int",
+                HighlightKind::Type,
+            ),
+            (
+                "python",
+                highlight_python,
+                "# a real comment\nx = 1\n",
+                "# a real comment",
+                HighlightKind::Comment,
+            ),
+            // A method name and a class name are two different `name` fields of two different
+            // node kinds, told apart inside one real parse.
+            (
+                "python",
+                highlight_python,
+                "class Foo:\n    def bar(self):\n        pass\n",
+                "bar",
+                HighlightKind::FunctionDefinition,
+            ),
+            (
+                "toml",
+                highlight_toml,
+                SAMPLE_TOML,
+                "name",
+                HighlightKind::Property,
+            ),
+            (
+                "toml",
+                highlight_toml,
+                SAMPLE_TOML,
+                "\"jerry\"",
+                HighlightKind::String,
+            ),
+            (
+                "toml",
+                highlight_toml,
+                SAMPLE_TOML,
+                "true",
+                HighlightKind::ConstantBuiltin,
+            ),
+            (
+                "toml",
+                highlight_toml,
+                SAMPLE_TOML,
+                "1979-05-27",
+                HighlightKind::StringSpecial,
+            ),
+            (
+                "go",
+                highlight_go,
+                SAMPLE_GO,
+                "func",
+                HighlightKind::Keyword,
+            ),
+            (
+                "go",
+                highlight_go,
+                SAMPLE_GO,
+                "add",
+                HighlightKind::FunctionDefinition,
+            ),
+            (
+                "go",
+                highlight_go,
+                SAMPLE_GO,
+                "len(",
+                HighlightKind::FunctionBuiltin,
+            ),
+            // A JSON key must win the more specific `string.special.key` registration over the
+            // plain `string` one; a JSON *value* must not.
+            (
+                "json",
+                highlight_json,
+                SAMPLE_JSON,
+                "\"name\"",
+                HighlightKind::Property,
+            ),
+            (
+                "json",
+                highlight_json,
+                SAMPLE_JSON,
+                "\"jerry\"",
+                HighlightKind::String,
+            ),
+            (
+                "json",
+                highlight_json,
+                SAMPLE_JSON,
+                "3",
+                HighlightKind::Number,
+            ),
+            (
+                "yaml",
+                highlight_yaml,
+                SAMPLE_YAML,
+                "count",
+                HighlightKind::Property,
+            ),
+            (
+                "yaml",
+                highlight_yaml,
+                SAMPLE_YAML,
+                "true",
+                HighlightKind::ConstantBuiltin,
+            ),
+            // `(anchor_name) @label` is the YAML half of the cross-language `"label"`
+            // registration; the C `goto` target below is its other half.
+            (
+                "yaml",
+                highlight_yaml,
+                SAMPLE_YAML,
+                "base\n",
+                HighlightKind::Label,
+            ),
+            (
+                "yaml",
+                highlight_yaml,
+                SAMPLE_YAML,
+                "&base",
+                HighlightKind::PunctuationSpecial,
+            ),
+            (
+                "yaml",
+                highlight_yaml,
+                SAMPLE_YAML,
+                "*base",
+                HighlightKind::PunctuationSpecial,
+            ),
+            ("c", highlight_c, SAMPLE_C, "return", HighlightKind::Keyword),
+            (
+                "c",
+                highlight_c,
+                SAMPLE_C,
+                "add",
+                HighlightKind::FunctionDefinition,
+            ),
+            ("c", highlight_c, SAMPLE_C, "done:", HighlightKind::Label),
+            (
+                "c",
+                highlight_c,
+                SAMPLE_C,
+                ";",
+                HighlightKind::PunctuationDelimiter,
+            ),
+            (
+                "markdown",
+                highlight_markdown,
+                SAMPLE_MARKDOWN,
+                "Title",
+                HighlightKind::Heading,
+            ),
+            (
+                "markdown",
+                highlight_markdown,
+                SAMPLE_MARKDOWN,
+                "bold",
+                HighlightKind::Strong,
+            ),
+            (
+                "markdown",
+                highlight_markdown,
+                SAMPLE_MARKDOWN,
+                "italic",
+                HighlightKind::Emphasis,
+            ),
+            (
+                "markdown",
+                highlight_markdown,
+                SAMPLE_MARKDOWN,
+                "inline code",
+                HighlightKind::String,
+            ),
+            (
+                "markdown",
+                highlight_markdown,
+                SAMPLE_MARKDOWN,
+                "https://example.com",
+                HighlightKind::Link,
+            ),
+            (
+                "markdown",
+                highlight_markdown,
+                SAMPLE_MARKDOWN,
+                "link",
+                HighlightKind::Link,
+            ),
+            // `string.special` must not match JSON's more specific `string.special.key`: the
+            // recognized-name rule needs every dot-part of the name present in the capture.
+            (
+                "css",
+                highlight_css,
+                SAMPLE_CSS,
+                "ff0000",
+                HighlightKind::StringSpecial,
+            ),
+        ];
+        for (label, highlighter, source, token, expected) in cases {
+            assert_eq!(
+                kind_at(&highlighter(source), source, token),
+                *expected,
+                "{label}: {token:?}"
+            );
+        }
     }
 
+    /// Tree-sitter produces a best-effort tree for malformed input rather than failing outright:
+    /// every grammar must still classify the keyword it *can* see, and none may panic.
     #[test]
-    fn typescript_string_literal_is_classified_as_string() {
-        let spans = highlight_typescript(SAMPLE_TYPESCRIPT, false);
-        let span = find_span(&spans, SAMPLE_TYPESCRIPT, "\"x\"").expect("string literal span");
-        assert_eq!(span.kind, HighlightKind::String);
+    fn highlighting_invalid_input_still_returns_a_real_non_empty_span_list() {
+        let cases: &[(&str, crate::language::HighlighterFn, &str)] = &[
+            ("rust", highlight_rust, "fn (((( broken"),
+            ("typescript", highlight_ts, "function (((( broken"),
+            ("python", highlight_python, "def (((( broken"),
+        ];
+        for (label, highlighter, source) in cases {
+            let spans = highlighter(source);
+            assert!(
+                spans.iter().any(|span| span.kind == HighlightKind::Keyword),
+                "{label}: malformed input must still classify its real leading keyword"
+            );
+        }
     }
 
-    /// `(regex) @string.special` - its own dedicated bucket since GitHub issue #183 (previously
-    /// fell through to the plain `"string"` entry, reading a regex literal as an ordinary
-    /// string).
-    #[test]
-    fn typescript_regex_literal_is_classified_as_string_special() {
-        let source = "const pattern = /^[a-z]+$/;\n";
-        let spans = highlight_typescript(source, false);
-        assert_eq!(
-            kind_at(&spans, source, "^[a-z]+$"),
-            HighlightKind::StringSpecial
-        );
-    }
+    // GitHub issue #200's own doc-tag coverage. `every_documented_token_lands_in_its_documented_
+    // bucket`'s TypeScript doc-comment row above deliberately calls `highlight_ts` directly - the
+    // raw grammar layer, bypassing `HighlightOptions::apply` entirely (same reason
+    // `colorize_bracket_pairs`'s own tests do this) - so it stays correct unchanged:
+    // `split_doc_comment_tags` only ever runs inside `apply()`, which every real, live rendering
+    // path (`load_file_with_options`, `highlight_block`) goes through but that pinned raw-grammar
+    // row doesn't.
 
+    /// Each shape `doc_tag_ranges` has to tell apart, in one table.
+    ///
+    /// The unclosed-inline row is the interesting one: `{@link` with no closing `}` never
+    /// matches the inline shape, but still degrades to the plain block-tag rule for the `@link`
+    /// word itself rather than emitting nothing for an honest, if malformed, doc comment.
     #[test]
-    fn typescript_function_declaration_name_is_classified_as_function() {
-        let spans = highlight_typescript(SAMPLE_TYPESCRIPT, false);
-        let span = find_span(&spans, SAMPLE_TYPESCRIPT, "add").expect("function name span");
-        assert_eq!(span.kind, HighlightKind::FunctionDefinition);
-    }
-
-    #[test]
-    fn typescript_predefined_type_is_classified_as_type_builtin() {
-        let spans = highlight_typescript(SAMPLE_TYPESCRIPT, false);
-        // `number` is a real `(predefined_type)` node, captured `@type.builtin`.
-        let type_spans: Vec<_> = spans
-            .iter()
-            .filter(|span| SAMPLE_TYPESCRIPT[span.start..span.end] == *"number")
-            .collect();
-        assert!(!type_spans.is_empty());
-        assert!(type_spans
-            .iter()
-            .all(|span| span.kind == HighlightKind::TypeBuiltin));
-    }
-
-    #[test]
-    fn typescript_doc_comment_is_classified_as_comment() {
-        let spans = highlight_typescript(SAMPLE_TYPESCRIPT, false);
-        let span =
-            find_span(&spans, SAMPLE_TYPESCRIPT, "/** Adds one. */").expect("doc comment span");
-        assert_eq!(span.kind, HighlightKind::Comment);
-    }
-
-    // GitHub issue #200's own doc-tag coverage. `typescript_doc_comment_is_classified_as_comment`
-    // just above deliberately calls `highlight_typescript` directly - the raw grammar layer,
-    // bypassing `HighlightOptions::apply` entirely (same reason `colorize_bracket_pairs`'s own
-    // tests do this) - so it stays correct unchanged: `split_doc_comment_tags` only ever runs
-    // inside `apply()`, which every real, live rendering path (`load_file_with_options`,
-    // `highlight_block`) goes through but this one pinned raw-grammar test doesn't.
-
-    #[test]
-    fn doc_tag_ranges_finds_a_real_block_tag_preceded_by_whitespace() {
-        let text = "Adds one.\n@param left the number to add to\n@returns the sum";
-        let ranges: Vec<&str> = doc_tag_ranges(text)
-            .into_iter()
-            .map(|range| &text[range])
-            .collect();
-        assert_eq!(ranges, vec!["@param", "@returns"]);
-    }
-
-    #[test]
-    fn doc_tag_ranges_never_matches_an_email_style_at_sign() {
-        let text = "Contact foo@example.com for details.";
-        assert!(
-            doc_tag_ranges(text).is_empty(),
-            "an `@` directly preceded by an identifier byte (the `o` in `foo`) is not a real \
-             doc tag - got: {:?}",
-            doc_tag_ranges(text)
-        );
-    }
-
-    #[test]
-    fn doc_tag_ranges_finds_a_real_inline_link_tag_brace_to_brace() {
-        let text = "See {@link Foo#bar} for more.";
-        let ranges: Vec<&str> = doc_tag_ranges(text)
-            .into_iter()
-            .map(|range| &text[range])
-            .collect();
-        assert_eq!(ranges, vec!["{@link Foo#bar}"]);
-    }
-
-    /// An unclosed `{@link` never matches the *inline*-tag shape (no real `}` to close it), but
-    /// still degrades gracefully to the plain block-tag rule for the `@link` word itself, rather
-    /// than emitting nothing at all for an honest, if malformed, doc comment.
-    #[test]
-    fn doc_tag_ranges_falls_back_to_a_bare_block_tag_for_an_unclosed_inline_tag() {
-        let text = "See {@link Foo#bar for more.";
-        let ranges: Vec<&str> = doc_tag_ranges(text)
-            .into_iter()
-            .map(|range| &text[range])
-            .collect();
-        assert_eq!(ranges, vec!["@link"]);
+    fn doc_tag_ranges_recognizes_every_real_tag_shape_and_nothing_else() {
+        let cases: &[(&str, &str, &[&str])] = &[
+            (
+                "block tags",
+                "Adds one.\n@param left the number to add to\n@returns the sum",
+                &["@param", "@returns"],
+            ),
+            // An `@` directly preceded by an identifier byte (the `o` in `foo`) is an email
+            // address, not a tag.
+            ("email address", "Contact foo@example.com for details.", &[]),
+            (
+                "inline link tag",
+                "See {@link Foo#bar} for more.",
+                &["{@link Foo#bar}"],
+            ),
+            (
+                "unclosed inline tag",
+                "See {@link Foo#bar for more.",
+                &["@link"],
+            ),
+        ];
+        for (label, text, expected) in cases {
+            let ranges: Vec<&str> = doc_tag_ranges(text)
+                .into_iter()
+                .map(|range| &text[range])
+                .collect();
+            assert_eq!(ranges, *expected, "{label}");
+        }
     }
 
     /// The real, full pipeline (`HighlightOptions::default().highlight(..)`, the same call
@@ -3502,228 +3700,12 @@ mod tests {
         );
     }
 
-    /// The real, live-verified regression this fix addresses: a `variable_declarator`'s own
-    /// `name` field collides with `function_declaration`'s `name` field in
-    /// `tree-sitter-typescript`'s real grammar, and the old, parent-kind-unaware matching
-    /// misclassified every `const`/`let`/`var` binding's name as a Function. `s` here must be
-    /// classified `Variable` (a use/declaration of a variable, not a function) - previously
-    /// asserted as plain `Text`, back when `"variable"` wasn't yet a registered highlight name at
-    /// all (GitHub issue #31 registered it); `theme::syntax::VARIABLE` is still a real, direct
-    /// alias of `theme::syntax::TEXT` (see that module's docs), so this is a classification-only
-    /// change with no visual difference.
-    #[test]
-    fn typescript_const_variable_name_is_not_misclassified_as_a_function() {
-        // The audit's exact reproduction. `find_span`'s plain substring search would otherwise
-        // match the embedded "s" inside "const" itself, so the real declared variable's own byte
-        // offset (right after "const ") is computed explicitly instead.
-        let source = "const s: string = \"hi\";\n";
-        let variable_start = source.find("const ").expect("const") + "const ".len();
-        let spans = highlight_typescript(source, false);
-        let kind = spans
-            .iter()
-            .find(|span| span.start <= variable_start && variable_start < span.end)
-            .map_or(HighlightKind::Text, |span| span.kind);
-        assert_eq!(
-            kind,
-            HighlightKind::Variable,
-            "a const/let/var binding's own name must never be classified as a function"
-        );
-    }
-
-    /// The same real collision, for an `interface` member name (`property_signature`'s `name`
-    /// field) - must not be classified as a function either. Classified `Property` (a real,
-    /// registered bucket since GitHub issue #31 - `tree-sitter-javascript`'s own
-    /// `(property_identifier) @property` rule is unconditional), not plain `Text` as before that
-    /// scope existed.
-    #[test]
-    fn typescript_interface_member_name_is_not_misclassified_as_a_function() {
-        let source = "interface Point { x: number }\n";
-        let spans = highlight_typescript(source, false);
-        assert_eq!(
-            kind_at(&spans, source, "x: number"),
-            HighlightKind::Property
-        );
-    }
-
-    /// The same real collision, for a class method's own name (`method_definition`'s `name`
-    /// field, a `property_identifier`) - this one, unlike the two above, genuinely *should* be
-    /// classified as a function.
-    #[test]
-    fn typescript_class_method_name_is_classified_as_a_function_method() {
-        let source = "class Point {\n    length() {\n        return 0;\n    }\n}\n";
-        let spans = highlight_typescript(source, false);
-        let span = find_span(&spans, source, "length").expect("method name span");
-        // `(method_definition name: (property_identifier) @function.method)` - its own
-        // dedicated bucket since GitHub issue #31 (previously folded into plain `Function`).
-        assert_eq!(span.kind, HighlightKind::FunctionDefinition);
-    }
-
-    /// The same real collision, for a real function call's callee (`call_expression`'s
-    /// `function` field) - genuinely a function, and must stay classified as one.
-    #[test]
-    fn typescript_call_expression_callee_is_classified_as_a_function() {
-        let source = "function top() {}\ntop();\n";
-        let spans = highlight_typescript(source, false);
-        let function_spans: Vec<_> = spans
-            .iter()
-            .filter(|span| source[span.start..span.end] == *"top")
-            .collect();
-        assert_eq!(function_spans.len(), 2, "the declaration and the call site");
-        assert_eq!(
-            function_spans[0].kind,
-            HighlightKind::FunctionDefinition,
-            "the `function top()` declaration is a real definition site"
-        );
-        assert_eq!(
-            function_spans[1].kind,
-            HighlightKind::Function,
-            "the `top()` call site stays a plain function - this split is the whole point of \
-             JAVASCRIPT_DEFINITION_SUPPLEMENT"
-        );
-    }
-
-    /// A real TSX tag name (`jsx_self_closing_element`'s own `name` field) is the same real
-    /// collision one more time - must not render as a Function either. Classified `Tag` (its own
-    /// real, dedicated bucket since GitHub issue #31 - previously folded into `Type`; see
-    /// `theme::syntax::TAG`'s own docs for why the two still render identically).
-    #[test]
-    fn tsx_tag_name_is_not_misclassified_as_a_function() {
-        let source = "const el = <div />;\n";
-        let spans = highlight_typescript(source, true);
-        let span = find_span(&spans, source, "div").expect("tag name span");
-        assert_ne!(span.kind, HighlightKind::Function);
-        assert_eq!(span.kind, HighlightKind::Tag);
-    }
-
-    #[test]
-    fn highlighting_invalid_typescript_still_returns_a_real_non_empty_span_list() {
-        let spans = highlight_typescript("function (((( broken", false);
-        assert!(spans.iter().any(|span| span.kind == HighlightKind::Keyword));
-    }
-
     // Real Python highlighting coverage - mirrors `highlight_rust`'s own test shape above.
     // Before this fix, none of `highlight_python`'s real, common-case behavior had any test
     // coverage at all.
 
     const SAMPLE_PYTHON: &str =
         "def add(left: int) -> int:\n    name = \"x\"\n    return left + 1\n";
-
-    #[test]
-    fn python_def_keyword_is_classified_as_keyword() {
-        let spans = highlight_python(SAMPLE_PYTHON);
-        let span = find_span(&spans, SAMPLE_PYTHON, "def").expect("def span");
-        assert_eq!(span.kind, HighlightKind::Keyword);
-    }
-
-    #[test]
-    fn python_string_literal_is_classified_as_string() {
-        let spans = highlight_python(SAMPLE_PYTHON);
-        let span = find_span(&spans, SAMPLE_PYTHON, "\"x\"").expect("string literal span");
-        assert_eq!(span.kind, HighlightKind::String);
-    }
-
-    #[test]
-    fn python_function_definition_name_is_classified_as_function() {
-        let spans = highlight_python(SAMPLE_PYTHON);
-        let span = find_span(&spans, SAMPLE_PYTHON, "add").expect("function name span");
-        assert_eq!(span.kind, HighlightKind::FunctionDefinition);
-    }
-
-    #[test]
-    fn python_type_annotation_is_classified_as_type() {
-        let spans = highlight_python(SAMPLE_PYTHON);
-        let type_spans: Vec<_> = spans
-            .iter()
-            .filter(|span| SAMPLE_PYTHON[span.start..span.end] == *"int")
-            .collect();
-        assert!(!type_spans.is_empty());
-        assert!(type_spans
-            .iter()
-            .all(|span| span.kind == HighlightKind::Type));
-    }
-
-    #[test]
-    fn python_comment_is_classified_as_comment() {
-        let source = "# a real comment\nx = 1\n";
-        let spans = highlight_python(source);
-        let span = find_span(&spans, source, "# a real comment").expect("comment span");
-        assert_eq!(span.kind, HighlightKind::Comment);
-    }
-
-    /// Matches Rust's own `self_is_classified_as_variable_builtin_not_keyword` test - a
-    /// deliberate, documented choice that Python's `self` gets the same `VariableBuiltin`
-    /// treatment Rust's does. Rust gets it from its grammar's own `(self) @variable.builtin` rule;
-    /// Python's grammar has no rule for `self` at all, so it comes from
-    /// [`PYTHON_HIGHLIGHTS_SUPPLEMENT`]'s second rule - see there.
-    #[test]
-    fn python_self_is_classified_as_variable_builtin_not_a_plain_identifier() {
-        let source = "class Foo:\n    def bar(self):\n        return self.value\n";
-        let spans = highlight_python(source);
-        let self_spans: Vec<_> = spans
-            .iter()
-            .filter(|span| source[span.start..span.end] == *"self")
-            .collect();
-        assert!(!self_spans.is_empty());
-        assert!(self_spans
-            .iter()
-            .all(|span| span.kind == HighlightKind::VariableBuiltin));
-    }
-
-    /// The real, live-verified regression this fix addresses: `class_definition`'s own `name`
-    /// field is a plain `identifier` in `tree-sitter-python`'s real grammar (unlike Rust/
-    /// TypeScript, where it's a distinct `type_identifier` node), and the old, parent-kind-
-    /// unaware matching misclassified every class name as a Function instead of a Type.
-    #[test]
-    fn python_class_name_is_classified_as_type_not_function() {
-        let source = "class Foo:\n    pass\n";
-        let spans = highlight_python(source);
-        let span = find_span(&spans, source, "Foo").expect("class name span");
-        assert_eq!(
-            span.kind,
-            HighlightKind::Type,
-            "a class's own declared name should be a Type, not a Function"
-        );
-    }
-
-    /// The same fixture's `def`, to prove the two real, colliding `"name"`-field cases (function
-    /// vs. class) are correctly told apart within one real, combined parse - not just correct in
-    /// isolation.
-    #[test]
-    fn python_method_name_inside_a_class_is_still_classified_as_function() {
-        let source = "class Foo:\n    def bar(self):\n        pass\n";
-        let spans = highlight_python(source);
-        let span = find_span(&spans, source, "bar").expect("method name span");
-        assert_eq!(span.kind, HighlightKind::FunctionDefinition);
-    }
-
-    /// The real call-expression collision one more time, for Python's own `call` node kind
-    /// (distinct from Rust/TypeScript's `call_expression`).
-    #[test]
-    fn python_call_callee_is_classified_as_a_function() {
-        let source = "def top():\n    pass\n\ntop()\n";
-        let spans = highlight_python(source);
-        let function_spans: Vec<_> = spans
-            .iter()
-            .filter(|span| source[span.start..span.end] == *"top")
-            .collect();
-        assert_eq!(function_spans.len(), 2, "the definition and the call site");
-        assert_eq!(
-            function_spans[0].kind,
-            HighlightKind::FunctionDefinition,
-            "the `def top()` name is a real definition site"
-        );
-        assert_eq!(
-            function_spans[1].kind,
-            HighlightKind::Function,
-            "the `top()` call site stays a plain function"
-        );
-    }
-
-    #[test]
-    fn highlighting_invalid_python_still_returns_a_real_non_empty_span_list() {
-        let spans = highlight_python("def (((( broken");
-        assert!(spans.iter().any(|span| span.kind == HighlightKind::Keyword));
-    }
 
     // ---------------------------------------------------------------------------------------
     // `tree-sitter-highlight` migration coverage.
@@ -4307,182 +4289,15 @@ mod tests {
 
     const SAMPLE_TOML: &str = "name = \"jerry\"\ncount = 3\nenabled = true\nbuilt = 1979-05-27\n";
 
-    #[test]
-    fn toml_key_is_classified_as_property() {
-        let spans = highlight_toml(SAMPLE_TOML);
-        assert_eq!(
-            kind_at(&spans, SAMPLE_TOML, "name"),
-            HighlightKind::Property
-        );
-    }
-
-    #[test]
-    fn toml_string_value_is_classified_as_string() {
-        let spans = highlight_toml(SAMPLE_TOML);
-        assert_eq!(
-            kind_at(&spans, SAMPLE_TOML, "\"jerry\""),
-            HighlightKind::String
-        );
-    }
-
-    #[test]
-    fn toml_boolean_is_classified_as_constant_builtin() {
-        let spans = highlight_toml(SAMPLE_TOML);
-        assert_eq!(
-            kind_at(&spans, SAMPLE_TOML, "true"),
-            HighlightKind::ConstantBuiltin
-        );
-    }
-
-    /// `(local_date) @string.special` - its own dedicated bucket since GitHub issue #183
-    /// (previously fell through to the plain `"string"` entry).
-    #[test]
-    fn toml_date_literal_is_classified_as_string_special() {
-        let spans = highlight_toml(SAMPLE_TOML);
-        assert_eq!(
-            kind_at(&spans, SAMPLE_TOML, "1979-05-27"),
-            HighlightKind::StringSpecial
-        );
-    }
-
     const SAMPLE_GO: &str =
         "package main\n\nfunc add(x int) int {\n\treturn len(fmt.Sprint(x))\n}\n";
 
-    #[test]
-    fn go_func_keyword_is_classified_as_keyword() {
-        let spans = highlight_go(SAMPLE_GO);
-        assert_eq!(kind_at(&spans, SAMPLE_GO, "func"), HighlightKind::Keyword);
-    }
-
-    #[test]
-    fn go_function_definition_name_is_classified_as_function() {
-        let spans = highlight_go(SAMPLE_GO);
-        assert_eq!(
-            kind_at(&spans, SAMPLE_GO, "add"),
-            HighlightKind::FunctionDefinition
-        );
-    }
-
-    /// `@function.builtin` (`len`) - its own dedicated bucket since GitHub issue #183 (previously
-    /// fell through to the plain `"function"` entry's subset match, same as a call to `add`).
-    #[test]
-    fn go_builtin_function_call_is_classified_as_function_builtin() {
-        let spans = highlight_go(SAMPLE_GO);
-        assert_eq!(
-            kind_at(&spans, SAMPLE_GO, "len("),
-            HighlightKind::FunctionBuiltin
-        );
-    }
-
     const SAMPLE_JSON: &str = "{\n  \"name\": \"jerry\",\n  \"count\": 3\n}\n";
-
-    #[test]
-    fn json_object_key_is_classified_as_property_not_string() {
-        let spans = highlight_json(SAMPLE_JSON);
-        assert_eq!(
-            kind_at(&spans, SAMPLE_JSON, "\"name\""),
-            HighlightKind::Property,
-            "a real JSON key must win the more-specific string.special.key registration over \
-             the plain string entry"
-        );
-    }
-
-    #[test]
-    fn json_string_value_is_classified_as_string_not_property() {
-        let spans = highlight_json(SAMPLE_JSON);
-        assert_eq!(
-            kind_at(&spans, SAMPLE_JSON, "\"jerry\""),
-            HighlightKind::String
-        );
-    }
-
-    #[test]
-    fn json_number_value_is_classified_as_number() {
-        let spans = highlight_json(SAMPLE_JSON);
-        assert_eq!(kind_at(&spans, SAMPLE_JSON, "3"), HighlightKind::Number);
-    }
 
     const SAMPLE_YAML: &str = "anchor: &base\n  enabled: true\nalias: *base\ncount: 3\n";
 
-    #[test]
-    fn yaml_key_is_classified_as_property() {
-        let spans = highlight_yaml(SAMPLE_YAML);
-        assert_eq!(
-            kind_at(&spans, SAMPLE_YAML, "count"),
-            HighlightKind::Property
-        );
-    }
-
-    #[test]
-    fn yaml_boolean_is_classified_as_constant_builtin() {
-        let spans = highlight_yaml(SAMPLE_YAML);
-        assert_eq!(
-            kind_at(&spans, SAMPLE_YAML, "true"),
-            HighlightKind::ConstantBuiltin
-        );
-    }
-
-    /// `(anchor_name) @label` - the cross-language `"label"` registration's YAML half, its own
-    /// dedicated bucket since GitHub issue #183 (its C half is a goto target - see
-    /// `c_goto_label_is_classified_as_label` below; previously both fell through to
-    /// `Variable`).
-    #[test]
-    fn yaml_anchor_name_is_classified_as_label() {
-        let spans = highlight_yaml(SAMPLE_YAML);
-        assert_eq!(kind_at(&spans, SAMPLE_YAML, "base\n"), HighlightKind::Label);
-    }
-
-    /// `"&"/"*" @punctuation.special` - its own dedicated bucket since GitHub issue #183
-    /// (previously fell through to `Operator`).
-    #[test]
-    fn yaml_anchor_and_alias_sigils_are_classified_as_punctuation_special() {
-        let spans = highlight_yaml(SAMPLE_YAML);
-        assert_eq!(
-            kind_at(&spans, SAMPLE_YAML, "&base"),
-            HighlightKind::PunctuationSpecial
-        );
-        assert_eq!(
-            kind_at(&spans, SAMPLE_YAML, "*base"),
-            HighlightKind::PunctuationSpecial
-        );
-    }
-
     const SAMPLE_C: &str =
         "int add(int x) {\n  int total = 0;\n  goto done;\n done:\n  return total;\n}\n";
-
-    #[test]
-    fn c_keyword_is_classified_as_keyword() {
-        let spans = highlight_c(SAMPLE_C);
-        assert_eq!(kind_at(&spans, SAMPLE_C, "return"), HighlightKind::Keyword);
-    }
-
-    #[test]
-    fn c_function_definition_name_is_classified_as_function() {
-        let spans = highlight_c(SAMPLE_C);
-        assert_eq!(
-            kind_at(&spans, SAMPLE_C, "add"),
-            HighlightKind::FunctionDefinition
-        );
-    }
-
-    /// `(statement_identifier) @label` - the `"label"` registration's C half (a goto target, not
-    /// a lifetime - see [`HighlightKind::Label`]'s own docs on the cross-language unification).
-    #[test]
-    fn c_goto_label_is_classified_as_label() {
-        let spans = highlight_c(SAMPLE_C);
-        assert_eq!(kind_at(&spans, SAMPLE_C, "done:"), HighlightKind::Label);
-    }
-
-    /// `";" @delimiter` - the new, plain `"delimiter"` registration, distinct from the
-    /// already-registered `"punctuation.delimiter"`.
-    #[test]
-    fn c_semicolon_is_classified_as_punctuation_delimiter() {
-        let spans = highlight_c(SAMPLE_C);
-        assert_eq!(
-            kind_at(&spans, SAMPLE_C, ";"),
-            HighlightKind::PunctuationDelimiter
-        );
-    }
 
     const SAMPLE_MARKDOWN: &str = "# Title\n\nSome **bold** and *italic* text with `inline code` and a [link](https://example.com).\n\n```rust\nfn main() {}\n```\n";
 
@@ -4498,57 +4313,6 @@ mod tests {
             spans.iter().any(|span| span.kind != HighlightKind::Text),
             "a real markdown document must produce at least one non-Text span - if this fails, \
              the inline grammar injection isn't firing at all"
-        );
-    }
-
-    #[test]
-    fn markdown_heading_text_is_classified_as_heading() {
-        let spans = highlight_markdown(SAMPLE_MARKDOWN);
-        assert_eq!(
-            kind_at(&spans, SAMPLE_MARKDOWN, "Title"),
-            HighlightKind::Heading
-        );
-    }
-
-    #[test]
-    fn markdown_bold_text_is_classified_as_strong() {
-        let spans = highlight_markdown(SAMPLE_MARKDOWN);
-        assert_eq!(
-            kind_at(&spans, SAMPLE_MARKDOWN, "bold"),
-            HighlightKind::Strong
-        );
-    }
-
-    #[test]
-    fn markdown_italic_text_is_classified_as_emphasis() {
-        let spans = highlight_markdown(SAMPLE_MARKDOWN);
-        assert_eq!(
-            kind_at(&spans, SAMPLE_MARKDOWN, "italic"),
-            HighlightKind::Emphasis
-        );
-    }
-
-    #[test]
-    fn markdown_inline_code_is_classified_as_literal_string() {
-        let spans = highlight_markdown(SAMPLE_MARKDOWN);
-        assert_eq!(
-            kind_at(&spans, SAMPLE_MARKDOWN, "inline code"),
-            HighlightKind::String
-        );
-    }
-
-    #[test]
-    fn markdown_link_destination_and_label_are_classified_as_link() {
-        let spans = highlight_markdown(SAMPLE_MARKDOWN);
-        assert_eq!(
-            kind_at(&spans, SAMPLE_MARKDOWN, "https://example.com"),
-            HighlightKind::Link,
-            "the link destination"
-        );
-        assert_eq!(
-            kind_at(&spans, SAMPLE_MARKDOWN, "link"),
-            HighlightKind::Link,
-            "the link's own visible label text"
         );
     }
 
@@ -4693,72 +4457,36 @@ mod tests {
         );
     }
 
-    /// `(color_value) @string.special` gets its own real bucket since GitHub issue #183
-    /// (previously fell through to the plain `"string"` entry), and must **not** resolve through
-    /// the more specific `"string.special.key"` one that JSON registers: the recognized-name rule
-    /// requires every one of a recognized name's own dot-parts to be present in the capture, and
-    /// `key` is not present in `string.special`.
-    #[test]
-    fn css_color_literal_is_a_string_special_not_a_json_style_key() {
-        let spans = highlight_css(SAMPLE_CSS);
-        assert_eq!(
-            kind_at(&spans, SAMPLE_CSS, "ff0000"),
-            HighlightKind::StringSpecial
-        );
-    }
-
     const SAMPLE_MARKDOWN_FENCES: &str = "# Fences\n\n```html\n<div class=\"card\">hi</div>\n```\n\n```css\n.card { color: red; }\n```\n\n```rust\nfn main() {}\n```\n\n```zig\nconst x = 1;\n```\n\n```\nplain fence\n```\n";
 
-    /// GitHub issue #154's own headline ask - "including in the markdown files". A ` ```html `
-    /// fence's *content* really is reparsed by `tree-sitter-html`: `div` comes out
-    /// [`Tag`](HighlightKind::Tag), which no markdown query has any rule capable of producing.
+    /// GitHub issue #154's own headline ask - "including in the markdown files". A tagged
+    /// fence's *content* really is reparsed by that tag's own grammar, and each of these buckets
+    /// is one no markdown query has any rule capable of producing.
+    ///
+    /// Three languages in one table because that is the point: the same injection query resolves
+    /// all of them, with no per-language code anywhere in [`MARKDOWN_INJECTION_QUERY`] or
+    /// [`Grammar::for_injection_name`]. The ` ```rust ` rows also cover the fence's very first
+    /// token, which is exactly the one a parent highlight left open over the injected range
+    /// would silently steal.
     #[test]
-    fn a_markdown_html_fence_really_highlights_its_content_as_html() {
+    fn a_tagged_markdown_fence_really_highlights_its_content_with_that_languages_grammar() {
         let spans = highlight_markdown(SAMPLE_MARKDOWN_FENCES);
-        assert_eq!(
-            kind_at(&spans, SAMPLE_MARKDOWN_FENCES, "div class"),
-            HighlightKind::Tag
-        );
-        assert_eq!(
-            kind_at(&spans, SAMPLE_MARKDOWN_FENCES, "class="),
-            HighlightKind::Attribute
-        );
-        assert_eq!(
-            kind_at(&spans, SAMPLE_MARKDOWN_FENCES, "card\">"),
-            HighlightKind::String
-        );
-    }
-
-    #[test]
-    fn a_markdown_css_fence_really_highlights_its_content_as_css() {
-        let spans = highlight_markdown(SAMPLE_MARKDOWN_FENCES);
-        assert_eq!(
-            kind_at(&spans, SAMPLE_MARKDOWN_FENCES, "card { "),
-            HighlightKind::Property,
-            "the class selector inside the ```css fence"
-        );
-        assert_eq!(
-            kind_at(&spans, SAMPLE_MARKDOWN_FENCES, "color: red"),
-            HighlightKind::Property
-        );
-    }
-
-    /// The proof that this is a real, general mechanism rather than an html/css special case: the
-    /// exact same injection query resolves ` ```rust ` too, with no Rust-specific code anywhere in
-    /// [`MARKDOWN_INJECTION_QUERY`] or [`Grammar::for_injection_name`].
-    #[test]
-    fn a_markdown_rust_fence_really_highlights_its_content_as_rust() {
-        let spans = highlight_markdown(SAMPLE_MARKDOWN_FENCES);
-        assert_eq!(
-            kind_at(&spans, SAMPLE_MARKDOWN_FENCES, "fn main"),
-            HighlightKind::Keyword,
-            "the `fn` keyword - the first token of the fence's content, which is exactly the one \
-             a parent highlight left open over the injected range would silently steal"
-        );
-        assert_eq!(
-            kind_at(&spans, SAMPLE_MARKDOWN_FENCES, "main()"),
-            HighlightKind::FunctionDefinition
-        );
+        let cases: &[(&str, &str, HighlightKind)] = &[
+            ("html tag name", "div class", HighlightKind::Tag),
+            ("html attribute", "class=", HighlightKind::Attribute),
+            ("html attribute value", "card\">", HighlightKind::String),
+            ("css class selector", "card { ", HighlightKind::Property),
+            ("css declaration", "color: red", HighlightKind::Property),
+            ("rust keyword", "fn main", HighlightKind::Keyword),
+            ("rust fn name", "main()", HighlightKind::FunctionDefinition),
+        ];
+        for (label, token, expected) in cases {
+            assert_eq!(
+                kind_at(&spans, SAMPLE_MARKDOWN_FENCES, token),
+                *expected,
+                "{label}"
+            );
+        }
     }
 
     /// The honest fallback, both halves of it: a fence tagged with a language this app has no
