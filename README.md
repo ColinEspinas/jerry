@@ -257,8 +257,6 @@ you.
 
 ## Built with
 
-A native Rust application — no Electron, no web view.
-
 | | |
 | --- | --- |
 | [**GPUI**](https://www.gpui.rs/) | The UI framework, from the Zed editor |
