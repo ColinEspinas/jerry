@@ -384,9 +384,16 @@ fn is_executable(path: &std::path::Path) -> bool {
 /// Windows has no execute-bit concept - a real, checkable equivalent instead: `%PATHEXT%`
 /// (default `.EXE` when unset, matching what `portable-pty` 0.9.0's own Windows
 /// `CommandBuilder::search_path` - `portable-pty-0.9.0/src/cmdbuilder.rs:581-606` - falls back
-/// to) lists the extensions Windows treats as directly runnable. Mirrors that real algorithm,
-/// the bare candidate first then each `PATHEXT` extension in turn, with two small, deliberate
-/// divergences worth documenting as intentional rather than drift: a real `is_file()` check at
+/// to) lists the extensions Windows treats as directly runnable. Mirrors that real algorithm's
+/// per-directory candidate set, with three small, deliberate divergences worth documenting as
+/// intentional rather than drift: each `PATHEXT` extension is tried *before* the bare candidate
+/// (upstream tries the bare name first) - a bare, extension-less file can never be run directly
+/// by `CreateProcessW` (no shebang support), so a directory shadowing a real `.cmd`/`.bat`
+/// shim with a same-named extension-less file (exactly what Node version managers like Volta
+/// and nvm-windows ship: a POSIX shell script under the bare name next to the real Windows
+/// `.cmd` wrapper) must not win over the extension that's actually runnable - see
+/// `resolve_in_path_var_prefers_a_pathext_extension_over_a_same_named_extensionless_file` in
+/// the test module; a real `is_file()` check at
 /// each candidate (upstream instead uses `exists()`, which would also match a same-named
 /// directory - see `resolve_on_path_skips_a_same_named_directory` in the test module for the
 /// unix equivalent of this guard), and `trim_start_matches('.')` to strip a `PATHEXT` entry's
@@ -412,14 +419,22 @@ fn resolve_in_path_var(path_var: &OsStr, program: &str) -> Option<PathBuf> {
 
     for dir in std::env::split_paths(path_var) {
         let candidate = dir.join(program);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
+        // PATHEXT extensions checked before the bare candidate: on Windows a bare,
+        // extension-less file can never be run directly by `CreateProcessW` (no shebang
+        // support), so preferring it over a real `.cmd`/`.bat`/`.exe` sibling is always wrong
+        // - and directories holding a Node version-manager shim (Volta, nvm-windows, ...)
+        // routinely contain exactly that pair: a POSIX shell script under the bare name
+        // *and* a `.cmd` wrapper beside it. Matching the bare file first used to hand that
+        // shell script straight to `Command::new`, which `CreateProcessW` then rejected with
+        // `%1 is not a valid Win32 application` instead of running the `.cmd` shim.
         for extension in &extensions {
             let candidate = candidate.with_extension(extension);
             if candidate.is_file() {
                 return Some(candidate);
             }
+        }
+        if candidate.is_file() {
+            return Some(candidate);
         }
     }
     None
@@ -1757,6 +1772,51 @@ mod tests {
         assert_eq!(
             result, None,
             "a same-named directory on PATH must never be returned as a resolved binary"
+        );
+    }
+
+    /// The real, live-reproduced Windows bug this closes: a directory holding both a bare,
+    /// extension-less file (what Volta/nvm-windows ship as the POSIX shim half of an npm
+    /// global install, e.g. `typescript-language-server`) and a real `.cmd` sibling
+    /// (`typescript-language-server.cmd`) must resolve to the `.cmd` - `CreateProcessW` can't
+    /// run the bare file at all (it has no PE header, just a shell script), which is exactly
+    /// how `%1 is not a valid Win32 application` gets reported once that bare path reaches
+    /// `Command::new` in `LspClient::spawn`. Builds a real, isolated `PATH` (not the process's
+    /// real one) so a genuine `.cmd` elsewhere on it can't accidentally make this pass for the
+    /// wrong reason - see `resolve_on_path_skips_a_same_named_directory`'s docs for why a
+    /// custom `PATH` is passed directly rather than mutating `std::env`.
+    #[cfg(windows)]
+    #[test]
+    fn resolve_in_path_var_prefers_a_pathext_extension_over_a_same_named_extensionless_file() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let bare = tmp.path().join("myprog");
+        let cmd = tmp.path().join("myprog.cmd");
+        std::fs::write(&bare, "#!/bin/sh\necho not runnable on windows\n").expect("write bare");
+        std::fs::write(&cmd, "@echo off\r\necho real windows shim\r\n").expect("write cmd");
+
+        let path_var = std::env::join_paths(std::iter::once(tmp.path().to_path_buf()))
+            .expect("joining a single PATH entry should not fail");
+
+        // Reads the real, process-global `%PATHEXT%` rather than overriding it -
+        // `std::env::set_var` needs an `unsafe` block this workspace's `unsafe_code = "deny"`
+        // lint forbids (see `Cargo.toml`), and every real Windows install already includes
+        // `.CMD` in its default `PATHEXT` (`.COM;.EXE;.BAT;.CMD;...`), which is the one this
+        // test's real bug report (`typescript-language-server.cmd`) actually depends on.
+        let result = resolve_in_path_var(&path_var, "myprog");
+
+        // Windows' filesystem is case-insensitive, and `with_extension` applies whatever
+        // casing `%PATHEXT%` itself uses (typically `.CMD`, not `.cmd`) - so the real resolved
+        // path and the `myprog.cmd` this test wrote can differ only in extension casing while
+        // still naming the same real file. `eq_ignore_ascii_case` on the full path string
+        // captures that; a plain `PathBuf` equality would not.
+        let resolved = result.expect("a real `.cmd` sibling should have resolved");
+        assert!(
+            resolved
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&cmd.to_string_lossy()),
+            "the real, runnable `.cmd` sibling must win over the same-named extension-less \
+             file, not the other way around - got {resolved:?}, expected (case-insensitively) \
+             {cmd:?}"
         );
     }
 }
