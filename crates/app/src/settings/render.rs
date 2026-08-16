@@ -2,8 +2,8 @@ use super::*;
 use crate::root::plural;
 use crate::root::scrollbar;
 use crate::root::widgets::{
-    self, hover_keycap_row, menu_popover_chrome, render_env_chip, render_keycap_row, KeycapSize,
-    SimpleInput, TextFieldHandle,
+    self, hover_keycap_row, menu_popover_chrome, render_env_chip, render_keycap_row, text_tooltip,
+    KeycapSize, SimpleInput, TextFieldHandle,
 };
 use crate::settings::widgets::ChoiceOption;
 use crate::sound::SoundEventKind;
@@ -3301,10 +3301,10 @@ impl AdeApp {
         );
         let respect_gitignore_row = self.render_settings_row(
             "Use .gitignore in search",
-            "The Search panel always skips target/, node_modules/, .git and a handful of other \
-             common build/dependency directories by name, regardless of this setting. On top of \
-             that, additionally hide whatever the active worktree's own .gitignore hides. Off \
-             scopes search independently of git entirely - only the built-in list above applies.",
+            "The Search panel always skips whatever is on the exclude list below, regardless of \
+             this setting. On top of that, additionally hide whatever the active worktree's own \
+             .gitignore hides. Off scopes search independently of git entirely - only the list \
+             below applies.",
             self.render_toggle_control(
                 "settings-editor-respect-gitignore",
                 self.settings.editor.respect_gitignore,
@@ -3312,6 +3312,7 @@ impl AdeApp {
                 |this, cx| this.toggle_respect_gitignore(cx),
             ),
         );
+        let search_exclude_list = self.render_search_exclude_list(cx);
 
         div()
             .flex()
@@ -3352,7 +3353,306 @@ impl AdeApp {
                     .child("Search"),
             )
             .child(respect_gitignore_row)
+            .child(
+                div()
+                    .pt(px(14.0))
+                    .pb(px(6.0))
+                    .font(font(theme::font::SANS))
+                    .text_size(px(12.0))
+                    .text_color(theme::text::HEADING)
+                    .child("Exclude patterns"),
+            )
+            .child(
+                div()
+                    .pb(px(2.0))
+                    .font(font(theme::font::SANS))
+                    .text_size(px(11.0))
+                    .line_height(px(16.0))
+                    .text_color(theme::text::FAINT)
+                    .child(
+                        "Directories and files search never descends into, by real glob pattern \
+                         (GitHub issue #401). Seeded from Jerry's own defaults - remove one you \
+                         don't want, or add your own below.",
+                    ),
+            )
+            .child(search_exclude_list)
             .child(self.render_snippet_block(settings_store::ConfigPage::Editor))
+    }
+
+    /// GitHub issue #401's real, editable exclude-pattern list: a bordered card holding one
+    /// [`Self::render_search_exclude_pattern_row`] per real entry in
+    /// `settings.editor.search_excludes`, followed by [`Self::render_search_exclude_add_row`] as
+    /// the card's own final row - the same "filter/action row lives inside the same card as the
+    /// rows it acts on" shape [`Self::render_settings_keymap_page`] already established for the
+    /// Keybindings page's filter field, applied here to an add-row instead of a filter.
+    ///
+    /// A genuinely empty list (every entry removed) renders the card with nothing in it but the
+    /// add row - a real, honest state, not specially called out, since
+    /// `EditorSettings::search_excludes`'s own docs already say plainly what an empty list means.
+    fn render_search_exclude_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let patterns = self.settings.editor.search_excludes.clone();
+        let has_patterns = !patterns.is_empty();
+        div()
+            .rounded(theme::radius::CARD)
+            .border_1()
+            .border_color(theme::border::CARD)
+            .overflow_hidden()
+            .children(
+                patterns
+                    .iter()
+                    .map(|pattern| self.render_search_exclude_pattern_row(pattern, cx)),
+            )
+            .child(self.render_search_exclude_add_row(has_patterns, cx))
+    }
+
+    /// One real pattern's own row: the pattern text, monospaced (it's a real glob, not prose), and
+    /// a single-click remove affordance. Deliberately **not**
+    /// [`Self::request_remove_custom_theme`]'s two-click arm/confirm: that guards a real,
+    /// irreversible disk delete, while removing one entry here is trivially reversible (retype
+    /// it, or reload Settings without having saved) - the same "don't add friction a real action
+    /// doesn't need" call [`Self::render_theme_card`]'s own docs make for *keeping* its two-click
+    /// guard, applied in the opposite direction here.
+    fn render_search_exclude_pattern_row(
+        &self,
+        pattern: &str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let label = pattern.to_string();
+        let selector_pattern = pattern.to_string();
+        let remove_button_selector_pattern = pattern.to_string();
+        let remove_pattern = pattern.to_string();
+        div()
+            .id(gpui::ElementId::from(format!(
+                "settings-search-exclude-row-{pattern}"
+            )))
+            // Test-only, no-op in release builds - lets a real interaction test confirm exactly
+            // which patterns rendered, the same convention `Self::render_theme_card`'s own
+            // `debug_selector` follows.
+            .debug_selector(move || format!("search-exclude-row-{selector_pattern}"))
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(10.0))
+            .px(px(11.0))
+            .py(px(7.0))
+            .bg(theme::surface::CARD)
+            .border_b_1()
+            .border_color(theme::settings::CARD_ROW_SEP)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font(font(theme::font::MONO))
+                    .text_size(px(11.0))
+                    .text_color(theme::text::BODY)
+                    .child(label),
+            )
+            .child(
+                div()
+                    .id(gpui::ElementId::from(format!(
+                        "settings-search-exclude-remove-{pattern}"
+                    )))
+                    // Test-only, no-op in release builds - `Self::render_theme_card`'s own
+                    // remove button follows the identical convention (a real, own `debug_selector`
+                    // distinct from the row's), so a real interaction test can find and click
+                    // *this* control specifically rather than only the row around it.
+                    .debug_selector(move || {
+                        format!("settings-search-exclude-remove-{remove_button_selector_pattern}")
+                    })
+                    .cursor_pointer()
+                    .flex_none()
+                    .w(px(20.0))
+                    .h(px(20.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(theme::radius::CHIP)
+                    .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
+                    .tooltip(text_tooltip(format!("Remove \"{pattern}\"")))
+                    .child(
+                        crate::icons::IconRow::new(
+                            &self.settings.icon_pack,
+                            crate::icons::IconSize::Control,
+                        )
+                        .draw(crate::icons::Icon::Trash, theme::text::FAINT),
+                    )
+                    .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                        this.remove_search_exclude_pattern(&remove_pattern, cx);
+                    })),
+            )
+    }
+
+    /// The list's own final row: a real text input (the same [`widgets::SimpleInput`]/
+    /// [`Self::render_simple_input_row`] shape [`Self::render_settings_keymap_filter_row`] already
+    /// uses) that appends a pattern to `settings.editor.search_excludes` on `Enter` - see
+    /// [`Self::handle_search_exclude_input_key_down`]/[`Self::add_search_exclude_pattern`].
+    /// `has_patterns` only controls whether a separating top border is drawn - with zero real rows
+    /// above it, this is the card's only content and needs no divider under a rounded top edge
+    /// that's already its own.
+    fn render_search_exclude_add_row(
+        &self,
+        has_patterns: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        self.wire_text_input_actions(
+            div()
+                .id("settings-search-exclude-add")
+                .track_focus(&self.search_exclude_input_focus_handle)
+                // See `crate::default_key_bindings`' `TextUndo`/`TextRedo` docs for why the tag
+                // and the listener both live on this exact node.
+                .key_context("text-input")
+                .on_action(cx.listener(Self::handle_search_exclude_input_text_undo))
+                .on_action(cx.listener(Self::handle_search_exclude_input_text_redo))
+                .on_key_down(cx.listener(Self::handle_search_exclude_input_key_down)),
+            search_exclude_input_handle(),
+            cx,
+        )
+        .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+            window.focus(&this.search_exclude_input_focus_handle, cx);
+        }))
+        .when(has_patterns, |el| {
+            el.border_t_1().border_color(theme::settings::CARD_ROW_SEP)
+        })
+        .flex()
+        .items_center()
+        .gap(px(7.0))
+        .px(px(11.0))
+        .py(px(7.0))
+        .bg(theme::surface::CARD_SUNK)
+        .child(
+            div()
+                .flex_none()
+                .font(font(theme::font::MONO))
+                .text_size(px(11.0))
+                .text_color(theme::text::GHOSTER)
+                .child("+"),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .child(self.render_simple_input_row(
+                    SimpleInput {
+                        caret_selector: "settings-search-exclude-add-caret".into(),
+                        text_selector: "settings-search-exclude-add-text".into(),
+                        focus_handle: Some(&self.search_exclude_input_focus_handle),
+                        text: self.search_exclude_input.as_str(),
+                        caret_offset: self.search_exclude_input.caret(),
+                        selection: self.search_exclude_input.selection(),
+                        placeholder: "add a pattern, e.g. coverage or *.map, then press Enter",
+                        font: theme::font::SANS,
+                        text_size: px(11.0),
+                        text_color: theme::text::DIM,
+                        placeholder_color: theme::text::GHOST,
+                        caret: widgets::SimpleInputCaret::default(),
+                        field: Some(search_exclude_input_handle()),
+                    },
+                    cx,
+                )),
+        )
+    }
+
+    /// The add row's key handler - append/backspace (ordinary typing), `Enter`
+    /// ([`Self::add_search_exclude_pattern`]), `Esc` (clears whatever's typed so far, mirroring
+    /// [`Self::handle_settings_keymap_filter_key_down`]'s identical `Esc` behaviour for its own
+    /// field). `Enter` always counts as a real change (the field always ends up cleared, whatever
+    /// state the pattern list ends up in - see [`Self::add_search_exclude_pattern`]'s own docs),
+    /// so `changed` is unconditionally `true` on that branch rather than threaded through from a
+    /// `bool` return.
+    pub(in crate::settings) fn handle_search_exclude_input_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let keystroke = &event.keystroke;
+        let Some(modifiers) = widgets::text_editing_modifiers(&keystroke.key, &keystroke.modifiers)
+        else {
+            return;
+        };
+        self.reset_caret_blink(cx);
+        let changed = match keystroke.key.as_str() {
+            "escape" => self.search_exclude_input.clear(Instant::now()),
+            "enter" => {
+                self.add_search_exclude_pattern(cx);
+                true
+            }
+            key => self.search_exclude_input.handle_editing_key(
+                key,
+                keystroke.key_char.as_deref(),
+                modifiers,
+                Instant::now(),
+            ),
+        };
+        if changed {
+            cx.notify();
+            cx.stop_propagation();
+        }
+    }
+
+    pub(in crate::settings) fn handle_search_exclude_input_text_undo(
+        &mut self,
+        _: &TextUndo,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.search_exclude_input.undo() {
+            cx.notify();
+        }
+    }
+
+    pub(in crate::settings) fn handle_search_exclude_input_text_redo(
+        &mut self,
+        _: &TextRedo,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.search_exclude_input.redo() {
+            cx.notify();
+        }
+    }
+
+    /// The real "add a pattern" action (GitHub issue #401): the input's current text, trimmed, is
+    /// appended to `settings.editor.search_excludes` and persisted - unless it's blank or already
+    /// on the list, in which case there's nothing to add. Either way the field is cleared
+    /// afterwards: a blank `Enter` had nothing to clear, and a duplicate's already-desired end
+    /// state (that pattern being excluded) already holds, so leaving the just-submitted text
+    /// sitting in the field would read as "did that not work?" for no reason.
+    ///
+    /// No `sanitize()` call here - trimming and de-duplicating this one insertion inline is
+    /// simpler and exactly as correct as calling the whole-list `EditorSettings::sanitize` for a
+    /// single append would be, and avoids re-normalizing (and potentially reordering) every other
+    /// entry on every keystroke's `Enter`.
+    fn add_search_exclude_pattern(&mut self, cx: &mut Context<Self>) {
+        let pattern = self.search_exclude_input.as_str().trim().to_string();
+        if !pattern.is_empty()
+            && !self
+                .settings
+                .editor
+                .search_excludes
+                .iter()
+                .any(|existing| existing == &pattern)
+        {
+            self.settings.editor.search_excludes.push(pattern);
+            self.persist_settings(cx);
+        }
+        self.search_exclude_input.clear(Instant::now());
+    }
+
+    /// The real "remove this pattern" action (GitHub issue #401) - a single click, see
+    /// [`Self::render_search_exclude_pattern_row`]'s own docs for why this has no two-click
+    /// confirm. A `pattern` no longer on the list (a stale click racing a second removal) is a
+    /// harmless no-op, matching every other by-value list mutation in this module.
+    fn remove_search_exclude_pattern(&mut self, pattern: &str, cx: &mut Context<Self>) {
+        self.settings
+            .editor
+            .search_excludes
+            .retain(|existing| existing != pattern);
+        self.persist_settings(cx);
+        cx.notify();
     }
 
     /// *Notifications* (GitHub issue #226): the sound design module. Master switch, one row per
@@ -4823,6 +5123,15 @@ fn settings_keymap_filter_handle() -> TextFieldHandle {
     TextFieldHandle::new(|app: &mut AdeApp| Some(&mut app.settings_keymap_filter))
 }
 
+/// The Editor > Search "add a pattern" field's own handle (GitHub issue #401). No `on_changed`:
+/// unlike a filter field, ordinary typing here has no live follow-up work at all - the real
+/// action only happens on `Enter`, which `Self::handle_search_exclude_input_key_down` already
+/// calls `Self::add_search_exclude_pattern` from directly rather than through this handle's
+/// `on_changed` hook.
+fn search_exclude_input_handle() -> TextFieldHandle {
+    TextFieldHandle::new(|app: &mut AdeApp| Some(&mut app.search_exclude_input))
+}
+
 /// The "Generate from colour" seed field's own handle. No `on_changed` for the same reason
 /// [`settings_keymap_filter_handle`] has none: the live colour swatch beside the field is derived
 /// from it at render time, so `cx.notify()` is all the follow-up there is.
@@ -5083,6 +5392,194 @@ mod settings_keymap_filter_tests {
         assert!(
             cx.debug_bounds("keybinding-row-Command palette").is_some(),
             "clearing the real filter should render every row again"
+        );
+    }
+}
+
+/// Interactive regression coverage for GitHub issue #401's real, editable exclude-pattern list -
+/// like `settings_keymap_filter_tests` above, this drives the actually rendered UI (a focused
+/// field receiving simulated keystrokes, a real click on a rendered button), checked through
+/// `VisualTestContext::debug_bounds`/the live `settings.editor.search_excludes` field and a real
+/// on-disk `settings.toml`, not just the pure `add`/`remove` methods called directly.
+#[cfg(test)]
+mod search_exclude_settings_tests {
+    use super::*;
+    use crate::root::focus::palette_focus_tests;
+    use gpui::TestAppContext;
+
+    fn open_test_app_with_real_settings_path(
+        cx: &mut TestAppContext,
+        repo_path: PathBuf,
+        settings: settings_store::Settings,
+        settings_path: PathBuf,
+    ) -> (gpui::Entity<AdeApp>, &mut gpui::VisualTestContext) {
+        cx.add_window_view(|window, cx| {
+            AdeApp::new_with_settings(
+                Some(repo_path),
+                true,
+                settings,
+                Some(settings_path),
+                window,
+                cx,
+            )
+        })
+    }
+
+    /// Typing a real pattern into the add row and pressing `Enter` must both update the live
+    /// setting (so the very next search picks it up - `crate::search::render::AdeApp::
+    /// start_search` reads `settings.editor.search_excludes` fresh every time) and clear the
+    /// field for the next entry, exactly like `crate::root::new_file`'s own Enter-submits-and-
+    /// prompt-closes shape.
+    #[gpui::test]
+    fn typing_a_pattern_and_pressing_enter_adds_it_and_clears_the_field(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        cx.dispatch_action(ToggleSettings);
+        app.update_in(cx, |app, window, cx| {
+            app.select_settings_page(SettingsPage::Editor, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("search-exclude-row-target").is_some(),
+            "the real default list must already be rendered, one row per entry"
+        );
+        assert!(
+            cx.debug_bounds("search-exclude-row-coverage").is_none(),
+            "sanity check: nothing named `coverage` yet"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            window.focus(&app.search_exclude_input_focus_handle, cx);
+        });
+        cx.simulate_input("coverage");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        assert!(
+            app.read_with(cx, |app, _| app
+                .settings
+                .editor
+                .search_excludes
+                .iter()
+                .any(|p| p == "coverage")),
+            "the real, live setting must now hold the just-typed pattern"
+        );
+        assert!(
+            cx.debug_bounds("search-exclude-row-coverage").is_some(),
+            "the newly added pattern must actually render as its own row"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.search_exclude_input.as_str().to_string()),
+            "",
+            "the field must clear itself after a real successful submit"
+        );
+    }
+
+    /// Pressing `Enter` on a blank field, or on a pattern that's already on the list, must not
+    /// grow the list with a blank/duplicate entry - see `Self::add_search_exclude_pattern`'s own
+    /// docs for why both are silent no-ops rather than errors.
+    #[gpui::test]
+    fn enter_on_a_blank_or_duplicate_pattern_is_a_silent_no_op(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+        cx.dispatch_action(ToggleSettings);
+        app.update_in(cx, |app, window, cx| {
+            app.select_settings_page(SettingsPage::Editor, window, cx);
+        });
+        cx.run_until_parked();
+
+        let before = app.read_with(cx, |app, _| app.settings.editor.search_excludes.clone());
+
+        app.update_in(cx, |app, window, cx| {
+            window.focus(&app.search_exclude_input_focus_handle, cx);
+        });
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.editor.search_excludes.clone()),
+            before,
+            "Enter on a genuinely blank field must add nothing"
+        );
+
+        cx.simulate_input("target");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.settings.editor.search_excludes.clone()),
+            before,
+            "Enter on a pattern already on the list must not add a second, duplicate entry"
+        );
+    }
+
+    /// Clicking a pattern row's own remove affordance must remove exactly that pattern from the
+    /// real, live setting, leave every other default entry alone, and persist the removal to a
+    /// real `settings.toml` on disk - the same "click really reaches the file" bar
+    /// `custom_theme_settings_tests::clicking_the_real_remove_button_deletes_the_theme_without_
+    /// selecting_its_card` already sets for a theme card's own remove button.
+    #[gpui::test]
+    fn clicking_the_remove_button_removes_exactly_that_pattern_and_persists(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = settings_dir.path().join("settings.toml");
+        let (app, cx) = open_test_app_with_real_settings_path(
+            cx,
+            repo.path().to_path_buf(),
+            settings_store::Settings::default(),
+            settings_path.clone(),
+        );
+        cx.dispatch_action(ToggleSettings);
+        app.update_in(cx, |app, window, cx| {
+            app.select_settings_page(SettingsPage::Editor, window, cx);
+        });
+        cx.run_until_parked();
+
+        let remove_bounds = cx
+            .debug_bounds("settings-search-exclude-remove-node_modules")
+            .expect("the remove affordance must have painted on the node_modules row");
+        cx.simulate_click(remove_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                !app.settings
+                    .editor
+                    .search_excludes
+                    .iter()
+                    .any(|p| p == "node_modules"),
+                "a single real click must really remove the pattern from the live setting"
+            );
+            assert!(
+                app.settings
+                    .editor
+                    .search_excludes
+                    .iter()
+                    .any(|p| p == "target"),
+                "every other default entry must be untouched by removing a different one"
+            );
+        });
+        assert!(
+            cx.debug_bounds("search-exclude-row-node_modules").is_none(),
+            "the removed pattern's own row must no longer render"
+        );
+
+        // The write is queued onto the background executor's serial writer loop - see
+        // `Self::persist_settings`'s own docs - so it has to be let run before the file is real.
+        cx.run_until_parked();
+
+        let on_disk = settings_store::Settings::load_or_init_at(&settings_path);
+        assert!(
+            !on_disk
+                .editor
+                .search_excludes
+                .iter()
+                .any(|p| p == "node_modules"),
+            "the removal must round-trip through a real save to settings.toml: {:?}",
+            on_disk.editor.search_excludes
         );
     }
 }

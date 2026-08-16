@@ -605,7 +605,7 @@ impl SoundEventSettings {
 /// `Shift+Tab`'s own dedent" - `crate::code_surface::indent::indent_settings_for_path` overrides
 /// either field from a real `.editorconfig` file when one applies to the file being edited; these
 /// are only the fallback once no `.editorconfig` sets a given property.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EditorSettings {
     pub minimap_enabled: bool,
@@ -651,6 +651,45 @@ pub struct EditorSettings {
     /// from this field), and toggled by the Editor settings page's own row
     /// (`crate::settings::render::AdeApp::toggle_respect_gitignore`).
     pub respect_gitignore: bool,
+    /// Layer one's own real, persisted, user-editable pattern list (GitHub issue #401, a direct
+    /// live follow-up to #394/#396: "The things you changed for the search are not configurable?
+    /// They are not in settings or something?"). Read by
+    /// `crate::search::engine::search_worktree_cancellable` via
+    /// `crate::search::engine::SearchRequest::search_excludes`
+    /// (`crate::search::render::AdeApp::start_search` populates it fresh from this field on every
+    /// real search, same as [`Self::respect_gitignore`]), and edited from the Editor settings
+    /// page's own Search section - one row per pattern with a remove affordance
+    /// (`crate::settings::render::AdeApp::remove_search_exclude_pattern`), plus a real text input
+    /// to add a new one (`crate::settings::render::AdeApp::add_search_exclude_pattern`).
+    ///
+    /// ## Replace, not additive - and why
+    ///
+    /// This field is compiled directly into the [`crate::search::glob::GlobList`]
+    /// [`crate::search::exclude::collect_files_excluding`]'s walk prunes against
+    /// (`crate::search::exclude::exclude_list_from`) - it **replaces**
+    /// `crate::search::exclude::DEFAULT_EXCLUDES` as the walk's real input, rather than being an
+    /// *additional* list layered on top of that constant. [`Self::default`] seeds this field from
+    /// [`crate::search::exclude::default_search_excludes`] (i.e. `DEFAULT_EXCLUDES` copied into an
+    /// owned, editable `Vec<String>`), so a fresh install starts out excluding exactly what it
+    /// always did - but the value the user actually sees and edits in Settings *is* the real,
+    /// complete, walk-time list, not a second one shadowing an invisible base they cannot change.
+    ///
+    /// This matches how VS Code's own `search.exclude` genuinely works: it is the editable,
+    /// visible source of truth, pre-populated with sensible defaults, not a hidden built-in list
+    /// plus a user-only add-on layered silently over it. The alternative (an always-on hidden
+    /// floor plus this field purely additive on top) would mean a user could never actually
+    /// *remove* `target` from what gets excluded even if they had a real reason to (say, a
+    /// worktree named `target/` that legitimately holds source, however unlikely) - "visible and
+    /// editable" has to include being able to shrink it, not just grow it.
+    ///
+    /// The one real risk that design choice accepts, stated plainly: unlike the old two-layer
+    /// model's `DEFAULT_EXCLUDES`, this list is not an unconditional floor - a user who explicitly
+    /// deletes `target` (or every entry) from their own copy really does get an unfiltered walk,
+    /// on *this* repository's own real ~59 GB `target/` + `.shared-target/` included. That is the
+    /// same tradeoff VS Code itself accepts for `search.exclude`, and is judged the right one here:
+    /// a setting the user cannot actually edit down to what they want is not the real, editable
+    /// setting issue #401 asked for.
+    pub search_excludes: Vec<String>,
 }
 
 impl Default for EditorSettings {
@@ -663,6 +702,7 @@ impl Default for EditorSettings {
             auto_import: true,
             suggest_auto_imports: true,
             respect_gitignore: true,
+            search_excludes: crate::search::exclude::default_search_excludes(),
         }
     }
 }
@@ -693,6 +733,27 @@ impl EditorSettings {
         self.tab_width = self
             .tab_width
             .clamp(EDITOR_TAB_WIDTH_MIN, EDITOR_TAB_WIDTH_MAX);
+        // A hand-edited `search_excludes` gets trimmed/deduped, not rejected - the same "hand-edit
+        // gets normalized" discipline [`SoundEventSettings::sanitize`]'s own docs describe for a
+        // blank `sound`. Blank entries (`""`, or whitespace-only after a stray trailing comma-style
+        // hand-edit) are dropped outright rather than kept as a pattern
+        // [`crate::search::glob::Glob::parse`] would silently treat as "no pattern" anyway - a
+        // Settings-page row rendering an entirely blank line would be a real, visible bug, not a
+        // faithful mirror of the file. Order is preserved and exact duplicates are collapsed to
+        // their first occurrence, so a hand-edited `["target", "target"]` shows one row, not two
+        // identical, independently-removable ones.
+        let mut seen = std::collections::HashSet::new();
+        self.search_excludes = std::mem::take(&mut self.search_excludes)
+            .into_iter()
+            .filter_map(|pattern| {
+                let trimmed = pattern.trim().to_string();
+                if trimmed.is_empty() || !seen.insert(trimmed.clone()) {
+                    None
+                } else {
+                    Some(trimmed)
+                }
+            })
+            .collect();
     }
 }
 
@@ -846,7 +907,7 @@ pub fn config_keys_line(page: ConfigPage) -> &'static str {
         }
         ConfigPage::Editor => {
             "editor.minimap_enabled \u{b7} editor.minimap_scale_percent \u{b7} \
-             editor.respect_gitignore"
+             editor.respect_gitignore \u{b7} editor.search_excludes"
         }
         ConfigPage::Notifications => {
             "sound.enabled \u{b7} sound.app_start.sound \u{b7} sound.agent_finished.sound \u{b7} \
@@ -1018,6 +1079,12 @@ mod tests {
             settings.editor.respect_gitignore,
             "matches VS Code's own search.useIgnoreFiles default of true"
         );
+        assert_eq!(
+            settings.editor.search_excludes,
+            crate::search::exclude::default_search_excludes(),
+            "GitHub issue #401: a fresh install's real, editable list must start out identical to \
+             crate::search::exclude::DEFAULT_EXCLUDES, not some independently-maintained copy"
+        );
     }
 
     /// The real toggle a user flips from the Editor settings page - see
@@ -1062,6 +1129,105 @@ mod tests {
         assert!(
             loaded.editor.respect_gitignore,
             "a missing key must fall back to the real default, not an implicit false"
+        );
+        assert_eq!(
+            loaded.editor.search_excludes,
+            crate::search::exclude::default_search_excludes(),
+            "a settings.toml written before GitHub issue #401 has no search_excludes key at all - \
+             it must fall back to the real default list, not an empty (unfiltered) one"
+        );
+    }
+
+    /// GitHub issue #401's real, editable list - proven the same way `respect_gitignore_persists_
+    /// through_a_real_save_and_load_in_both_states` proves its own toggle: a real save + load
+    /// round trip, both adding a custom pattern and removing a default one, since a setting nobody
+    /// can actually edit-and-keep-edited is not a real setting.
+    #[test]
+    fn search_excludes_persists_through_a_real_save_and_load_with_a_custom_edit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+
+        let mut settings = Settings::default();
+        assert_eq!(
+            settings.editor.search_excludes,
+            crate::search::exclude::default_search_excludes(),
+            "the real default"
+        );
+        // The real shape of a Settings-page edit: the user added `coverage` and removed the
+        // default `dist` entry.
+        settings.editor.search_excludes.push("coverage".to_string());
+        settings.editor.search_excludes.retain(|p| p != "dist");
+        settings.save_at(&path).expect("save");
+
+        let reloaded = Settings::load_or_init_at(&path);
+        assert!(
+            reloaded
+                .editor
+                .search_excludes
+                .iter()
+                .any(|p| p == "coverage"),
+            "a real save must round-trip a user-added pattern: {:?}",
+            reloaded.editor.search_excludes
+        );
+        assert!(
+            !reloaded.editor.search_excludes.iter().any(|p| p == "dist"),
+            "a real save must round-trip a user's removal of a default pattern too, not silently \
+             restore it: {:?}",
+            reloaded.editor.search_excludes
+        );
+        assert!(
+            reloaded
+                .editor
+                .search_excludes
+                .iter()
+                .any(|p| p == "target"),
+            "every other untouched default entry must still be there: {:?}",
+            reloaded.editor.search_excludes
+        );
+    }
+
+    /// [`EditorSettings::sanitize`]'s own "hand-edit gets normalized, not rejected" discipline,
+    /// applied to `search_excludes`: blank entries are dropped and exact duplicates are collapsed,
+    /// the same way a hand-edited `settings.toml` full of stray whitespace/repeats is normalized
+    /// rather than rejected outright elsewhere in this module.
+    #[test]
+    fn a_hand_edited_search_excludes_with_blanks_and_duplicates_is_sanitized() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        std::fs::write(
+            &path,
+            "[editor]\nsearch_excludes = [\"target\", \" \", \"target\", \"  coverage  \", \"\"]\n",
+        )
+        .expect("write hand-edited file");
+
+        let loaded = Settings::load_or_init_at(&path);
+        assert_eq!(
+            loaded.editor.search_excludes,
+            vec!["target".to_string(), "coverage".to_string()],
+            "blank entries dropped, duplicates collapsed, real entries trimmed: {:?}",
+            loaded.editor.search_excludes
+        );
+    }
+
+    /// A user who genuinely wants an unfiltered search is allowed to delete every entry - a real,
+    /// honest empty list, not one `sanitize` quietly refills back to the default. See
+    /// `EditorSettings::search_excludes`'s own "one real risk" docs for why this is the accepted
+    /// tradeoff.
+    #[test]
+    fn a_genuinely_empty_search_excludes_list_round_trips_as_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+
+        let mut settings = Settings::default();
+        settings.editor.search_excludes.clear();
+        settings.save_at(&path).expect("save");
+
+        let reloaded = Settings::load_or_init_at(&path);
+        assert!(
+            reloaded.editor.search_excludes.is_empty(),
+            "an explicit, deliberate empty list must round-trip as empty, not be re-seeded with \
+             the default: {:?}",
+            reloaded.editor.search_excludes
         );
     }
 

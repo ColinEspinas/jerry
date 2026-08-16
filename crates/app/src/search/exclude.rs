@@ -24,6 +24,27 @@
 //! filter checked on top of this module's walk, not as the sole file source #388 originally made
 //! it - see that function's own docs for exactly how the two compose.
 //!
+//! ## GitHub issue #401: the list itself is now real, user-editable settings state
+//!
+//! [`DEFAULT_EXCLUDES`] below is still the real, compiled-in list, but as of #401 it is no longer
+//! the list layer one's own walk actually prunes against in production. That list now lives at
+//! [`crate::settings::store::EditorSettings::search_excludes`] - a real, persisted `Vec<String>`
+//! the Editor settings page's own Search section lets the user add a pattern to or remove a
+//! pattern from - and [`exclude_list_from`] is what compiles *that* list into the same
+//! [`GlobList`] [`default_exclude_list`] used to build from the constant alone.
+//!
+//! [`EditorSettings::search_excludes`]'s own default is [`default_search_excludes`], i.e.
+//! [`DEFAULT_EXCLUDES`] copied into an owned, editable `Vec<String>` - so [`DEFAULT_EXCLUDES`]
+//! survives as this module's real floor for a *fresh install with no settings file yet* (and as
+//! the value every existing test in this module below still exercises directly), while a user who
+//! has actually opened Settings is editing their own real copy of it, not a second list layered on
+//! top of an invisible one they can't see or change. This is the deliberate "seed, don't hide"
+//! answer to the replace-vs-additive question: VS Code's own `search.exclude` is the editable,
+//! visible source of truth, seeded with real defaults, not a hidden base plus an add-on - see
+//! `EditorSettings::search_excludes`'s own docs for the full reasoning, including why this
+//! repository's own checkout (`target`/`.shared-target`) is the concrete case that reasoning has to
+//! hold up against if a user ever trims their own copy of the list too far.
+//!
 //! ## Why `target` and `.shared-target` are both in the default list
 //!
 //! This repository's own checkout is the real, live case [`DEFAULT_EXCLUDES`] has to hold up
@@ -87,6 +108,31 @@ pub const DEFAULT_EXCLUDES: &[&str] = &[
 /// more than that for the walk itself.
 pub fn default_exclude_list() -> GlobList {
     GlobList::parse(&DEFAULT_EXCLUDES.join(","))
+}
+
+/// [`DEFAULT_EXCLUDES`] as an owned, editable `Vec<String>` - the real seed value
+/// [`crate::settings::store::EditorSettings::search_excludes`]'s own `Default` impl uses, and what
+/// every real fresh install starts out with in Settings > Editor > Search before the user ever
+/// touches it. See this module's own "GitHub issue #401" docs for why the persisted setting is
+/// seeded from this rather than layered additively on top of it.
+pub fn default_search_excludes() -> Vec<String> {
+    DEFAULT_EXCLUDES.iter().map(|s| s.to_string()).collect()
+}
+
+/// Compiles a real, user-editable pattern list (`EditorSettings::search_excludes`, or a test's own
+/// stand-in for it) into the same [`GlobList`] [`default_exclude_list`] builds from the constant -
+/// one real compilation path for "whatever list of bare/glob directory patterns is currently in
+/// force," whether that list is the compiled-in default or the user's own edited copy of it.
+///
+/// Reuses [`GlobList::parse`]'s own comma-joined-list parsing rather than a `Vec`-specific one:
+/// each pattern is validated and normalized exactly the way a single pattern typed into the
+/// panel's own include/exclude fields already is (bare name -> basename-anywhere, blank entries
+/// dropped) - see [`crate::search::glob`]'s own module docs for the full rule set. An empty
+/// `patterns` slice (a user who has genuinely deleted every entry) compiles to an empty
+/// [`GlobList`], which [`GlobList::is_empty`]/[`GlobList::matches`] already treat as "never
+/// excludes anything" - a real, honest state this function does not second-guess.
+pub fn exclude_list_from(patterns: &[String]) -> GlobList {
+    GlobList::parse(&patterns.join(","))
 }
 
 /// Every real file under `root`, as an absolute path paired with its worktree-relative,
@@ -294,6 +340,86 @@ mod tests {
             assert_eq!(relatives(&files), vec!["src/lib.rs"]);
             assert!(!truncated);
         }
+    }
+
+    #[test]
+    fn default_search_excludes_is_an_owned_copy_of_default_excludes() {
+        assert_eq!(
+            default_search_excludes(),
+            DEFAULT_EXCLUDES
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+            "the real settings default must seed from exactly the compiled-in list, not a \
+             hand-copied second one that could drift from it"
+        );
+    }
+
+    #[test]
+    fn exclude_list_from_a_custom_pattern_excludes_matching_directories() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write(root, "src/lib.rs", "fn main() {}\n");
+        write(root, "coverage/report.html", "<html></html>\n");
+
+        // Not on the built-in list at all - only real once the user has actually added it.
+        let excludes = exclude_list_from(&["coverage".to_string()]);
+        let (files, _truncated) = collect_files_excluding(root, &excludes, 20_000);
+        assert_eq!(
+            relatives(&files),
+            vec!["src/lib.rs"],
+            "a user-added pattern must be pruned by the walk exactly like a built-in one"
+        );
+    }
+
+    #[test]
+    fn exclude_list_from_with_a_default_entry_removed_re_includes_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write(root, "src/lib.rs", "fn main() {}\n");
+        for i in 0..5 {
+            write(root, &format!("target/debug/deps/artifact-{i}.o"), "junk");
+        }
+        write(
+            root,
+            "node_modules/left-pad/index.js",
+            "module.exports = 1;\n",
+        );
+
+        // The user's own edited copy of the default list with `target` deleted from it - the
+        // real shape `EditorSettings::search_excludes` takes once a row's remove affordance is
+        // clicked (`crate::settings::render::AdeApp::remove_search_exclude_pattern`).
+        let mut patterns = default_search_excludes();
+        patterns.retain(|pattern| pattern != "target");
+        let excludes = exclude_list_from(&patterns);
+
+        let (files, _truncated) = collect_files_excluding(root, &excludes, 20_000);
+        let found = relatives(&files);
+        assert!(
+            found.iter().any(|path| path.starts_with("target/")),
+            "removing `target` from the user's own list must really re-include it: {found:?}"
+        );
+        assert!(
+            !found.iter().any(|path| path.starts_with("node_modules/")),
+            "every other still-present default entry must keep excluding: {found:?}"
+        );
+        assert!(found.contains(&"src/lib.rs"));
+    }
+
+    #[test]
+    fn exclude_list_from_an_empty_list_excludes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write(root, "src/lib.rs", "fn main() {}\n");
+        write(root, "target/debug/x.o", "junk");
+
+        let excludes = exclude_list_from(&[]);
+        let (files, _truncated) = collect_files_excluding(root, &excludes, 20_000);
+        assert_eq!(
+            relatives(&files),
+            vec!["src/lib.rs", "target/debug/x.o"],
+            "a user who has genuinely deleted every entry gets an honest, unfiltered walk"
+        );
     }
 
     #[test]

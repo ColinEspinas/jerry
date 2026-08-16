@@ -2207,6 +2207,14 @@ pub struct AdeApp {
     /// [`Self::filter_query`], and the same real per-widget undo history (GitHub issue #17).
     pub(crate) settings_keymap_filter: text_history::TextField,
     pub(crate) settings_keymap_filter_focus_handle: FocusHandle,
+    /// GitHub issue #401: the Editor > Search page's "add a pattern" row - a real, focusable
+    /// text input (same minimal append/backspace/`Esc`-clears/`Enter`-submits shape as
+    /// [`Self::new_file_input`]'s own name field, and the same real per-widget undo history,
+    /// GitHub issue #17) that appends a real, persisted entry to
+    /// [`settings_store::EditorSettings::search_excludes`] on `Enter`, then clears itself for the
+    /// next pattern - see `crate::settings::render::AdeApp::add_search_exclude_pattern`.
+    pub(crate) search_exclude_input: text_history::TextField,
+    pub(crate) search_exclude_input_focus_handle: FocusHandle,
     /// GitHub issue #141: the Themes page's "Generate from colour" seed - a real, focusable hex
     /// input (`#rrggbb`), same minimal append/backspace/`Esc`-clears shape as
     /// [`Self::settings_keymap_filter`] and the same real per-widget undo history (GitHub issue
