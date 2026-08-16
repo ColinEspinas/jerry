@@ -1124,7 +1124,17 @@ impl TextField {
         if text.is_empty() && !self.has_selection() {
             return false;
         }
-        self.replace_range_recorded(self.selection.clone(), text, EditKind::Type, now);
+        // [`EditKind::for_replacement`] rather than a flat [`EditKind::Type`]: inserting the empty
+        // string *over a selection* is a deletion, and mislabelling it would let it coalesce with
+        // a typing burst on either side of it. Not reachable from `handle_editing_key` (which
+        // never passes an empty `key_char`), but this is a `pub` primitive and the honest kind
+        // costs nothing.
+        self.replace_range_recorded(
+            self.selection.clone(),
+            text,
+            EditKind::for_replacement(text),
+            now,
+        );
         true
     }
 
