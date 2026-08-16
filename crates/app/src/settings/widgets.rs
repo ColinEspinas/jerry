@@ -111,7 +111,9 @@ impl AdeApp {
     /// commands (see [`open_command_for`]'s docs), not verified by running them.
     pub(in crate::settings) fn open_settings_file(&mut self, cx: &mut Context<Self>) {
         let Some(path) = settings_store::settings_toml_path() else {
-            log::warn!("cannot open settings file: $HOME is not set");
+            log::warn!(
+                "cannot open settings file: no home directory ($HOME, or %USERPROFILE% on Windows)"
+            );
             return;
         };
         let (program, args) = open_command_for(std::env::consts::OS, path.as_os_str());

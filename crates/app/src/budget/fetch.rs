@@ -128,13 +128,10 @@ pub fn credential_dir_from(
     Some(home?.join(default_dir))
 }
 
-/// This user's home directory. `$HOME` on unix, `%USERPROFILE%` on Windows - the same pair
-/// `crate::settings::store` already resolves its own config path from.
+/// This user's home directory - the same resolution `crate::settings::store` uses for its own
+/// config path, rather than a second copy of the `$HOME`/`%USERPROFILE%` rule.
 fn home_dir() -> Option<PathBuf> {
-    let key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-    std::env::var_os(key)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
+    crate::settings::store::home_dir()
 }
 
 /// The credential file for a provider - `~/.claude/.credentials.json`, `~/.codex/auth.json`.

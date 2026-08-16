@@ -4922,9 +4922,7 @@ impl AdeApp {
             source_path: None,
             ..active
         };
-        let default_dir = std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_default();
+        let default_dir = settings_store::home_dir().unwrap_or_default();
         // Reuses `crate::settings::custom_theme::slugify` rather than a second, hand-rolled
         // implementation - an adversarial audit caught the original inline `.replace(...)` here
         // disagreeing with the real one on e.g. runs of punctuation, so the suggested filename

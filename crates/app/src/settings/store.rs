@@ -776,14 +776,22 @@ impl CfgFormat {
     }
 }
 
-/// `$HOME`-relative settings path resolution - Unix-only for now (`std::env::var_os("HOME")`,
-/// no `dirs` crate dependency). Returns `None` if `$HOME` isn't set - callers fall back to an
-/// unpersisted, in-memory [`Settings::default`] rather than panicking or guessing a path.
-/// Windows/macOS home-directory resolution is out of scope for now.
+/// This user's home directory - `$HOME` on unix, `%USERPROFILE%` on Windows (which does not set
+/// `HOME`), with no `dirs` crate dependency. An empty value counts as unset. Returns `None` when
+/// neither is set, which callers treat as "no persistent config path".
+pub fn home_dir() -> Option<PathBuf> {
+    let key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    std::env::var_os(key)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Home-relative settings path resolution, via [`home_dir`]. Returns `None` if the home directory
+/// isn't resolvable - callers fall back to an unpersisted, in-memory [`Settings::default`] rather
+/// than panicking or guessing a path.
 pub fn settings_toml_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
     Some(
-        PathBuf::from(home)
+        home_dir()?
             .join(".config")
             .join("jerry")
             .join("settings.toml"),
@@ -856,7 +864,7 @@ impl Settings {
         std::fs::write(path, self.to_toml_string())
     }
 
-    /// The production entry point - [`settings_toml_path`]'s `$HOME`-resolved path, or an
+    /// The production entry point - [`settings_toml_path`]'s home-resolved path, or an
     /// unpersisted in-memory default if that couldn't be resolved.
     pub fn load_or_init() -> Settings {
         match settings_toml_path() {
@@ -1715,10 +1723,26 @@ mod tests {
     #[test]
     fn settings_toml_path_is_rooted_at_a_real_home_directory_config_jerry() {
         let Some(path) = settings_toml_path() else {
-            // No real $HOME in this environment - a legitimate, if unusual, honest `None`.
+            // No home directory in this environment - a legitimate, if unusual, honest `None`.
             return;
         };
-        assert!(path.ends_with(".config/jerry/settings.toml"));
+        let home = home_dir().expect("settings_toml_path resolved, so home_dir must have too");
+        assert_eq!(
+            path,
+            home.join(".config").join("jerry").join("settings.toml")
+        );
+    }
+
+    #[test]
+    fn home_dir_reads_the_variable_this_platform_actually_sets() {
+        // Windows sets `%USERPROFILE%` and leaves `HOME` unset, which is exactly what made the
+        // config file unopenable there; unix is the mirror image.
+        let key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        let expected = std::env::var_os(key)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+
+        assert_eq!(home_dir(), expected);
     }
 
     #[test]
