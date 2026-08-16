@@ -1100,14 +1100,14 @@ fn fold_merge_result(
 #[cfg(test)]
 mod merge_regression_tests {
     use super::*;
-    use crate::test_support::{temp_repo, TempRepo};
+    use crate::test_support::{temp_repo_with, TempRoot};
     use gpui::{EntityInputHandler, TestAppContext};
     use std::fs;
     use std::process::Command;
     use tempfile::TempDir;
     use test_support::{git, git_output};
 
-    fn init_repo() -> TempRepo {
+    fn init_repo() -> TempRoot {
         temp_repo_with(|root| {
             test_support::seed_empty_repo_at(root);
             test_support::commit(root, "base.txt", "base\n", "initial");

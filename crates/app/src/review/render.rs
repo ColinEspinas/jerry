@@ -677,7 +677,7 @@ mod review_flow_tests {
     use super::*;
     use crate::review::state::BaselineReason;
     use crate::root::focus::palette_focus_tests;
-    use crate::test_support::{temp_repo, TempRepo};
+    use crate::test_support::{temp_repo_with, TempRoot};
     use crate::work_surface::agents::{AgentKind, ProcessKind};
     use gpui::TestAppContext;
     use test_support::{git, git_output, git_try};
@@ -686,7 +686,7 @@ mod review_flow_tests {
     /// change on it. That divergence is the whole point: it gives the worktree a real, non-empty
     /// *git* diff that has nothing to do with any agent, which is exactly the state that used to
     /// make an agent falsely report "review ready".
-    fn diverged_repo() -> TempRepo {
+    fn diverged_repo() -> TempRoot {
         temp_repo_with(|root| {
             test_support::seed_empty_repo_at(root);
             test_support::commit(root, "base.txt", "base\n", "initial");

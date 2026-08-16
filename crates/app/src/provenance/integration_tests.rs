@@ -16,7 +16,7 @@ use gpui::EntityInputHandler as _;
 
 use crate::hooks::settings_file::{PORT_ENV, TOKEN_ENV};
 use crate::provenance::{AgentKey, Author};
-use crate::test_support::{open_test_app, temp_repo};
+use crate::test_support::{open_test_app, temp_repo_with};
 use crate::work_surface::agents::ProcessKind;
 
 const USERS_RS_BASE: &str = "\

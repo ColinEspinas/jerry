@@ -471,13 +471,13 @@ mod history_surface_tests {
     use crate::hooks::store::LiveRun;
     use crate::rail::status::Status;
     use crate::root::focus::palette_focus_tests;
-    use crate::test_support::{temp_repo, TempRepo};
+    use crate::test_support::{temp_repo_with, TempRoot};
     use crate::work_surface::agents::AgentKind;
     use crate::work_surface::state::TabRef;
     use gpui::TestAppContext;
     use std::path::Path;
 
-    fn init_repo() -> TempRepo {
+    fn init_repo() -> TempRoot {
         temp_repo_with(|root| {
             test_support::seed_empty_repo_at(root);
             test_support::commit(root, "base.txt", "base\n", "initial");

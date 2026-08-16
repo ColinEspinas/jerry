@@ -1201,13 +1201,13 @@ mod status_bar_deletion_tests {
 #[cfg(test)]
 mod status_bar_branch_cluster_visibility_tests {
     use crate::root::focus::palette_focus_tests;
-    use crate::test_support::{temp_repo, TempRepo};
+    use crate::test_support::{temp_repo_with, TempRoot};
     use gpui::TestAppContext;
 
     /// A real repo on a real branch, so the cluster has genuine branch text to show rather than
     /// falling through to `"(detached)"` for want of a git repository at all. Shared with
     /// `super::resources_popover_tests`, which needs the same real worktree list.
-    pub(super) fn seeded_repo() -> TempRepo {
+    pub(super) fn seeded_repo() -> TempRoot {
         temp_repo_with(|root| {
             test_support::seed_empty_repo_at(root);
             test_support::commit(root, "a.txt", "1", "base");

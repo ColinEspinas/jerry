@@ -11,7 +11,7 @@ use super::{FileNoteState, NoteAnchor};
 use crate::provenance::{store::ProvenanceStore, AgentKey};
 use crate::root::AdeApp;
 use crate::sidebar::render::RightSidebarView;
-use crate::test_support::{open_test_app, temp_repo, TempRepo};
+use crate::test_support::{open_test_app, temp_repo_with, TempRoot};
 use crate::work_surface::agents::{AgentId, AgentKind, ProcessKind};
 use gpui::TestAppContext;
 use std::path::{Path, PathBuf};
@@ -40,7 +40,7 @@ impl UserApi {
 
 /// A real repo with a real one-line change in `src/api/users.rs`, plus provenance recording that
 /// one real agent wrote it.
-fn repo_with_an_agent_authored_change(spawned_at: i64) -> (TempRepo, ProvenanceStore) {
+fn repo_with_an_agent_authored_change(spawned_at: i64) -> (TempRoot, ProvenanceStore) {
     let dir = temp_repo_with(|root| {
         test_support::seed_empty_repo_at(root);
         test_support::commit(root, PATH, BASE, "initial");
@@ -98,7 +98,7 @@ fn agent_stand_in(dir: &Path) -> String {
 /// process weight of one"). The *process* is real either way, which is the half this test needs.
 fn open_review<'a>(
     cx: &'a mut TestAppContext,
-    repo: &TempRepo,
+    repo: &TempRoot,
     shim_dir: &TempDir,
     store: ProvenanceStore,
     spawned_at: i64,
