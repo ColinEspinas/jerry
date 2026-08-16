@@ -182,9 +182,8 @@ pub struct Agent {
     /// label/title; `TerminalPane` doesn't expose its own `cwd` back out.
     pub cwd: PathBuf,
     pub pane: Entity<TerminalPane>,
-    /// When this agent was spawned - the rail agent row's real elapsed-time trailing text
-    /// (`design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §2.3: "elapsed 9.5px mono
-    /// right"). Set once, here, and never mutated afterwards - this app has no
+    /// When this agent was spawned - the rail agent row's real elapsed-time trailing text.
+    /// Set once, here, and never mutated afterwards - this app has no
     /// pause/resume-with-a-fresh-clock concept (see `crate::work_surface::state::pty_state_label`'s
     /// docs), so "elapsed" is simply wall-clock time since this real process was spawned.
     pub spawned_at: Instant,

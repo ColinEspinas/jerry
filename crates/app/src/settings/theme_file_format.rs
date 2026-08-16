@@ -134,10 +134,10 @@ const MAX_KEY_NOTE: usize = 60;
 /// Turns a token's own doc into a note worth putting next to a value in a theme file, or `None`.
 ///
 /// A doc comment is written for someone editing `crate::theme`, not for someone editing a theme,
-/// so some of them are whole paragraphs of design history and cite things (`Jerry.dc.html`, issue
-/// numbers, other tokens) a theme author has no use for. This keeps the short, genuinely
-/// descriptive ones - which is most of the palette, since the tokens ported from the design
-/// handoff carry real one-line labels like `window body` - and drops the rest rather than
+/// so some of them are whole paragraphs of design rationale and cite things (issue numbers,
+/// other tokens, `docs/design/`) a theme author has no use for. This keeps the short, genuinely
+/// descriptive ones - which is most of the palette, most tokens carrying a real one-line label
+/// like `window body` - and drops the rest rather than
 /// wrapping an essay into the file. No note is better than a wall of text.
 fn key_note_from(doc: &str) -> Option<String> {
     let sentence = first_sentence(doc);

@@ -4,8 +4,7 @@
 //!
 //! > **Every count goes through the pluralisation helper; never inline a ternary.**
 //!
-//! (Revision 6, `design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §7 rule 9,
-//! restating §6 and `REVISION-2026-08-13.md` §8a.)
+//! (A design rule, restated across three revisions before this module existed.)
 //!
 //! Before this module existed, every counter in the app conjugated itself: a dozen copies of
 //! `if count == 1 { "" } else { "s" }`, plus a second, worse population of labels that simply

@@ -669,16 +669,16 @@ pub fn replace_across(
 }
 
 /// How many characters of context sit before the hit on a match row before the prefix elides from
-/// the left. `Jerry.dc.html`'s own `trimPre`: `s.length > 16 ? '…' + s.slice(-15)`.
+/// the left.
 pub const ELIDE_PREFIX_MAX: usize = 16;
 
-/// The same for the tail. `Jerry.dc.html`'s own `trimPost`: `s.length > 26 ? s.slice(0, 25) + '…'`.
+/// The same for the tail.
 pub const ELIDE_SUFFIX_MAX: usize = 26;
 
 /// Splits `line` around `range` into the three spans a match row draws, with the design's own
 /// left-elision applied.
 ///
-/// `Jerry.dc.html` states the rule and the reason verbatim: "The row is ~40 characters at 10px
+/// The design states the rule and the reason verbatim: "The row is ~40 characters at 10px
 /// mono. A long prefix pushes the match clean out of the box, which defeats the point of showing
 /// the line at all - so the prefix elides from the LEFT and the hit stays at a fixed early column,
 /// the way VS Code does it. The tail may overflow; the tail is only context."
@@ -1103,9 +1103,8 @@ mod perf_tests {
 /// for the walk, the reads or the writes, because the walk's own rules (`.git`, symlinks, binary
 /// files, the size cap) are exactly the part an in-memory fixture cannot exercise.
 ///
-/// The corpus mirrors `Jerry.dc.html`'s own fixture (`refresh_token` across `src/auth/`,
-/// `tests/` and `migrations/`) so the shapes asserted here are the shapes the panel was designed
-/// against.
+/// The corpus mirrors the design's own example (`refresh_token` across `src/auth/`, `tests/` and
+/// `migrations/`) so the shapes asserted here are the shapes the panel was designed against.
 #[cfg(test)]
 mod worktree_tests {
     use super::*;

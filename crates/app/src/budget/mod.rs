@@ -1,7 +1,5 @@
 //! Per-provider rate-limit budget: the agent pane's `claude 5h ▓░░░░░░ 19% 7d ▓▓▓▓░░░ 60%`
-//! readout and the popover behind it (GitHub issue #294,
-//! `design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §2,
-//! `STAGE-A-CHANGELOG.md` §4c/§4t/§4u′).
+//! readout and the popover behind it (GitHub issue #294).
 //!
 //! Split the way every feature folder in this crate is split - pure, GPUI-window-free logic
 //! apart from the `gpui::Div`-building code that draws it:
@@ -28,10 +26,9 @@
 //!
 //! # Two bars, not one - decided by what the payloads actually contain
 //!
-//! The design bundle disagreed with itself here (`REVISION-2026-08-14.md` §2 describes one meter
-//! "filled to the tighter of the two windows"; `Jerry.dc.html` and §4u′ draw one bar per window),
-//! and issue #294's Phase 0 spike resolved it against the real data rather than by picking a
-//! document. **Both** supported providers expose two genuinely independent windows with their
+//! The design disagreed with itself here - one meter "filled to the tighter of the two windows"
+//! in one place, one bar per window in another - and issue #294's Phase 0 spike resolved it
+//! against the real data rather than by picking a document. **Both** supported providers expose two genuinely independent windows with their
 //! own utilisation *and their own reset instant*: Claude's `five_hour`/`seven_day`, Codex's
 //! `primary_window`/`secondary_window`. They do not move together - a session window refills in
 //! hours, a week does not - so a single bar filled to the tighter one answers the reader's only

@@ -1,6 +1,6 @@
 //! `lsp-core`: a Language Server Protocol client, built to spawn and drive `rust-analyzer` for
-//! Surface C's File view (`design_handoff_jerry_ade/README.md`'s "Language server UI"
-//! subsection, *Diagnostic* state - see `crate::diagnostics_view` in the `app` crate for how a
+//! Surface C's File view (`docs/design/work-surface.md`'s language-server UI,
+//! *Diagnostic* state - see `crate::diagnostics_view` in the `app` crate for how a
 //! `PublishDiagnosticsParams` becomes rendered UI).
 //!
 //! ## Scope decision: this crate, not a module of `app`

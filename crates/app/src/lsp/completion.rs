@@ -405,9 +405,8 @@ fn kind_has_no_one_word_type(kind: Option<lsp_types::CompletionItemKind>) -> boo
     )
 }
 
-/// The Completions detail pane's own real signature line (its top band, syntax-highlighted in
-/// mono - `design_handoff_jerry_ade/revision 3/Jerry.dc.html`'s `fn push_str(&mut self, string:
-/// &str)` example) - the same [`CompletionDetail::signature`] [`completion_item_display`] reads
+/// The Completions detail pane's own real signature line - its top band, syntax-highlighted in
+/// mono - the same [`CompletionDetail::signature`] [`completion_item_display`] reads
 /// (see [`split_completion_detail`]'s own docs for why `label_details.detail` is deliberately not
 /// consulted here), falling back to the bare `label` for an item with no real
 /// detail at all (a bare `label`/`kind`-only item that hasn't been resolved yet, or a server that
@@ -476,10 +475,9 @@ fn strip_leading_kind_parenthetical(detail: &str) -> &str {
     }
 }
 
-/// A completion item's real doc prose, for the detail pane's own body text
-/// (`design_handoff_jerry_ade/revision 3/README.md`: "Right 300: signature in mono, doc in 11px
-/// Plex Sans #7d848b, module path footer" - the Completions popup's own doc/module-path pane,
-/// mirroring `crate::lsp::hover::HoverRenderModel::doc` exactly). `None` for an item with no real
+/// A completion item's real doc prose, for the detail pane's own body text - the Completions
+/// popup's own doc/module-path pane, mirroring `crate::lsp::hover::HoverRenderModel::doc`
+/// exactly. `None` for an item with no real
 /// documentation - an honest "nothing to show", never a fabricated empty string.
 ///
 /// Reuses [`crate::lsp::hover::degrade_markdown_to_plain_text`] for a genuinely `Markdown`-kinded
@@ -571,9 +569,8 @@ pub fn completion_row_hint(item: &lsp_types::CompletionItem) -> Option<String> {
     completion_import_source(item).or_else(|| split_completion_detail(item).signature)
 }
 
-/// The Completions popup's real kind-badge category (design:
-/// `design_handoff_jerry_ade/revision/Jerry.dc.html`'s own `f`/`v`/`t` kind badges, lines
-/// ~1792-1793 and ~467-473) - a coarse grouping of the much finer-grained real
+/// The Completions popup's real kind-badge category - the design's own `f`/`v`/`t` badges, a
+/// coarse grouping of the much finer-grained real
 /// `lsp_types::CompletionItemKind` a server actually reports, kept here (not in
 /// `crate::lsp::completion_popup`) so the mapping is testable without a live `gpui` window, matching
 /// this module's own gpui-free convention (see this module's own top docs).

@@ -319,9 +319,9 @@ pub fn diff_against_base(worktree_path: &Path) -> Result<DiffBase, Error> {
 ///
 /// Deliberately a *different question* from [`diff_against_base`], not a filtered view of it.
 /// `diff_against_base` compares against the merge-base with the default branch, so its file list
-/// mixes work that is already committed on this branch with work that is not
-/// (`design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §1's *Against main* scope: "what
-/// would land"). This compares against `HEAD`, so a file whose only difference from `main` is
+/// mixes work that is already committed on this branch with work that is not - the
+/// *Against main* scope, "what would land". This compares against `HEAD`, so a file whose only
+/// difference from `main` is
 /// already inside a commit on this branch does not appear here at all. The two agree only on a
 /// branch with no commits of its own.
 ///
@@ -635,9 +635,8 @@ fn sum_numstat(text: &str) -> (u32, u32) {
 
 /// Merge-state of a worktree's `HEAD` against the repository's detected default base branch
 /// (see the module docs' "What 'base' means" section for the detection order) - powers the
-/// session rail's "by project" worktree rows
-/// (`design_handoff_jerry_ade/README.md`: a worktree whose branch is fully merged into the
-/// default branch, with no running session, is offered as `merged HH:MM · prunable`).
+/// rail's worktree rows: a worktree whose branch is fully merged into the default branch, with
+/// no running agent, is offered as `merged HH:MM · prunable`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeMergeStatus {
     /// The short name of the detected default branch this was checked against.

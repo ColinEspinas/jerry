@@ -73,8 +73,8 @@ pub const QUESTION_MAX_CHARS: usize = 200;
 /// Longest [`HookReport::prompt`] Jerry will keep - GitHub issue #227's run title.
 ///
 /// Narrower than [`QUESTION_MAX_CHARS`] and wider than [`ACTIVITY_MAX_CHARS`], because this is a
-/// *title*: `design_handoff_jerry_ade/revision 5/REVISION-2026-08-13.md` §3's history row shows it
-/// on one truncated line ("Reproduce the refresh race in a test"), and the transcript tab header
+/// *title*: a history row shows it on one truncated line ("Reproduce the refresh race in a
+/// test"), and the transcript tab header
 /// shows the same string. A user's first message can be a page long; the first sentence of it is
 /// what names the run.
 pub const PROMPT_MAX_CHARS: usize = 120;

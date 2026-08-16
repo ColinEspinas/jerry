@@ -1,6 +1,6 @@
-//! Real git-index staging primitives for the Changes panel's staging checkbox
-//! (`design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §5: "The checkbox **is**
-//! staging"). Before this module existed, `app::sidebar::render::AdeApp::toggle_staged` only
+//! Real git-index staging primitives for the Changes panel's staging checkbox - the design's
+//! rule is that "the checkbox **is** staging".
+//! Before this module existed, `app::sidebar::render::AdeApp::toggle_staged` only
 //! flipped an in-memory `HashSet<PathBuf>` - real git never saw anything until the commit
 //! composer's own `git add` ran at commit time (`crate::undo::commit_paths`). That contradicted
 //! the design's explicit framing: checking the box is supposed to be real, immediate staging,
@@ -48,8 +48,8 @@ pub fn unstage_path(worktree_path: &Path, path: &Path) -> Result<(), Error> {
     check_success(&args, &output)
 }
 
-/// Real, immediate **discard** of one path's uncommitted changes - the second click of
-/// `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4i's two-step `Discard?` confirm
+/// Real, immediate **discard** of one path's uncommitted changes - the second click of the
+/// two-step `Discard?` confirm
 /// (GitHub issue #286). Puts `path` back exactly as `HEAD` has it, in both the index and the
 /// working tree, or removes it outright if `HEAD` never had it.
 ///

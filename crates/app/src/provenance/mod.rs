@@ -16,8 +16,8 @@
 //! record of that at all, because both agents write through the same working tree as the same OS
 //! user.
 //!
-//! The competitive audit (`design_handoff_jerry_ade/revision 5/AUDIT-2026-08-13-competitive-v2.md`
-//! §3.1) found the closest shipped mechanism to be binary - AI or human - and concluded that
+//! A competitive audit found the closest shipped mechanism to be binary - AI or human - and
+//! concluded that
 //! "per-agent attribution inside a shared worktree is genuinely unclaimed… the one thing Jerry's
 //! architecture is uniquely positioned to do". This folder is that mechanism.
 //!

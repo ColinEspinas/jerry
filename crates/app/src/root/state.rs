@@ -1983,8 +1983,8 @@ impl AdeApp {
         cx.notify();
     }
 
-    /// The current worktree's open file tabs (`design_handoff_jerry_ade/revision 3/
-    /// REVISION-2026-07-31.md` §3) - an empty slice for a worktree that has never opened one,
+    /// The current worktree's open file tabs - an empty slice for a worktree that has never
+    /// opened one,
     /// never a panic or a fabricated default. See [`Self::open_files_by_worktree`]'s own docs for
     /// why this is keyed by [`Self::file_tree_root`] rather than a flat, unscoped `Vec`.
     pub(crate) fn open_files(&self) -> &[PathBuf] {
@@ -2190,8 +2190,8 @@ impl AdeApp {
 ///
 /// **Deliberately does *not* touch `open_files`/`edit_buffers` anymore.** Both moved to real,
 /// per-worktree-keyed storage (`AdeApp::open_files_by_worktree`, keyed by
-/// [`AdeApp::file_tree_root`]; `AdeApp::edit_buffers`, keyed by `(file_tree_root, path)`) -
-/// `design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §1/§3's explicit requirement that
+/// [`AdeApp::file_tree_root`]; `AdeApp::edit_buffers`, keyed by `(file_tree_root, path)`) - the
+/// design's explicit requirement that
 /// each worktree remembers its own open files, and that an unsaved edit must survive fluidly
 /// hopping between worktrees rather than being silently discarded. Clearing them here used to be
 /// how this function kept one worktree's tabs/buffers from leaking into another's; now that both

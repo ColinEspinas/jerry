@@ -1,6 +1,6 @@
-//! Pure width-clamping logic for Zone 1/Zone 3's drag-to-resize splitters
-//! (`design_handoff_jerry_ade/README.md`'s Layout table: rail "276 (range 240–340)", files/
-//! changes panel "320 (260 in empty states)").
+//! Pure width-clamping logic for Zone 1/Zone 3's drag-to-resize splitters - the rail is 276 wide
+//! over a 240-340 range, the files/changes panel 320 (260 in empty states). See
+//! `docs/design/layout.md`.
 //!
 //! Deliberately `gpui`-free (plain `f32`s, not `gpui::Pixels`) so the clamp math is directly
 //! unit-testable without a window, mirroring `crate::work_surface::state`/`crate::rail::status`'s own

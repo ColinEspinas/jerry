@@ -1,9 +1,7 @@
 //! Agent history: the sidebar's repo → worktree → run index, and the run-transcript centre tab
 //! (GitHub issue #227). Everything about one feature, in one folder.
 //!
-//! Design sources, read directly rather than paraphrased:
-//! `design_handoff_jerry_ade/revision 5/REVISION-2026-08-13.md` (the whole document) as amended by
-//! `REVISION-2026-08-14.md` §4/§6/§7, and `Jerry.dc.html`'s own `Run · transcript` state.
+//! See `docs/design/work-surface.md` and `docs/design/sidebar.md`.
 //!
 //! ## The one sentence the whole feature hangs off
 //!

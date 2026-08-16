@@ -37,10 +37,9 @@
 //! An audit for that issue flagged this popover's `theme::surface::POPOVER` background,
 //! `theme::radius::CARD_SM` (5px) corner radius, and `theme::shadow::POPOVER` shadow as
 //! inconsistent with the `theme::surface::PALETTE`/`theme::radius::CARD`/`theme::shadow::MENU`
-//! recipe every dropdown/context-menu in the app now shares. They're not drift: each value is
-//! pinned to `design_handoff_jerry_ade/Jerry.dc.html`'s own completions-popup markup (line ~406 -
-//! `border-radius:5px;background:#181c20;box-shadow:0 8px 20px rgba(0,0,0,.5)`), which specifies
-//! a genuinely different recipe from the app-level menus for this specific surface. Left
+//! recipe every dropdown/context-menu in the app now shares. They're not drift: the design
+//! specifies a genuinely different recipe from the app-level menus for this specific surface, and
+//! this is it. Left
 //! unchanged, along with `crate::code_surface::lsp_ui`'s hover card, which intentionally matches
 //! it (same `theme::surface::POPOVER`/`theme::border::POPOVER` pair, plus every plain tooltip via
 //! `crate::root::widgets::TextTooltip`) - all three are the "info popover" family, not the "menu"
@@ -117,22 +116,18 @@ impl CompletionsStatus {
     }
 }
 
-/// 290px - the design mockup's own real completions-list column width
-/// (`design_handoff_jerry_ade/revision 3/Jerry.dc.html`: `width:290px` on the list column), plus
-/// its own `1px` right divider. Design-review follow-up: this used to be the popup's *entire*
+/// 290px - the designed completions-list column width, plus its own `1px` right divider. Design-review follow-up: this used to be the popup's *entire*
 /// width, with the detail pane below left out of scope entirely (see [`DETAIL_WIDTH`]'s own docs
 /// for why that was a real, addressable gap rather than a permanent one).
 const LIST_WIDTH: gpui::Pixels = gpui::px(290.0);
-/// 300px - the design mockup's own real signature/doc/module-path detail pane width
-/// (`Jerry.dc.html`: `width:300px` on the right column), shown alongside [`LIST_WIDTH`] only
-/// while [`CompletionsStatus::Ready`] has a real selected item to describe - `Loading`/`Failed`
-/// show the list column alone, since neither has anything real for a detail pane to describe.
-/// `README.md`'s own summary confirms this is core to "the differentiator" three-popup language
-/// server UI ("Right 300: signature in mono, doc in 11px Plex Sans #7d848b, module path
-/// footer"), not optional polish - this was a real, previously undocumented-to-the-user scope
-/// cut, not a deliberate permanent simplification.
+/// 300px - the designed signature/doc/module-path detail pane width, shown alongside
+/// [`LIST_WIDTH`] only while [`CompletionsStatus::Ready`] has a real selected item to describe -
+/// `Loading`/`Failed` show the list column alone, since neither has anything real for a detail
+/// pane to describe. The detail pane is core to the three-popup language-server UI
+/// (`docs/design/work-surface.md`), not optional polish - leaving it out was a real scope cut,
+/// not a deliberate permanent simplification.
 const DETAIL_WIDTH: gpui::Pixels = gpui::px(300.0);
-/// The design mockup's own real completion-item row height (`Jerry.dc.html`: `height:22px`).
+/// The designed completion-item row height.
 /// `uniform_list`'s one real requirement is that every row is exactly this tall - see
 /// [`AdeApp::render_completions_popover`]'s own docs.
 const POPOVER_ROW_HEIGHT: gpui::Pixels = gpui::px(22.0);
@@ -142,9 +137,9 @@ const POPOVER_ROW_HEIGHT: gpui::Pixels = gpui::px(22.0);
 /// judgment every other real editor makes here - `vendor/zed/crates/editor`'s own completions
 /// menu defaults to 12 lines too (`max_height_in_lines`), as does VS Code's.
 const MAX_VISIBLE_COMPLETION_ROWS: usize = 12;
-/// The popover's own real `py(3.0)` top/bottom padding, as a single vertical total - the design
-/// mockup's own completions-list column padding is `3px 0` (`Jerry.dc.html`: `padding:3px 0` on
-/// the `290px` list column), so the popup is exactly this much taller than its list.
+/// The popover's own real `py(3.0)` top/bottom padding, as a single vertical total - the
+/// designed completions-list column padding is `3px 0`, so the popup is exactly this much taller
+/// than its list.
 const POPOVER_VERTICAL_PADDING: gpui::Pixels = gpui::px(6.0);
 /// The popover's own real `border_1()`, top plus bottom. GPUI lays out border-box, so this counts
 /// toward the popup's painted height and therefore toward its own `max_h` - leaving it out of
@@ -680,10 +675,9 @@ impl AdeApp {
             .w(LIST_WIDTH)
             .flex()
             .flex_col()
-            // `py(3.0)`, not `py(4.0)`: the design mockup's own completions-list column padding
-            // is `3px 0` (`Jerry.dc.html`: `padding:3px 0` on the `290px` list column) - see
-            // `POPOVER_VERTICAL_PADDING`'s own docs, which restate the same `3px 0` as one
-            // vertical total.
+            // `py(3.0)`, not `py(4.0)`: the designed completions-list column padding is `3px 0`
+            // - see `POPOVER_VERTICAL_PADDING`'s own docs, which restate it as one vertical
+            // total.
             .py(gpui::px(3.0));
 
         // The selected item, if any - drives the detail pane below. Read once, outside the
@@ -715,9 +709,8 @@ impl AdeApp {
                 selected_item = visible
                     .get(*selected)
                     .and_then(|index| self.described_completion_item(items, *index));
-                // `border-right:1px solid #23282c` in the mockup, on the list column's own right
-                // edge (`Jerry.dc.html`: `width:290px;border-right:1px solid #23282c`) - only
-                // while there's a real detail pane beside it to divide from.
+                // The seam lives on the list column's own right edge - only while there's a real
+                // detail pane beside it to divide from.
                 if selected_item.is_some() {
                     list_column = list_column.border_r_1().border_color(theme::border::CARD);
                 }
@@ -888,18 +881,16 @@ impl AdeApp {
             .bg(theme::surface::POPOVER)
             .border_1()
             .border_color(theme::border::POPOVER)
-            // `CARD_SM` (`5px`), not `CARD` (`6px`) - the design mockup's own completions popup
-            // border-radius is `5px` (`Jerry.dc.html`: `border-radius:5px` on the popup itself),
+            // `CARD_SM` (`5px`), not `CARD` (`6px`) - the designed completions popup radius,
             // matching `crate::code_surface::lsp_ui::AdeApp::render_hover_card`'s own popover,
             // which already used the correct radius here.
             .rounded(theme::radius::CARD_SM)
             .shadow(vec![BoxShadow::new(
                 shadow_x,
                 shadow_y,
-                // `0.50`, not `0.55` - the design mockup's own completions popup shadow is
-                // `rgba(0,0,0,.5)` (`Jerry.dc.html`: `box-shadow:0 8px 20px rgba(0,0,0,.5)`),
-                // matching `theme::shadow::POPOVER`'s own doc comment, which already recorded
-                // the correct `0.50` even though this call site had drifted from it.
+                // `0.50`, not `0.55` - the designed completions popup shadow, matching
+                // `theme::shadow::POPOVER`'s own doc comment, which already recorded the correct
+                // `0.50` even though this call site had drifted from it.
                 gpui::black().opacity(0.50),
             )
             .blur_radius(shadow_blur)])
@@ -912,10 +903,9 @@ impl AdeApp {
             .occlude()
             .child(list_column);
 
-        // The detail pane - `border-right` lives on the list column's own right edge in the
-        // mockup (`Jerry.dc.html`: `border-right:1px solid #23282c` on the 290px list), so it's
-        // applied to `list_column` above only when there's a real detail pane beside it to
-        // divide from; a lone list column (Loading/Failed) has no seam to draw.
+        // The detail pane - the seam lives on the list column's own right edge, so it's applied
+        // to `list_column` above only when there's a real detail pane beside it to divide from;
+        // a lone list column (Loading/Failed) has no seam to draw.
         if let Some(item) = selected_item {
             popover = popover.child(self.render_completion_detail_pane(item, extension, cx));
         }
@@ -951,8 +941,7 @@ fn render_completion_row(
         .flex_none()
         .w_full()
         .h(POPOVER_ROW_HEIGHT)
-        // `px(8.0)`, not `px(10.0)` - the design mockup's own completion-item row padding is
-        // `0 8px` (`Jerry.dc.html`: `padding:0 8px` on each `.completions` row).
+        // `px(8.0)`, not `px(10.0)` - the designed completion-item row padding is `0 8px`.
         .px(gpui::px(8.0))
         .flex()
         .items_center()
@@ -1030,8 +1019,7 @@ fn render_completion_row(
 }
 
 /// A real completion item's kind badge - a 13x13 box with a one-letter glyph, colored per
-/// [`completion_view::CompletionKindBadge`] - matches the design mockup's own kind-badge markup
-/// exactly (`Jerry.dc.html`: `width:13px;height:13px;border-radius:2px` with `font:500 8px`).
+/// [`completion_view::CompletionKindBadge`] - the designed 13x13 kind badge exactly.
 fn render_completion_kind_badge(kind: completion_view::CompletionKindBadge) -> gpui::AnyElement {
     let (fg, bg) = match kind {
         completion_view::CompletionKindBadge::Function => theme::completions_popup::KIND_FUNCTION,
@@ -1056,8 +1044,7 @@ fn render_completion_kind_badge(kind: completion_view::CompletionKindBadge) -> g
 }
 
 impl AdeApp {
-    /// The Completions popup's own detail pane - the design mockup's real, 300px right column
-    /// (`design_handoff_jerry_ade/revision 3/Jerry.dc.html`: `width:300px;padding:8px 10px`),
+    /// The Completions popup's own detail pane - the designed 300px right column,
     /// describing whichever item is currently selected: a syntax-highlighted signature line, doc
     /// prose, and a module-path footer - mirroring `crate::code_surface::lsp_ui`'s Hover card
     /// exactly (same three-piece shape, same reasoning for showing it), just for the selected
@@ -1645,10 +1632,8 @@ mod completions_scroll_tests {
 }
 
 /// Regression coverage for the design-review follow-up: the Completions popup used to be a
-/// list-only single column - `design_handoff_jerry_ade/revision 3/Jerry.dc.html`'s own mockup
-/// (and `README.md`'s "Right 300: signature in mono, doc in 11px Plex Sans #7d848b, module path
-/// footer") describes a real two-column popup with a detail pane and a footer hint row, neither
-/// of which existed before this fix. These tests prove the real painted layout, not just that
+/// list-only single column, where the design describes a real two-column popup with a detail
+/// pane and a footer hint row, neither of which existed before this fix. These tests prove the real painted layout, not just that
 /// the new code compiles and runs.
 #[cfg(test)]
 mod completion_detail_pane_tests {

@@ -385,8 +385,8 @@ impl AdeApp {
     /// stop-gap rail header it was parked in and into the sidebar strip that was always its home,
     /// where it goes through `crate::rail::strip_render::strip_cell` like every other child - so
     /// it carries the column rule, the 38px width and the glyph-only hover the rest of the strip
-    /// does. `Jerry.dc.html` gives it a `border-left` (rather than the view cells' `border-right`)
-    /// because it sits on the far side of the strip's flex spacer.
+    /// does. It carries a `border-left` rather than the view cells' `border-right`, because it
+    /// sits on the far side of the strip's flex spacer.
     ///
     /// None of the menu machinery below changed in that move, exactly as this comment promised it
     /// would not: a `gpui::canvas` still captures the button's real window-space rect (the same

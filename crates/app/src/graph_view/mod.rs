@@ -1,5 +1,4 @@
-//! The git graph tab (GitHub issue #1, phase (a) - design handoff
-//! `design_handoff_jerry_ade/revision 2/CHANGELOG.md`, 2026-07-31 entry).
+//! The git graph tab (GitHub issue #1, phase (a)). See `docs/design/work-surface.md`.
 //!
 //! Split the way every feature folder in this crate is split - see `crate::sidebar`'s own docs
 //! for the convention this mirrors:
@@ -55,7 +54,7 @@
 //! Agent-to-commit correlation (which agent
 //! authored a commit) is a
 //! separate, later feature too; a first draft carried an always-empty per-commit agent column
-//! for it, but `design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §6.2 removed that
+//! for it, but the design removed that
 //! column outright rather than leave it honestly empty - a commit belongs to a worktree, which
 //! can hold several agents, so pinning one agent's live status to a past commit was imprecise on
 //! its own terms, independent of whether the phase (a) data existed to fill it in. The row list

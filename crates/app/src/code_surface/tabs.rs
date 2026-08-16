@@ -1982,9 +1982,8 @@ mod multi_file_tab_tests {
         );
     }
 
-    /// Real, live-reproduced coverage for `design_handoff_jerry_ade/revision 3/
-    /// REVISION-2026-07-31.md` §3 ("Switching worktrees swaps the whole strip. Each worktree
-    /// remembers its own ... open files") - the real bug this revision fixes: `AdeApp::
+    /// Real, live-reproduced coverage for the design's rule that "switching worktrees swaps the
+    /// whole strip. Each worktree remembers its own ... open files" - the real bug it fixes: `AdeApp::
     /// select_worktree` used to clear `open_files` unconditionally on every switch, so a
     /// worktree's tabs were lost the moment you navigated away. Drives two *real* worktrees
     /// (temp directories, real `AdeApp::select_worktree` switches, real `open_file_view` calls),

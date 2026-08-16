@@ -872,16 +872,16 @@ fn render_diff_gutter_number(number: Option<usize>) -> impl IntoElement {
 /// `you`.
 ///
 /// `filter` dims every line whose author is somebody *else* to
-/// `crate::provenance::render::FILTER_DIM_OPACITY` (the mock's 0.32). A line with no author is
-/// deliberately **not** dimmed - `Jerry.dc.html`'s own `muted = attr && who && who !== attr` - so
-/// filtering by one author never hides the context its work sits in.
+/// `crate::provenance::render::FILTER_DIM_OPACITY`. A line with no author is
+/// deliberately **not** dimmed - a line only mutes when it has an author and that author is not
+/// the filtered one - so filtering by one author never hides the context its work sits in.
 ///
 /// ## The note channel (GitHub issue #288)
 ///
 /// A **third** left-edge channel, and by the same discipline: *is there a note on this line* is
-/// its own fact, so it gets its own column rather than sharing one. `Jerry.dc.html` draws it as a
+/// its own fact, so it gets its own column rather than sharing one. The design draws it as a
 /// 14px centred glyph immediately after the gutters - `●` where a note is pinned. `○` is the note
-/// **cursor**: the line `C` would toggle a note on, which in the mock is the "a note exists here
+/// **cursor**: the line `C` would toggle a note on, which in the design is the "a note exists here
 /// but is hidden" state and here is "this is the line you are on". A line with neither draws
 /// nothing at all, following the author bar's own rule that the honest rendering of no answer is
 /// an empty column.
@@ -1062,8 +1062,8 @@ pub(in crate::code_surface) fn render_diff_line(
         })
 }
 
-/// `Jerry.dc.html`'s own 14px note column: `●` for a pinned note, `○` for the note cursor, and
-/// genuinely nothing for a line that is neither.
+/// The 14px note column: `●` for a pinned note, `○` for the note cursor, and genuinely nothing
+/// for a line that is neither.
 fn render_note_column(note: Option<NoteMark>, is_note_cursor: bool) -> impl IntoElement {
     let (glyph, color) = match (note, is_note_cursor) {
         (Some(_), _) => ("\u{25cf}", theme::notes::DOT),

@@ -95,7 +95,7 @@ impl Outcome {
         }
     }
 
-    /// How the synthesised closing line opens, per outcome - `Jerry.dc.html`'s own four strings.
+    /// How the synthesised closing line opens, per outcome - the design's own four strings.
     pub const fn closing_lead(self) -> &'static str {
         match self {
             Outcome::Done => "Finished.",
@@ -167,10 +167,9 @@ pub fn drift_sentence(commits: usize) -> String {
     )
 }
 
-/// Which runs the History view is showing - `REVISION-2026-08-14.md` §6's `all` / `this worktree`
-/// toggle.
+/// Which runs the History view is showing - the `all` / `this worktree` toggle.
 ///
-/// `All` is the default, matching `Jerry.dc.html`'s own `hScope` default, and it is the one that
+/// `All` is the design's own default, and it is the one that
 /// makes this surface worth visiting: the rail already tells you about the worktree you are in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HistoryScope {
@@ -493,9 +492,9 @@ pub fn earlier_runs_label(count: usize) -> String {
 /// `crate::hooks::flow::AdeApp::resume_past_agent` would honestly refuse it anyway.
 ///
 /// `collapsed` names the worktrees whose group the user has explicitly folded. A group not in it
-/// opens if it is the active worktree, or if the scope is already narrowed to one worktree -
-/// `Jerry.dc.html`'s own default, and the reason `REVISION-2026-08-14.md` §6 says the active
-/// worktree "opens by default" rather than "is the only one open".
+/// opens if it is the active worktree, or if the scope is already narrowed to one worktree - the
+/// design's own default, and the reason it says the active worktree "opens by default" rather
+/// than "is the only one open".
 pub fn build_run_tree(
     runs: &[PastAgent],
     worktrees: &[HistoryWorktree],

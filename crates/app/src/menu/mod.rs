@@ -1,8 +1,8 @@
 //! The app's one shared menu (GitHub issue #290): the popover every "list of actions" surface
 //! draws, and the pure model behind it.
 //!
-//! `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4t states the reason for the
-//! folder existing at all, verbatim: "Two requests, one build: right-click actions on rail rows,
+//! The design states the reason for the folder existing at all, verbatim: "Two requests, one
+//! build: right-click actions on rail rows,
 //! and History moved into an overflow. Both are 'a list of actions', so they are **one menu
 //! component** - 206 wide, 24px rows, keycaps right-aligned, destructive rows in `#c4726d` on a
 //! `#2a1719` hover - rather than two idioms that drift."

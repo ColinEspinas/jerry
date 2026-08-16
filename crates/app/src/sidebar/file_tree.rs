@@ -278,9 +278,9 @@ fn visit(dir: &Path, depth: usize, walk: &mut Walk) -> io::Result<()> {
     Ok(())
 }
 
-/// A file tree row's real 13×13 language chip - `design_handoff_jerry_ade/README.md`'s Zone 3
-/// table (`.rs`→`rs`, `.toml`→`to`, `.md`→`md`, `.sql`→`sq`, matching `theme::lang::*` from
-/// Phase A's `theme.rs`), plus a neutral fallback (`theme::lang::UNKNOWN`) for any other
+/// A file tree row's real 13×13 language chip (`.rs`→`rs`, `.toml`→`to`, `.md`→`md`,
+/// `.sql`→`sq`, matching `theme::lang::*`), plus a neutral fallback (`theme::lang::UNKNOWN`) for
+/// any other
 /// extension so every file row still gets *some* chip rather than one silently missing.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LangChip {
@@ -340,7 +340,7 @@ pub fn directory_paths(entries: &[FileTreeEntry]) -> HashSet<PathBuf> {
 /// A row's left padding before any indentation (`crate::sidebar::render`'s `pl(px(8.0) + indent)`).
 pub const ROW_LEFT_PAD: f32 = 8.0;
 
-/// Horizontal indent per nesting level, per `design_handoff_jerry_ade/README.md`'s Zone 3 spec.
+/// Horizontal indent per nesting level.
 pub const INDENT_STEP: f32 = 13.0;
 
 /// Where level `level`'s vertical indent guide sits, in pixels from the row's left edge.

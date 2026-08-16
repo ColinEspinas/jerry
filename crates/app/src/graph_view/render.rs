@@ -2156,8 +2156,8 @@ impl AdeApp {
                     .text_color(theme::text::BODY)
                     .child(row.commit.subject.clone()),
             )
-            // The working-tree row's own union figure (GitHub issue #287) - `Jerry.dc.html`'s
-            // `Git graph` state carries `13 files · +319 −145` in this slot, between the subject
+            // The working-tree row's own union figure (GitHub issue #287) - the design carries
+            // `13 files · +319 −145` in this slot, between the subject
             // and the author column. Read straight off the uncommitted change set, so it is the
             // same number the Uncommitted section's header states rather than a second count of
             // the same working tree. A commit row has no note: what a commit changed is its own
@@ -3244,10 +3244,9 @@ fn render_graph_footer_action_button(
 /// One "Files changed" row - the change-row visual's spirit (git's own status letter + path),
 /// simplified since a historical commit has no review checkbox or per-file stat counts to show.
 ///
-/// The commit file list is the third of the three places `STAGE-A-CHANGELOG.md` §4j names as
-/// having carried the old word badge, and like the Uncommitted rows it is a *list*, so the letter
-/// sits in its fixed column ahead of the directory and every filename below it starts on the same
-/// x - `Jerry.dc.html`'s own `gFiles` rows, in that order.
+/// The commit file list is the third of the three places that carried the old word badge, and
+/// like the Uncommitted rows it is a *list*, so the letter sits in its fixed column ahead of the
+/// directory and every filename below it starts on the same x.
 fn render_graph_file_row(file: wt_core::graph::CommitFileChange) -> impl IntoElement {
     let (dir, name) = changes::split_dir_name(&file.path);
     let letter = changes::status_letter(file.status);

@@ -884,9 +884,9 @@ impl Settings {
 }
 
 /// Which settings page a [`snippet_lines`]/[`config_keys_line`] call is for - only the four
-/// pages `crate::settings::render` shows a config banner/snippet block on. Every other page
-/// `Jerry.dc.html`'s own `cfgKeys` fixture lists isn't backed by a [`Settings`] field, so a
-/// banner for it would describe a file section that doesn't exist.
+/// pages `crate::settings::render` shows a config banner/snippet block on. Every other designed
+/// page isn't backed by a [`Settings`] field, so a banner for it would describe a file section
+/// that doesn't exist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigPage {
     General,
@@ -896,9 +896,9 @@ pub enum ConfigPage {
     Notifications,
 }
 
-/// The config banner's dot-joined key list for `page` - rewritten from `Jerry.dc.html`'s own
-/// `cfgKeys` fixture to list only the [`Settings`] field paths this app actually persists (that
-/// fixture also names settings this app doesn't implement, e.g. `window.restore_sessions`).
+/// The config banner's dot-joined key list for `page` - narrowed from the design's own list to
+/// only the [`Settings`] field paths this app actually persists (the design also names settings
+/// this app doesn't implement, e.g. `window.restore_sessions`).
 pub fn config_keys_line(page: ConfigPage) -> &'static str {
     match page {
         ConfigPage::General => "window.controls \u{b7} terminal.shell",

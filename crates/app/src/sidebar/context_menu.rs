@@ -10,8 +10,8 @@
 //! Everything *generic* about a menu - what a row is, how groups become separated rows, the
 //! popover's painted height, and the edge-aware geometry that keeps it on screen - moved to
 //! [`crate::menu::model`] when GitHub issue #290 promoted this component into the app's one
-//! shared menu (`design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4t: "Both are 'a list
-//! of actions', so they are **one menu component** ... rather than two idioms that drift"). The
+//! shared menu - "Both are 'a list of actions', so they are **one menu component** ... rather
+//! than two idioms that drift". The
 //! file tree draws through that shared popover now; what stays here is only what is genuinely the
 //! file tree's own: its targets, its actions, and its row sets.
 

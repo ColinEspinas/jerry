@@ -1,5 +1,4 @@
-//! Read-only commit-graph data for the git graph tab (design handoff
-//! `design_handoff_jerry_ade/revision 2/CHANGELOG.md`, 2026-07-31 entry, "git graph (issue #1)").
+//! Read-only commit-graph data for the git graph tab (GitHub issue #1).
 //!
 //! This module builds the data a graph *view* renders: a topologically-walked list of commits,
 //! each assigned to a lane so merges and branch points can be drawn as a real lane diagram, plus
@@ -327,11 +326,10 @@ pub fn build_graph(
     // `HEAD`'s own commit really is the first row - see the module docs on why this is skipped
     // (not faked) for scopes where a newer commit on another branch legitimately sorts first.
     //
-    // Named `Working tree`, not `Uncommitted changes`, since rev 6 (audit item I5, applied in
-    // `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md`'s §3.2.5 row). The panel already
+    // Named `Working tree`, not `Uncommitted changes`. The panel already
     // has a section called `Uncommitted`; this row is the working tree *as a point on the graph*,
     // one step past `HEAD`, and naming it after the other surface's section made two different
-    // things share a word. `Jerry.dc.html`'s own `Git graph` state reads `Working tree`.
+    // things share a word. The design's own graph reads `Working tree`.
     if let Some(first) = rows.first() {
         if Some(&first.commit.id) == head_id.map(|id| id.to_string()).as_ref()
             && is_dirty(repo_path).unwrap_or(false)

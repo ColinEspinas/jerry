@@ -9,9 +9,9 @@
 //!
 //! ## What the strip is
 //!
-//! `design_handoff_jerry_ade/revision 5/REVISION-2026-08-13.md` §1 introduced it - "The left panel
-//! was hard-wired to one thing. It is now a switchable surface with a **horizontal icon strip
-//! along the top** - Cursor's arrangement, not VS Code's vertical activity bar. A vertical bar
+//! The left panel was once hard-wired to one thing. It is now a switchable surface with a
+//! **horizontal icon strip along the top** - Cursor's arrangement, not VS Code's vertical
+//! activity bar. A vertical bar
 //! costs 44px of permanent width on a window whose whole job is fitting three panels side by
 //! side" - and `STAGE-A-CHANGELOG.md` §4v is its final form, which this module implements.
 //!
@@ -83,10 +83,9 @@ impl SidebarView {
         }
     }
 
-    /// The view's hint - the second half of its tooltip, quoted from `Jerry.dc.html`'s own
-    /// `sideViews` table. §1 explains why every cell needs one: "With labels gone, [the] glyphs
-    /// are the only affordance identifying the views, so the hint has to live somewhere
-    /// reachable."
+    /// The view's hint - the second half of its tooltip. Every cell needs one: with labels gone,
+    /// the glyphs are the only affordance identifying the views, so the hint has to live
+    /// somewhere reachable.
     pub const fn hint(self) -> &'static str {
         match self {
             SidebarView::Worktrees => "repo \u{b7} worktree \u{b7} agent",
@@ -112,11 +111,10 @@ impl SidebarView {
         }
     }
 
-    /// The cell's `title="<view> — <hint>"` tooltip (§1), with the marker's real count appended in
-    /// parentheses when there is one - `Jerry.dc.html`'s own
-    /// `v.label + ' — ' + v.hint + (badge ? ' (' + badge + ')' : '')`.
+    /// The cell's `"<view> — <hint>"` tooltip, with the marker's real count appended in
+    /// parentheses when there is one.
     ///
-    /// The count living *here* rather than on the cell is §4v's own correction: "The 9px pill
+    /// The count living *here* rather than on the cell is a design correction: "The 9px pill
     /// printing a count at 7px sat on top of the glyph and was a second vocabulary for state in a
     /// strip built to match the tabs - which already mark state with a **5px square dot**. That is
     /// what the cells use now, in the badge's colour, with the count moved to the tooltip."
@@ -206,8 +204,7 @@ impl StripCell {
     }
 
     /// The colour this cell's glyph rests at: [`theme::text::SELECTED`] for the view you are in,
-    /// [`theme::text::FAINTER`] for one you are not (`Jerry.dc.html`'s own
-    /// `fg: on ? '#dde2e7' : '#5e646a'`).
+    /// [`theme::text::FAINTER`] for one you are not.
     pub const fn glyph_color(self) -> theme::ColorToken {
         if self.selected {
             theme::text::SELECTED
@@ -249,7 +246,7 @@ pub struct Problem {
 }
 
 impl Problem {
-    /// `line:column`, the way `Jerry.dc.html`'s own `p.line` prints it (`212:17`).
+    /// `line:column`, the way every compiler prints one (`212:17`).
     pub fn position(&self) -> String {
         format!("{}:{}", self.line, self.column)
     }
@@ -330,8 +327,8 @@ impl ProblemTally {
 
     /// The marker for this tally, or `None` when the worktree is clean.
     ///
-    /// Red once anything is a real error, amber otherwise - `Jerry.dc.html`'s own
-    /// `probTally.err ? '#e0625c' : '#e2a336'`. A worktree with only warnings is genuinely not in
+    /// Red once anything is a real error, amber otherwise. A worktree with only warnings is
+    /// genuinely not in
     /// the same state as one that does not compile, and the strip is the only place that says so
     /// before you open the view.
     pub fn marker(self) -> Option<StripMarker> {
@@ -405,10 +402,9 @@ pub fn problems_filtered_away_note(hidden: usize) -> String {
 /// cannot survive the gate because they are built here, below it, rather than beside a `when(..)`
 /// in the renderer that someone could later write for one and not the other.
 ///
-/// `agents_needing_you` is the real count of agents waiting on a human. §1 names the unit
-/// outright - "worktrees shows agents needing a human" - and `Jerry.dc.html` computes exactly
-/// that (`sessions.filter(s => s.status === 'ask' || s.status === 'fail').length`), which is why
-/// this is an agent count and not the worktree count §4v's one-line hue table reads as. It comes
+/// `agents_needing_you` is the real count of agents waiting on a human - the design names the
+/// unit outright, "worktrees shows agents needing a human", which is why this is an agent count
+/// and not a worktree count. It comes
 /// from the same `crate::rail::state::urgency_counts` pass over the same [`crate::rail::state::
 /// AgentRow`]s the title bar's own dots read, so the two can never report different numbers for
 /// the same window. `problems` is the real tally for the selected worktree.
@@ -548,8 +544,8 @@ mod tests {
         );
     }
 
-    /// §2's row spec prints `line:column`, 1-based - the shape `Jerry.dc.html`'s own `212:17`
-    /// takes, and the shape the click's own target line is derived from.
+    /// A row prints `line:column`, 1-based - the shape every compiler prints, and the shape the
+    /// click's own target line is derived from.
     #[test]
     fn a_rows_position_reads_the_way_every_compiler_prints_one() {
         let row = problem(Severity::Error, "src/db/mod.rs", 118, "no method", "rustc");
@@ -727,7 +723,7 @@ mod tests {
         assert!(cells.iter().all(|cell| cell.marker.is_none()));
     }
 
-    /// `Jerry.dc.html`'s `probTally.err ? '#e0625c' : '#e2a336'`, and the Worktrees cell's single
+    /// The Problems cell's red-once-there-is-an-error rule and the Worktrees cell's single
     /// amber - read through the real tokens, so a theme rename can't quietly decouple them.
     #[test]
     fn the_marker_hues_are_the_apps_own_status_hues() {

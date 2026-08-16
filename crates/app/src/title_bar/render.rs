@@ -411,11 +411,8 @@ fn title_bar_agent_state_chips(rows: &[AgentRow]) -> Vec<(Status, usize, String)
         .collect()
 }
 
-/// Title-bar text for one agent-status chip
-/// (`design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §4: "Title bar |
-/// `2 agents need input · 1 agent failed · 4 agents running` | agent-level, one chip per
-/// non-empty state", confirmed verbatim by
-/// `design_handoff_jerry_ade/revision 3/CHANGELOG.md`'s own "Counts" section). `None` for a
+/// Title-bar text for one agent-status chip - `2 agents need input · 1 agent failed · 4 agents
+/// running`, agent-level, one chip per non-empty state. `None` for a
 /// zero count - hidden entirely, never an empty chip - and for [`Status::Review`]/
 /// [`Status::Idle`]: the design's own title-bar example names exactly three states
 /// (`Status::Ask`/`Status::Fail`/`Status::Run`), and finished/idle counts already have a
@@ -447,10 +444,9 @@ fn title_bar_agent_state_chip_text(status: Status, count: usize) -> Option<Strin
     }
 }
 
-/// One title-bar agent-state chip, rebuilt for rev 6 as a **compact dot + count**
-/// (`design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4b's table: "agent status counts |
-/// title-bar text badges · footer dot cluster | **title bar, compact dots**, words in the
-/// tooltip").
+/// One title-bar agent-state chip, rebuilt as a **compact dot + count** with the words moved into
+/// the tooltip - this is also where the status bar's own footer dot cluster went
+/// (`docs/design/decisions.md` §11).
 ///
 /// The sentence is not deleted, it *moves*: `sentence` - still
 /// [`title_bar_agent_state_chip_text`]'s fully conjugated `"2 agents need input"` - becomes this
@@ -870,8 +866,7 @@ mod agent_state_chip_text_tests {
             title_bar_agent_state_chip_text(Status::Run, 1).as_deref(),
             Some("1 agent running")
         );
-        // `design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §4's own literal
-        // example text - "4 agents running" - reproduced verbatim.
+        // The design's own literal example text - "4 agents running" - reproduced verbatim.
         assert_eq!(
             title_bar_agent_state_chip_text(Status::Run, 4).as_deref(),
             Some("4 agents running")

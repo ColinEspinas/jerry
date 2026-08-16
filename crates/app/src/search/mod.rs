@@ -1,8 +1,8 @@
 //! The right panel's **Search** tab: everything about one feature, in one folder.
 //!
-//! `design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §5 ("Search is a real panel") and
-//! `STAGE-A-CHANGELOG.md` §4u/§4v/§4w re-scoped search from a flat list of filenames into the
-//! middle tab of `Files · Search · Changes`, with the verdict this whole folder exists to satisfy:
+//! Search was re-scoped from a flat list of filenames into a real panel - the
+//! middle tab of `Files · Search · Changes` - with the verdict this whole folder exists to
+//! satisfy:
 //! **"a search result that only names a file is an index, not a result. Show the line."**
 //!
 //! Split the way every feature folder in this crate is split - pure, GPUI-free logic separate from

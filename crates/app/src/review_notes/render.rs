@@ -1,8 +1,7 @@
 //! The two surfaces GitHub issue #288 adds: the **notes bar** above the hunks, and the **card**
 //! pinned beneath a line.
 //!
-//! Both are transcribed from `Jerry.dc.html`'s `Review · uncommitted` state - the bar is the
-//! `hasNotes` block, the card is the `l.isNote` branch of the diff row loop. Every colour is a
+//! Both come from the design's `Review · uncommitted` state. Every colour is a
 //! [`crate::theme::notes`] token, and every string that is design copy is quoted in the doc
 //! comment beside it.
 
@@ -38,9 +37,9 @@ fn note_draft_handle() -> TextFieldHandle {
         })
 }
 
-/// The bar's fixed second line, **verbatim** from `Jerry.dc.html` and from `STAGE-A-CHANGELOG.md`
-/// §1's own row for this feature: *"A notes bar above the hunks: count, the line `one prompt,
-/// line-anchored · pinned after the revision`, and `Send notes to <agent>` with `⌘⏎` keycaps"*.
+/// The bar's fixed second line, **verbatim** design copy: *"A notes bar above the hunks: count,
+/// the line `one prompt, line-anchored · pinned after the revision`, and `Send notes to <agent>`
+/// with `⌘⏎` keycaps"*.
 pub const NOTES_BAR_META: &str = "one prompt, line-anchored \u{b7} pinned after the revision";
 
 /// The send button's tooltip, verbatim from the mock's own `title=` attribute.
@@ -67,10 +66,9 @@ pub const SEND_NOTES_SPEC: &str = "mod+enter";
 
 /// What an empty card says while it is waiting to be written into.
 ///
-/// **A derivation, not a transcription.** `Jerry.dc.html`'s cards are all pre-authored demo data,
-/// so the mock has no empty state for one at all - in it, "toggle a note" can only ever mean
-/// show/hide something that already exists. A real reviewer starts from nothing, and a blank card
-/// with no prompt would read as a rendering fault.
+/// **A derivation, not a transcription.** The design has no empty state for a card at all - in
+/// it, "toggle a note" can only ever mean show/hide something that already exists. A real reviewer
+/// starts from nothing, and a blank card with no prompt would read as a rendering fault.
 const NOTE_PLACEHOLDER: &str = "what should change on this line?";
 
 /// The notes bar's own count sentence, and the design copy it is checked against.
@@ -411,9 +409,9 @@ impl AdeApp {
 
     /// One pinned note, as a row of the diff's own `uniform_list`.
     ///
-    /// ## The one place this is not the mock
+    /// ## The one place this is not the design
     ///
-    /// `Jerry.dc.html` draws the card as a free-height block whose text wraps. It cannot be one
+    /// The design draws the card as a free-height block whose text wraps. It cannot be one
     /// here: since GitHub issue #224 the diff is a `gpui::uniform_list`, which measures item 0 and
     /// lays **every** slot out at exactly that height (`rems(1.6)`, a diff line's own line
     /// height). A taller card would be silently clipped, and a list that measured itself from a
@@ -596,8 +594,7 @@ impl AdeApp {
             //
             // `w_full` is a percentage against the definite width `uniform_list` really hands
             // each item, so the card is the pane's width less the insets below, whatever it says.
-            // `Jerry.dc.html`'s own card is a block in normal flow with `margin:3px 14px 5px
-            // 74px`, i.e. exactly this: full width, inset.
+            // The designed card is a block in normal flow, inset on all four sides - exactly this.
             .w_full()
             // The mock's own inset: the card starts where the code text does, not at the gutter,
             // so it visibly belongs to the line above it.

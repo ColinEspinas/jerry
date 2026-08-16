@@ -1,8 +1,8 @@
 //! Pure logic for the Changes panel's four stacked sections (GitHub issue #285).
 //!
-//! `design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §1: the right panel's single flat
-//! change list becomes **four collapsible sections in one scroller**, each with its own count and
-//! diffstat, the commit box pinned above them.
+//! The right panel's single flat change list became **four collapsible sections in one
+//! scroller**, each with its own count and diffstat, the commit box pinned above them. See
+//! `docs/design/sidebar.md`.
 //!
 //! > Sections, not a segmented picker: triage needs to see that there are uncommitted changes
 //! > *and* three commits *and* a run waiting, without operating a control.
@@ -99,9 +99,8 @@ pub enum ChangesSection {
 }
 
 impl ChangesSection {
-    /// Top to bottom, exactly as `Jerry.dc.html` both paints them (`onSecUnc` at line 1314,
-    /// `onSecCommits` at 1370, `onSecBase` at 1390, `onSecRuns` last at 1434) and says so in its own
-    /// comment: "Four stacked sections, in this order: Uncommitted, Commits, Against main, Runs.
+    /// Top to bottom, exactly as the design paints them and states in as many words:
+    /// "Four stacked sections, in this order: Uncommitted, Commits, Against main, Runs.
     /// The first three are one ladder of git state, narrowing to widening. Runs is not on that
     /// ladder — it indexes the same changes by author — so it sits after it rather than inside it,
     /// which also keeps Uncommitted's top edge fixed however many agents have run."
@@ -438,8 +437,8 @@ pub enum SectionRow {
     Commit(wt_core::diff::BranchCommit),
     /// The Against-main section's *only* body row (besides its own notes): what would land, and
     /// how far ahead or behind the branch is. Unlike the other three sections, Against main never
-    /// lists a row per file - `Jerry.dc.html` line 1422's own `baseRows` is a synthetic one-entry
-    /// array (`wtBaseDefs`'s `files` is a plain count, never an array of files), and the panel's
+    /// lists a row per file - the design carries a plain file *count* here, never an array of
+    /// files, and the panel's
     /// own header count reads that count directly (`Self::changes_section_rows`), not the number
     /// of rows this section renders - a deliberate exception to `SectionHeader::count`'s usual
     /// "derived from the body" rule, and a deliberate removal of this section's earlier per-file
@@ -473,7 +472,7 @@ impl SectionRow {
     /// Which of the four sections this row belongs to - what
     /// `Self::render_changes_sections`/`Self::render_changes_runs_section` (in `sidebar::render`)
     /// split the flattened `changes_section_rows` list on to give Runs its own pinned-bottom
-    /// scroller (`Jerry.dc.html` line 1433) instead of sharing the other three's.
+    /// scroller instead of sharing the other three's.
     pub fn section(&self) -> ChangesSection {
         match self {
             SectionRow::Header(header) => header.section,
@@ -729,10 +728,10 @@ mod tests {
 
     #[test]
     fn the_order_matches_the_mock_not_the_issue_sketch() {
-        // `Jerry.dc.html` paints `onSecUnc`, `onSecCommits`, `onSecBase`, then `onSecRuns` last,
-        // and says so in its own comment - "Runs is not on [the git-state] ladder ... so it sits
+        // The design paints Uncommitted, Commits, Against main, then Runs last, and says so in
+        // as many words - "Runs is not on [the git-state] ladder ... so it sits
         // after it rather than inside it, which also keeps Uncommitted's top edge fixed however
-        // many agents have run." `REVISION-2026-08-14.md` §1's sketch lists Runs first; the mock
+        // many agents have run." An earlier sketch listed Runs first; the design
         // wins the disagreement.
         assert_eq!(
             ChangesSection::ORDER,

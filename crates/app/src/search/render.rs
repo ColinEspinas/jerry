@@ -1,7 +1,7 @@
 //! The real GPUI Search panel - the middle tab of `Files · Search · Changes`, as `impl AdeApp`
 //! methods.
 //!
-//! Built from top to bottom exactly as `Jerry.dc.html`'s own `showFind` block is:
+//! Built from top to bottom exactly as the design's own search panel is:
 //!
 //! - the **query row** (30 high): leading `⌕`, the real query input, then the `Aa` / `ab` / `.*`
 //!   modifier buttons,
@@ -1376,9 +1376,8 @@ mod panel_tests {
     use gpui::TestAppContext;
     use tempfile::TempDir;
 
-    /// A real worktree on disk with `refresh_token` across four files - the same corpus
-    /// `Jerry.dc.html`'s own search fixture uses, so what these tests see is what the design was
-    /// drawn against.
+    /// A real worktree on disk with `refresh_token` across four files - the same corpus the
+    /// design's own search example uses, so what these tests see is what it was drawn against.
     fn fixture_repo() -> TempDir {
         let repo = TempDir::new().expect("tempdir");
         let write = |relative: &str, content: &str| {
@@ -1431,7 +1430,7 @@ mod panel_tests {
     /// `⇄`/funnel toggle buttons kept their real 17px hit box, but the SVG glyph inside each one
     /// was wrongly stretched to fill that whole box instead of painting at
     /// `icons::IconSize::Control`'s real 12px optical box (`icons.rs`'s doc comment has the
-    /// bounding-box measurements off `Jerry.dc.html` this 12 comes from).
+    /// bounding-box measurements this 12 comes from).
     #[gpui::test]
     fn the_count_row_toggle_icons_paint_smaller_than_their_hit_box(cx: &mut TestAppContext) {
         let repo = fixture_repo();

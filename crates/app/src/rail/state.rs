@@ -1,5 +1,5 @@
-//! The agent rail's data model: pure, GPUI-free types and functions for grouping and
-//! filtering (`design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md`'s Zone 1). No `gpui`
+//! The agent rail's data model: pure, GPUI-free types and functions for grouping and filtering
+//! (`docs/design/rail.md`). No `gpui`
 //! dependency, so this logic is unit-testable without a real window, terminal, or git state.
 //! `crate::root` gathers the real signals (`TerminalPane`, `wt_core::list_worktrees`,
 //! `wt_core::diff::diff_against_base`) into the plain types this module operates on, and renders
@@ -38,9 +38,8 @@ pub struct AgentRow {
     /// The process exit code, only for [`Status::Fail`]/[`Status::Review`]/exited-`Idle`
     /// rows. `None` while still running or never started.
     pub exit_code: Option<u32>,
-    /// The agent row's "what it is doing" trailing text for a [`Status::Run`] row -
-    /// `design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §2.3: "the live tool call -
-    /// `writing auth.rs`, `editing reports.rs`, `bench 3 of 5`, `148 of 312`".
+    /// The agent row's "what it is doing" trailing text for a [`Status::Run`] row - the live
+    /// tool call: `writing auth.rs`, `editing reports.rs`, `bench 3 of 5`, `148 of 312`.
     ///
     /// A sibling field here rather than a payload on [`Status::Run`] itself (status-conditional,
     /// but a row-level fact rather than part of the status enum) - keeping [`Status`] itself a plain
@@ -145,8 +144,8 @@ pub fn sum_diff_stat(diff: &WorktreeDiff) -> (usize, usize) {
     (add, del)
 }
 
-/// Real per-status counts across every agent row, in [`Status::ORDER`] - the status bar's
-/// five urgency-counter squares (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s change 7).
+/// Real per-status counts across every agent row, in [`Status::ORDER`] - the five
+/// urgency-counter squares.
 /// Unlike [`group_worktrees_by_repo`], a status with zero matching rows still gets a real `0`
 /// entry rather than being omitted, since the status bar always shows all five squares. Built
 /// from the
@@ -315,8 +314,8 @@ impl WorktreeRow {
     }
 
     /// This row's rank for sorting *inside* a repo group (and, via [`RepoGroup::rank`], the
-    /// groups themselves) - `design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §2.1's
-    /// full seven-step order: `input → failed → review → running → idle → bare → prunable`.
+    /// groups themselves) - the full seven-step order:
+    /// `input → failed → review → running → idle → bare → prunable`.
     /// Lower sorts first (more urgent).
     ///
     /// The first five steps are exactly [`Status::urgency_rank`] (§2.3's own agent state words -
@@ -457,9 +456,8 @@ pub struct RepoWorktrees {
     pub repo_id: RepoId,
     pub repo_name: String,
     /// This repo's real, complete worktree list - unaffected by the rail's filter box. The
-    /// source of the group header's `N wt` and `N worktrees waiting` counts
-    /// (`design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §2.0: "a repo you have
-    /// scrolled past still reports that something in it wants a human" - a header that shrank
+    /// source of the group header's `N wt` and `N worktrees waiting` counts: a repo you have
+    /// scrolled past still reports that something in it wants a human, and a header that shrank
     /// or grew as the *filter box* was typed into would break that same promise for the repo
     /// you're currently looking at). See [`Self::rows`] for the separate, filtered list.
     pub all_rows: Vec<WorktreeRow>,
@@ -483,9 +481,8 @@ pub struct RepoWorktrees {
     pub rows_loaded: bool,
 }
 
-/// One repo group in the rail - `design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md`
-/// §2.0-2.1: the rail's only grouping axis, always present (even for a single repo), with its
-/// own worktree rows ranked most-urgent-first inside it.
+/// One repo group in the rail - the rail's only grouping axis, always present (even for a single
+/// repo), with its own worktree rows ranked most-urgent-first inside it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RepoGroup {
     pub repo_id: RepoId,
@@ -508,10 +505,9 @@ impl RepoGroup {
     /// The group header's **red** urgency count: worktrees in this repo holding at least one
     /// failed agent, hidden at zero.
     ///
-    /// Revision 6 (`design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §4,
-    /// `STAGE-A-CHANGELOG.md` §4q) split the header's single amber `N worktrees waiting` into two
-    /// counts, because merging them "said 'three worktrees want you' when one of the three had
-    /// actually died, and amber is the wrong colour for that". §7 rule 4, verbatim: **"Two states
+    /// The header's single amber `N worktrees waiting` was split into two counts, because merging
+    /// them "said 'three worktrees want you' when one of the three had actually died, and amber is
+    /// the wrong colour for that". The general rule, verbatim: **"Two states
     /// distinguished anywhere in the app are never summed anywhere in it."** The title bar has
     /// always shown `ask`/`fail`/`running` apart; the rail header now does too.
     ///
@@ -760,8 +756,8 @@ pub fn flatten_rail_list_items(
 /// twice is two specifications of one thing, and the reader cannot tell which is real").
 ///
 /// Both the noun and the verb agree through [`crate::root::plural`] rather than a hand-written
-/// ternary (§7 rule 9) - `Jerry.dc.html`'s own `askTip` conjugates `needs`/`need` too, and a
-/// tooltip reading "1 worktrees here need input" would be exactly the defect that rule exists for.
+/// ternary - a tooltip reading "1 worktrees here need input" is exactly the defect that helper
+/// exists for.
 /// Hiding at zero is the *caller's* decision (a content choice, made at the render site by not
 /// drawing the pair at all), so this function is total and always returns a real sentence.
 pub fn needs_input_tooltip(count: usize) -> String {
@@ -794,9 +790,8 @@ pub fn failed_tooltip(count: usize) -> String {
 /// theirs into `diff::STAT_ADD`/`diff::STAT_DEL`. Same number, read the same way, styled two
 /// different ways depending on which panel it was in.
 ///
-/// The deletion half is `Option` rather than a `−0`: `Jerry.dc.html`'s own `wtStats` returns
-/// `del: d ? '−' + d : ''`, so a pure-addition diff shows one part, not a second one that says
-/// nothing. Both zero is `None` outright - the row's prose fallback (`checkout · clean`, `merged ·
+/// The deletion half is `Option` rather than a `−0`, so a pure-addition diff shows one part, not
+/// a second one that says nothing. Both zero is `None` outright - the row's prose fallback (`checkout · clean`, `merged ·
 /// prunable`), which stays neutral, is what occupies that slot instead.
 pub fn diff_stat_parts(add: usize, del: usize) -> Option<(String, Option<String>)> {
     if add == 0 && del == 0 {

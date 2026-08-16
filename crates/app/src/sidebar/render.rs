@@ -804,8 +804,8 @@ impl AdeApp {
             .collect()
     }
 
-    /// The file tree - `design_handoff_jerry_ade/README.md`'s Zone 3 "Files (tree)" spec:
-    /// rect-composed folder/language-chip icons (see [`render_folder_icon`]/
+    /// The file tree (`docs/design/sidebar.md`): rect-composed folder/language-chip icons (see
+    /// [`render_folder_icon`]/
     /// [`render_lang_chip`], never emoji or an SVG pipeline), collapse/expand (see
     /// [`Self::toggle_dir_expanded`]/`crate::sidebar::file_tree::visible_entries`).
     ///
@@ -1673,19 +1673,16 @@ impl AdeApp {
         row.into_any_element()
     }
 
-    /// Zone 3's header band (36 high): the real `Files · Search · Changes` segmented control
-    /// (`design_handoff_jerry_ade/README.md`: "Header 36: segmented `Files | Changes`
-    /// (Files is first and default...)", with GitHub issue #162 adding Search in the middle) plus
+    /// Zone 3's header band (36 high): the real `Files · Search · Changes` segmented control -
+    /// Files first and default, with GitHub issue #162 having added Search in the middle - plus
     /// the real `+n`/`−n` totals across the currently loaded diff, summed from the same real
     /// per-file stats (`crate::sidebar::changes::diff_file_stats`) the Changes rows themselves
     /// show.
     ///
-    /// The three segments are **icons**, not text - `STAGE-A-CHANGELOG.md` §4w: "`Files` /
-    /// `Search` / `Changes` were the only text tabs left in a window whose left strip is already
-    /// iconographic. Now three 26x19 buttons in the same segmented shell, selected state
-    /// unchanged, each with a tooltip carrying the old label plus its old hint." The tooltip
-    /// strings below are `Jerry.dc.html`'s own `title` attributes on those three buttons,
-    /// transcribed rather than paraphrased.
+    /// The three segments are **icons**, not text: `Files` / `Search` / `Changes` were the only
+    /// text tabs left in a window whose left strip is already iconographic. Three 26x19 buttons
+    /// in the same segmented shell, selected state unchanged, each with a tooltip carrying the
+    /// old label plus its old hint.
     pub(in crate::sidebar) fn render_right_sidebar_toggle(
         &self,
         cx: &mut Context<Self>,
@@ -1751,10 +1748,9 @@ impl AdeApp {
             // `crate::root::scrollbar::CONTENT_CLEARANCE`'s own docs for the value.
             .pr(px(scrollbar::CONTENT_CLEARANCE))
             // The third of the window's three column headers, so the rule it draws is the same
-            // one the sidebar strip and the centre tab strip draw - GitHub issue #291 /
-            // `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4v: "all three borders
-            // are `#191c1f` ... [otherwise it] would have read as one rule changing shade
-            // mid-span". This was `theme::border::INNER` (`#1c2023`), a third shade on the same y.
+            // one the sidebar strip and the centre tab strip draw (GitHub issue #291). All three
+            // share one colour; otherwise it reads as one rule changing shade mid-span. This was
+            // `theme::border::INNER` (`#1c2023`), a third shade on the same y.
             .border_b_1()
             .border_color(theme::border::RAIL_INNER)
             .child(toggle)
@@ -1860,8 +1856,7 @@ impl AdeApp {
     }
 
     /// Zone 3's whole real body: the `Files | Changes` header, then either the scrollable file
-    /// tree, or the Changes list's own header/scrollable-rows/footer trio -
-    /// `design_handoff_jerry_ade/README.md`'s Changes spec ("Header 7/12 ... Footer 29"). Both
+    /// tree, or the Changes list's own header/scrollable-rows/footer trio. Both
     /// list arms wrap their list in a plain `flex_1().min_h_0()` column, so a long list scrolls
     /// under its own pinned header/footer instead of pushing them off-screen.
     ///
@@ -1914,10 +1909,10 @@ impl AdeApp {
             // GitHub issue #285: four collapsible sections, with the commit composer pinned
             // **above** them rather than at the panel's foot. The composer is a git control and
             // the sections are what it acts on, so it reads first; that ordering is
-            // `REVISION-2026-08-14.md` §1's own sketch. Of the four, only Runs is pinned to the
-            // panel's own *bottom*, in its own capped well below the other three's shared
-            // scroller (`Self::render_changes_runs_section`) - `Jerry.dc.html` line 1433's own
-            // separate `max-height:170px` wrapper, not a fourth entry in the shared one.
+            // the design's own ordering. Of the four, only Runs is pinned to the panel's own
+            // *bottom*, in its own capped well below the other three's shared scroller
+            // (`Self::render_changes_runs_section`) - a separate, capped wrapper, not a fourth
+            // entry in the shared one.
             RightSidebarView::Changes => container
                 .child(self.render_commit_composer(cx))
                 .children(self.render_changes_row_error(cx))
@@ -2167,10 +2162,9 @@ impl AdeApp {
                 // one - the exact defect §4e removed them from the agent header for.
                 //
                 // No per-file rows, though issue #285's own checklist says "diffstat, file list
-                // and commit context" - a deliberate deviation from that restated checklist back
-                // toward `Jerry.dc.html` itself: line 1422's `baseRows` is a synthetic one-entry
-                // array (`wtBaseDefs`'s `files` is a plain count, never an array of files), so a
-                // committed file was never meant to be its own row here. Requested directly:
+                // and commit context" - a deliberate deviation from that restated checklist: the
+                // design carries a plain file *count* here, never an array of files, so a
+                // committed file was never meant to be its own row. Requested directly:
                 // "commited files should not appear on the changes tab under against master."
                 let base = self.changes_base_branch().map(str::to_string);
                 if let Some(base) = base {
@@ -2246,9 +2240,8 @@ impl AdeApp {
     /// The Changes panel's main scroller: **three** of its four sections' worth of rows
     /// (Uncommitted, Commits, Against main) in a single `gpui::list`, with the same shared overlay
     /// scrollbar every other scrollable region in this app draws (`crate::root::scrollbar`). Runs
-    /// is deliberately excluded - it renders in its own pinned-bottom well,
-    /// [`Self::render_changes_runs_section`], matching `Jerry.dc.html` line 1433's own separate
-    /// `max-height:170px;overflow-y:auto` wrapper rather than sharing this scroller.
+    /// is deliberately excluded - it renders in its own pinned-bottom, capped well,
+    /// [`Self::render_changes_runs_section`], rather than sharing this scroller.
     ///
     /// `gpui::list`, not the `uniform_list` this panel used to use, for one structural reason: even
     /// with Runs split out, these three sections still put a 24px header and a 27px file row in the
@@ -2316,8 +2309,7 @@ impl AdeApp {
     }
 
     /// The Runs section, pinned to the Changes panel's own bottom in its own capped,
-    /// independently-scrolled well - `Jerry.dc.html` line 1433's `flex:none;max-height:170px;
-    /// overflow-y:auto` wrapper, which sits *outside* the shared scroller the other three
+    /// independently-scrolled well, which sits *outside* the shared scroller the other three
     /// sections share rather than as a fourth entry inside it (the user: "run row should be
     /// pinned to the bottom and not to the top look at the design").
     ///
@@ -2539,10 +2531,8 @@ impl AdeApp {
     /// Clicking focuses that agent's tab - a real, existing action
     /// ([`Self::activate_agent_tab`]), not a new surface.
     ///
-    /// No row tooltip, though `Jerry.dc.html`'s own markup carries one (`title="{{ r.tip }}"`,
-    /// stating the live/frozen consequence `STAGE-A-CHANGELOG.md` §4l moved off the row's visible
-    /// text) - a deliberate, requested deviation from both the mock and that citation, not an
-    /// oversight.
+    /// No row tooltip, though the design carries one stating the live/frozen consequence that
+    /// was moved off the row's visible text - a deliberate, requested deviation, not an oversight.
     fn render_run_row(&self, run: &sections::RunRow, cx: &mut Context<Self>) -> impl IntoElement {
         let agent_id = run.agent_id;
         let selector = format!("changes-run-{}", run.agent_id);
@@ -3390,8 +3380,8 @@ impl AdeApp {
         self.open_uncommitted_change().is_some()
     }
 
-    /// `space`'s action handler ([`crate::root::ToggleChangeStaged`]) - the binding behind
-    /// `Jerry.dc.html`'s `changesHints` first hint, `space stage` (line 4548).
+    /// `space`'s action handler ([`crate::root::ToggleChangeStaged`]) - the binding behind the
+    /// Changes footer's first hint, `space stage`.
     ///
     /// Its subject is [`Self::open_change`], exactly like [`Self::handle_toggle_change_seen_action`]
     /// beside it, and for the same reason: that path is *both* the file whose diff is on screen
@@ -4194,11 +4184,9 @@ impl AdeApp {
     }
 }
 
-/// The Changes list's footer 29 - **three keycap hints and no prose at all**, exactly as
-/// `design_handoff_jerry_ade/revision 5/Jerry.dc.html` line 4548 declares it:
-/// `changesHints: this.mkHints([['space', 'stage'], ['V', 'mark seen'], ['⌥click', 'filter by
-/// author']])`, rendered through the same `diffHints` hint-row template (line 842) that is purely a
-/// loop over keycap+label pairs. `STAGE-A-CHANGELOG.md` §2's ride-along I10 lists the same strip.
+/// The Changes list's footer 29 - **three keycap hints and no prose at all**: `space stage`,
+/// `V mark seen`, `⌥click filter by author`, rendered through the same hint-row template the diff
+/// footer uses, which is purely a loop over keycap+label pairs.
 ///
 /// This band used to open with the sentence `click a file to open its diff in the centre` as a
 /// shrinkable lead-in. That string comes from `README.md`'s Changes section - a *superseded*
@@ -4314,11 +4302,8 @@ pub(in crate::sidebar) const CHANGES_SEEN_SPEC: &str = "v";
 /// the cursor. (The Changes view's *no-diff* arm still has no footer; that arm renders a single
 /// message rather than a list, so there is nothing for a footer to sit under.)
 ///
-/// The shape is the hint strip the design handoff already specifies for
-/// exactly this job - `design_handoff_jerry_ade/revision/Jerry.dc.html`'s own `diffHints` strip:
-/// `height:28px ... padding:0 12px;background:#111316;border-top:1px solid #1c2023`, hints at
-/// `gap:11`, each hint `gap:5`, hint-size keycaps, label `400 10px 'IBM Plex Sans'` in `#4a5057`.
-/// Which is this app's
+/// The shape is the hint strip the design already specifies for exactly this job - a 28-high
+/// band with hint-size keycaps and their labels. Which is this app's
 /// `theme::band::SURFACE_FOOTER`/`surface::FOOTER`/`border::INNER`/`text::PATH` and the
 /// `KeycapSize::Hint` keycap it already had.
 ///
@@ -4441,11 +4426,10 @@ pub(in crate::sidebar) fn render_tree_caret(
 /// entirely from `div()`s (never an emoji glyph, which is what caused the "tofu box" bug:
 /// no matching glyph installed on the reporting machine).
 ///
-/// The two rects are *not* styled identically (verified against `design_handoff_jerry_ade/
-/// Jerry.dc.html`'s `n.folderBd`/`n.folderBg`): the body alternates between a filled `bg`
+/// The two rects are *not* styled identically: the body alternates between a filled `bg`
 /// (open) and transparent (collapsed), both with a `border` - but the tab is always
 /// solid-filled with the `border` colour and has no separate border of its own. An earlier
-/// version gave the tab the same hollow-when-collapsed treatment as the body; the mockup's
+/// version gave the tab the same hollow-when-collapsed treatment as the body; the design's
 /// collapsed-folder tab is solid, not outlined.
 pub(in crate::sidebar) fn render_folder_icon(open: bool) -> impl IntoElement {
     let (fill, border): (gpui::Rgba, gpui::Rgba) = if open {
@@ -4546,8 +4530,7 @@ pub(in crate::sidebar) fn render_moved_tag() -> impl IntoElement {
         .child("moved")
 }
 
-/// The Changes row's real five-segment 3×8 stat bar (`design_handoff_jerry_ade/README.md`:
-/// "a five-segment 3×8 stat bar (`#4e8c68` / `#a35f5b` / `#22262a`)"), per
+/// The Changes row's real five-segment 3×8 stat bar, per
 /// `crate::sidebar::changes::stat_bar_segments`'s real, unit-tested proportional allocation.
 pub(in crate::sidebar) fn render_stat_bar(segments: [changes::StatSegment; 5]) -> impl IntoElement {
     div()
@@ -8125,9 +8108,9 @@ mod changes_sections_tests {
         // section is read-only.
         //
         // And, separately: no row per committed file either, reported directly ("commited files
-        // should not appear on the changes tab under against master") and confirmed against
-        // `Jerry.dc.html` line 1422's own `baseRows` - a synthetic one-entry array, never a
-        // per-file loop. Against main's only real body row is its context card.
+        // should not appear on the changes tab under against master") and confirmed against the
+        // design, which carries a plain count here rather than a per-file loop. Against main's
+        // only real body row is its context card.
         let repo = four_scope_repo();
         let (app, cx) = open_changes_view(cx, &repo);
         open_every_section(&app, cx);
@@ -8989,7 +8972,7 @@ mod change_row_tests {
         );
     }
 
-    /// The same honesty half for `Jerry.dc.html`'s *first* `changesHints` entry, `space stage`.
+    /// The same honesty half for the Changes footer's *first* hint, `space stage`.
     #[gpui::test]
     fn the_footer_shows_the_space_keycap_only_while_the_binding_is_live(cx: &mut TestAppContext) {
         let repo = mixed_status_repo();
@@ -9013,9 +8996,9 @@ mod change_row_tests {
     }
 
     /// The live bug this fixes: the footer used to open with the sentence `click a file to open
-    /// its diff in the centre` - `README.md`'s wording for the *superseded* pre-`#285` panel -
-    /// ahead of the keycaps, so a user saw truncated prose where `Jerry.dc.html` line 4548's
-    /// `changesHints` specifies three chips and nothing else.
+    /// its diff in the centre` - the wording for the *superseded* pre-`#285` panel - ahead of the
+    /// keycaps, so a user saw truncated prose where the design specifies three chips and nothing
+    /// else.
     ///
     /// Asserted geometrically rather than by hunting for a string, because that is what actually
     /// pins the design: the mock's strip is `padding:0 12px` with the hints as its first child, so
@@ -9088,7 +9071,7 @@ mod change_row_tests {
             app.read_with(cx, |app, _| app
                 .staged_files
                 .contains(&PathBuf::from("modified.txt"))),
-            "a real `space` keystroke stages the open row - `Jerry.dc.html`'s `space stage`"
+            "a real `space` keystroke stages the open row - the footer's `space stage` hint"
         );
         assert!(
             cx.debug_bounds("stage-checkbox-modified.txt").is_some(),
@@ -9198,7 +9181,7 @@ mod change_row_tests {
         let modifiers = keystroke.modifiers();
         assert!(
             !modifiers.control && !modifiers.alt && !modifiers.platform && !modifiers.shift,
-            "a bare `space`, exactly as `Jerry.dc.html`'s `changesHints` prints it"
+            "a bare `space`, exactly as the Changes footer prints it"
         );
         let predicate = |binding: &gpui::KeyBinding| {
             binding

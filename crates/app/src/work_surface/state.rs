@@ -38,9 +38,8 @@ pub enum TabRef {
     Review(AgentId),
     /// The run-transcript tab (GitHub issue #227), showing one finished run's own recording.
     ///
-    /// Carries no payload, like `Graph` and unlike `Review`: `design_handoff_jerry_ade/revision
-    /// 5/REVISION-2026-08-13.md` §3 is "**one run tab per worktree**; opening another replaces
-    /// it", and this order is already per worktree
+    /// Carries no payload, like `Graph` and unlike `Review`: there is **one run tab per
+    /// worktree** and opening another replaces it, and this order is already per worktree
     /// (`crate::root::AdeApp::tab_order`), so within one strip there is never a second one to
     /// tell this apart from. Which run it shows lives in
     /// `crate::root::AdeApp::run_tab_by_worktree` - keeping it out of the identity is what makes
@@ -239,11 +238,11 @@ pub const TRANSPARENT: Rgba = Rgba {
 /// colour, so the same agent is the same colour on its rail badge, its CLI tab chip, its Changes
 /// panel run rows and the conflict side headers.
 ///
-/// Every tint returned here comes from [`theme::agent`]'s pool, which rev 6 reallocated to satisfy
-/// the reserved-hue rule in `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4a: agent
+/// Every tint returned here comes from [`theme::agent`]'s pool, reallocated to satisfy the
+/// reserved-hue rule (`docs/design/decisions.md` §9): agent
 /// identity is allocated only *outside* the five structural hue families (amber, violet, green,
 /// red, blue). Claude is copper and Codex is teal; both used to sit inside a reserved family
-/// (amber and green respectively), which is exactly what §4a fixed. See [`theme::agent`]'s own
+/// (amber and green respectively), which is exactly what that rule fixed. See [`theme::agent`]'s own
 /// docs for the full rule and table, and `theme::agent_tint_allocation_tests` for the test that
 /// keeps it true - **map a new agent to a pool tint here rather than inventing a colour**, or that
 /// test will fail.
@@ -349,10 +348,9 @@ pub struct TabColors {
 
 /// An inactive tab's `underline` is the **window's column rule**, not a tab-level decoration -
 /// which is why it is [`theme::border::RAIL_INNER`] and not [`theme::border::ZONE`]. GitHub issue
-/// #291 / `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4v: once the three column
-/// headers line up, "**All three column headers are now 36** ... and all three borders are
-/// `#191c1f` - the centre strip had been `#1e2225`, which once the rules lined up would have read
-/// as one rule changing shade mid-span."
+/// #291: once the three column headers line up, all three of their bottom rules must be one
+/// colour - the centre strip had been a shade lighter, which once the rules lined up read as one
+/// rule changing shade mid-span.
 ///
 /// The active tab keeps painting its own background there instead - "so it joins the pane below" -
 /// which is the cut-out `crate::rail::strip_render`'s selected cell copies for the left column.
@@ -417,9 +415,8 @@ pub fn live_tab_label(title: Option<&str>, program: &str) -> String {
     }
 }
 
-/// The `+` menu's "New agent" row secondary text (`design_handoff_jerry_ade/revision 3/
-/// REVISION-2026-07-31.md` §3: "*New agent* (`runs in <branch>`)") - the real, currently selected
-/// worktree's branch substituted in, never a hardcoded model/kind name (that was the pre-fix
+/// The `+` menu's "New agent" row secondary text - `runs in <branch>`, with the real, currently
+/// selected worktree's branch substituted in, never a hardcoded model/kind name (that was the pre-fix
 /// bug: the row showed `agent.kind.label()`, e.g. `"Claude"`, which is not what this spec item
 /// asks for at all). Falls back to `(detached)` for a worktree with no recorded branch, mirroring
 /// `crate::work_surface::render::AdeApp::render_agent_context_bar`'s own branch fallback so the
@@ -654,7 +651,7 @@ mod tests {
         assert!(
             same(active.bg, active.underline),
             "an active tab's underline must match its own background - that's how it visually \
-             merges into the surface below it, per design_handoff_jerry_ade/README.md"
+             merges into the surface below it"
         );
     }
 

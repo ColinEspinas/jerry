@@ -58,7 +58,7 @@ impl gpui::Render for DraggedRebaseRow {
 /// exactly like every other keycap in the app. Each spec is the real, registered keystroke of the
 /// matching action in `crate::default_key_bindings` - `"P"`/`"S"`/`"D"` are shown uppercase (a
 /// keycap is a key, not a character) while the binding itself is the unmodified letter, the same
-/// way `Jerry.dc.html`'s own reference footer prints them.
+/// way the designed reference footer prints them.
 const REBASE_FOOTER_HINTS: [(&str, &str); 5] = [
     ("alt+\u{2191}\u{2193}", "reorder"),
     ("P", "pick"),

@@ -2,9 +2,7 @@
 //! one prompt, delivered to a **named** agent's pty, and **kept pinned** afterwards so the
 //! revision can be checked against them.
 //!
-//! Spec of record: `design_handoff_jerry_ade/revision 5/AUDIT-2026-08-13-competitive-v2.md`
-//! §6 top-5 #2, `STAGE-A-CHANGELOG.md` §1 (the two `§6.2` rows) and §3's verification list, and
-//! `Jerry.dc.html`'s `Review · uncommitted` state for the markup.
+//! See `docs/design/work-surface.md` for where this sits in the centre surface.
 //!
 //! ## The three rules, and where each one lives
 //!
@@ -48,8 +46,8 @@ use std::path::{Path, PathBuf};
 
 /// Which line of a diff a note is pinned beneath.
 ///
-/// **Not a row index.** `Jerry.dc.html`'s own `noteDefs` key notes by their position in the
-/// rendered line array, which is fine for a mock whose diff never changes and fatal here: this
+/// **Not a row index.** The design keys notes by their position in the rendered line array,
+/// which is fine for a mockup whose diff never changes and fatal here: this
 /// app re-reads the working tree constantly, and a row index would silently re-anchor every note
 /// on a file the moment a hunk above it grew by a line. The issue's requirement is that notes are
 /// *"keyed per worktree + path + line"*, and the only stable meaning of "line" in a unified diff
@@ -128,7 +126,7 @@ pub enum NoteMark {
 }
 
 impl NoteMark {
-    /// The card's own word, verbatim from `Jerry.dc.html`'s `noteMark`.
+    /// The card's own word, verbatim design copy.
     pub fn label(self) -> &'static str {
         match self {
             NoteMark::Draft => "draft",

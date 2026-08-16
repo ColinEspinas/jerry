@@ -897,10 +897,9 @@ impl AdeApp {
     ///
     /// Same order as the strip, just with the shells dropped, so `secondary-2` still means "the
     /// second agent you can see, reading left to right" - it simply stops counting the terminal
-    /// sitting between them. GitHub issue #381: `Jerry.dc.html` has never treated a terminal as
-    /// an agent (`isAgent = t => activeWt.agents.indexOf(t) >= 0`, with `'terminal'` a separate
-    /// tab id its `isFileTab` test excludes by name), and the design's own keybinding table calls
-    /// this `Jump to session by position`. Counting shells made the keycap row advertise more
+    /// sitting between them. GitHub issue #381: the design has never treated a terminal as an
+    /// agent - a shell is its own kind of tab throughout - and its keybinding table calls this
+    /// `Jump to session by position`. Counting shells made the keycap row advertise more
     /// positions than there were agents and pushed every real agent off its own number.
     ///
     /// A shell is not made unreachable by this: it still has a real tab to click, and - since
@@ -1006,8 +1005,8 @@ impl AdeApp {
     /// staying clipped to the space actually available.
     ///
     /// The `+` button rides inside the same scrollable region, immediately after the last tab
-    /// (exactly where `Jerry.dc.html`'s own tab row puts it: `sc-for tabs`, then the `+` cell,
-    /// then a `flex:1` filler, then the trailing hint cluster), so reaching it when tabs overflow
+    /// (exactly where the designed tab row puts it: the tabs, then the `+` cell, then a growing
+    /// filler, then the trailing hint cluster), so reaching it when tabs overflow
     /// is the same one scroll gesture that reaches the last tab - not a second, independently
     /// reachable control pinned somewhere else.
     ///
@@ -1026,8 +1025,8 @@ impl AdeApp {
     /// PR #403 (GitHub issue #402) tried to fix that same report by making the scroller
     /// `.flex_initial()` and moving the `+` button out behind a new growing pusher, which pinned
     /// the `+` to the far right of the strip. That mis-read a plain tab row (a `+` immediately
-    /// after the last tab, bare strip after it - what `Jerry.dc.html` itself draws, and what
-    /// every other tabbed editor draws) as a layout bug, and left the actual 12px spacer
+    /// after the last tab, bare strip after it - what the design draws, and what every other
+    /// tabbed editor draws) as a layout bug, and left the actual 12px spacer
     /// untouched. The product owner's verdict on the result was immediate: "you fixed the plus
     /// button on the right, why? And the padding is still here." Both halves of that change are
     /// reverted here.
@@ -1036,7 +1035,7 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         // No `border_b` here, deliberately: the *children* own this column's bottom edge. GitHub
-        // issue #291 / `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4v, verbatim -
+        // issue #291 - the defect this fixes was that
         // "the centre column drew its bottom edge **twice** - once on the tab-strip container and
         // once on every tab - so under an inactive tab the rule was 1.6px of two shades stacked,
         // and the active tab's cut-out (its `border-bottom` set to its own background, so it joins
@@ -2046,8 +2045,7 @@ impl AdeApp {
     /// agent surface.
     ///
     /// **Not rendered over a `Shell` tab in a worktree that does have agents** - see
-    /// [`Self::render_center_pane`]'s `show_context_bar`, which reproduces `Jerry.dc.html`'s
-    /// `showAgentBar: noAgents || activeWt.agents.indexOf(tab) >= 0` and the mock's own reason:
+    /// [`Self::render_center_pane`]'s `show_context_bar`, and the design's own reason:
     /// "The whole row is agent identity, so it belongs to agent panes only… in a terminal pane
     /// there is no agent to describe. Kept when the worktree has no agents at all, since it holds
     /// that empty state's CTA."
@@ -2218,10 +2216,9 @@ impl AdeApp {
     /// [`Self::render_plus_menu`]'s "Open file…" row sets).
     ///
     /// An agent pane's pid rides **this header**, and a shell's rides its info footer - which is
-    /// exactly where `Jerry.dc.html` puts each. The mock's two pane branches are mutually
-    /// exclusive (`isChat: isAgent(tab)` vs `isTerminal: tab === 'terminal'`) and only the
-    /// `isTerminal` one has a `pid`/`termSize` bottom bar; the `isChat` header reads
-    /// `{{ focus.cli }} · pid {{ focus.pid }} … {{ focus.ptyHint }}`. See
+    /// exactly where the design puts each. Its two pane branches are mutually exclusive, and only
+    /// the shell one has a pid/grid-size bottom bar; the agent header carries the invocation, the
+    /// pid and the pty hint instead. See
     /// [`Self::render_pty_info_footer`] and [`Self::render_pty_footer`] for the bottom half of
     /// that same split.
     ///
@@ -2326,10 +2323,9 @@ impl AdeApp {
     /// docs), and a hint about file:line references.
     ///
     /// [`ProcessKind::Shell`] only, and mutually exclusive with [`Self::render_pty_footer`] - a
-    /// pane gets one bottom bar, never both. `Jerry.dc.html`'s two pane branches are `sc-if`
-    /// siblings on mutually exclusive conditions (`isTerminal: tab === 'terminal'` vs
-    /// `isChat: isAgent(tab)`), and only the `isTerminal` one carries this bar:
-    /// `pid {{ focus.pid }} │ {{ termSize }} │ [{{ footRemote }}] … file:line references open in
+    /// pane gets one bottom bar, never both. The design's two pane branches are mutually
+    /// exclusive, and only the shell one carries this bar:
+    /// `pid … │ grid size │ [environment chip] … file:line references open in
     /// a tab`. Its `isChat` sibling's only bottom bar is the `hasBar` readout strip. Issue #20
     /// named this bar "the **terminal** footer" too ("2. Terminal: move Clear into the footer"),
     /// and §4b gates the environment chip "in both the window bar and **the terminal footer**".
@@ -2419,11 +2415,11 @@ impl AdeApp {
     /// `STAGE-A-CHANGELOG.md` §4t).
     ///
     /// [`ProcessKind::Agent`] only, and mutually exclusive with
-    /// [`Self::render_pty_info_footer`] - a pane gets one bottom bar, never both. §4t's "the bar
-    /// now renders **whenever there is an agent**" is a statement about *status*, not about pane
-    /// kind: it means the strip no longer waits for a status that offers a button. A `Shell` tab
-    /// is not "an agent" in that sentence's sense - `Jerry.dc.html` gates the whole strip on
-    /// `isChat: isAgent(tab)`, and §4u′ says so from the other direction when it accepts that the
+    /// [`Self::render_pty_info_footer`] - a pane gets one bottom bar, never both. "The bar now
+    /// renders whenever there is an agent" is a statement about *status*, not about pane kind: it
+    /// means the strip no longer waits for a status that offers a button. A `Shell` tab is not
+    /// "an agent" in that sentence's sense - the design gates the whole strip on the pane being
+    /// an agent pane, and says so from the other direction when it accepts that the
     /// budget popover is "reachable only from an agent pane. **On a terminal tab**, the graph or
     /// Settings there is no way to open it… those surfaces have no agent spending anything."
     /// Reading it as "whenever there is a pane" is what stacked this strip under the terminal's
@@ -2768,11 +2764,10 @@ impl AdeApp {
                                 .overflow_hidden()
                                 .child(agent.pane.clone().into_any_element()),
                         )
-                        // One bottom bar per pane, picked by pane kind - never both stacked.
-                        // `Jerry.dc.html`'s two pane branches are mutually exclusive `sc-if`
-                        // siblings: `isTerminal` gets `pid │ 148×38 │ [wsl] … file:line
-                        // references open in a tab`, `isChat` gets the `hasBar` readout strip
-                        // (actions · cost · budget) and puts its pid in the header instead.
+                        // One bottom bar per pane, picked by pane kind - never both stacked. A
+                        // shell gets `pid │ 148×38 │ [wsl] … file:line references open in a tab`;
+                        // an agent gets the readout strip (actions · cost · budget) and puts its
+                        // pid in the header instead.
                         // Rendering both under every pane is the duplication reported live
                         // against the shipped build - see the two methods' own docs.
                         .child(match agent.kind {
@@ -5741,8 +5736,7 @@ mod select_agent_cross_repo_tests {
 }
 
 /// GitHub issue #295: the agent pane's context bar is identity-only, and its bottom strip is a
-/// readout rather than an action bar (`design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md`
-/// §4e/§4r/§4t).
+/// readout rather than an action bar (`docs/design/decisions.md` §12).
 ///
 /// These drive the real painted surface - real spawned child processes, real
 /// `VisualTestContext::debug_bounds` measurements of what actually reached the screen, and real
@@ -5960,10 +5954,9 @@ mod agent_pane_readout_tests {
     /// "the footer of the terminals and agents… right now both are displayed at the same time in
     /// both terminal and agents but should not".
     ///
-    /// `Jerry.dc.html`'s two pane branches are mutually exclusive `sc-if` siblings
-    /// (`isTerminal: tab === 'terminal'` and `isChat: isAgent(tab)`). The `isTerminal` one is the
-    /// only one with a `pid │ {{ termSize }} │ [{{ footRemote }}] … file:line references open in
-    /// a tab` bar; the `isChat` one's only bottom bar is the `hasBar` readout strip. So a `Shell`
+    /// The design's two pane branches are mutually exclusive. The shell one is the only one with
+    /// a `pid │ grid size │ [environment chip] … file:line references open in a tab` bar; the
+    /// agent one's only bottom bar is the readout strip. So a `Shell`
     /// tab paints the info footer and **not** the readout strip.
     #[gpui::test]
     fn a_shell_tab_paints_the_info_footer_and_not_the_agent_readout_strip(cx: &mut TestAppContext) {
@@ -6610,8 +6603,8 @@ mod tab_strip_trailing_margin_tests {
     ///
     /// The real, measured cause: `#tab-strip` ended in a bare `w(px(12))` bordered spacer left
     /// behind by PR #398 (GitHub issue #397) when it deleted the trailing agent-jump keycap
-    /// cluster's *content* but kept its padding. `Jerry.dc.html`'s own tab row has no such thing:
-    /// the 12px there is that cluster's own `padding:0 12px`, and padding with no content in it
+    /// cluster's *content* but kept its padding. The designed tab row has no such thing:
+    /// the 12px there is that cluster's own padding, and padding with no content in it
     /// is not breathing room, it is 12px of dead chrome. With the scroller sitting behind it, the
     /// tabs it clips stopped 12px short of the pane's real right edge instead of running flush
     /// into it - which is exactly the margin both screenshots show, and exactly what survived
@@ -6688,8 +6681,8 @@ mod tab_strip_trailing_margin_tests {
     ///
     /// PR #403 moved the `+` out of the scroller and put a growing `#tab-strip-pusher` in front of
     /// it, which pinned it to the far right of the strip whether the tabs filled it or not. That
-    /// is not what `Jerry.dc.html` draws - its tab row is `sc-for tabs`, then the `+` cell, then a
-    /// `flex:1` filler - nor what any other tabbed editor draws, and it was rejected on sight by
+    /// is not what the design draws - its tab row is the tabs, then the `+` cell, then a growing
+    /// filler - nor what any other tabbed editor draws, and it was rejected on sight by
     /// the product owner. The `+` belongs immediately after the last tab; the bare strip after it
     /// is the design, not a gap in need of filling.
     #[gpui::test]

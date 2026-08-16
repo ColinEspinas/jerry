@@ -1,4 +1,4 @@
-//! Pure logic for Zone 3's "Changes" list (`design_handoff_jerry_ade/README.md`'s Zone 3 spec)
+//! Pure logic for Zone 3's "Changes" list (`docs/design/sidebar.md`)
 //! and the fold-marker treatment used when rendering a file's hunks.
 //!
 //! Deliberately GPUI-window-free, mirroring `crate::work_surface::state`/`crate::rail::status`'s split: only
@@ -34,10 +34,9 @@ pub fn diff_file_stats(file: &DiffFile) -> (u32, u32) {
     (add, del)
 }
 
-/// Git's own status letter for one file row - `A`, `M` or `D`
-/// (`design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4j).
+/// Git's own status letter for one file row - `A`, `M` or `D`.
 ///
-/// **Total, not optional**, and that is the whole point of §4j: the `new`/`del` word pills this
+/// **Total, not optional**, and that is the whole point: the `new`/`del` word pills this
 /// replaced marked only the exceptions, so a *modified* file - the common case - got no mark at
 /// all and "the row could not answer 'what happened to this file', which is the first thing a
 /// reviewer asks". Every row gets a letter, in a fixed column, so every filename also starts on
@@ -223,8 +222,7 @@ impl StagedProgress {
     }
 }
 
-/// Splits a diff file path into the Changes row / diff toolbar's `dir` and `name` fields
-/// (`design_handoff_jerry_ade/README.md`: "`dir` 10.5px mono ... `name` 11.5px/450 mono").
+/// Splits a diff file path into the Changes row / diff toolbar's `dir` and `name` fields.
 /// `wt_core::diff` paths are repo-relative (stripped of the `a/`/`b/` prefixes `git diff`
 /// prints - see that module's `parse_diff_git_header`), so a root-level file's `dir` is empty,
 /// not `.`.

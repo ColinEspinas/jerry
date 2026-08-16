@@ -1,7 +1,6 @@
-//! The pure glob matcher behind the search panel's `include` / `exclude` path filters
-//! (`design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §5: "a funnel for path filters",
-//! and STAGE-A-CHANGELOG.md §4v's "Include/exclude globs behind `⋯` - `src/**, tests/**` /
-//! `target/**, *.lock`").
+//! The pure glob matcher behind the search panel's `include` / `exclude` path filters - the
+//! design's "funnel for path filters", with include/exclude globs behind it (`src/**, tests/**`
+//! / `target/**, *.lock`).
 //!
 //! ## Why hand-rolled rather than `globset`
 //!

@@ -1,11 +1,11 @@
-//! Pure logic for Surface C's File view *Diagnostic* state (`design_handoff_jerry_ade/
-//! README.md`'s "Language server UI" subsection): turns a `Vec<lsp_types::Diagnostic>` (as
+//! Pure logic for Surface C's File view *Diagnostic* state (`docs/design/work-surface.md`'s
+//! language-server UI): turns a `Vec<lsp_types::Diagnostic>` (as
 //! published by `rust-analyzer` via `lsp_core::LspClient::diagnostics_for`) into per-line,
 //! byte-range-addressed data `crate::root`'s renderer draws a dotted underline/row tint/inline
 //! message/card from. Deliberately `gpui`-window-free, mirroring `crate::code_surface::code_view`'s split
 //! between pure logic and `crate::root`'s `Div` construction.
 //!
-//! Completions and Hover (`design_handoff_jerry_ade/README.md`'s `lsp_popup` state) are out of
+//! Completions and Hover - the other two `lsp_popup` states - are out of
 //! scope here - `lsp_core::LspClient`'s generic `request`/`notify` methods are equally usable
 //! for those later; only this module's mapping logic is diagnostics-specific.
 

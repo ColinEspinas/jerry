@@ -107,10 +107,9 @@ use crate::root::scrollbar_geometry as geometry;
 /// The scrollbar's own thickness (track + thumb width/height) - the hit target as well as the
 /// visual width.
 ///
-/// This used to be a local `8.0` chosen to match this UI's compact chrome, because the mockup had
-/// no scrollbar spec at all. Rev 6 supplies one (`design_handoff_jerry_ade/revision 5/
-/// STAGE-A-CHANGELOG.md` §4p, whose own note is that "for the Rust build this is a spec, not
-/// CSS"), so the number now tracks [`theme::scrollbar::WIDTH`] along with the rest of §4p's table:
+/// This used to be a local `8.0` chosen to match this UI's compact chrome, because there was no
+/// scrollbar spec at all. There is one now, so the number tracks [`theme::scrollbar::WIDTH`]
+/// along with the rest of that spec's table:
 /// [`theme::scrollbar::THUMB_RADIUS`], [`theme::scrollbar::THUMB_INSET`], and a *transparent*
 /// track. The thumb is inset on each side, so what is actually painted is `10 - 2*2 = 6px` wide,
 /// visually slimmer than the old flush 8px bar, on a larger hit target.

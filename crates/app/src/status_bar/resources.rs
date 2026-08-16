@@ -1,9 +1,8 @@
 //! The Resources popover's data model: the `repo → worktree → agent` cost tree behind the status
-//! bar's `41% cpu · 3.4 GB` readout (GitHub issue #293,
-//! `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4d).
+//! bar's `41% cpu · 3.4 GB` readout (GitHub issue #293).
 //!
 //! Pure and GPUI-free, like `crate::rail::state` - the whole point of this module is that the one
-//! sentence §4d insists on ("**everything derives from `resDefs`, so the bar readout is the sum of
+//! sentence the design insists on ("**everything derives from one source, so the bar readout is the sum of
 //! the tree** - a hardcoded total that drifts from its own breakdown is the defect this panel
 //! would otherwise ship with") is a property that can be tested directly, without a window.
 //!

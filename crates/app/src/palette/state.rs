@@ -622,7 +622,7 @@ pub fn build_language_server_groups(
 ///
 /// **`Agents` and `Terminals` are two groups, not one** (GitHub issue #381). Both are open panes
 /// and both are worth switching to by name, but a plain `ProcessKind::Shell` is not an agent -
-/// `Jerry.dc.html` has never counted the terminal among a worktree's `agents`, and filing a shell
+/// the design has never counted a terminal among a worktree's agents, and filing a shell
 /// under a heading that reads `Agents` told the user the opposite of what the rest of the app
 /// (the rail, which gives a shell no agent row at all; the pane chrome, which draws a shell a
 /// different bottom bar) tells them. Splitting rather than filtering is deliberate: the palette

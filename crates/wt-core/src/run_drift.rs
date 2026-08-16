@@ -1,7 +1,7 @@
 //! How far a worktree's branch has moved on since a moment in time - the real git side of
 //! GitHub issue #227's **drift** axis.
 //!
-//! `design_handoff_jerry_ade/revision 5/REVISION-2026-08-13.md` §4 defines drift as a count of
+//! The design defines drift as a count of
 //! "commits since" a finished agent run ended, banded into `at the tip` / `1-2 commits since` /
 //! `3+ commits since`. The band and its wording are the app's (`app::run_history::model`); the
 //! *number* is this module, and it is a real `git log` traversal in the run's own checkout, never

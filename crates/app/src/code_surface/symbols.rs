@@ -1,6 +1,6 @@
 //! The File view breadcrumb's **symbol path** - the real chain of enclosing declarations around
-//! wherever the caret currently sits (`design_handoff_jerry_ade/README.md`: "Breadcrumb 26
-//! (`src › db › query_builder.rs › impl QueryBuilder › build`, ...)").
+//! wherever the caret currently sits - the breadcrumb's
+//! `src › db › query_builder.rs › impl QueryBuilder › build`.
 //!
 //! GitHub issue #178: the breadcrumb band used to render only `code_view::breadcrumb_segments`'
 //! path components, which the Surface C toolbar directly above it already shows - a literal

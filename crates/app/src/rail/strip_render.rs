@@ -7,9 +7,9 @@
 //!
 //! ## The strip speaks the tab language
 //!
-//! `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4v, verbatim, on what the cells
-//! are: "**38px full-height cells, no radius, no gap**, selected = a filled slab that cuts the
-//! column rule to join the panel below, inactive = transparent over a recessed strip." Then, on
+//! What the cells are, verbatim from the design: "**38px full-height cells, no radius, no gap**,
+//! selected = a filled slab that cuts the column rule to join the panel below, inactive =
+//! transparent over a recessed strip." Then, on
 //! the divisions: "each cell carries `border-right: 1px #1c2023` - the same rule the tabs use
 //! between them ... Segments divided by vertical rules is most of what makes a tab strip legible;
 //! the first cut had the slab and the cut-out but no divisions, so it read as icons on a dark
@@ -45,10 +45,10 @@
 //! [`crate::rail::strip`], which can assert them without a window.
 //!
 //! **What the design does not ask for here, and this therefore does not do**: grouping rows by
-//! file, and an `all`/`this worktree` scope toggle. `Jerry.dc.html`'s `probRows` is a flat list,
-//! and §6's scope toggle belongs to *Agent history* ("**Agent history** is repo → worktree → run,
+//! file, and an `all`/`this worktree` scope toggle. Problems is a flat list, and the scope toggle
+//! belongs to *Agent history* ("**Agent history** is repo → worktree → run,
 //! matching the rail, with an `all` / `this worktree` scope toggle") - Problems is specified the
-//! other way in the same revision, as following the selected worktree and only that. A scope
+//! other way, as following the selected worktree and only that. A scope
 //! toggle here would contradict §2's own reason for keying the store at all.
 
 use super::*;
@@ -474,9 +474,9 @@ impl AdeApp {
     }
 
     /// One Problems row: a 5px severity square, the message, and the file/position/source line
-    /// under it - `Jerry.dc.html`'s own `probRows` markup - and the click that opens it.
+    /// under it - and the click that opens it.
     ///
-    /// **The click** is `REVISION-2026-08-13.md` §2's own half of the row spec ("severity square,
+    /// **The click** is the design's own half of the row spec ("severity square,
     /// message, file, line, source; opens the file at the line on click"). It goes through
     /// [`Self::open_file_at_line`], the same one move go-to-definition and a terminal `path:line`
     /// link already make - so a Problems row lands the caret on the diagnostic's line through the
@@ -569,12 +569,12 @@ impl AdeApp {
             )
     }
 
-    /// The row's `file` cell: the directory prefix dimmed, the file name at the mock's own
-    /// `#7d848b` ([`theme::text::DIMMER`]).
+    /// The row's `file` cell: the directory prefix dimmed, the file name at
+    /// [`theme::text::DIMMER`].
     ///
-    /// `Jerry.dc.html` prints the **bare file name** here (`p.file.split('/').pop()`), and this
+    /// The design prints the **bare file name** here, and this
     /// deliberately keeps the directory in front of it. The reason is the one thing #292 adds that
-    /// the mock's rows do not have: these rows *open a file*. Four `mod.rs` rows that all read
+    /// the designed rows do not have: these rows *open a file*. Four `mod.rs` rows that all read
     /// `mod.rs` give no way to tell which file a click is about to open - and the design already
     /// has a shape for exactly this tension, in the Search view one section over, whose rows carry
     /// `dir` and `file` as two spans at two weights rather than dropping either. This is that
@@ -662,9 +662,9 @@ pub(in crate::rail) fn strip_cell(
 /// why the already-lit selected cell keeps its own [`theme::text::SELECTED`] rather than taking
 /// [`theme::text::GLYPH_HOVER`]: at `#dde2e7` over `#c8ced4` that assignment would make hovering
 /// the *active* view visibly dim it, re-creating in one direction the exact "hover out-reads
-/// selected" collision the section moved hover off background to fix. (`Jerry.dc.html` applies its
-/// one `style-hover` to every cell from a shared template, so its selected cell really does dim;
-/// the stated rule is the one followed here.)
+/// selected" collision the design moved hover off background to fix. (The design applies its one
+/// hover style to every cell from a shared template, so its selected cell really does dim; the
+/// stated rule is the one followed here.)
 fn strip_glyph_hover(selected: bool) -> theme::ColorToken {
     if selected {
         theme::text::SELECTED
@@ -673,9 +673,8 @@ fn strip_glyph_hover(selected: bool) -> theme::ColorToken {
     }
 }
 
-/// A cell's state marker: the tabs' own 5px square dot, in the marker's hue, at `Jerry.dc.html`'s
-/// own `right:7 top:8` (§4v: "Badges moved to `right:5 top:6` - on a square cell, corner-anchored
-/// badges read as clipped", and the final markup settled one step further in again).
+/// A cell's state marker: the tabs' own 5px square dot, in the marker's hue, inset from the
+/// cell's corner - on a square cell, corner-anchored badges read as clipped.
 ///
 /// [`theme::radius::MARK_SM`] rather than [`theme::radius::MARK`] because that 1px is what makes a
 /// 5px square read as a square: this app already uses a real circle for "an agent's status", and
@@ -1442,7 +1441,7 @@ mod problems_view_tests {
 
     /// §2's header "names every severity the list is showing", over a real three-severity list -
     /// and the strip's marker over the same one pass. The marker is red because there is a real
-    /// error in it (`Jerry.dc.html`'s `probTally.err ? '#e0625c' : '#e2a336'`).
+    /// error in it, and the marker is red once anything is.
     #[gpui::test]
     fn the_header_and_the_marker_are_tallied_over_the_real_published_list(cx: &mut TestAppContext) {
         let repo = init_repo();

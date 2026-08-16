@@ -26,11 +26,9 @@ pub(crate) fn available_cores() -> usize {
     })
 }
 
-/// The three type tiers rev 6 rebuilt the bar around
-/// (`design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §3, and
-/// `STAGE-A-CHANGELOG.md` §4c's diagnosis: "the cause was not density - it was that after the
-/// cut, **all thirteen-then-five readouts sat at 10px in `#4a5057`**, one flat tone on `#101214`.
-/// No hierarchy means the eye has to read all of it to find any of it").
+/// The three type tiers the bar was rebuilt around. The diagnosis: "the cause was not density -
+/// it was that after the cut, **all thirteen-then-five readouts sat at 10px in `#4a5057`**, one
+/// flat tone on `#101214`. No hierarchy means the eye has to read all of it to find any of it".
 ///
 /// A named enum rather than three ad-hoc `.text_color(...)`/`.text_size(...)` pairs at each call
 /// site: the whole defect was that every readout independently picked the same tone, so the fix
@@ -111,10 +109,10 @@ fn running_agents_label(count: usize) -> String {
 ///
 /// ## What this bar carries, and what it deliberately no longer does
 ///
-/// `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4b counted the old bar's thirteen
-/// readouts and found eight of them lifted from VS Code's status bar: "VS Code's footer answers
-/// 'what am I typing into'; Jerry's job is watching agents. Wrong app's chrome." Deleted with
-/// this rebuild, code paths and all (§7 rule 5: "Replacing a control means deleting its old keys
+/// An audit counted the old bar's thirteen readouts and found eight of them lifted from VS
+/// Code's status bar: "VS Code's footer answers 'what am I typing into'; Jerry's job is watching
+/// agents. Wrong app's chrome." Deleted with
+/// this rebuild, code paths and all ("Replacing a control means deleting its old keys
 /// in the same edit"): `ln N`, the indent width, the line ending, the encoding, the editor-zoom
 /// readout, the UI-scale readout, `N servers · M errors`, the five urgency-counter dots, and the
 /// `N wt · Y GB` cluster.

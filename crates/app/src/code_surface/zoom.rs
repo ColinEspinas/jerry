@@ -300,7 +300,7 @@ mod code_zoom_tests {
             app.read_with(cx, |app, _| app.settings.appearance.editor_zoom_percent),
             AdeApp::ZOOM_DEFAULT_PERCENT,
             "resetting zoom - the toolbar value's own click affordance - must land exactly on \
-             100%, matching design_handoff_jerry_ade/revision/CHANGELOG.md's change 6"
+             100%"
         );
     }
 

@@ -1,9 +1,9 @@
 //! The real sidebar History body (GitHub issue #227): the scope toggle, the count line, the
 //! repo → worktree → run tree, and the click that opens a run's transcript.
 //!
-//! `design_handoff_jerry_ade/revision 5/REVISION-2026-08-13.md` §3 is the whole brief for this
-//! file, in one sentence: History "is a **list you pick from**, like a file tree - not a
-//! document. Centre tabs hold things you read or work in; the sidebar holds things you navigate."
+//! The whole brief for this file is one design sentence: History "is a **list you pick from**,
+//! like a file tree - not a document. Centre tabs hold things you read or work in; the sidebar
+//! holds things you navigate."
 //! So nothing here renders a transcript; a row's only job is to open one
 //! ([`crate::run_history::tab`]).
 //!

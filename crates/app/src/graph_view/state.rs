@@ -142,8 +142,8 @@ pub(crate) struct GraphBranchMergeFacts {
 
 /// Whether the branch menu's "Merge into current branch…" row is live, and if not, the real
 /// reason - rendered *on the row itself*, dimmed and un-clickable, never a silent no-op (GitHub
-/// issue #241; `design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §1 rule 3: "disabled
-/// while anything is uncommitted, with the reason on the button itself").
+/// issue #241). The design's rule: "disabled while anything is uncommitted, with the reason on
+/// the button itself".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GraphBranchMergeGate {
     /// Every precondition holds. `current_branch` is the branch the merge would land in - the
@@ -180,9 +180,8 @@ impl GraphBranchMergeGate {
 /// The one place the graph decides whether "Merge into current branch…" may run (GitHub issue
 /// #241).
 ///
-/// The two *content* preconditions and their exact wording come straight from the design's own
-/// `mergeReady`/`mergeWhy` (`design_handoff_jerry_ade/revision 5/Jerry.dc.html`):
-/// `!uncommitted.length && !liveAgents.length`, reported as `N files still uncommitted` /
+/// The two *content* preconditions and their exact wording come straight from the design: no
+/// uncommitted files and no live agents, reported as `N files still uncommitted` /
 /// `N agents still working`. The structural ones ahead of them are this app's own: they describe
 /// states in which `wt_core::merge::attempt_merge_into_current` could not do anything meaningful
 /// at all, and each mirrors a real `wt_core::Error` variant that function would otherwise return

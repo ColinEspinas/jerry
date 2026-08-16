@@ -794,10 +794,8 @@ impl AdeApp {
             )
     }
 
-    /// A 1.5×16 bar at the palette input's real insertion point - matching `Jerry.dc.html`'s own
-    /// `paletteEmpty`/`paletteTyped` fixture (`design_handoff_jerry_ade/revision/Jerry.dc.html`),
-    /// which renders the identical two-position caret rather than a fixed one, so this isn't a
-    /// new invention. `margin_right`/`margin_left` place it on whichever side of the text it sits
+    /// A 1.5×16 bar at the palette input's real insertion point - the design renders the
+    /// identical two-position caret rather than a fixed one, so this isn't a new invention. `margin_right`/`margin_left` place it on whichever side of the text it sits
     /// on: before the placeholder (empty query) or after the real typed text (non-empty).
     /// The palette's input row: scope-prefix glyph, typed query (or its placeholder), a caret at
     /// the real insertion point, and the clickable segmented scope control.
@@ -805,8 +803,7 @@ impl AdeApp {
     /// The caret used to be a fixed bar rendered unconditionally *after* the text/placeholder,
     /// which read as a UI artefact rather than a real insertion-point indicator (the design
     /// audit's own wording). It now sits before the placeholder while the query is empty, and
-    /// immediately after the real typed text once something has been entered - matching
-    /// `Jerry.dc.html`'s own two-position fixture.
+    /// immediately after the real typed text once something has been entered.
     ///
     /// In a drill-down step the placeholder states the question being asked and the segmented
     /// scope control is dropped: scopes filter the root list's three candidate kinds, and a step
@@ -842,8 +839,7 @@ impl AdeApp {
             )
             // GitHub issue #336: through the one helper that owns this structure, like every
             // other simple input in the app. The palette keeps its own caret *metrics* (16px
-            // tall, 3px before the placeholder, 2px after the typed text -
-            // `Jerry.dc.html`'s own `paletteEmpty`/`paletteTyped` fixture) through
+            // tall, 3px before the placeholder, 2px after the typed text) through
             // `SimpleInputCaret`, which is exactly why that type exists. What it gains is a caret
             // that follows `TextField::caret` instead of sitting at the end of the query
             // regardless, a real selection highlight, and real click/drag/double-click selection.

@@ -1,5 +1,5 @@
-//! Pure logic for Surface C's File view *Hover* state (`design_handoff_jerry_ade/README.md`'s
-//! "Language server UI" subsection) - turns an `lsp_types::Hover` response (returned by
+//! Pure logic for Surface C's File view *Hover* state (`docs/design/work-surface.md`'s
+//! language-server UI) - turns an `lsp_types::Hover` response (returned by
 //! `rust-analyzer` via `lsp_core::LspClient::request`, see `crate::root::AdeApp::request_hover`)
 //! into a render model `crate::root` draws a signature/doc/module-path card from, plus the
 //! position-encoding helper the hover trigger needs to build that request. Deliberately
@@ -8,7 +8,7 @@
 //!
 //! ## Completions are out of scope
 //!
-//! `design_handoff_jerry_ade/README.md`'s `lsp_popup` state also covers `Completions`, not built
+//! The `lsp_popup` state also covers `Completions`, not built
 //! here. The design's Completions popup assumes an editable caret mid-edit (`⏎ accept` inserts
 //! the selected candidate) - `crate::code_surface::code_view`'s File view is read-only, with no caret and no
 //! text insertion, so a Completions popup would show real candidates with no way to accept one:
@@ -110,7 +110,7 @@ pub fn position_for_line_byte_offset(
 /// this module's top-level docs for how [`build_hover_render_model`] derives these three fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HoverRenderModel {
-    /// The crate/module path prefix (`design_handoff_jerry_ade/README.md`: "`core::convert`"),
+    /// The crate/module path prefix (e.g. `core::convert`),
     /// when the hovered symbol is path-qualified and rust-analyzer's response included one -
     /// `None` for a local/parameter/literal/anything else with no module path.
     pub module_path: Option<String>,
@@ -591,9 +591,8 @@ pub fn build_hover_render_model(hover: &lsp_types::Hover) -> Option<HoverRenderM
 /// Picks the first usable `(Uri, Range)` out of an `lsp_types::GotoDefinitionResponse`, an
 /// untagged three-way union per the LSP spec (a single `Location`, a `Vec<Location>`, or a
 /// `Vec<LocationLink>`) - `lsp_core::client`'s end-to-end definition test observes rust-analyzer
-/// replying with the `Array` shape for a call-site query. Only the *first* location is used:
-/// `design_handoff_jerry_ade/README.md`'s `F12 definition` footer navigates to one place, not a
-/// disambiguation list. `Range` (not just a line number) is returned so the caller can navigate
+/// replying with the `Array` shape for a call-site query. Only the *first* location is used: the
+/// hover card's `F12 definition` footer navigates to one place, not a disambiguation list. `Range` (not just a line number) is returned so the caller can navigate
 /// without a second lookup, even though `crate::root::AdeApp::trigger_goto_definition` only uses
 /// `range.start.line`.
 pub fn first_definition_location(

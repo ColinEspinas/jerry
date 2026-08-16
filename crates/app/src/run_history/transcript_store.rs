@@ -1,7 +1,7 @@
 //! Real, on-disk transcripts for finished runs, **keyed by run id** (GitHub issue #227).
 //!
-//! `design_handoff_jerry_ade/revision 5/REVISION-2026-08-13.md` §3: "Archived runs carry their own
-//! transcript, keyed by run id (`runOutputs`), never the live agent's buffer." This module is that
+//! The design's rule: "Archived runs carry their own transcript, keyed by run id, never the live
+//! agent's buffer." This module is that
 //! key-value store, and the key is the same [`crate::review::state::baseline_key`] every other
 //! per-run persisted thing in this app is filed under, so a transcript can never end up attached
 //! to a different run than the record beside it.

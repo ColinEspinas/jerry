@@ -189,9 +189,8 @@ pub(crate) fn render_sidebar_message(text: String, color: gpui::Rgba) -> gpui::A
         .into_any_element()
 }
 
-/// Git's own status letter for one file - `A`/`M`/`D` - in the fixed 9px, centred column
-/// `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4j specifies, with the tooltip
-/// that spells it out.
+/// Git's own status letter for one file - `A`/`M`/`D` - in the fixed 9px, centred column the
+/// design specifies, with the tooltip that spells it out.
 ///
 /// One function for all four sites that show it (the Uncommitted rows, the diff toolbar above a
 /// file, the commit file list, and the review file list) rather than four hand-written spans, for
@@ -1110,8 +1109,8 @@ pub(crate) fn text_editing_modifiers(
 /// One [`SimpleInput`]'s caret metrics.
 ///
 /// Exists because the command palette's caret is genuinely a different control from every other
-/// field's: `design_handoff_jerry_ade/revision/Jerry.dc.html`'s own `paletteEmpty`/`paletteTyped`
-/// fixture draws it 16px tall with a 3px gap before the placeholder and a 2px gap after the typed
+/// field's: the design draws it 16px tall with a 3px gap before the placeholder and a 2px gap
+/// after the typed
 /// text, while every other input in the app is the plain flush 14px bar this type defaults to. The
 /// alternative to modelling that here was leaving the palette hand-assembling its own row
 /// forever, which is exactly how it ended up the one field whose caret ignored
@@ -1274,8 +1273,7 @@ impl AdeApp {
 /// The fill behind a centered modal panel - the New file prompt
 /// (`crate::root::new_file::AdeApp::render_new_file_prompt`).
 ///
-/// Derived from `theme::surface::SCRIM`, the design handoff's own scrim colour
-/// (`design_handoff_jerry_ade/revision/README.md`: "Scrim rgba(6,7,8,.62)"), rather than a raw
+/// Derived from `theme::surface::SCRIM`, the designed scrim colour, rather than a raw
 /// `gpui::black()` literal - a literal colour rather than a token, which is exactly what this
 /// app's theming discipline exists to keep out. The alpha stays at 0.35: a small centered dialog
 /// does not dim as hard as the palette, which replaces the entire workspace and uses the

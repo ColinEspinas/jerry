@@ -1,5 +1,5 @@
-//! Pure data model for the Settings surface (`design_handoff_jerry_ade/revision/README.md`'s
-//! "Settings" section). Maps already-real app state (agent binaries on `$PATH`, the worktree
+//! Pure data model for the Settings surface (`docs/design/settings.md`). Maps already-real app
+//! state (agent binaries on `$PATH`, the worktree
 //! list, the registered global keybindings) to what a settings row should show, with no `gpui`
 //! dependency so it's directly unit-testable; `crate::root` turns the result into `gpui::Div`
 //! trees. Config-file-backed values live in `crate::settings::store` instead - this module is
@@ -9,8 +9,8 @@
 //!
 //! General, Agents, Worktrees, Appearance, Themes, Keybindings, Editor, Language servers, and
 //! Notifications render real, live-derived content (see [`SettingsPage::is_implemented`]).
-//! Integrations and About are honest nav-only placeholders - `Jerry.dc.html`'s own `setStub`
-//! copy, "not designed in this mockup". Editor is a partial exception, not a full one: its one
+//! Integrations and About are honest nav-only placeholders that say so out loud rather than
+//! faking content. Editor is a partial exception, not a full one: its one
 //! real row is the minimap (`crate::code_surface::minimap`, GitHub issue #30's
 //! `editor.minimap.enabled`) - indentation/soft-wrap/whitespace-display still have no real
 //! backing anywhere in this codebase, so those stay left off the page entirely rather than
@@ -22,7 +22,7 @@
 //!
 //! ## Why the Agents/Worktrees "Behaviour"/"Policy" toggle sections are left out
 //!
-//! `Jerry.dc.html`'s `settingsRows.agents`/`settingsRows.worktrees` fixtures show toggles like
+//! The design's Agents and Worktrees pages show toggles like
 //! "Plan before editing" or a "Worktree root" path field, but nothing in this app persists a
 //! value per agent or per worktree (even `crate::settings::store::Settings` is a flat, global
 //! struct with nowhere to hang a per-agent bool). Rendering them anyway would be a control bound
@@ -34,8 +34,7 @@ use std::path::PathBuf;
 use crate::rail::state::WorktreeNote;
 use crate::work_surface::agents::AgentKind;
 
-/// Every page `Jerry.dc.html`'s `settingsNavDefs` fixture lists, in the order the design's four
-/// nav groups present them (see [`nav_groups`]).
+/// Every Settings page, in the order the four nav groups present them (see [`nav_groups`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsPage {
     General,
@@ -117,11 +116,10 @@ impl SettingsPage {
         )
     }
 
-    /// The content column's one-line rationale under the page title
-    /// (`design_handoff_jerry_ade/revision/README.md`'s "Content column" section) - app-authored
-    /// text, not copy from the mockup (`Jerry.dc.html` has no per-page subtitle fixture). Every
-    /// nav-only page shares the same placeholder text; the placeholder page *body* is separately
-    /// the mockup's verbatim `setStub` copy - see `crate::settings::render::render_settings_placeholder_page`.
+    /// The content column's one-line rationale under the page title - app-authored text, the
+    /// design carrying no per-page subtitle. Every nav-only page shares the same placeholder
+    /// text; the placeholder page *body* is separate - see
+    /// `crate::settings::render::render_settings_placeholder_page`.
     pub fn subtitle(self) -> &'static str {
         match self {
             SettingsPage::General => {
@@ -163,7 +161,7 @@ pub struct NavGroup {
     pub pages: Vec<SettingsPage>,
 }
 
-/// The fixed nav structure - `Jerry.dc.html`'s own `settingsNavDefs` grouping and order,
+/// The fixed nav structure - the design's own grouping and order,
 /// unchanged. Every page is clickable navigation even though not every page renders real
 /// content past that point (see [`SettingsPage::is_implemented`]).
 pub fn nav_groups() -> Vec<NavGroup> {
@@ -224,8 +222,8 @@ impl AgentRow {
         self.resolved_path.is_some()
     }
 
-    /// The status label next to the row's status dot ("green dot + 'ready'" per
-    /// `design_handoff_jerry_ade/revision/README.md`), or the honest opposite when not found.
+    /// The status label next to the row's status dot - a green dot and `ready`, or the honest
+    /// opposite when not found.
     pub fn status_label(&self) -> &'static str {
         if self.is_ready() {
             "ready"
@@ -287,9 +285,8 @@ pub fn worktree_dot_status(is_main: bool, note: &WorktreeNote) -> WorktreeDotSta
     }
 }
 
-/// A worktree row's right-aligned action - `design_handoff_jerry_ade/README.md`'s "a
-/// right-aligned Open ... or Prune ... action" (the main checkout's row has no action at all;
-/// every other row is `Open` or `Prune`, never both).
+/// A worktree row's right-aligned action - `Open` or `Prune`, never both. The main checkout's
+/// row has no action at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorktreeRowAction {
     /// The main checkout - `git worktree remove` refuses it outright, and there's nowhere else
@@ -382,10 +379,10 @@ pub struct LspLanguage {
     /// file-tree row for that language would show.
     pub ext: &'static str,
     pub binary: &'static str,
-    /// Generic descriptive copy, not a live count - `Jerry.dc.html`'s own `lspDefs` notes mix
-    /// this with fabricated live data ("1,284 crates indexed") this app has no per-language
-    /// agent summary to back (`crate::lsp::client`'s server clients are keyed by worktree, not
-    /// surfaced here). Every note here is deliberately the descriptive kind only.
+    /// Generic descriptive copy, not a live count. The design mixes this slot with live figures
+    /// ("1,284 crates indexed") this app has no per-language agent summary to back
+    /// (`crate::lsp::client`'s server clients are keyed by worktree, not surfaced here), so every
+    /// note here is deliberately the descriptive kind only.
     pub note: &'static str,
     /// This server's real official install/docs page - see
     /// `crate::language::SettingsLspRow::install_url`'s own docs for how each was verified.
@@ -447,8 +444,8 @@ impl LspRow {
         self.resolved_path.is_some()
     }
 
-    /// `Jerry.dc.html`'s own word for the not-found state - `"not installed"`, distinct from the
-    /// Agents page's `"not found"`; each page keeps its own mockup's wording.
+    /// This page's own word for the not-found state - `"not installed"`, distinct from the
+    /// Agents page's `"not found"`; each page keeps its own designed wording.
     pub fn status_label(&self) -> &'static str {
         if self.is_ready() {
             "ready"
@@ -2120,8 +2117,8 @@ mod tests {
         // *global* and so is not counted here - the right panel's Search tab has no editor to be
         // scoped to, and a real Cmd/Ctrl-modified keystroke never reaches a focused pty anyway.
         // The Changes-footer prose fix added 1 more: `space` -> `ToggleChangeStaged`, alongside
-        // `v` and `]` - `Jerry.dc.html`'s `changesHints` advertises `space stage` in that footer
-        // and nothing was bound to it. All three of those now also carry `&& !text-input`, since
+        // `v` and `]` - the Changes footer advertises `space stage` and nothing was bound to it.
+        // All three of those now also carry `&& !text-input`, since
         // issue #288's pinned note card is a real text input *inside* the `"diff"` node that
         // `"file-editor"` does not cover.
         // GitHub issue #336 added 4 more scoped bindings: `TextCopy`/`TextCut`/`TextPaste`/

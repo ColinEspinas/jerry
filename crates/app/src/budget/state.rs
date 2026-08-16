@@ -138,8 +138,7 @@ impl Provider {
     /// Every provider, in the order `Other providers` lists them.
     pub const ALL: [Provider; 2] = [Provider::Claude, Provider::Codex];
 
-    /// The lowercase name the pane strip prints (`Jerry.dc.html`'s `paneBudgetName` is
-    /// `budgetDefs[].id`, lowercase).
+    /// The lowercase name the pane strip prints.
     pub fn id(self) -> &'static str {
         match self {
             Provider::Claude => "claude",

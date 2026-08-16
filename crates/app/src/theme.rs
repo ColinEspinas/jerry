@@ -1,5 +1,5 @@
-//! Jerry's design tokens, ported from `design_handoff_jerry_ade/tokens.rs` (colour/size
-//! constants transcribed from the reviewed mockup `Jerry.dc.html`).
+//! Jerry's design tokens: every colour and dimension the UI paints, defined once here. What
+//! each group is *for*, and the rules that constrain it, is `docs/design/`.
 //!
 //! ## Runtime-swappable colour tokens ([`ColorToken`])
 //!
@@ -878,13 +878,10 @@ pub mod surface {
     pub const RAIL: ColorToken = token("surface.rail", 0x101113); // left rail + right panel
     /// The sidebar strip's own recessed band (GitHub issue #291) - the 36px view switcher above
     /// the rail. Deliberately **darker than [`RAIL`]**, and that is the whole reason it is its own
-    /// token rather than a reuse of [`WINDOW`] or [`PTY`]:
-    /// `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4v, verbatim - "a tab only
-    /// reads as connected if the strip behind it is **darker than the panel**, and here strip and
-    /// rail were both `#101113`, so the slab floated. Strip is now `#0c0e10`; the selected cell is
-    /// `#101113`, exactly the rail's own background". `Jerry.dc.html`'s own final markup then
-    /// settled one step lower again (`background:#0a0b0d`, matching §4v's closing verification
-    /// line "selected `rgb(16,17,19)` over strip `rgb(10,11,13)`"), which is the value here.
+    /// token rather than a reuse of [`WINDOW`] or [`PTY`]: a tab only reads as connected if the
+    /// strip behind it is **darker than the panel**. A strip sharing the rail's own background
+    /// makes the selected cell float instead of sitting in the strip, so this is two steps below
+    /// [`RAIL`], which the selected cell itself uses.
     ///
     /// A theme that lifted this to or above [`RAIL`] would not merely recolour the strip - it
     /// would destroy the selected cell's "cut the column rule and join the panel below" reading,
@@ -906,20 +903,18 @@ pub mod surface {
     pub const SEGMENT_TRACK: ColorToken = token("surface.segment_track", 0x171a1d);
     pub const SEGMENT_ACTIVE: ColorToken = token("surface.segment_active", 0x242a2f);
     pub const KEYCAP: ColorToken = token("surface.keycap", 0x181c1f);
-    /// The hint-size keycap's own background - distinct from [`KEYCAP`]'s standard-size
-    /// `#181c1f` (`Jerry.dc.html`: `background:#15181a;border:1px solid #23272b`).
+    /// The hint-size keycap's own background - distinct from [`KEYCAP`]'s standard-size value.
     pub const KEYCAP_HINT: ColorToken = token("surface.keycap_hint", 0x15181a);
     pub const CHIP_NEUTRAL: ColorToken = token("surface.chip_neutral", 0x23272b);
     pub const CURRENT_LINE: ColorToken = token("surface.current_line", 0x181c20);
     /// The Changes panel's Runs section - pinned to the panel's own bottom in its own capped,
     /// independently-scrolled well, distinct from the lighter [`HEADER`] the other three sections'
-    /// shared scroller sits on (`Jerry.dc.html` line 1433: `background:#0f1113`).
+    /// shared scroller sits on.
     pub const RUNS_WELL: ColorToken = token("surface.runs_well", 0x0f1113);
-    /// The Windows/Linux title bar's close caption button's hover fill. The design handoff
-    /// (`Jerry.dc.html`: `style-hover="background:#8c3a38"`, unchanged through revision 3) spec'd
-    /// a muted maroon; Colin asked for this to be the real Windows Fluent Design close-hover red
+    /// The Windows/Linux title bar's close caption button's hover fill. The original design
+    /// spec'd a muted maroon; Colin asked for the real Windows Fluent Design close-hover red
     /// (`#E81123`, the same color Windows 10/11's own native title bar uses) instead - a
-    /// deliberate override of the handoff, not a stale-spec bug.
+    /// deliberate override, not a stale-spec bug.
     pub const TITLE_BAR_CLOSE_HOVER: ColorToken = token("surface.title_bar_close_hover", 0xe81123);
     /// GitHub issue #129: the shared row-hover fill for every dropdown/context-menu in the app
     /// (`+` menu, title bar menu, tree context menu, git graph's push/row menus) - distinct from
@@ -932,10 +927,8 @@ pub mod surface {
     /// mouse-hover styled at all - a real, mockup-verified design difference, not drift; see
     /// `crate::lsp::completion_popup`'s own module docs).
     pub const MENU_ROW_HOVER: ColorToken = token("surface.menu_row_hover", 0x1d2226);
-    /// The same row hover, for a **destructive** menu row (GitHub issue #290).
-    /// `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4t specifies the shared menu's
-    /// rows as "destructive rows in `#c4726d` on a `#2a1719` hover" - so the destructive tint is
-    /// carried on the hover fill too, not on the resting label alone. Without it, `Delete` and
+    /// The same row hover, for a **destructive** menu row (GitHub issue #290). The destructive
+    /// tint is carried on the hover fill too, not on the resting label alone. Without it, `Delete` and
     /// `Copy Path` are visually identical the moment the pointer is on either of them, which is
     /// exactly when the click is about to happen.
     ///
@@ -947,9 +940,8 @@ pub mod surface {
     /// A file tab's close-affordance hover fill - one hex step off [`CHIP_NEUTRAL`]
     /// (`#23272b`), kept as its own token.
     pub const TAB_CLOSE_HOVER: ColorToken = token("surface.tab_close_hover", 0x23282c);
-    /// The Hover/Diagnostic popover footer's own band background
-    /// (`design_handoff_jerry_ade/revision 3/Jerry.dc.html`: `background:#141719` on both cards'
-    /// `source · code`/`F12 definition` footer rows) - one hex step darker than [`CARD_SUNK`]
+    /// The Hover/Diagnostic popover footer's own band background, shared by both cards'
+    /// `source · code`/`F12 definition` footer rows - one hex step darker than [`CARD_SUNK`]
     /// (`#131619`, used for every *other* card footer in the app), not a duplicate of it: the
     /// mockup genuinely uses two adjacent-but-different footer tones, and this app's own contrast
     /// tests already pin `CARD_SUNK`'s exact value elsewhere, so reusing it here would have
@@ -1012,8 +1004,7 @@ pub mod border {
     /// The hint-size keycap's own border - see [`super::surface::KEYCAP_HINT`].
     pub const KEYCAP_HINT: ColorToken = token("border.keycap_hint", 0x23272b);
     pub const SELECTED_EDGE: ColorToken = token("border.selected_edge", 0x3f5b74); // 2px left edge on a selected row
-    /// The Diagnostic popover's own border (`design_handoff_jerry_ade/revision 3/Jerry.dc.html`:
-    /// `border:1px solid #3a2224` on the diagnostic card). Paired with
+    /// The Diagnostic popover's own border. Paired with
     /// [`super::syntax::DIAGNOSTIC_ROW_BG`] for that card's background - together they give the
     /// Diagnostic popover the design's own red-tinted chrome, distinct from the Hover/Completions
     /// popovers' neutral [`POPOVER`] - see `crate::code_surface::lsp_ui::render_diagnostic_card_content`.
@@ -1118,9 +1109,8 @@ pub mod text {
     /// The colour a hovered glyph lifts to in a surface whose *background* already encodes
     /// selection - today the sidebar strip's cells (GitHub issue #291).
     ///
-    /// `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4v derives it from a real
-    /// defect and states the rule verbatim: **"two states must not compete on one property. If
-    /// background says 'selected', hover says it somewhere else."** Making the selected cell match
+    /// The rule this exists for: **two states must not compete on one property. If background
+    /// says 'selected', hover says it somewhere else.** Making the selected cell match
     /// the rail (which the cut-out requires) dropped selected to luminance 16.9 while a background
     /// hover sat at 25.4, so hovering an *inactive* view out-read the active one. "Hover moved off
     /// background entirely: the cell sets `color`, every glyph part draws with `currentColor`, and
@@ -1203,23 +1193,19 @@ pub mod status {
     ];
 }
 
-/// Tokens used only by the Revision R12 rail rewrite (`design_handoff_jerry_ade/revision 3/
-/// REVISION-2026-07-31.md` §2) that have no exact match elsewhere in this module - every other
-/// colour that section calls for (the branch/note/model/activity greys, the amber flag, the
-/// spine/selection edges) already has one, reused directly at the call site rather than
-/// duplicated here under a second name.
+/// Tokens the rail needs that have no exact match elsewhere in this module - every other colour
+/// it calls for (the branch/note/model/activity greys, the amber flag, the spine/selection edges)
+/// already has one, reused directly at the call site rather than duplicated here under a second
+/// name. See `docs/design/rail.md`.
 pub mod rail {
     use super::{token, ColorToken};
 
     /// Repo group header's uppercase name.
     ///
-    /// Revision 6 (`design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4s) retargeted this
-    /// from the rail-only `#787f86` to the app-wide section-label value: "It was `#787f86` at
-    /// `.08em` while every other section label in the app - `Runs`, `Uncommitted`, `Commits`,
-    /// `Resources`, `Rate limits` - was already `#9aa1a8` at `.09em`. It now uses that token."
-    /// `Jerry.dc.html`'s rail band and all four Changes-panel section labels really do paint the
-    /// same `#9aa1a8`, which is why [`super::changes::SECTION_LABEL`] carries the identical value:
-    /// a repo band is a section header, not a rail-specific ornament.
+    /// The app-wide section-label value, not a rail-only one: `Runs`, `Uncommitted`, `Commits`,
+    /// `Resources` and `Rate limits` all paint this same grey, which is why
+    /// [`super::changes::SECTION_LABEL`] carries the identical value. A repo band is a section
+    /// header, not a rail-specific ornament.
     ///
     /// Kept under its own `rail.` key rather than folded into one shared constant because the key
     /// is a *themable* name a user's `.toml` may already set - renaming it would silently drop
@@ -1234,8 +1220,7 @@ pub mod rail {
     /// (`STAGE-A-CHANGELOG.md` §4n: agent title `450 11.5px/16px` `#c2c7cc` -> `450 11px/15px`
     /// **`#a3a9b0`**). Deliberately dimmer than [`super::text::STRONG`] (`#c2c7cc`), which the
     /// branch above it uses: "Fix hierarchy by shrinking the child, never by growing the parent."
-    /// A `crate::rail::Status::Idle` agent drops further still, to [`super::text::DIMMER`]
-    /// (`#7d848b`), exactly as `Jerry.dc.html`'s own `titleFg` does.
+    /// A `crate::rail::Status::Idle` agent drops further still, to [`super::text::DIMMER`].
     pub const AGENT_TITLE: ColorToken = token("rail.agent_title", 0xa3a9b0);
     /// The repo header's amber urgency **count** - the number beside the [`super::status::ASK`]
     /// dot (`REVISION-2026-08-14.md` §4: "`● 2` amber (`#e2a336` dot, `#c99b4e` text, needs
@@ -1691,8 +1676,7 @@ pub mod syntax {
     /// The Diagnostic state's dim, end-of-line inline message text (`README.md`: `#6b4a48`).
     pub const DIAGNOSTIC_INLINE_MESSAGE: ColorToken =
         token("syntax.diagnostic_inline_message", 0xb6706b);
-    /// The Diagnostic state's card message text (`design_handoff_jerry_ade/revision 3/
-    /// Jerry.dc.html`'s diagnostic card headline: `color:#e3908b`). Same hex as
+    /// The Diagnostic state's card message headline. Same hex as
     /// [`super::button::DANGER_FG_HOVER`], kept as its own token - unrelated elements that
     /// happen to share a designed red. Was previously `0xf07f77` - a real, uncaught typo against
     /// this same doc comment's own cited value, fixed as part of GitHub issue #186's design
@@ -1894,13 +1878,12 @@ pub mod term {
     pub const MENU_SEL_FG: ColorToken = token("term.menu_sel_fg", 0xe0b263);
     pub const MENU_SEL_BG: ColorToken = token("term.menu_sel_bg", 0x1f1a10);
     pub const CURSOR: ColorToken = token("term.cursor", 0x5a9ad4);
-    /// A clickable path/`path:line` link inside terminal output (`Jerry.dc.html`:
-    /// `color:#7fb4e3;border-bottom:1px dotted #3d6a91`).
+    /// A clickable path/`path:line` link inside terminal output, under a dotted
+    /// [`LINK_UNDERLINE`] rule.
     pub const LINK: ColorToken = token("term.link", 0x7fb4e3);
     pub const LINK_UNDERLINE: ColorToken = token("term.link_underline", 0x3d6a91);
-    /// The link's hover state (`Jerry.dc.html`: `style-hover="color:#a5cdf0;border-bottom:1px
-    /// solid #78a8d0"`). Same value as [`super::button::BLUE_FG`], kept as its own token for a
-    /// distinct element.
+    /// The link's hover state, which also swaps the dotted underline for a solid one. Same value
+    /// as [`super::button::BLUE_FG`], kept as its own token for a distinct element.
     pub const LINK_HOVER: ColorToken = token("term.link_hover", 0xa5cdf0);
     pub const LINK_UNDERLINE_HOVER: ColorToken = token("term.link_underline_hover", 0x78a8d0);
 
@@ -2085,8 +2068,7 @@ pub mod terminal {
 pub mod env {
     use super::{token, ColorToken};
 
-    /// Defaults to [`super::term::PROMPT`]'s own value (`Jerry.dc.html`'s `footRemoteFg` for
-    /// `plat === 'windows'`), independently themeable from it.
+    /// Defaults to [`super::term::PROMPT`]'s own value, independently themeable from it.
     pub const WSL_FG: ColorToken = token("env.wsl_fg", 0x8fbde6);
     pub const WSL_BG: ColorToken = token("env.wsl_bg", 0x16222c);
     pub const WSL_BORDER: ColorToken = token("env.wsl_border", 0x24384a);
@@ -2113,8 +2095,7 @@ pub mod env {
 ///
 /// # The reserved-hue allocation rule
 ///
-/// Quoted verbatim from the rev-6 design bundle, `design_handoff_jerry_ade/revision 5/
-/// STAGE-A-CHANGELOG.md` §4a ("Colour allocation rule", added after review):
+/// See `docs/design/decisions.md` §9 for how this rule came about:
 ///
 /// > **Five hue families are structural and reserved. Agent identity is allocated only outside
 /// > them.**
@@ -2227,8 +2208,6 @@ pub mod lang {
     ); // "to"
     pub const MD: (ColorToken, ColorToken) =
         (token("lang.md.fg", 0x7f9ad4), token("lang.md.bg", 0x1d2532)); // "md"
-                                                                        // Verified directly against `design_handoff_jerry_ade/revision/tokens.rs:149-160`'s real
-                                                                        // hex values, not paraphrased.
     pub const SQL: (ColorToken, ColorToken) = (
         token("lang.sql.fg", 0x6ab97f),
         token("lang.sql.bg", 0x1b2a20),
@@ -2321,9 +2300,8 @@ pub mod button {
     pub const GREEN_BG_HOVER: ColorToken = token("button.green_bg_hover", 0x2c6045);
     pub const GREEN_FG: ColorToken = token("button.green_fg", 0x9fdcb6);
     pub const GREEN_KEYCAP: ColorToken = token("button.green_keycap", 0x376b4d);
-    /// The keycap glyph colour inside a green primary button (`README.md`/`Jerry.dc.html`:
-    /// `#8ac9a4`) - not in `tokens.rs`'s `button` module (only [`GREEN_KEYCAP`], the border, is
-    /// transcribed there), added here directly.
+    /// The keycap glyph colour inside a green primary button - the fill to [`GREEN_KEYCAP`]'s
+    /// border.
     pub const GREEN_KEYCAP_FG: ColorToken = token("button.green_keycap_fg", 0x8ac9a4);
     // The equivalent blue keycap glyph colour (`#8fbde6`) needs no separate constant here -
     // it's the exact same value already ported as `term::PROMPT`.
@@ -2410,9 +2388,9 @@ pub mod toggle {
 /// the same grey.
 ///
 /// [`TREE_MODIFIED`] is **not** this `M` and is deliberately left alone: the Files tree paints
-/// its own change marks amber (`#a3873f`) in `Jerry.dc.html`'s own tree rows, where the mark is
-/// the only thing saying a file is dirty at all and genuinely is the exception. On a Changes row
-/// every line is a change, which is exactly why §4j's `M` recedes.
+/// its own change marks amber, where the mark is the only thing saying a file is dirty at all
+/// and genuinely is the exception. On a Changes row every line is a change, which is exactly why
+/// this `M` recedes.
 pub mod tag {
     use super::{token, ColorToken};
 
@@ -2438,10 +2416,8 @@ pub mod tag {
     ];
 }
 
-/// Exact colours for Surface C's real Completions popup item rows - read directly from
-/// `design_handoff_jerry_ade/revision/Jerry.dc.html`'s own `completions`/`KBG`/`KFG` data (the
-/// `sel ? ... : ...` ternaries around line 2289, and the `KBG`/`KFG` maps around line 1792) - not
-/// reused from any nearby-but-not-identical existing token (e.g. [`super::text::SELECTED`]
+/// Exact colours for Surface C's real Completions popup item rows - each its own token rather
+/// than a reuse of a nearby-but-not-identical existing one (e.g. [`super::text::SELECTED`]
 /// (`#dde2e7`) is a real, different colour from this module's own [`ITEM_SELECTED_FG`]
 /// (`#e3e8ed`), and [`super::surface::CURRENT_LINE`] (`#181c20`) - the File view's current-line
 /// tint - is the exact same hex as [`super::surface::POPOVER`] itself, which is why reusing it as
@@ -2449,28 +2425,27 @@ pub mod tag {
 pub mod completions_popup {
     use super::{token, ColorToken};
 
-    /// A selected completion row's real background (`Jerry.dc.html`: `c.sel ? '#243c50' : ...`).
+    /// A selected completion row's background.
     pub const ITEM_SELECTED_BG: ColorToken = token("completions_popup.item_selected_bg", 0x243c50);
-    /// A selected completion row's real label colour (`Jerry.dc.html`: `c.sel ? '#e3e8ed' : ...`).
+    /// A selected completion row's label colour.
     pub const ITEM_SELECTED_FG: ColorToken = token("completions_popup.item_selected_fg", 0xe3e8ed);
-    /// An unselected completion row's real label colour (`Jerry.dc.html`: `... : '#b8bfc6'`) -
-    /// the exact same hex as [`super::text::BODY`], carried here as its own token.
+    /// An unselected completion row's label colour - the exact same hex as
+    /// [`super::text::BODY`], carried here as its own token.
     pub const ITEM_FG: ColorToken = token("completions_popup.item_fg", 0xb8bfc6);
 
-    /// `(fg, bg)` for a `function`/`method`/`constructor`-shaped completion item's kind badge
-    /// (`Jerry.dc.html`'s `KFG.f`/`KBG.f`).
+    /// `(fg, bg)` for a `function`/`method`/`constructor`-shaped completion item's kind badge.
     pub const KIND_FUNCTION: (ColorToken, ColorToken) = (
         token("completions_popup.kind_function.fg", 0x8fbde6),
         token("completions_popup.kind_function.bg", 0x243c50),
     );
     /// `(fg, bg)` for a `variable`/`field`/`property`/`constant`-shaped completion item's kind
-    /// badge (`Jerry.dc.html`'s `KFG.v`/`KBG.v`).
+    /// badge.
     pub const KIND_VARIABLE: (ColorToken, ColorToken) = (
         token("completions_popup.kind_variable.fg", 0xd8a94a),
         token("completions_popup.kind_variable.bg", 0x33280f),
     );
     /// `(fg, bg)` for a `class`/`struct`/`interface`/`enum`/`type`-shaped completion item's kind
-    /// badge (`Jerry.dc.html`'s `KFG.t`/`KBG.t`).
+    /// badge.
     pub const KIND_TYPE: (ColorToken, ColorToken) = (
         token("completions_popup.kind_type.fg", 0xc294e0),
         token("completions_popup.kind_type.bg", 0x33203e),
@@ -2492,21 +2467,18 @@ pub mod completions_popup {
     ];
 }
 
-/// Settings-surface-only colours read directly from `Jerry.dc.html`'s inline literals for the
-/// `settingsOpen` block - real values present in the mockup but missing from `tokens.rs`'s
-/// transcription (predates the Settings section). Every other Settings colour reuses an
-/// existing token from another module - see `crate::root`'s Settings render methods.
+/// Settings-surface-only colours: the ones that have no equivalent in another module. Every
+/// other Settings colour reuses an existing token - see `crate::root`'s Settings render methods.
 pub mod settings {
     use super::{token, ColorToken};
 
-    /// A nav row's hover background (`Jerry.dc.html`: `style-hover="background:#17191b"`) -
-    /// distinct from [`super::surface::ROW_HOVER`] (`#15181b`).
+    /// A nav row's hover background - distinct from [`super::surface::ROW_HOVER`] (`#15181b`).
     pub const NAV_ROW_HOVER: ColorToken = token("settings.nav_row_hover", 0x17191b);
-    /// The content column's page-subtitle text (`Jerry.dc.html`: `color:#767d84`) - close to
-    /// but distinct from [`super::text::DIM`] (`#8b9197`).
+    /// The content column's page-subtitle text - close to but distinct from
+    /// [`super::text::DIM`] (`#8b9197`).
     pub const SUBTITLE: ColorToken = token("settings.subtitle", 0x767d84);
-    /// A card row's own bottom separator (`Jerry.dc.html`: `border-bottom:1px solid #1f2327`) -
-    /// distinct from [`super::border::CARD_FIELD`] (`#22272b`).
+    /// A card row's own bottom separator - distinct from [`super::border::CARD_FIELD`]
+    /// (`#22272b`).
     pub const CARD_ROW_SEP: ColorToken = token("settings.card_row_sep", 0x1f2327);
     /// A binary-found status dot on the Agents page. Same hex as [`super::status::REVIEW`],
     /// kept as its own token: the agent `Status` palette is reserved for agent urgency
@@ -2523,11 +2495,10 @@ pub mod settings {
     /// [`CARD_UNSELECTED_BG`] for the unselected counterpart.
     pub const CARD_SELECTED_BG: ColorToken = token("settings.card_selected_bg", 0x161b1f);
     pub const CARD_UNSELECTED_BG: ColorToken = token("settings.card_unselected_bg", 0x131619);
-    /// A Theme card's hover border (`Jerry.dc.html`: `style-hover="border-color:#3a4148"`).
+    /// A Theme card's hover border.
     pub const THEME_CARD_HOVER_BORDER: ColorToken =
         token("settings.theme_card_hover_border", 0x3a4148);
-    /// The config snippet block's section-header line colour (`Jerry.dc.html`'s `CSFG.s`:
-    /// `#c294e0`).
+    /// The config snippet block's section-header line colour.
     pub const SNIPPET_SECTION: ColorToken = token("settings.snippet_section", 0xc294e0);
 
     /// Every real [`ColorToken`] this module declares, paired with its own Rust `const` name -
@@ -2549,10 +2520,8 @@ pub mod settings {
 
 /// The overlay scrollbar (GitHub issue #30).
 ///
-/// Rev 5 of the mockup had no scrollbar spec at all - every scrollable region there relied on raw
-/// browser/OS scrolling - so these values used to be a judgment-call derivation from neighbouring
-/// neutral tokens. **Rev 6 supersedes that with a real spec**, `design_handoff_jerry_ade/
-/// revision 5/STAGE-A-CHANGELOG.md` §4p, whose own note is explicit that it governs this build:
+/// These values used to be a judgment-call derivation from neighbouring neutral tokens, there
+/// being no scrollbar spec at all. The real spec that superseded that:
 ///
 /// > | Part | Value |
 /// > |---|---|
@@ -2598,8 +2567,7 @@ pub mod scrollbar {
     pub const TOKENS: &[(&str, ColorToken)] = &[("THUMB", THUMB), ("THUMB_HOVER", THUMB_HOVER)];
 }
 
-/// Per-provider rate-limit budget - the meter on an agent tab and in the budget popover
-/// (`design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §2).
+/// Per-provider rate-limit budget - the meter on an agent tab and in the budget popover.
 ///
 /// Rev 6 moved budget from a single global footer readout to **one meter per agent**, because a
 /// budget is per-provider and a provider belongs to an agent. There is then **one bar per window**
@@ -2656,9 +2624,8 @@ pub mod budget {
     ];
 }
 
-/// The Changes panel - four stacked, collapsible sections in one scroller
-/// (`design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §1), plus the file row's own
-/// seen/unseen and discard states (`STAGE-A-CHANGELOG.md` §4i).
+/// The Changes panel - four stacked, collapsible sections in one scroller, plus the file row's
+/// own seen/unseen and discard states. See `docs/design/sidebar.md`.
 ///
 /// # The four sections and their left edges
 ///
@@ -2713,12 +2680,9 @@ pub mod changes {
 
     /// Section header label - 9.5px/600 uppercase, `.09em` tracking.
     ///
-    /// `#9aa1a8`, not §1's transcribed `#787f86`: `STAGE-A-CHANGELOG.md` §4s is the later word on
-    /// the same value ("every other section label in the app - `Runs`, `Uncommitted`, `Commits`,
-    /// `Resources`, `Rate limits` - was already `#9aa1a8` at `.09em`") and `Jerry.dc.html` - which
-    /// outranks both prose files - really does paint all four of these labels `#9aa1a8`. Same
-    /// value, same citation, as [`super::rail::REPO_HEADER_NAME`]: a repo band and a Changes
-    /// section are the same kind of header.
+    /// Every section label in the app paints this same grey - `Runs`, `Uncommitted`, `Commits`,
+    /// `Resources`, `Rate limits`. Same value as [`super::rail::REPO_HEADER_NAME`]: a repo band
+    /// and a Changes section are the same kind of header.
     pub const SECTION_LABEL: ColorToken = token("changes.section_label", 0x9aa1a8);
     /// Section header count - 9.5px mono, immediately after the label.
     pub const SECTION_COUNT: ColorToken = token("changes.section_count", 0x4a5057);
@@ -2785,13 +2749,11 @@ pub mod changes {
     /// border weight, on two unrelated elements.
     pub const SHARED_RING: ColorToken = token("changes.shared_ring", 0x8a6420);
 
-    /// The `you` gutter bar in the diff view - Orca's second rule, kept: *"your own hand edit
-    /// flips that line back to you"* (`REVISION-2026-08-14.md` §1), and `you` is deliberately
-    /// **not** an agent, so it is deliberately not an agent tint either.
+    /// The `you` gutter bar in the diff view - *your own hand edit flips that line back to you*,
+    /// and `you` is deliberately **not** an agent, so it is deliberately not an agent tint either.
     ///
-    /// `#4e545a`, `Jerry.dc.html`'s own `attrOf('you').bg` - a neutral, outside
-    /// [`super::agent`]'s whole pool by construction, so a hand edit can never be mistaken for
-    /// whichever agent happens to hold the nearest hue.
+    /// A neutral, outside [`super::agent`]'s whole pool by construction, so a hand edit can never
+    /// be mistaken for whichever agent happens to hold the nearest hue.
     pub const HAND_EDIT_GUTTER: ColorToken = token("changes.hand_edit_gutter", 0x4e545a);
     /// The `you` author chip's glyph, the neutral counterpart to an agent chip's own tint.
     pub const HAND_EDIT_CHIP_FG: ColorToken = token("changes.hand_edit_chip_fg", 0x8b9197);
@@ -2848,8 +2810,7 @@ pub mod changes {
     ];
 }
 
-/// The status bar's three type tiers
-/// (`design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §3).
+/// The status bar's three type tiers - see `docs/design/layout.md`.
 ///
 /// > Three tiers instead of one flat 10px smear - the problem was never density, it was that five
 /// > readouts at `#4a5057` all read at once, so you had to read all of it to find any of it.
@@ -2874,10 +2835,9 @@ pub mod status_bar {
     /// Tier 1 - the readouts you are meant to find first (`main ↑2 ↓0`, `4 agents running`).
     pub const PRIMARY: ColorToken = token("status_bar.primary", 0xa9b0b7);
     /// Tier 2 - the supporting half of a split readout, dimmer than [`PRIMARY`] but still meant
-    /// to be read (`design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4c's `#7d848b`
-    /// "secondary" row: provider names in the bar once GitHub issue #294 lands, and today the
+    /// to be read: provider names in the bar once GitHub issue #294 lands, and today the
     /// Resources popover's own memory column, which is that same "detail you read only if the
-    /// count surprised you" tone).
+    /// count surprised you" tone.
     pub const SECONDARY: ColorToken = token("status_bar.secondary", 0x7d848b);
     /// Tier 3 - resource readouts, present but never competing (`41% cpu · 3.4 GB`).
     pub const RECESSIVE: ColorToken = token("status_bar.recessive", 0x4a5057);
@@ -2918,10 +2878,10 @@ pub mod status_bar {
     ];
 }
 
-/// Diff-line review notes (GitHub issue #288, `STAGE-A-CHANGELOG.md` §1's two `§6.2` rows and
-/// the audit's top-5 #2) - the notes bar above the hunks and the card pinned beneath a line.
+/// Diff-line review notes (GitHub issue #288) - the notes bar above the hunks and the card
+/// pinned beneath a line.
 ///
-/// Every value here is transcribed directly from `Jerry.dc.html`'s own inline styles for that
+/// Every value here is its own token rather than a reuse of a neighbouring one, for that
 /// surface (the `hasNotes` bar and the `l.isNote` branch of the diff row loop), not derived.
 ///
 /// The one colour worth naming twice is [`EDGE`]: `#5a9ad4` is this palette's *selection* blue -
@@ -3006,9 +2966,8 @@ pub mod notes {
     ];
 }
 
-/// Agent history - the sidebar's run list and the run-transcript tab (GitHub issue #227,
-/// `design_handoff_jerry_ade/revision 5/REVISION-2026-08-13.md` §4/§5, transcribed from that
-/// revision's own tables and from `revision 5/tokens.rs`'s `history` module).
+/// Agent history - the sidebar's run list and the run-transcript tab (GitHub issue #227). See
+/// `docs/design/work-surface.md` and `docs/design/sidebar.md`.
 ///
 /// # Two independent axes
 ///
@@ -3078,10 +3037,9 @@ pub mod history {
     /// The drift label in the far band only (§4: "`N commits since` in `#a3873f`").
     pub const DRIFT_FAR_TEXT: ColorToken = token("history.drift_far_text", 0xa3873f);
 
-    /// The scope toggle's selected segment (`REVISION-2026-08-14.md` §6's `all` / `this worktree`
-    /// pair) - `Jerry.dc.html`'s own `hScopes` fill and border. Its own keys rather than
-    /// [`surface::SEGMENT_ACTIVE`]'s, because the mock draws this control as a *bordered* pill
-    /// inside a 27px band rather than as the settings screen's tracked segmented control.
+    /// The scope toggle's selected segment - the `all` / `this worktree` pair. Its own keys
+    /// rather than [`surface::SEGMENT_ACTIVE`]'s, because this control is a *bordered* pill
+    /// inside a 27px band rather than the settings screen's tracked segmented control.
     pub const SCOPE_ON_BG: ColorToken = token("history.scope_on_bg", 0x1d2226);
     pub const SCOPE_ON_BORDER: ColorToken = token("history.scope_on_border", 0x2a3138);
     pub const SCOPE_ON_FG: ColorToken = token("history.scope_on_fg", 0xc2c7cc);
@@ -3097,10 +3055,9 @@ pub mod history {
     /// A run row's title when the row is not the open one.
     pub const ROW_TITLE: ColorToken = token("history.row_title", 0xc2c7cc);
 
-    /// The transcript body's four line tones, transcribed from `Jerry.dc.html`'s own `LFG` map
-    /// (`p` / `c` / `d` / `w`) - the leading `❯ claude --resume …` command line, ordinary body
-    /// text, the indented `⎿ …` detail lines, and the `● …` lead line that opens and closes a
-    /// synthesised transcript.
+    /// The transcript body's four line tones - the leading `❯ claude --resume …` command line,
+    /// ordinary body text, the indented `⎿ …` detail lines, and the `● …` lead line that opens
+    /// and closes a synthesised transcript.
     ///
     /// A **captured** transcript is plain text with no styling of its own (the terminal grid's
     /// colours are not stored - see `crate::run_history::transcript_store`), so every one of its
@@ -3209,12 +3166,9 @@ pub mod search {
     ];
 }
 
-/// The git graph tab (design handoff `design_handoff_jerry_ade/revision 2/CHANGELOG.md`,
-/// 2026-07-31 entry, "git graph (issue #1)") - real hex values transcribed directly from that
-/// entry's §2/§3, not paraphrased. The column header band and the removal of the per-commit
-/// session column (`HEADER`/`HEADER_BG`/`HEADER_LABEL_FG` below) are `revision 3/
-/// REVISION-2026-07-31.md` §6.1/§6.2 instead - that revision supersedes the revision-2 entry
-/// for those two points only, everything else here is still the revision-2 values.
+/// The git graph tab (GitHub issue #1). The column header band and the removal of the per-commit
+/// session column (`HEADER`/`HEADER_BG`/`HEADER_LABEL_FG` below) came later and supersede the
+/// graph's first spec on those two points only; everything else here is that first spec's values.
 pub mod graph {
     use super::{px, token, ColorToken, Pixels};
 
@@ -3565,10 +3519,9 @@ pub mod band {
     /// title bar and must line up pixel-perfect, so they read off one constant instead of three
     /// values that could drift independently.
     ///
-    /// `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4v is the reason this is one
-    /// constant and not three, and it is worth reading before changing it - the design really did
-    /// raise one of the three to 38 and produced "a visible staircase at every column boundary".
-    /// Its rule, verbatim: **"column headers that share a y are one rule, not three. Changing any
+    /// This is one constant and not three because raising one of the three to 38 once produced
+    /// "a visible staircase at every column boundary".
+    /// The rule, verbatim: **"column headers that share a y are one rule, not three. Changing any
     /// of their heights changes a line that spans the whole window - check the other two in the
     /// same edit."** The same section also fixes the *colour* of that rule at
     /// [`super::border::RAIL_INNER`] for all three, "which once the rules lined up would have read
@@ -3581,14 +3534,12 @@ pub mod band {
     pub const PTY_HEADER: Pixels = px(27.0);
     /// The **shell** pane's info footer band (`pid` · grid dimensions · environment chip ·
     /// right-aligned static copy) - the alternative to [`SURFACE_FOOTER`] (the **agent** pane's
-    /// readout strip: GitHub issue #295 / `STAGE-A-CHANGELOG.md` §4t), never stacked with it. A
-    /// pane gets exactly one bottom bar, chosen by `ProcessKind`, matching `Jerry.dc.html`'s
-    /// mutually exclusive `isTerminal` / `isChat` branches.
+    /// readout strip: GitHub issue #295), never stacked with it. A pane gets exactly one bottom
+    /// bar, chosen by `ProcessKind`.
     pub const PTY_INFO_FOOTER: Pixels = px(26.0);
     pub const BREADCRUMB: Pixels = px(26.0);
-    /// 26 -> 28 (`CHANGELOG.md`'s change 7: "Height 26 -> 28"), then 28 -> 30 for rev 6's
-    /// three-tier rebuild (`design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4c:
-    /// "bar 28 -> 30 high, group gap 9 -> 14").
+    /// Raised twice, 26 -> 28 -> 30, the second time for the three-tier rebuild that also took
+    /// the group gap from 9 to 14 (GitHub issue #293).
     pub const STATUS_BAR: Pixels = px(30.0);
     pub const PALETTE_INPUT: Pixels = px(44.0);
     pub const PALETTE_ROW: Pixels = px(30.0);
@@ -3610,10 +3561,10 @@ pub mod band {
     /// The tab strip's `+` menu popover's row height.
     pub const PLUS_MENU_ROW: Pixels = px(29.0);
 
-    // The right panel's Search tab (GitHub issue #162). Every value below is a real measurement
-    // off `Jerry.dc.html`'s own `showFind` block, not a round number picked here. The query row
-    // itself is [`FILTER_ROW`] (30), shared with the rail's own filter - they are the same object
-    // in two places and must not drift.
+    // The right panel's Search tab (GitHub issue #162). Every value below is a real designed
+    // measurement, not a round number picked here. The query row itself is [`FILTER_ROW`] (30),
+    // shared with the rail's own filter - they are the same object in two places and must not
+    // drift.
     /// The `⇄` replace row, revealed under the query row.
     pub const SEARCH_REPLACE_ROW: Pixels = px(28.0);
     /// One of the two `include`/`exclude` glob rows, revealed under those.
@@ -3649,9 +3600,8 @@ pub mod zone {
     pub const COMPOSER_WIDTH: Pixels = px(560.0);
     /// The tab strip's `+` menu popover's width.
     pub const PLUS_MENU_WIDTH: Pixels = px(326.0);
-    /// One sidebar-strip cell's width (GitHub issue #291). `STAGE-A-CHANGELOG.md` §4v: the strip's
-    /// cells "are now the same object" as the centre tabs - "**38px full-height cells, no radius,
-    /// no gap**" - which `Jerry.dc.html`'s own markup renders as `width:38px` inside a
+    /// One sidebar-strip cell's width (GitHub issue #291). The strip's cells are the same object
+    /// as the centre tabs - **full-height cells, no radius, no gap** - inside a
     /// [`super::band::CHROME_HEADER`]-high band. Every cell in the strip is exactly this wide,
     /// view cells and the `+`/`⋯` alike, which is what makes the dividing rules read as a tab
     /// strip's segments rather than as icons on a dark band.
@@ -3716,27 +3666,25 @@ pub mod font {
     pub const MONO: &str = "IBM Plex Mono";
 }
 
-/// Palette-only (⌘P) colours read directly from `Jerry.dc.html`'s inline literals for the
-/// `paletteOpen` block - real values missing from `tokens.rs`'s transcription (predates the
-/// palette section).
+/// Palette-only (⌘P) colours: the ones that have no equivalent in another module. See
+/// `docs/design/command-palette.md`.
 pub mod palette {
     use super::{token, ColorToken};
 
-    /// The input row's scope-prefix glyph (`Jerry.dc.html`: `color:#5f7f9e`).
+    /// The input row's scope-prefix glyph.
     pub const PREFIX: ColorToken = token("palette.prefix", 0x5f7f9e);
-    /// A result group's uppercase header label (`Jerry.dc.html`: `color:#5b6167`) - close to
-    /// but distinct from [`super::text::FAINT`] (`#6b7178`).
+    /// A result group's uppercase header label - close to but distinct from
+    /// [`super::text::FAINT`] (`#6b7178`).
     pub const GROUP_HEADER: ColorToken = token("palette.group_header", 0x5b6167);
-    /// An unselected result row's hover background (`Jerry.dc.html`: `style-hover`:
-    /// `background:#191d20`) - distinct from [`super::surface::ROW_HOVER`] (`#15181b`, which
+    /// An unselected result row's hover background - distinct from
+    /// [`super::surface::ROW_HOVER`] (`#15181b`, which
     /// happens to equal the palette panel's own background, [`super::surface::PALETTE`]).
     pub const ROW_HOVER: ColorToken = token("palette.row_hover", 0x191d20);
-    /// The selected/first row's label colour (`Jerry.dc.html`: `fg: first ? '#e3e8ed' :
-    /// '#c2c7cc'`) - one hex step brighter than [`super::text::SELECTED`] (`#dde2e7`).
+    /// The selected/first row's label colour - one hex step brighter than
+    /// [`super::text::SELECTED`] (`#dde2e7`).
     pub const LABEL_SELECTED: ColorToken = token("palette.label_selected", 0xe3e8ed);
-    /// A command result's kind chip `(fg, bg)` (`Jerry.dc.html`: `background:#1d2532` /
-    /// `color:#7f9ad4`) - the same hex pair as [`super::lang::MD`], kept as its own token since
-    /// a command chip and a Markdown-file chip are unrelated concepts.
+    /// A command result's kind chip `(fg, bg)` - the same hex pair as [`super::lang::MD`], kept
+    /// as its own token since a command chip and a Markdown-file chip are unrelated concepts.
     pub const COMMAND_CHIP: (ColorToken, ColorToken) = (
         token("palette.command_chip.fg", 0x7f9ad4),
         token("palette.command_chip.bg", 0x1d2532),
@@ -3755,11 +3703,10 @@ pub mod palette {
     ];
 }
 
-/// Revision R8's new `lang` chip tokens (item 6) - verified against the exact hex values in
-/// `design_handoff_jerry_ade/revision/tokens.rs:149-160`, independently reconstructed from the
-/// raw `u32` here rather than reusing [`hex`] (the same function under test), so a transcription
-/// error in [`lang::TS`]/[`lang::VUE`]/[`lang::PY`]/[`lang::GO`] would actually be caught rather
-/// than tautologically confirmed.
+/// The four later `lang` chip tokens, checked against their designed hex values - reconstructed
+/// independently from the raw `u32` here rather than by reusing [`hex`] (the same function under
+/// test), so a transcription error in [`lang::TS`]/[`lang::VUE`]/[`lang::PY`]/[`lang::GO`] would
+/// actually be caught rather than tautologically confirmed.
 #[cfg(test)]
 mod lang_token_tests {
     use super::{lang, Rgba};
@@ -4033,9 +3980,8 @@ mod token_registry_tests {
     }
 }
 
-/// Enforces the reserved-hue allocation rule from `design_handoff_jerry_ade/revision 5/
-/// STAGE-A-CHANGELOG.md` §4a - quoted in full in [`agent`]'s own docs, which is the rule these
-/// tests exist to make unbreakable.
+/// Enforces the reserved-hue allocation rule quoted in full in [`agent`]'s own docs, which is
+/// the rule these tests exist to make unbreakable.
 ///
 /// # Why this is a test and not a review note
 ///
@@ -4840,9 +4786,9 @@ mod syntax_contrast_tests {
 
     /// The sidebar strip's one structural invariant, in every bundled theme (GitHub issue #291).
     ///
-    /// `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4v: "a tab only reads as
-    /// connected if the strip behind it is **darker than the panel**, and here strip and rail were
-    /// both `#101113`, so the slab floated." The selected cell fills with [`surface::RAIL`] and
+    /// A tab only reads as connected if the strip behind it is **darker than the panel**: with
+    /// strip and rail on one colour the slab floats. The selected cell fills with
+    /// [`surface::RAIL`] and
     /// paints its own rule in the same colour, so a theme that let [`surface::SIDEBAR_STRIP`]
     /// collapse onto `RAIL` would take the strip's entire selection idiom with it - a failure no
     /// contrast floor catches, because both colours would still be perfectly legible.

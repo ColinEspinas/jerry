@@ -172,9 +172,8 @@ pub trait ProcessSampler {
 ///
 /// This is only ever a *denominator*: the Resources popover's `MEMORY` meter fills to the agents'
 /// real summed resident bytes over this total. `None` therefore means "draw the value, draw no
-/// fill" - never a fallback constant, since a real numerator over a guessed total is precisely the
-/// fabricated fraction `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4d calls the
-/// defect this panel would otherwise ship with.
+/// fill" - never a fallback constant, since a real numerator over a guessed total is precisely
+/// the fabricated fraction this panel would otherwise ship with.
 pub fn system_memory_bytes() -> Option<u64> {
     backend::system_memory_bytes()
 }

@@ -231,7 +231,7 @@ impl AdeApp {
     /// Clicking a diff line: pin a note beneath it, or - if the click landed on the line whose
     /// note is already open for typing - close that note again.
     ///
-    /// `STAGE-A-CHANGELOG.md` §1 says the gesture *toggles*, and `Jerry.dc.html` implements that
+    /// The design says the gesture *toggles*, and implements that
     /// against a fixed set of pre-authored notes, where "toggle" can only mean show/hide. Here the
     /// note does not exist until you make one, so toggling has to mean create/remove - with one
     /// deliberate asymmetry: a card you have **written into** is never destroyed by a click. It

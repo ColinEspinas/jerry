@@ -1839,7 +1839,7 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
             // Multi-cursor (Revision R13, issue #28): every *secondary* real cursor's own
             // selection fill/caret bar on this row, painted with the exact same real tokens as
             // the primary's own above - `theme.rs` has no separate "secondary cursor" color, and
-            // inventing one with no `design_handoff_jerry_ade` spec to back it would be an
+            // inventing one with no design spec to back it would be an
             // unjustified guess (`CONTRIBUTING.md`'s own "exact values" discipline) - so a real
             // multi-cursor agent simply shows several real, identically-styled carets/
             // selections rather than a fabricated visual distinction between them. Empty in
@@ -5106,9 +5106,9 @@ mod editing_tests {
         );
     }
 
-    /// Real, live-reproduced coverage for `design_handoff_jerry_ade/revision 3/
-    /// REVISION-2026-07-31.md` §1 ("the open file tabs, the active tab ... the commit composer"
-    /// is worktree-scoped) and the coordinator's own explicit call-out: a user with an unsaved
+    /// Real, live-reproduced coverage for the design's rule that "the open file tabs, the active
+    /// tab ... the commit composer" are worktree-scoped, and the coordinator's own explicit
+    /// call-out: a user with an unsaved
     /// edit open who switches worktrees must never lose it - real data loss, no confirm dialog,
     /// nothing, was the bug. Drives two *real* worktrees (temp directories) that both have a file
     /// at the identical relative path `sample.txt`, edits both with different, real unsaved

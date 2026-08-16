@@ -1,10 +1,10 @@
 //! Two render helpers shared by every settings page backed by `crate::settings::store::Settings`
 //! (General, Appearance & scaling, Themes - see `crate::settings::store::ConfigPage`'s own docs
-//! for why only those three), plus the `toggle`/`stepper`/`choice` row-control widgets
-//! `design_handoff_jerry_ade/revision/README.md`'s "Settings rows" section defines.
+//! for why only those three), plus the `toggle`/`stepper`/`choice` row-control widgets the design
+//! defines (`docs/design/settings.md`).
 //! `crate::settings::render` is the only caller; this module exists separately so the
-//! visual "control shape" stays independent of any one page's field-mutation logic. (That
-//! section also defines a `path` control shape - `value` + `Change…` - but no page wires a
+//! visual "control shape" stays independent of any one page's field-mutation logic. (The design
+//! also defines a `path` control shape - `value` + `Change…` - but no page wires a
 //! click handler to a `Change…` action, so it isn't built here.)
 //!
 //! Every row-control text size in this module routes through `Self::ui_text_size`
@@ -138,7 +138,7 @@ impl AdeApp {
         self.spawn_open_command(program, args, url.to_string(), cx);
     }
 
-    /// The config banner (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s change 3): a
+    /// The config banner: a
     /// bordered strip directly under a real page's header showing the real settings file path,
     /// that page's real key list (`crate::settings::store::config_keys_line`), the real
     /// `TOML | JSON` segment, and an `Open file` button. Only ever called for the three pages
@@ -330,9 +330,9 @@ impl AdeApp {
             )
     }
 
-    /// One real settings row shell - `design_handoff_jerry_ade/revision/README.md`'s "Settings
-    /// rows" spec: "11px vertical padding, bottom border, label + hint on the left, control
-    /// right." `control` is whichever of [`Self::render_toggle_control`]/
+    /// One real settings row shell - 11px vertical padding, bottom border, label plus hint on
+    /// the left, control right.
+    /// `control` is whichever of [`Self::render_toggle_control`]/
     /// [`Self::render_stepper_control`]/[`Self::render_choice_control`] the caller built.
     pub(in crate::settings) fn render_settings_row(
         &self,
@@ -375,8 +375,8 @@ impl AdeApp {
             .child(control)
     }
 
-    /// The real 26×15 toggle control (`design_handoff_jerry_ade/revision/README.md`'s "Settings
-    /// rows" spec) - `id` must be unique per row (used as the GPUI element id). Always
+    /// The real 26×15 toggle control - `id` must be unique per row (used as the GPUI element
+    /// id). Always
     /// interactive - see [`Self::render_toggle_control_gated`] for the variant a parent
     /// switch/setting can disable.
     pub(in crate::settings) fn render_toggle_control(
@@ -443,8 +443,8 @@ impl AdeApp {
             })
     }
 
-    /// The real `− value +` stepper control (`design_handoff_jerry_ade/revision/README.md`'s
-    /// "Settings rows" spec) - `value` is already-formatted display text (e.g. `"13 px"`).
+    /// The real `− value +` stepper control - `value` is already-formatted display text (e.g.
+    /// `"13 px"`).
     pub(in crate::settings) fn render_stepper_control(
         &self,
         id_prefix: &'static str,

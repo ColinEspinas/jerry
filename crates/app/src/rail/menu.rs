@@ -2,8 +2,7 @@
 //! and the `⋯` overflow each offer, and what running one of those rows means.
 //!
 //! GPUI-free, like every other `state`-shaped module in this folder - the row sets are exactly
-//! what `design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §4 lists, so they are worth
-//! asserting directly, without a window. [`crate::rail::menu_render`] is the `impl AdeApp` half:
+//! what the design lists, so they are worth asserting directly, without a window. [`crate::rail::menu_render`] is the `impl AdeApp` half:
 //! opening these menus off a real right-click, and running the actions below.
 //!
 //! Every row is drawn by the app's one shared menu ([`crate::menu`]) - this module only decides
@@ -209,9 +208,9 @@ pub fn agent_menu_groups(running: bool) -> Vec<Vec<MenuEntry<RailMenuAction>>> {
 ///
 /// It does, as of GitHub issue #227: [`crate::rail::strip::SidebarView::History`] is a real
 /// sidebar view - the repo → worktree → run index, with its own scope toggle and its own
-/// run-transcript centre tab - reached through this overflow rather than through a cell, per
-/// `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4t ("a permanent cell in a 5-cell
-/// strip is a claim that you switch to it constantly. If you don't, it belongs in the overflow").
+/// run-transcript centre tab - reached through this overflow rather than through a cell: "a
+/// permanent cell in a 5-cell strip is a claim that you switch to it constantly. If you don't, it
+/// belongs in the overflow".
 ///
 /// Kept as a named constant rather than collapsed into an ungated row: the row that reads it, the
 /// reason it would show while disabled, and this fact are one thing, and §7 rule 1 ("Ship the

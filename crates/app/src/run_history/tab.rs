@@ -1,9 +1,8 @@
 //! The real run-transcript centre tab (GitHub issue #227): its strip entry, its header, its
 //! dimmed body, and its footer's `Resume here` / `Start a new agent from this`.
 //!
-//! `design_handoff_jerry_ade/revision 5/REVISION-2026-08-13.md` §3-§4 is this file's brief. Two
-//! of its sentences are load-bearing enough to repeat here, because breaking either one is what
-//! the design caught *itself* doing:
+//! Two of the design's own sentences are load-bearing enough to repeat here, because breaking
+//! either one is what it caught *itself* doing:
 //!
 //! 1. **Keyed by run id, never the live agent's buffer.** "Borrowing the live buffer produces a
 //!    pane whose header and body describe two different runs, whose diffstats contradict each

@@ -16,10 +16,10 @@ use crate::status_bar::render::StatusTier;
 use crate::status_bar::resources;
 use crate::work_surface::agents::ProcessKind;
 
-/// §4c: "Click opens a popover (292 wide, above the bar)".
+/// The design: "Click opens a popover (292 wide, above the bar)".
 const POPOVER_WIDTH: f32 = 292.0;
 
-/// The pane strip's meter: `Jerry.dc.html`'s own `30x3` track, one per window.
+/// The pane strip's meter: a 30x3 track, one per window.
 const METER_WIDTH: f32 = 30.0;
 const METER_HEIGHT: f32 = 3.0;
 
@@ -310,12 +310,12 @@ impl AdeApp {
 
     /// `RATE LIMITS` and the `Refresh` control.
     ///
-    /// **`Refresh` sits in the header, not next to `Updated N ago` in the foot.** §4c's prose runs
-    /// the two together in one sentence ("`Updated 3m ago` and a `Refresh` that sets `Updated just
-    /// now`"), but `Jerry.dc.html` - the newest state of the bundle, and the build §4u′ describes -
+    /// **`Refresh` sits in the header, not next to `Updated N ago` in the foot.** The design's
+    /// prose runs the two together in one sentence ("`Updated 3m ago` and a `Refresh` that sets
+    /// `Updated just now`"), but its own markup - the newer of the two -
     /// puts `Refresh` at the head opposite the title and leaves the foot to `Updated N ago` and the
     /// `counts spend, not headroom` footnote. That is also the better reading of the same sentence:
-    /// it fixes what `Refresh` *does* to the foot line, not where it is drawn. The mock wins on
+    /// it fixes what `Refresh` *does* to the foot line, not where it is drawn. The markup wins on
     /// placement; the prose's actual claim - that the foot line is derived from a real read - is
     /// what [`Self::render_budget_popover_footer`] implements.
     fn render_budget_popover_header(&self, cx: &mut Context<Self>) -> impl IntoElement {

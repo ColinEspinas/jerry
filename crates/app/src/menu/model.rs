@@ -7,9 +7,8 @@
 //! tree's own `crate::sidebar::context_menu`, which is where all of this was written first; this
 //! module is that model with its file-tree specifics (a `ContextTarget`, a fixed `MenuAction`
 //! enum) lifted out into the generic [`MenuEntry<A>`], so the file tree, the rail's row menus and
-//! the sidebar strip's `⋯` overflow are one component rather than three that drift
-//! (`design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4t: "Both are 'a list of
-//! actions', so they are **one menu component**").
+//! the sidebar strip's `⋯` overflow are one component rather than three that drift - "Both are
+//! 'a list of actions', so they are **one menu component**".
 //!
 //! `A` is the caller's own action payload - `crate::sidebar::context_menu::MenuAction` for the
 //! tree, `crate::rail::menu::RailMenuAction` for the rail. Everything the popover *draws* (label,
@@ -160,7 +159,7 @@ pub const MENU_EDGE_MARGIN: f32 = 4.0;
 pub const MENU_BORDER: f32 = 2.0;
 
 /// The gap the `⋯` overflow menu leaves between the button it hangs off and its own top edge, in
-/// px (`Jerry.dc.html`'s own `br.bottom + 4`).
+/// px.
 pub const MENU_ANCHOR_GAP: f32 = 4.0;
 
 /// The popover's real painted height for exactly the `rows` it is about to paint - action rows

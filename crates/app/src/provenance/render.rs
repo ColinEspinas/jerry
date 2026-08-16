@@ -68,8 +68,7 @@ use crate::work_surface;
 use crate::work_surface::agents::ProcessKind;
 
 /// How far a line that is **not** the filtered author's is dimmed while a per-author filter is
-/// active - `Jerry.dc.html`'s own `opacity: .32`, quoted as an acceptance criterion by GitHub
-/// issue #287 ("other authors' lines dim (the mock uses 0.32 opacity)").
+/// active - the designed 0.32 opacity, an acceptance criterion of GitHub issue #287.
 ///
 /// Dimmed, never hidden: the lines around a filtered author's work are what make it legible as a
 /// change, and removing them would turn a filter into a different, much less honest diff.
@@ -136,8 +135,8 @@ fn agent_tint_of(key: &AgentKey) -> Option<(Rgba, Rgba)> {
 /// The colour of `author`'s gutter bar, or `None` for a line that carries no bar at all.
 ///
 /// `you` deliberately does **not** take [`AuthorStyle::fg`] here: the chip's glyph has to read
-/// against its own fill, while the bar is a 2px stripe against the diff's background, and
-/// `Jerry.dc.html` gives the two different values (`#8b9197` and `#4e545a`). An agent's bar and
+/// against its own fill, while the bar is a 2px stripe against the diff's background, and the
+/// design gives the two different values. An agent's bar and
 /// chip glyph are one value, because its own tint already is.
 pub fn author_gutter_color(author: &Author) -> Option<Rgba> {
     match author {
@@ -150,8 +149,7 @@ pub fn author_gutter_color(author: &Author) -> Option<Rgba> {
 /// The sentence a gutter bar's, or a chip's, tooltip states - `None` for an author that is not
 /// drawn at all, which therefore has no tooltip either.
 ///
-/// `STAGE-A-CHANGELOG.md` §1 gives `you`'s wording outright; an agent's is its own name, which is
-/// what `Jerry.dc.html`'s `attrOf` puts in the same slot.
+/// `you`'s wording is the design's own; an agent's is simply its own name.
 pub fn author_tooltip(author: &Author) -> Option<String> {
     match author {
         Author::You => Some("you \u{2014} hand edit".to_string()),
@@ -161,7 +159,8 @@ pub fn author_tooltip(author: &Author) -> Option<String> {
 
 /// Whether one diff line is dimmed to [`FILTER_DIM_OPACITY`] by an active per-author filter.
 ///
-/// `Jerry.dc.html`'s own predicate, kept exactly: `muted = attr && who && who !== attr`. Three
+/// The designed predicate, kept exactly: a line is muted when a filter is active, the line has
+/// an author, and that author is not the filtered one. Three
 /// things follow from it, and all three are load-bearing rather than incidental:
 ///
 /// - **No filter, nothing dims.** A diff at rest is one flat, honest surface.
@@ -186,7 +185,7 @@ pub fn line_is_dimmed(author: Option<&Author>, filter: Option<&Author>) -> bool 
 pub const SHARED_RING_TOOLTIP: &str =
     "Two agents edited this file \u{2014} click to filter the diff by author";
 
-/// The filter indicator's tooltip, verbatim from `Jerry.dc.html`'s own `title=`.
+/// The filter indicator's tooltip, verbatim from the design.
 pub const FILTER_INDICATOR_TOOLTIP: &str =
     "Showing one author's lines \u{2014} click to show every author";
 
@@ -489,7 +488,7 @@ impl AdeApp {
         let author = self.active_author_filter()?;
         let style = author_style(author)?;
         let dot = author_gutter_color(author)?;
-        // `your lines only` rather than `you only` - `Jerry.dc.html`'s own `attrFilterLabel`.
+        // `your lines only` rather than `you only` - the design's own wording.
         let label = match author {
             Author::You => "your lines".to_string(),
             _ => style.label.clone(),
@@ -681,7 +680,8 @@ mod tests {
         );
     }
 
-    /// `Jerry.dc.html`'s `muted = attr && who && who !== attr`, all four arms.
+    /// The mute predicate - filter active, line authored, author not the filtered one - all four
+    /// arms.
     #[test]
     fn a_filter_dims_other_authors_lines_and_nothing_else() {
         let claude = agent(AgentKind::Claude);
@@ -746,11 +746,12 @@ mod tests {
     }
 }
 
-/// The mock's shared-file sad path, rendered for real (GitHub issue #287's acceptance criteria).
+/// The design's shared-file sad path, rendered for real (GitHub issue #287's acceptance
+/// criteria).
 ///
-/// > `Jerry.dc.html`'s `Review · uncommitted` state, `src/api/users.rs`: the row shows the `⚠`
-/// > ring and **three author chips** […]; the open diff shows **three distinct gutter tints, one
-/// > of which is the neutral hand-edit tint**.
+/// > A file two agents both edited shows the `⚠` ring and **three author chips** on its row;
+/// > the open diff shows **three distinct gutter tints, one of which is the neutral hand-edit
+/// > tint**.
 ///
 /// Everything below is built from real parts: a real git repo, real agent sessions in it, real
 /// provenance recorded through the store's own `PreToolUse`/write/`PostToolUse` sequence, and a
