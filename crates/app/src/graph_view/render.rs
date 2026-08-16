@@ -4318,7 +4318,7 @@ mod graph_row_menu_tests {
     use super::*;
     use crate::test_support::open_test_app;
     use gpui::{Bounds, Entity, Pixels, Point, Size, TestAppContext};
-    use test_support::seed_three_commits;
+    use test_support::{git_output, seed_three_commits};
 
     fn open_seeded_graph(
         cx: &mut TestAppContext,
@@ -4480,32 +4480,12 @@ mod graph_row_menu_tests {
             app.request_graph_checkout(expected_sha.clone(), cx);
         });
         cx.run_until_parked();
-        let head_sha = String::from_utf8(
-            std::process::Command::new("git")
-                .current_dir(_repo.path())
-                .args(["rev-parse", "HEAD"])
-                .output()
-                .expect("git rev-parse")
-                .stdout,
-        )
-        .expect("utf8")
-        .trim()
-        .to_string();
+        let head_sha = git_output(_repo.path(), &["rev-parse", "HEAD"]);
         assert_eq!(
             head_sha, expected_sha,
             "commit checkout must land HEAD on that exact commit's SHA"
         );
-        let branch = String::from_utf8(
-            std::process::Command::new("git")
-                .current_dir(_repo.path())
-                .args(["branch", "--show-current"])
-                .output()
-                .expect("git branch --show-current")
-                .stdout,
-        )
-        .expect("utf8")
-        .trim()
-        .to_string();
+        let branch = git_output(_repo.path(), &["branch", "--show-current"]);
         assert!(
             branch.is_empty(),
             "a commit checkout must leave the worktree in detached HEAD, not on a named branch, \
@@ -4666,59 +4646,6 @@ mod graph_row_menu_tests {
             "a right-click that opens the row menu must also move real keyboard focus onto the \
              graph view"
         );
-    }
-
-    /// The `⋯` button's own anchor: derived from that row's real captured trigger bounds
-    /// (`row_menu_bounds`), not a formula involving the row's index - proven here with a bounds
-    /// value far down the y axis, standing in for a row deep in a scrolled list, which a fixed
-    /// `index * row_height` formula would get wrong (the real, adversarial-audit-relevant case).
-    #[gpui::test]
-    fn the_dots_button_anchors_off_its_own_real_captured_bounds(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        seed_three_commits(repo.path());
-        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
-        cx.run_until_parked();
-
-        let scrolled_bounds = Bounds {
-            origin: Point::new(px(500.0), px(2000.0)),
-            size: Size::new(px(22.0), px(22.0)),
-        };
-        app.update_in(cx, |app, window, cx| {
-            app.graph_state.row_menu_bounds.insert(2, scrolled_bounds);
-            app.toggle_graph_row_menu(2, window, cx);
-        });
-
-        let viewport = cx.update(|window, _cx| window.bounds().size);
-        // `y = 2000` is past the (real, 1080px-tall) test viewport, so the real edge-clamp must
-        // have kicked in - computed here via the exact same real `clamp_menu_origin` the
-        // implementation calls, not a second, hand-derived formula that could quietly drift from
-        // it.
-        let unclamped_x =
-            scrolled_bounds.origin.x + scrolled_bounds.size.width - theme::graph::ROW_MENU_WIDTH;
-        let unclamped_y = scrolled_bounds.origin.y + scrolled_bounds.size.height + px(2.0);
-        let (expected_x, expected_y) = crate::menu::model::clamp_menu_origin(
-            f32::from(unclamped_x),
-            f32::from(unclamped_y),
-            f32::from(theme::graph::ROW_MENU_WIDTH),
-            f32::from(theme::graph::ROW_MENU_HEIGHT),
-            f32::from(viewport.width),
-            f32::from(viewport.height),
-        );
-        app.read_with(cx, |app, _| {
-            let menu = app.graph_state.row_menu_open.expect("the menu must open");
-            assert_eq!(menu.row_index, 2);
-            assert_eq!(
-                (menu.origin_x, menu.origin_y),
-                (px(expected_x), px(expected_y)),
-                "x/y both come from the button's own real bounds (run through the real edge \
-                 clamp), not row_index * a row height - a formula that would put this \
-                 2000px-deep row's menu at roughly 48px"
-            );
-            assert_ne!(
-                menu.origin_y, unclamped_y,
-                "premise: y=2000 really is past the viewport, so the clamp really did something"
-            );
-        });
     }
 
     /// `revision 3/REVISION-2026-07-31.md` §6.1 added a real 22px column header band between
@@ -4916,9 +4843,10 @@ mod graph_row_menu_tests {
     /// the row `⋯`/right-click menu and the Push `▾` menu are independent state, with nothing
     /// stopping both from being open at once - opening one left the other's own full-window scrim
     /// painted underneath it, silently eating the next click aimed at dismissing it.
-    /// `Self::open_graph_row_menu_at` and `Self::toggle_graph_push_menu` now each close the other.
+    /// `Self::open_graph_row_menu_at` and `Self::toggle_graph_push_menu` now each close the other,
+    /// so this drives the gesture in both directions rather than once per direction.
     #[gpui::test]
-    fn opening_the_row_menu_closes_an_open_push_menu(cx: &mut TestAppContext) {
+    fn the_row_menu_and_the_push_menu_each_close_the_other(cx: &mut TestAppContext) {
         let (_repo, app, cx) = open_seeded_graph(cx);
 
         app.update_in(cx, |app, _window, cx| {
@@ -4933,7 +4861,6 @@ mod graph_row_menu_tests {
 
         let row0 = cx.debug_bounds("graph-row-0").expect("row 0 painted");
         right_click(cx, row0.center());
-
         app.read_with(cx, |app, _| {
             assert_eq!(app.graph_state.row_menu_open.map(|m| m.row_index), Some(0));
             assert!(
@@ -4941,27 +4868,11 @@ mod graph_row_menu_tests {
                 "opening the row menu must close the Push menu, not paint both at once"
             );
         });
-    }
 
-    /// The other direction of the same fix: opening the Push menu while a row menu is open must
-    /// close the row menu.
-    #[gpui::test]
-    fn opening_the_push_menu_closes_an_open_row_menu(cx: &mut TestAppContext) {
-        let (_repo, app, cx) = open_seeded_graph(cx);
-
-        let row0 = cx.debug_bounds("graph-row-0").expect("row 0 painted");
-        right_click(cx, row0.center());
-        app.read_with(cx, |app, _| {
-            assert!(
-                app.graph_state.row_menu_open.is_some(),
-                "premise: the row menu really is open"
-            );
-        });
-
+        // And back the other way, from the row menu the right-click above just left open.
         app.update_in(cx, |app, _window, cx| {
             app.toggle_graph_push_menu(cx);
         });
-
         app.read_with(cx, |app, _| {
             assert!(app.graph_state.push_menu_open);
             assert!(
@@ -5165,18 +5076,6 @@ mod elbow_geometry_tests {
     /// elbow's dot end may run before it stops being hidden underneath that dot.
     const SMALLEST_DOT: Pixels = theme::graph::DOT_COMMIT;
 
-    #[test]
-    fn elbow_curve_size_is_exactly_double_the_radius_so_gpuis_own_clamp_never_kicks_in() {
-        // GPUI (`Corners::clamp_radii_for_quad_size`, `vendor/zed/crates/gpui/src/style.rs`)
-        // always clamps a requested corner radius to half the box's own shorter side. A real
-        // user-reported vertical-alignment bug traced back to this: the curve box used to be
-        // exactly `ELBOW_RADIUS`-square with a requested radius of `ELBOW_RADIUS` itself, silently
-        // clamped down to half that (an invisible straight lead-in eating the other half of the
-        // box, with only a much smaller arc actually rendering). This is the one invariant that
-        // must hold for the radius to render unclamped, at its own full requested size.
-        assert_eq!(CURVE_SIZE, RADIUS * 2.0);
-    }
-
     /// The `waist_y` row every piece of one elbow must actually *paint* on. Deliberately derived
     /// the same way GPUI itself lays a border out - inward from the box's own bounds edge (see
     /// `CurveBox`'s own docs) - rather than from the box's anchoring edge, because the entire bug
@@ -5228,34 +5127,23 @@ mod elbow_geometry_tests {
     }
 
     #[test]
-    fn only_the_bottom_edged_curve_carries_the_extra_stroke_of_height() {
-        // Pins *which* box gets corrected. An earlier attempt grew both curves toward the waist,
-        // which just moved the 1px step to the other side of the bridge - only the box whose
-        // border is painted on the far side of its own anchoring edge is wrong.
-        for kind in [ElbowKind::Diverging, ElbowKind::Converging] {
-            let geo = elbow_geometry(kind, px(9.0), px(23.0), ROW_H, SnapGrid::IDENTITY);
-            assert_eq!(geo.entry.horizontal, HorizontalEdge::Bottom);
-            assert_eq!(geo.entry.height, CURVE_SIZE + ELBOW_STROKE);
-            assert_eq!(geo.exit.horizontal, HorizontalEdge::Top);
-            assert_eq!(geo.exit.height, CURVE_SIZE);
-        }
-    }
-
-    #[test]
-    fn the_extra_stroke_of_height_still_cannot_trigger_gpuis_radius_clamp() {
-        // The correction above grows a box on one axis only. GPUI clamps a requested radius to
-        // half the box's own *shorter* side, so the invariant that actually has to hold is on the
-        // shorter side, not on `ELBOW_CURVE_SIZE` alone - growing the other axis is free, but a
-        // future change that shrank either one below `2 * RADIUS` would silently halve the arc
-        // again (exactly the earlier bug the sibling test above pins).
-        for kind in [ElbowKind::Diverging, ElbowKind::Converging] {
-            let geo = elbow_geometry(kind, px(9.0), px(23.0), ROW_H, SnapGrid::IDENTITY);
+    fn no_curve_box_is_ever_short_enough_to_trigger_gpuis_radius_clamp() {
+        // GPUI (`Corners::clamp_radii_for_quad_size`, `vendor/zed/crates/gpui/src/style.rs`)
+        // always clamps a requested corner radius to half the box's own shorter side. A real
+        // user-reported vertical-alignment bug traced back to this: the curve box used to be
+        // exactly `ELBOW_RADIUS`-square with a requested radius of `ELBOW_RADIUS` itself, silently
+        // clamped down to half that - an invisible straight lead-in eating the other half of the
+        // box, with only a much smaller arc actually rendering. A future change that shrank either
+        // axis below `2 * RADIUS` would halve the arc again the same way.
+        for (kind, x_from, x_to) in ALL_SHAPES_AND_GAPS {
+            let geo = elbow_geometry(kind, x_from, x_to, ROW_H, SnapGrid::IDENTITY);
             for curve in [geo.entry, geo.exit] {
-                let shorter = CURVE_SIZE.min(curve.height);
+                let shorter = curve.width.min(curve.height);
                 assert!(
                     shorter / 2.0 >= RADIUS,
-                    "{kind:?} {curve:?}: half the shorter side ({:?}) must still be at least the \
-                     requested radius {RADIUS:?}, or GPUI silently renders a smaller arc",
+                    "{kind:?} {x_from:?}->{x_to:?} {curve:?}: half the shorter side ({:?}) must \
+                     still be at least the requested radius {RADIUS:?}, or GPUI silently renders \
+                     a smaller arc",
                     shorter / 2.0
                 );
             }
@@ -5378,107 +5266,33 @@ mod elbow_geometry_tests {
     }
 
     #[test]
-    fn a_diverging_elbow_leaves_this_rows_dot_and_lands_on_the_other_lanes_line() {
-        // Pins the `LaneJoin` assignment itself, which is what tells the two kinds apart now that
-        // both use the same entry/exit border-edge pattern. `Diverging`'s `from_lane` is always
-        // `own_lane` (`layout_lanes` Step 4), so its entry is the dot end.
-        let geo = elbow_geometry(
-            ElbowKind::Diverging,
-            px(9.0),
-            px(23.0),
-            ROW_H,
-            SnapGrid::IDENTITY,
-        );
-        // The entry's own vertical stroke has to start under the dot's own disc, so no gap opens
-        // between the dot and the line leaving it. It may start above the dot's centre - the dot is
-        // painted last and hides that stretch - but never below the disc's own bottom edge, and
-        // never so far above that it pokes out of the smallest dot this row can have.
-        assert!(
-            (ROW_H / 2.0 - SMALLEST_DOT / 2.0..=ROW_H / 2.0).contains(&geo.entry.top),
-            "entry must start under the dot's own disc: {:?}",
-            geo.entry.top
-        );
-        assert_eq!(geo.entry.horizontal, HorizontalEdge::Bottom);
-        assert_eq!(geo.entry.vertical, VerticalEdge::Left);
-        assert_eq!(geo.exit.horizontal, HorizontalEdge::Top);
-        assert_eq!(geo.exit.vertical, VerticalEdge::Right);
-        // The exit still reaches past the row's own edge, into the next row where `to_lane`'s own
-        // full-height segment picks the line up - `render_graph_lane_canvas` clips that stretch
-        // away rather than letting it paint over the neighbour.
-        assert!(
-            geo.exit.top + geo.exit.height > ROW_H,
-            "the exit curve must reach the row's own bottom edge: {:?}",
-            geo.exit.top + geo.exit.height
-        );
-    }
-
-    #[test]
-    fn a_converging_elbow_continues_the_ending_lane_and_lands_on_this_rows_dot() {
-        // The mirror of the test above, and the shape this repository's own real history produces:
-        // `own_lane` (lane 0) sits left of the ending lane. The entry curve must continue
-        // `from_lane`'s own already-painted line - a previous single-corner version got this
-        // backwards, confirmed by a real user report that the curve rendered disconnected from the
-        // straight line it was supposed to continue.
-        let geo = elbow_geometry(
-            ElbowKind::Converging,
-            px(23.0),
-            px(9.0),
-            ROW_H,
-            SnapGrid::IDENTITY,
-        );
-        assert_eq!(geo.entry.horizontal, HorizontalEdge::Bottom);
-        assert_eq!(geo.entry.vertical, VerticalEdge::Right);
-        assert_eq!(
-            painted_vertical_column(&geo.entry),
-            px(23.0),
-            "the entry curve must continue from_lane's own already-painted line"
-        );
-        assert_eq!(geo.exit.horizontal, HorizontalEdge::Top);
-        assert_eq!(geo.exit.vertical, VerticalEdge::Left);
-        // The mirror of the Diverging entry above: the dot end has to finish under the dot's own
-        // disc - at or past its centre, but not out the far side of the smallest dot.
-        let exit_bottom = geo.exit.top + geo.exit.height;
-        assert!(
-            (ROW_H / 2.0..=ROW_H / 2.0 + SMALLEST_DOT / 2.0).contains(&exit_bottom),
-            "the exit curve must land under own_lane's own dot: {exit_bottom:?}"
-        );
-        // And it must reach back past the row's own top edge, to where the ending lane's own
-        // full-height segment in the row above left off - `render_graph_lane_canvas` clips that
-        // stretch away rather than letting it paint over the neighbour.
-        assert!(
-            geo.entry.top < px(0.0),
-            "the entry curve must reach the row's own top edge: {:?}",
-            geo.entry.top
-        );
-    }
-
-    #[test]
-    fn a_wide_lane_gap_gets_a_real_straight_middle_segment_covering_each_curves_own_straight_run() {
-        // Three lane steps apart (42px) is comfortably past 2*CURVE_SIZE (20px) - a real straight
-        // segment must bridge the two curves, each end reaching exactly `RADIUS` *past* the
-        // natural tangent point (where each curve's own arc ends and its own straight border
-        // lead-in begins) and out to that curve's own outer edge (see `StraightSegment`'s own docs
-        // for why: a real user report found a persistent, direction-flipping vertical
-        // misalignment at this exact seam, traced back to a border-radius arc and a filled rect
-        // being different rendering paths - covering each curve's own straight-run length with the
-        // fill removes the border's own rendering from that stretch of the seam entirely).
-        let geo = elbow_geometry(
-            ElbowKind::Diverging,
-            px(9.0),
-            px(9.0 + 3.0 * 14.0),
-            ROW_H,
-            SnapGrid::IDENTITY,
-        );
-        assert_eq!(geo.straight.left, geo.entry.left + RADIUS);
-        assert_eq!(
-            geo.straight.left + geo.straight.width,
-            geo.exit.left + RADIUS
-        );
-        // Both ends of the bridge must sit on the row each curve actually *paints* its
-        // horizontal stroke on, which for the bottom-edged entry curve is not its box edge - see
-        // `all_three_elbow_pieces_paint_their_horizontal_stroke_on_the_very_same_pixel_row`.
-        assert_eq!(geo.straight.top, painted_horizontal_row(&geo.entry));
-        assert_eq!(geo.straight.top, painted_horizontal_row(&geo.exit));
+    fn each_elbows_dot_end_finishes_under_this_rows_own_dot() {
+        // The `LaneJoin` assignment itself, which is what tells the two kinds apart now that both
+        // use the same entry/exit border-edge pattern: `Diverging`'s `from_lane` is always
+        // `own_lane` (`layout_lanes` Step 4), so its *entry* is the dot end, and `Converging`'s
+        // *exit* is. Either way that end has to finish under the dot's own disc, so no gap opens
+        // between the dot and the line leaving (or arriving at) it. It may run past the dot's
+        // centre - the dot is painted last and hides that stretch - but never out the far side of
+        // the smallest dot this row can have.
+        for (kind, x_from, x_to) in ALL_SHAPES_AND_GAPS {
+            let geo = elbow_geometry(kind, x_from, x_to, ROW_H, SnapGrid::IDENTITY);
+            let label = format!("{kind:?} {x_from:?}->{x_to:?}");
+            match kind {
+                ElbowKind::Diverging => assert!(
+                    (ROW_H / 2.0 - SMALLEST_DOT / 2.0..=ROW_H / 2.0).contains(&geo.entry.top),
+                    "{label}: the entry curve must start under the dot's own disc: {:?}",
+                    geo.entry.top
+                ),
+                ElbowKind::Converging => {
+                    let exit_bottom = geo.exit.top + geo.exit.height;
+                    assert!(
+                        (ROW_H / 2.0..=ROW_H / 2.0 + SMALLEST_DOT / 2.0).contains(&exit_bottom),
+                        "{label}: the exit curve must land under own_lane's own dot: \
+                         {exit_bottom:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -5530,36 +5344,6 @@ mod elbow_geometry_tests {
                 geo.straight.width
             );
         }
-    }
-
-    #[test]
-    fn adjacent_lanes_get_a_real_but_shorter_bridge_than_a_wide_gap() {
-        // Pins the concrete numbers behind the invariant above, so a future change that quietly
-        // reintroduces a minimum width has to face them. One lane step apart: the two boxes overlap
-        // by `2 * CURVE_SIZE - LANE_STEP` = 6px, and the bridge that survives is 4px - real, but
-        // less than the `2 * RADIUS` = 10px floor that used to be forced on it.
-        let adjacent = elbow_geometry(
-            ElbowKind::Diverging,
-            px(9.0),
-            px(23.0),
-            ROW_H,
-            SnapGrid::IDENTITY,
-        );
-        assert_eq!(adjacent.straight.width, px(4.0));
-        let wide = elbow_geometry(
-            ElbowKind::Diverging,
-            px(9.0),
-            px(9.0 + 3.0 * 14.0),
-            ROW_H,
-            SnapGrid::IDENTITY,
-        );
-        assert!(
-            adjacent.straight.width < wide.straight.width,
-            "an adjacent-lane bridge must be shorter than a wide-gap one, not clamped up to a \
-             fixed minimum: {:?} vs {:?}",
-            adjacent.straight.width,
-            wide.straight.width
-        );
     }
 
     /// The vertical span one curve's own *arc* sweeps: it always fills exactly an `ELBOW_RADIUS`
@@ -5912,20 +5696,24 @@ mod elbow_geometry_tests {
     }
 
     #[test]
-    fn a_diverging_elbows_color_follows_the_branch_merged_in_not_the_branch_it_lands_in() {
-        // from_lane is always own_lane (the branch merged *into*) for Diverging - a real user
-        // report found the connector was being colored with that landing branch's color instead of
-        // the merged-in branch's own color (to_lane).
-        assert_eq!(elbow_color_lane(ElbowKind::Diverging, 0, 2), 2);
-        assert_eq!(elbow_color_lane(ElbowKind::Diverging, 2, 0), 0);
-    }
-
-    #[test]
-    fn a_converging_elbows_color_follows_the_ending_lane_it_continues() {
-        // Converging has no "merged into" branch at all - from_lane (the ending lane) is already
-        // the color that continues its own already-painted `ends_here` stub from the row above.
-        assert_eq!(elbow_color_lane(ElbowKind::Converging, 1, 0), 1);
-        assert_eq!(elbow_color_lane(ElbowKind::Converging, 0, 1), 0);
+    fn an_elbow_takes_the_colour_of_the_branch_it_represents_not_the_one_it_lands_in() {
+        // `Diverging`'s `from_lane` is always `own_lane` - the branch merged *into* - so its
+        // colour has to come from `to_lane`, the branch actually merged in; a real user report
+        // found the connector wearing the landing branch's colour instead. `Converging` has no
+        // "merged into" branch at all: `from_lane` (the ending lane) is already the colour that
+        // continues its own already-painted `ends_here` stub from the row above.
+        for (kind, from_lane, to_lane, expected) in [
+            (ElbowKind::Diverging, 0, 2, 2),
+            (ElbowKind::Diverging, 2, 0, 0),
+            (ElbowKind::Converging, 1, 0, 1),
+            (ElbowKind::Converging, 0, 1, 0),
+        ] {
+            assert_eq!(
+                elbow_color_lane(kind, from_lane, to_lane),
+                expected,
+                "{kind:?} {from_lane}->{to_lane}"
+            );
+        }
     }
 }
 
@@ -6048,10 +5836,6 @@ mod elbow_fractional_scale_tests {
         }
     }
 
-    fn overlap(a: (f32, f32), b: (f32, f32)) -> f32 {
-        (a.1.min(b.1) - a.0.max(b.0)).max(0.0)
-    }
-
     #[test]
     fn a_lane_continuing_curve_lands_on_exactly_the_lanes_own_device_columns_at_every_scale() {
         // The device-space restatement of
@@ -6157,68 +5941,6 @@ mod elbow_fractional_scale_tests {
             }
         }
     }
-
-    #[test]
-    fn the_one_px_design_this_replaces_really_did_break_at_fractional_scales() {
-        // The negative control that proves this module can actually see the bug it guards
-        // against, pinned to the numbers measured off the real renderer before the fix. With the
-        // old 1px stroke at scale 1.5, lane 0's vertical (`.left(9) .w(1)`) pre-rounds to device
-        // columns [13, 14), while the adjacent-lane elbow's lane-continuing right-bordered curve
-        // (box `.left(9 + 1 - 10) .w(10)`, stroke painted inward from its far edge) lands on
-        // [14, 15) - fully disjoint, the measured 100% break at the junction (the real capture
-        // showed absolute columns [469, 470) vs [470, 471); only the origin differs).
-        let scale = 1.5;
-        let one_px_line = fill(px(9.0), px(1.0), scale);
-        assert_eq!(one_px_line, (13.0, 14.0));
-        let old_box_left = device_length(px(9.0 + 1.0 - 10.0), scale);
-        let old_box_width = device_length(theme::graph::ELBOW_CURVE_SIZE, scale);
-        let old_stroke_width = device_stroke(px(1.0), scale);
-        let old_curve_stroke = (
-            old_box_left + old_box_width - old_stroke_width,
-            old_box_left + old_box_width,
-        );
-        assert_eq!(old_curve_stroke, (14.0, 15.0));
-        assert_eq!(
-            overlap(one_px_line, old_curve_stroke),
-            0.0,
-            "sanity: the old 1px design must reproduce the total break in this emulation, or \
-             the emulation is not modelling the renderer that showed it"
-        );
-    }
-
-    #[test]
-    fn round_1s_unsnapped_authoring_really_did_step_at_the_waist_at_1_25x() {
-        // Round 2's own negative control: geometry authored on the identity grid is exactly the
-        // round-1 (#349) design - 2px strokes, raw logical coordinates - and at scale 1.25 it
-        // must reproduce the one-device-row waist step measured off the real fixed build (curve
-        // stroke on rows `[n, n+3)`-style intervals against a 2-row bridge; the user's follow-up
-        // "still jagged" report). If this stops failing the exact-equality assertions above,
-        // the harness has gone blind to the very defect they exist to keep fixed.
-        let scale = 1.25;
-        let mut stepped_junctions = 0;
-        for (kind, x_from, x_to) in ALL_SHAPES_AND_GAPS {
-            let geo = elbow_geometry(kind, x_from, x_to, ROW_H, SnapGrid::IDENTITY);
-            // What round 1 authored: raw `ELBOW_STROKE` everywhere.
-            let bridge = fill(geo.straight.top, ELBOW_STROKE, scale);
-            for curve in [geo.entry, geo.exit] {
-                let stroke_dev = device_stroke(ELBOW_STROKE, scale);
-                let top = device_length(curve.top, scale);
-                let height = device_length(curve.height, scale);
-                let stroke = match curve.horizontal {
-                    HorizontalEdge::Top => (top, top + stroke_dev),
-                    HorizontalEdge::Bottom => (top + height - stroke_dev, top + height),
-                };
-                if stroke != bridge {
-                    stepped_junctions += 1;
-                }
-            }
-        }
-        assert!(
-            stepped_junctions > 0,
-            "sanity: the unsnapped round-1 authoring must show at least one stepped waist \
-             junction at 1.25x in this emulation, or the emulation cannot see the round-2 bug"
-        );
-    }
 }
 
 /// Real, paint-based coverage for `render_graph_lane_canvas`'s two elbow shapes
@@ -6235,51 +5957,9 @@ mod elbow_fractional_scale_tests {
 #[cfg(test)]
 mod graph_elbow_render_tests {
     use super::*;
-    use crate::root::focus::palette_focus_tests;
+    use crate::test_support::open_test_app;
     use gpui::{Entity, TestAppContext};
-
-    fn git(dir: &std::path::Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    /// Real timestamps (like `wt_core::graph`'s own `commit_at` test helper) so the time-sorted
-    /// walk produces a deterministic row order across runs, rather than depending on the test
-    /// process happening to cross a wall-clock second between two git invocations.
-    fn commit_at(dir: &std::path::Path, file: &str, contents: &str, message: &str, unix: i64) {
-        std::fs::write(dir.join(file), contents).expect("write file");
-        git(dir, &["add", file]);
-        let date = format!("{unix} +0000");
-        let output = std::process::Command::new("git")
-            .current_dir(dir)
-            .args(["commit", "-m", message])
-            .env("GIT_AUTHOR_DATE", &date)
-            .env("GIT_COMMITTER_DATE", &date)
-            .output()
-            .expect("failed to spawn git commit");
-        assert!(
-            output.status.success(),
-            "git commit failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn init_repo(dir: &std::path::Path) {
-        git(dir, &["init", "-b", "main"]);
-        git(dir, &["config", "user.email", "test@example.com"]);
-        git(dir, &["config", "user.name", "Test User"]);
-    }
+    use test_support::{commit_at, git, git_with_env, seed_empty_repo_at};
 
     /// Where a painted curve's own vertical stroke must land, derived from the elbow's own lanes
     /// and the documented painting rules only - deliberately *not* by calling `elbow_geometry`,
@@ -6329,7 +6009,7 @@ mod graph_elbow_render_tests {
     /// no merge commit involved anywhere. `root`'s row must therefore end up with real Converging
     /// elbows for *both* `a`'s and `b`'s now-ending lanes - not one, not zero.
     fn seed_converging_history(dir: &std::path::Path) {
-        init_repo(dir);
+        seed_empty_repo_at(dir);
         commit_at(dir, "root.txt", "1", "root", 1_700_000_000);
         git(dir, &["branch", "a"]);
         git(dir, &["branch", "b"]);
@@ -6339,6 +6019,29 @@ mod graph_elbow_render_tests {
         commit_at(dir, "b.txt", "1", "b1", 1_700_000_200);
         git(dir, &["checkout", "main"]);
         commit_at(dir, "main2.txt", "1", "main2", 1_700_000_300);
+    }
+
+    /// A real two-parent merge commit: `feature` branches off `base`, gets its own commit, and is
+    /// merged back into `main` with `--no-ff`. That merge row is the one shape that produces a
+    /// real `Diverging` elbow, and lane 1 both `starts_here` there and carries that elbow.
+    fn seed_diverging_merge_history(dir: &std::path::Path) {
+        seed_empty_repo_at(dir);
+        commit_at(dir, "base.txt", "1", "base", 1_700_000_000);
+        git(dir, &["checkout", "-b", "feature"]);
+        commit_at(dir, "feature.txt", "1", "feature work", 1_700_000_100);
+        git(dir, &["checkout", "main"]);
+        let date = "1700000200 +0000";
+        git_with_env(
+            dir,
+            &[
+                "merge",
+                "--no-ff",
+                "feature",
+                "-m",
+                "Merge branch 'feature'",
+            ],
+            &[("GIT_AUTHOR_DATE", date), ("GIT_COMMITTER_DATE", date)],
+        );
     }
 
     fn open_seeded(
@@ -6351,7 +6054,7 @@ mod graph_elbow_render_tests {
     ) {
         let repo = tempfile::tempdir().expect("tempdir");
         seed(repo.path());
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_git_graph(window, cx);
         });
@@ -6487,32 +6190,7 @@ mod graph_elbow_render_tests {
 
     #[gpui::test]
     fn a_diverging_elbow_paints_in_the_rows_bottom_half(cx: &mut TestAppContext) {
-        let (_repo, app, cx) = open_seeded(cx, |dir| {
-            init_repo(dir);
-            commit_at(dir, "base.txt", "1", "base", 1_700_000_000);
-            git(dir, &["checkout", "-b", "feature"]);
-            commit_at(dir, "feature.txt", "1", "feature work", 1_700_000_100);
-            git(dir, &["checkout", "main"]);
-            let date = "1700000200 +0000";
-            let output = std::process::Command::new("git")
-                .current_dir(dir)
-                .args([
-                    "merge",
-                    "--no-ff",
-                    "feature",
-                    "-m",
-                    "Merge branch 'feature'",
-                ])
-                .env("GIT_AUTHOR_DATE", date)
-                .env("GIT_COMMITTER_DATE", date)
-                .output()
-                .expect("failed to spawn git merge");
-            assert!(
-                output.status.success(),
-                "git merge failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        });
+        let (_repo, app, cx) = open_seeded(cx, seed_diverging_merge_history);
 
         let merge_row_index = app.read_with(cx, |app, _| {
             let GraphLoadState::Loaded(graph) = &app.graph_state.load else {
@@ -6616,28 +6294,7 @@ mod graph_elbow_render_tests {
     fn a_lane_with_a_diverging_elbow_does_not_also_paint_a_plain_starts_here_stub(
         cx: &mut TestAppContext,
     ) {
-        let (_repo, app, cx) = open_seeded(cx, |dir| {
-            init_repo(dir);
-            commit_at(dir, "base.txt", "1", "base", 1_700_000_000);
-            git(dir, &["checkout", "-b", "feature"]);
-            commit_at(dir, "feature.txt", "1", "feature work", 1_700_000_100);
-            git(dir, &["checkout", "main"]);
-            let date = "1700000200 +0000";
-            let output = std::process::Command::new("git")
-                .current_dir(dir)
-                .args([
-                    "merge",
-                    "--no-ff",
-                    "feature",
-                    "-m",
-                    "Merge branch 'feature'",
-                ])
-                .env("GIT_AUTHOR_DATE", date)
-                .env("GIT_COMMITTER_DATE", date)
-                .output()
-                .expect("failed to spawn git merge");
-            assert!(output.status.success());
-        });
+        let (_repo, app, cx) = open_seeded(cx, seed_diverging_merge_history);
 
         let merge_row_index = app.read_with(cx, |app, _| {
             let GraphLoadState::Loaded(graph) = &app.graph_state.load else {
@@ -6820,37 +6477,17 @@ mod graph_elbow_render_tests {
 #[cfg(test)]
 mod graph_selection_render_tests {
     use super::*;
-    use crate::root::focus::palette_focus_tests;
+    use crate::test_support::open_test_app;
     use gpui::{Entity, TestAppContext};
-
-    fn git(dir: &std::path::Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    use test_support::{commit, seed_empty_repo_at};
 
     /// Two real commits - `build_graph` yields exactly two rows (indices 0..=1, newest first).
     /// Row 0 is auto-selected on load (`AdeApp`'s own `load_graph`), so row 1 starts genuinely
     /// unselected - exactly the row this test drives through a real selection change.
     fn seed_two_commits(dir: &std::path::Path) {
-        git(dir, &["init", "-b", "main"]);
-        git(dir, &["config", "user.email", "test@example.com"]);
-        git(dir, &["config", "user.name", "Test User"]);
-        std::fs::write(dir.join("a.txt"), "1\n").expect("write a.txt");
-        git(dir, &["add", "."]);
-        git(dir, &["commit", "-m", "first"]);
-        std::fs::write(dir.join("a.txt"), "2\n").expect("write a.txt");
-        git(dir, &["commit", "-am", "second"]);
+        seed_empty_repo_at(dir);
+        commit(dir, "a.txt", "1\n", "first");
+        commit(dir, "a.txt", "2\n", "second");
     }
 
     fn open_seeded_graph(
@@ -6862,7 +6499,7 @@ mod graph_selection_render_tests {
     ) {
         let repo = tempfile::tempdir().expect("tempdir");
         seed_two_commits(repo.path());
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_git_graph(window, cx);
         });
@@ -6893,8 +6530,21 @@ mod graph_selection_render_tests {
         );
     }
 
+    /// The reported "when we click on a line, don't move the line, just highlight it", and the
+    /// reported "double border left and bottom" behind it: GPUI's `Style::border_color` is one
+    /// shared value for every edge of a single element (confirmed directly in `gpui`'s own
+    /// `style.rs`: `border_color: Option<Hsla>`, not per-edge), so a row using both
+    /// `border_b_1()` (its own permanent separator) and a conditional `border_l_2()` (its
+    /// selection edge) on the *same* div used to have the second `.border_color()` call silently
+    /// overwrite the first. The fix is a real, separate child element for the left edge
+    /// (`Self::render_graph_row`'s own docs), created unconditionally.
+    ///
+    /// Both consequences are one invariant on painted bounds: every element of a row keeps
+    /// exactly the bounds it had before that row was selected, the selection edge included - and
+    /// a `debug_bounds` miss on the *unselected* row would mean the edge is back to being created
+    /// `.when(selected, ...)`, the exact regression this covers.
     #[gpui::test]
-    fn selecting_a_row_never_shifts_its_own_lane_canvas(cx: &mut TestAppContext) {
+    fn selecting_a_row_moves_and_resizes_nothing_it_paints(cx: &mut TestAppContext) {
         let (_repo, app, cx) = open_seeded_graph(cx);
 
         assert_eq!(
@@ -6903,9 +6553,15 @@ mod graph_selection_render_tests {
             "premise: row 0 is auto-selected on load, so row 1 starts genuinely unselected"
         );
 
-        let bounds_unselected = cx
-            .debug_bounds("graph-row-1-lane-canvas")
-            .expect("row 1's lane canvas must be painted while unselected");
+        let elements = ["graph-row-1-lane-canvas", "graph-row-1-selection-edge"];
+        let unselected: Vec<_> = elements
+            .iter()
+            .map(|selector| {
+                cx.debug_bounds(selector).unwrap_or_else(|| {
+                    panic!("{selector} must be painted while row 1 is unselected")
+                })
+            })
+            .collect();
 
         app.update(cx, |app, cx| {
             app.select_graph_row(1, cx);
@@ -6917,75 +6573,22 @@ mod graph_selection_render_tests {
             "premise: row 1 really is selected now"
         );
 
-        let bounds_selected = cx
-            .debug_bounds("graph-row-1-lane-canvas")
-            .expect("row 1's lane canvas must be painted while selected");
-
-        assert_eq!(
-            bounds_unselected.origin.x, bounds_selected.origin.x,
-            "selecting a row must never shift its own content to the right - the row's real \
-             `.border_l_2()` reserves its 2px unconditionally, only its colour should toggle \
-             (unselected: {:?}, selected: {:?})",
-            bounds_unselected, bounds_selected
-        );
-        assert_eq!(
-            bounds_unselected.size, bounds_selected.size,
-            "selecting a row must never resize its own content (unselected: {:?}, selected: \
-             {:?})",
-            bounds_unselected, bounds_selected
-        );
-    }
-
-    /// The reported "double border left and bottom" - GPUI's `Style::border_color` is one
-    /// shared value for every edge of a single element (confirmed directly in `gpui`'s own
-    /// `style.rs`: `border_color: Option<Hsla>`, not per-edge), so a row using both
-    /// `border_b_1()` (its own permanent separator) and a conditional `border_l_2()` (its
-    /// selection edge) on the *same* div used to have the second `.border_color()` call
-    /// silently overwrite the first - recolouring the bottom separator to the selection colour
-    /// too, on every selected row, everywhere this pattern was used. The fix is a real, separate
-    /// child element for the left edge (`Self::render_graph_row`'s own docs). This proves that
-    /// child exists and is genuinely unconditional - painted with the same bounds whether or not
-    /// the row is selected, only its colour differs (which this test harness has no way to
-    /// inspect directly, but a `debug_bounds` miss on the unselected row would mean the child is
-    /// still conditionally created, i.e. this fix regressed back to the broken pattern).
-    #[gpui::test]
-    fn the_selection_edge_is_a_real_element_painted_regardless_of_selection(
-        cx: &mut TestAppContext,
-    ) {
-        let (_repo, app, cx) = open_seeded_graph(cx);
-
-        assert_eq!(
-            app.read_with(cx, |app, _| app.graph_state.selected_row),
-            Some(0),
-            "premise: row 0 is auto-selected on load, so row 1 starts genuinely unselected"
-        );
-
-        let edge_unselected = cx.debug_bounds("graph-row-1-selection-edge").expect(
-            "the selection-edge child must be painted even while row 1 is unselected - if \
-                 it's `None` here, the edge is still only created `.when(selected, ...)`, the \
-                 exact regression this test exists to catch",
-        );
-
-        app.update(cx, |app, cx| {
-            app.select_graph_row(1, cx);
-        });
-        cx.run_until_parked();
-
-        let edge_selected = cx
-            .debug_bounds("graph-row-1-selection-edge")
-            .expect("the selection-edge child must still be painted while row 1 is selected");
-
-        assert_eq!(
-            edge_unselected.origin, edge_selected.origin,
-            "the selection edge's own position must never move - only its colour toggles \
-             (unselected: {:?}, selected: {:?})",
-            edge_unselected, edge_selected
-        );
-        assert_eq!(
-            edge_unselected.size, edge_selected.size,
-            "the selection edge's own size must never change (unselected: {:?}, selected: {:?})",
-            edge_unselected, edge_selected
-        );
+        for (selector, before) in elements.iter().zip(unselected) {
+            let after = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} must still be painted while selected"));
+            assert_eq!(
+                before.origin, after.origin,
+                "selecting a row must never move {selector} - the row's real `.border_l_2()` \
+                 reserves its 2px unconditionally, only its colour should toggle (unselected: \
+                 {before:?}, selected: {after:?})"
+            );
+            assert_eq!(
+                before.size, after.size,
+                "selecting a row must never resize {selector} (unselected: {before:?}, selected: \
+                 {after:?})"
+            );
+        }
     }
 
     /// GitHub issue #127: `AdeApp::graph_view_focused` - the bool `Self::render_graph_row`'s own
@@ -7051,24 +6654,9 @@ mod graph_selection_render_tests {
 #[cfg(test)]
 mod graph_focus_tests {
     use super::*;
-    use crate::root::focus::palette_focus_tests;
+    use crate::test_support::open_test_app;
     use gpui::{Entity, Focusable, TestAppContext};
-
-    fn git(dir: &std::path::Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    use test_support::{commit, seed_empty_repo_at};
 
     /// A real one-commit repo (so `AdeApp::load_graph` succeeds and the Branches panel's filter
     /// row - only rendered once a `Graph` is actually loaded - really paints) plus a real, already-
@@ -7082,13 +6670,9 @@ mod graph_focus_tests {
         &mut gpui::VisualTestContext,
     ) {
         let repo = tempfile::tempdir().expect("tempdir");
-        git(repo.path(), &["init", "-b", "main"]);
-        git(repo.path(), &["config", "user.email", "test@example.com"]);
-        git(repo.path(), &["config", "user.name", "Test User"]);
-        std::fs::write(repo.path().join("a.txt"), "1\n").expect("write a.txt");
-        git(repo.path(), &["add", "."]);
-        git(repo.path(), &["commit", "-m", "initial"]);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        seed_empty_repo_at(repo.path());
+        commit(repo.path(), "a.txt", "1\n", "initial");
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         (repo, app, cx)
     }
 
@@ -7525,43 +7109,11 @@ mod graph_focus_tests {
 /// stub these replaced.
 #[cfg(test)]
 mod graph_remote_action_tests {
-    use crate::root::focus::palette_focus_tests;
     use crate::root::AdeApp;
+    use crate::test_support::open_test_app;
     use gpui::{Entity, TestAppContext};
-    use std::path::Path;
+    use test_support::{commit, git, git_output, seed_empty_repo_at};
     use wt_core::remote::PushForce;
-
-    fn git(dir: &Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn git_output(dir: &Path, args: &[&str]) -> String {
-        let output = std::process::Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(output.status.success(), "git {args:?} failed in {dir:?}");
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
-    }
-
-    fn commit(dir: &Path, file: &str, contents: &str, message: &str) {
-        std::fs::write(dir.join(file), contents).expect("write file");
-        git(dir, &["add", file]);
-        git(dir, &["commit", "-m", message]);
-    }
 
     /// A real bare remote plus a real clone of it, with a real committer identity and one
     /// tracked file - the app is opened against the clone, matching how a real user's worktree
@@ -7595,7 +7147,7 @@ mod graph_remote_action_tests {
         git(local.path(), &["config", "user.email", "test@example.com"]);
         git(local.path(), &["config", "user.name", "Test User"]);
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, local.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, local.path().to_path_buf());
         (remote, local, app, cx)
     }
 
@@ -7805,12 +7357,10 @@ mod graph_remote_action_tests {
         &mut gpui::VisualTestContext,
     ) {
         let local = tempfile::tempdir().expect("tempdir");
-        git(local.path(), &["init", "-b", "main"]);
-        git(local.path(), &["config", "user.email", "test@example.com"]);
-        git(local.path(), &["config", "user.name", "Test User"]);
+        seed_empty_repo_at(local.path());
         commit(local.path(), "a.txt", "base", "base");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, local.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, local.path().to_path_buf());
         (local, app, cx)
     }
 
@@ -8288,59 +7838,62 @@ mod graph_remote_action_tests {
         );
     }
 
+    /// Both non-destructive reset modes: each really moves the branch tip back, leaves the working
+    /// tree's own content alone, and differs only in whether the undone commit's change lands
+    /// staged (`Soft`) or unstaged (`Mixed`). `Hard` is deliberately not here - it is destructive,
+    /// so it carries its own arm-then-confirm test below.
     #[gpui::test]
-    async fn soft_reset_moves_the_branch_tip_and_keeps_the_change_staged(cx: &mut TestAppContext) {
-        let (local, app, cx) = open_seeded_local_repo(cx);
-        let base_sha = git_output(local.path(), &["rev-parse", "HEAD"]);
-        commit(local.path(), "a.txt", "changed", "second commit");
+    async fn a_soft_or_mixed_reset_moves_the_branch_tip_and_keeps_the_change(
+        cx: &mut TestAppContext,
+    ) {
+        for (mode, status, staged, unstaged) in [
+            (
+                wt_core::checkout::ResetMode::Soft,
+                "Soft reset",
+                "a.txt",
+                "",
+            ),
+            (
+                wt_core::checkout::ResetMode::Mixed,
+                "Mixed reset",
+                "",
+                "a.txt",
+            ),
+        ] {
+            let (local, app, cx) = open_seeded_local_repo(cx);
+            let base_sha = git_output(local.path(), &["rev-parse", "HEAD"]);
+            commit(local.path(), "a.txt", "changed", "second commit");
 
-        app.update_in(cx, |app, _window, cx| {
-            app.request_graph_reset(wt_core::checkout::ResetMode::Soft, base_sha.clone(), cx);
-        });
-        cx.run_until_parked();
+            app.update_in(cx, |app, _window, cx| {
+                app.request_graph_reset(mode, base_sha.clone(), cx);
+            });
+            cx.run_until_parked();
 
-        assert_eq!(git_output(local.path(), &["rev-parse", "HEAD"]), base_sha);
-        assert_eq!(
-            git_output(local.path(), &["diff", "--cached", "--name-only"]),
-            "a.txt",
-            "a soft reset must leave the undone commit's own change staged"
-        );
-        assert_eq!(
-            std::fs::read_to_string(local.path().join("a.txt")).expect("read a.txt"),
-            "changed",
-            "the working tree content must be untouched by a soft reset"
-        );
-        assert_eq!(
-            app.read_with(cx, |app, _| app.graph_state.status_message.clone()),
-            Some("Soft reset".to_string())
-        );
-    }
-
-    #[gpui::test]
-    async fn mixed_reset_moves_the_branch_tip_and_unstages_the_change(cx: &mut TestAppContext) {
-        let (local, app, cx) = open_seeded_local_repo(cx);
-        let base_sha = git_output(local.path(), &["rev-parse", "HEAD"]);
-        commit(local.path(), "a.txt", "changed", "second commit");
-
-        app.update_in(cx, |app, _window, cx| {
-            app.request_graph_reset(wt_core::checkout::ResetMode::Mixed, base_sha.clone(), cx);
-        });
-        cx.run_until_parked();
-
-        assert_eq!(git_output(local.path(), &["rev-parse", "HEAD"]), base_sha);
-        assert!(
-            git_output(local.path(), &["diff", "--cached", "--name-only"]).is_empty(),
-            "a mixed reset must leave nothing staged"
-        );
-        assert_eq!(
-            git_output(local.path(), &["diff", "--name-only"]),
-            "a.txt",
-            "the undone commit's own change must land unstaged instead"
-        );
-        assert_eq!(
-            app.read_with(cx, |app, _| app.graph_state.status_message.clone()),
-            Some("Mixed reset".to_string())
-        );
+            assert_eq!(
+                git_output(local.path(), &["rev-parse", "HEAD"]),
+                base_sha,
+                "{mode:?} must really move the branch tip back"
+            );
+            assert_eq!(
+                git_output(local.path(), &["diff", "--cached", "--name-only"]),
+                staged,
+                "{mode:?}: wrong staged set for the undone commit's own change"
+            );
+            assert_eq!(
+                git_output(local.path(), &["diff", "--name-only"]),
+                unstaged,
+                "{mode:?}: wrong unstaged set for the undone commit's own change"
+            );
+            assert_eq!(
+                std::fs::read_to_string(local.path().join("a.txt")).expect("read a.txt"),
+                "changed",
+                "{mode:?} must leave the working tree's own content untouched"
+            );
+            assert_eq!(
+                app.read_with(cx, |app, _| app.graph_state.status_message.clone()),
+                Some(status.to_string())
+            );
+        }
     }
 
     #[gpui::test]
@@ -8473,53 +8026,15 @@ mod graph_remote_action_tests {
 #[cfg(test)]
 mod graph_virtualization_tests {
     use super::*;
-    use crate::root::focus::palette_focus_tests;
+    use crate::test_support::open_test_app;
     use gpui::{Entity, TestAppContext};
-
-    fn git(dir: &std::path::Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn init_repo(dir: &std::path::Path) {
-        git(dir, &["init", "-b", "main"]);
-        git(dir, &["config", "user.email", "test@example.com"]);
-        git(dir, &["config", "user.name", "Test User"]);
-    }
-
-    /// `count` real commits, and a clean working tree at the end so `build_graph` adds no
-    /// "Working tree" row to shift the indices these tests name by literal selector.
-    ///
-    /// `--allow-empty` keeps the seed cheap: what is being measured here is how many *rows* get
-    /// painted, and an empty commit is as real a `GraphRow` as any other.
-    fn seed_commits(dir: &std::path::Path, count: usize) {
-        init_repo(dir);
-        std::fs::write(dir.join("a.txt"), "1\n").expect("write a.txt");
-        git(dir, &["add", "."]);
-        git(dir, &["commit", "-m", "first"]);
-        for index in 1..count {
-            git(
-                dir,
-                &["commit", "--allow-empty", "-m", &format!("c{index}")],
-            );
-        }
-    }
+    use test_support::seed_commits;
 
     fn open_graph_on<'a>(
         cx: &'a mut TestAppContext,
         repo: &std::path::Path,
     ) -> (Entity<AdeApp>, &'a mut gpui::VisualTestContext) {
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_git_graph(window, cx);
         });
@@ -8940,53 +8455,21 @@ mod graph_virtualization_tests {
 #[cfg(test)]
 mod graph_branch_menu_tests {
     use super::*;
-    use crate::root::focus::palette_focus_tests;
+    use crate::test_support::open_test_app;
     use gpui::{Entity, Pixels, TestAppContext};
-
-    fn git(dir: &std::path::Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn git_output(dir: &std::path::Path, args: &[&str]) -> String {
-        let output = std::process::Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(output.status.success(), "git {args:?} failed in {dir:?}");
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
-    }
+    use test_support::{commit, git, git_output, seed_empty_repo_at};
 
     /// A real repository with three real local branches - `main` (checked out), `feature-a` and
     /// `feature-b` - all reachable from the default `GraphScope::All` walk, so all three really
     /// appear as rows in the Branches panel.
     fn seed_three_branches(dir: &std::path::Path) {
-        git(dir, &["init", "-b", "main"]);
-        git(dir, &["config", "user.email", "test@example.com"]);
-        git(dir, &["config", "user.name", "Test User"]);
-        std::fs::write(dir.join("a.txt"), "1\n").expect("write a.txt");
-        git(dir, &["add", "."]);
-        git(dir, &["commit", "-m", "first"]);
+        seed_empty_repo_at(dir);
+        commit(dir, "a.txt", "1\n", "first");
         git(dir, &["checkout", "-b", "feature-a"]);
-        std::fs::write(dir.join("a.txt"), "2\n").expect("write a.txt");
-        git(dir, &["commit", "-am", "feature a work"]);
+        commit(dir, "a.txt", "2\n", "feature a work");
         git(dir, &["checkout", "main"]);
         git(dir, &["checkout", "-b", "feature-b"]);
-        std::fs::write(dir.join("b.txt"), "1\n").expect("write b.txt");
-        git(dir, &["add", "."]);
-        git(dir, &["commit", "-m", "feature b work"]);
+        commit(dir, "b.txt", "1\n", "feature b work");
         git(dir, &["checkout", "main"]);
     }
 
@@ -9000,7 +8483,7 @@ mod graph_branch_menu_tests {
     ) {
         let repo = tempfile::tempdir().expect("tempdir");
         seed_three_branches(repo.path());
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_git_graph(window, cx);
         });
@@ -9224,9 +8707,11 @@ mod graph_branch_menu_tests {
         });
     }
 
-    /// GitHub issue #176's shared one-menu-at-a-time invariant, at this menu's own real trigger.
+    /// GitHub issue #176's shared one-menu-at-a-time invariant, at this menu's own real trigger
+    /// and in both directions - the mirror direction is what registering `MenuSurface::GraphBranch`
+    /// buys.
     #[gpui::test]
-    fn opening_the_branch_menu_closes_an_open_row_menu(cx: &mut TestAppContext) {
+    fn the_branch_menu_and_the_row_menu_each_close_the_other(cx: &mut TestAppContext) {
         let (_repo, app, cx) = open_seeded_branches_panel(cx);
         app.update_in(cx, |app, window, cx| {
             app.open_graph_row_menu_at(0, px(20.0), px(120.0), window, cx);
@@ -9241,7 +8726,6 @@ mod graph_branch_menu_tests {
             .debug_bounds("graph-branch-row-feature-a")
             .expect("branch row painted");
         right_click(cx, row.center());
-
         app.read_with(cx, |app, _| {
             assert!(
                 app.graph_state.row_menu_open.is_none(),
@@ -9250,27 +8734,11 @@ mod graph_branch_menu_tests {
             );
             assert!(app.graph_state.branch_menu_open.is_some());
         });
-    }
-
-    /// The mirror direction: the row menu's own opener sweeps this one closed too, which is what
-    /// registering `MenuSurface::GraphBranch` buys.
-    #[gpui::test]
-    fn opening_the_row_menu_closes_an_open_branch_menu(cx: &mut TestAppContext) {
-        let (_repo, app, cx) = open_seeded_branches_panel(cx);
-        let row = cx
-            .debug_bounds("graph-branch-row-feature-a")
-            .expect("branch row painted");
-        right_click(cx, row.center());
-        assert!(
-            app.read_with(cx, |app, _| app.graph_state.branch_menu_open.is_some()),
-            "premise: the branch menu really is open first"
-        );
 
         app.update_in(cx, |app, window, cx| {
             app.open_graph_row_menu_at(0, px(20.0), px(120.0), window, cx);
         });
         cx.run_until_parked();
-
         app.read_with(cx, |app, _| {
             assert!(
                 app.graph_state.branch_menu_open.is_none(),
@@ -9616,7 +9084,7 @@ mod graph_branch_menu_tests {
         // `wt_core::stage::dirty_paths` read is what fills `dirty_files` - never a hand-set field.
         std::fs::write(repo.path().join("dirty-one.txt"), "uncommitted\n").expect("write");
         std::fs::write(repo.path().join("dirty-two.txt"), "uncommitted\n").expect("write");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_git_graph(window, cx);
         });
@@ -9664,44 +9132,6 @@ mod graph_branch_menu_tests {
         assert!(
             !wt_core::merge::merge_head_exists(repo.path()).expect("merge_head_exists"),
             "and no real git merge must have been run in the worktree"
-        );
-    }
-
-    /// Merging the branch that is already checked out into itself is a guaranteed no-op
-    /// (`wt_core::Error::MergeSourceIsCurrentBranch`) - refused on the row rather than after the
-    /// click, and phrased as the state it really is rather than as something the user could fix by
-    /// committing.
-    #[gpui::test]
-    fn merge_row_is_disabled_on_the_branch_that_is_already_checked_out(cx: &mut TestAppContext) {
-        let (repo, app, cx) = open_seeded_branches_panel(cx);
-        assert_eq!(
-            git_output(repo.path(), &["rev-parse", "--abbrev-ref", "HEAD"]),
-            "main",
-            "premise: the focused worktree really is on main"
-        );
-
-        app.read_with(cx, |app, cx| {
-            let gate =
-                graph_branch_merge_gate(&app.graph_branch_merge_facts("main".to_string(), cx));
-            assert_eq!(gate.reason(), Some("already on main"));
-        });
-
-        open_menu_at(cx, "graph-branch-row-main");
-        click_menu_row(cx, "dropdown-menu-row-Merge into current branch\u{2026}");
-        app.read_with(cx, |app, _| {
-            assert!(
-                app.merge_flow.is_none(),
-                "merging main into main must not even start"
-            );
-            assert_eq!(
-                app.graph_state.status_message, None,
-                "and the row must genuinely be disabled - a click that reached the action would \
-                 have reported the gate's refusal on the status line instead"
-            );
-        });
-        assert!(
-            !wt_core::merge::merge_head_exists(repo.path()).expect("merge_head_exists"),
-            "and must have run no real git merge"
         );
     }
 
@@ -9766,44 +9196,13 @@ mod graph_branch_menu_tests {
 #[cfg(test)]
 mod graph_branch_action_tests {
     use crate::merge::state as merge;
-    use crate::root::focus::palette_focus_tests;
     use crate::root::AdeApp;
+    use crate::test_support::open_test_app;
     use crate::text_history::TextField;
     use crate::work_surface::agents::ProcessKind;
     use gpui::{Entity, TestAppContext};
     use std::path::Path;
-
-    fn git(dir: &Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn git_output(dir: &Path, args: &[&str]) -> String {
-        let output = std::process::Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(output.status.success(), "git {args:?} failed in {dir:?}");
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
-    }
-
-    fn commit(dir: &Path, file: &str, contents: &str, message: &str) {
-        std::fs::write(dir.join(file), contents).expect("write file");
-        git(dir, &["add", file]);
-        git(dir, &["commit", "-m", message]);
-    }
+    use test_support::{commit, git, git_output, seed_empty_repo_at};
 
     fn branches(dir: &Path) -> Vec<String> {
         git_output(dir, &["branch", "--format=%(refname:short)"])
@@ -9839,15 +9238,13 @@ mod graph_branch_action_tests {
         &mut gpui::VisualTestContext,
     ) {
         let local = tempfile::tempdir().expect("tempdir");
-        git(local.path(), &["init", "-b", "main"]);
-        git(local.path(), &["config", "user.email", "test@example.com"]);
-        git(local.path(), &["config", "user.name", "Test User"]);
+        seed_empty_repo_at(local.path());
         commit(local.path(), "a.txt", "base", "base");
         git(local.path(), &["checkout", "-b", "feature"]);
         commit(local.path(), "b.txt", "feature", "feature work");
         git(local.path(), &["checkout", "main"]);
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, local.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, local.path().to_path_buf());
         (local, app, cx)
     }
 
@@ -10199,7 +9596,7 @@ mod graph_branch_action_tests {
         // named branch rather than whatever is checked out.
         commit(local.path(), "c.txt", "main only", "main only work");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, local.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, local.path().to_path_buf());
         app.update_in(cx, |app, _window, cx| {
             app.request_graph_push_branch("feature".to_string(), cx);
         });
@@ -10317,10 +9714,13 @@ mod graph_branch_action_tests {
         let (local, app, cx) = open_seeded_with_feature_branch(cx);
         // The worktree's own agent tab - the surface the existing resolver renders inside. A test
         // app already opens one for the focused repo, which is exactly the real situation this
-        // action expects to find.
+        // action expects to find. Keyed off the app's own `diff_root`, the very key
+        // `start_merge_from_graph_branch` looks agents up by: a `TempDir`'s own path is a symlink
+        // on macOS (`/var/...`) while the app stores the canonicalized one (`/private/var/...`),
+        // so `local.path()` matches no agent at all there.
         let agent_id = app.read_with(cx, |app, _| {
             app.agents
-                .iter_for_cwd(local.path().to_path_buf())
+                .iter_for_cwd(app.diff_root.clone())
                 .map(|agent| agent.id)
                 .next()
                 .expect("the test app opens a real agent in the focused worktree")
@@ -10404,9 +9804,7 @@ mod graph_branch_action_tests {
         cx: &mut TestAppContext,
     ) {
         let local = tempfile::tempdir().expect("tempdir");
-        git(local.path(), &["init", "-b", "main"]);
-        git(local.path(), &["config", "user.email", "test@example.com"]);
-        git(local.path(), &["config", "user.name", "Test User"]);
+        seed_empty_repo_at(local.path());
         commit(local.path(), "shared.txt", "line1\nline2\nline3\n", "base");
         git(local.path(), &["checkout", "-b", "feature"]);
         commit(
@@ -10423,7 +9821,7 @@ mod graph_branch_action_tests {
             "main changes shared",
         );
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, local.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, local.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.agents.spawn(
                 ProcessKind::Shell,
@@ -10499,13 +9897,19 @@ mod graph_branch_action_tests {
     ) {
         let (local, app, cx) = open_seeded_with_feature_branch(cx);
         // Close every agent in the focused worktree, so there is genuinely no surface left to
-        // show the resolver in - the real state this refusal exists for.
+        // show the resolver in - the real state this refusal exists for. Keyed off `diff_root`
+        // for the same reason as `merge_into_current_branch_lands_in_the_existing_merge_flow`.
         let existing: Vec<_> = app.read_with(cx, |app, _| {
             app.agents
-                .iter_for_cwd(local.path().to_path_buf())
+                .iter_for_cwd(app.diff_root.clone())
                 .map(|agent| agent.id)
                 .collect()
         });
+        assert!(
+            !existing.is_empty(),
+            "premise: the test app really did open an agent in this worktree, or this test would \
+             pass without exercising the refusal at all"
+        );
         for id in existing {
             app.update_in(cx, |app, window, cx| app.close_agent(id, window, cx));
         }
