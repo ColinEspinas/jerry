@@ -358,8 +358,17 @@ impl AdeApp {
             right_sidebar_view: RightSidebarView::Files,
             file_tree_scroll_handle: UniformListScrollHandle::new(),
             search: crate::search::state::SearchPanel::new(cx),
-            search_scroll_handle: gpui::ScrollHandle::new(),
+            // Starts empty and is reset to the real row count from the one place that builds the
+            // rows (`crate::search::render::AdeApp::render_search_body`) - never seeded with a
+            // guessed count, which `gpui::list` would then measure against nothing. Mirrors
+            // `rail_list_state`'s own init above for the identical reason.
+            search_list_state: gpui::ListState::new(
+                0,
+                gpui::ListAlignment::Top,
+                crate::search::render::SEARCH_LIST_OVERDRAW,
+            ),
             _search_task: None,
+            search_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             _search_replace_task: None,
             find_bar: None,
             find_bar_focus_handle: cx.focus_handle(),

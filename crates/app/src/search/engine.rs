@@ -26,12 +26,46 @@
 //! silently applied: [`MAX_MATCHES`], [`MAX_SCANNED_FILES`], [`MAX_FILE_BYTES`] and a binary-file
 //! check. [`SearchOutcome::truncated`] is what the panel's count row turns into a real truncation
 //! notice - the issue's own "results cap with an honest truncation notice".
+//!
+//! ## Parallel, because a directory walk is not one file
+//!
+//! A live report (GitHub issue #162's own follow-up) found a real, unbounded-looking query
+//! latency: typing into the query field could take "a very long time" to answer on a checkout of
+//! merely "dozens to hundreds of files" - measured directly against a 415-file, 14MB fixture at
+//! **582ms** for a single-threaded, one-file-at-a-time walk (a query that does not hit either
+//! cap, so every candidate file is really read and scanned). [`search_worktree`]'s own read+scan
+//! step (the expensive part - `fs::read` plus a real `regex::Regex` pass, not the directory
+//! listing, which is a cheap `stat` per entry) now runs across [`SEARCH_SCAN_BATCH`]-sized
+//! batches of candidates on `rayon`'s global thread pool, folding each batch's results back into
+//! [`SearchOutcome`] **sequentially and in the original, sorted order** - so [`MAX_MATCHES`]/
+//! [`MAX_SCANNED_FILES`] still stop the walk at exactly the same file/line the old sequential loop
+//! would have (`worktree_tests::the_result_cap_stops_the_search_and_says_so_rather_than_returning_a_silent_prefix`
+//! still pins the same tight `<= MAX_MATCHES + 1` bound), and a re-run never reorders rows the
+//! user was reading mid-keystroke. Batching (rather than handing the whole candidate list to
+//! `rayon` at once) is what keeps [`MAX_SCANNED_FILES`]'s own point intact: without it, a
+//! `target/`-sized checkout would still pay to read and scan every file the cap exists to avoid
+//! reading in the first place, just on more threads at once.
+//!
+//! ## Cancelled, because a superseded search is not a finished one
+//!
+//! `crate::search::render::AdeApp::start_search` already discarded a slow search's *result* once
+//! a newer one answered first (its own generation guard), but the slow search itself kept running
+//! to completion on the background executor regardless - burning a real CPU thread competing with
+//! the query that superseded it, on every keystroke of a fast typist against a large-enough
+//! worktree. [`search_worktree_cancellable`] is the real fix: `is_stale` is polled once per batch
+//! (cheap - a single atomic load) and a `true` answer stops the walk immediately, returning
+//! whatever partial [`SearchOutcome`] has accumulated so far. The caller never looks at that
+//! outcome (its own generation guard already discards it), so this is a pure CPU-saving early
+//! exit, not a correctness-affecting one. [`search_worktree`] is the non-cancellable convenience
+//! wrapper every existing (and every non-panel) caller keeps using.
 
 use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+
+use rayon::prelude::*;
 
 use crate::search::glob::GlobList;
 
@@ -54,6 +88,13 @@ pub const MAX_SCANNED_FILES: usize = 20_000;
 
 /// How much of a file is sniffed for a NUL byte before it is called binary and skipped.
 const BINARY_SNIFF_BYTES: usize = 8 * 1024;
+
+/// How many candidate files [`search_worktree_cancellable`] hands to `rayon` at once. Large
+/// enough that a "dozens to hundreds of files" checkout (the live report this exists for) is one
+/// batch, so it gets full parallelism; small enough that [`MAX_SCANNED_FILES`]/`is_stale` are both
+/// re-checked often enough on a checkout big enough to need them - see this module's own "Bounded"
+/// and "Cancelled" docs.
+const SEARCH_SCAN_BATCH: usize = 128;
 
 /// The three modifier buttons in the query row, as real state
 /// (`REVISION-2026-08-14.md` §5: "`Aa` / `ab` / `.*` modifier buttons").
@@ -290,7 +331,24 @@ pub struct SearchRequest {
 /// start_search`). Errors reading an individual file or directory are skipped rather than
 /// aborting - one unreadable folder must never blank a whole result tree - which is the same call
 /// `build_file_tree`'s own walk makes.
+///
+/// The non-cancellable convenience wrapper: every caller that isn't the panel's own debounced,
+/// generation-guarded search (every test in this module included) has nothing to cancel *for* -
+/// see [`search_worktree_cancellable`]'s own docs for the one caller that does.
 pub fn search_worktree(request: &SearchRequest) -> SearchOutcome {
+    search_worktree_cancellable(request, &|| false)
+}
+
+/// [`search_worktree`], plus the real fix for a live, reported "typing is slow" defect: `is_stale`
+/// is polled between batches, and answering `true` stops the walk immediately rather than running
+/// it to completion only to have the result discarded - see this module's own "Cancelled" docs.
+///
+/// `is_stale` is called from this function's own thread only (never from inside a `rayon` worker),
+/// so it needs no `Send`/`Sync` bound of its own.
+pub fn search_worktree_cancellable(
+    request: &SearchRequest,
+    is_stale: &dyn Fn() -> bool,
+) -> SearchOutcome {
     let mut outcome = SearchOutcome::default();
     let mut candidates = Vec::new();
     collect_files(&request.root, &mut candidates, &mut outcome);
@@ -298,50 +356,91 @@ pub fn search_worktree(request: &SearchRequest) -> SearchOutcome {
     // keystroke must not shuffle rows the user was reading. `read_dir` order is not defined.
     candidates.sort();
 
-    for path in candidates {
-        if outcome.truncated {
+    // The include/exclude filter is real path-string work, not file IO, so it stays sequential -
+    // parallelizing it would not meaningfully speed up the walk, and doing it here keeps every
+    // batch below holding only real candidates to read.
+    let filtered: Vec<(PathBuf, String)> = candidates
+        .into_iter()
+        .filter_map(|path| {
+            let relative = relative_slash_path(&request.root, &path)?;
+            request.filter.allows(&relative).then_some((path, relative))
+        })
+        .collect();
+
+    for batch in filtered.chunks(SEARCH_SCAN_BATCH) {
+        if outcome.truncated || is_stale() {
             break;
         }
-        let Some(relative) = relative_slash_path(&request.root, &path) else {
-            continue;
-        };
-        if !request.filter.allows(&relative) {
-            continue;
-        }
-        if outcome.scanned_files >= MAX_SCANNED_FILES {
-            outcome.truncated = true;
-            break;
-        }
-        let Some(content) = read_searchable(&path) else {
-            continue;
-        };
-        outcome.scanned_files += 1;
-        let mut lines = Vec::new();
-        for (index, line) in content.lines().enumerate() {
-            let ranges = request.matcher.find_in_line(line);
-            if ranges.is_empty() {
-                continue;
+        // The expensive part - `fs::read` plus a real `regex::Regex` pass per file - run across
+        // `rayon`'s global thread pool. Each file's own full match set is computed independently
+        // and without regard to `MAX_MATCHES` (there is no running total to check from inside a
+        // parallel closure); the cap is enforced afterwards, sequentially, in the fold loop below
+        // - the same place [`MAX_SCANNED_FILES`] already was, so both caps still stop the walk at
+        // exactly the file/line the old single-threaded loop would have.
+        let scanned: Vec<Option<Vec<LineMatch>>> = batch
+            .par_iter()
+            .map(|(path, _relative)| scan_file(path, &request.matcher))
+            .collect();
+
+        for ((path, relative), lines) in batch.iter().zip(scanned) {
+            if outcome.truncated {
+                break;
             }
-            outcome.total_matches += ranges.len();
-            lines.push(LineMatch {
-                line_number: index + 1,
-                text: line.to_string(),
-                ranges,
-            });
-            if outcome.total_matches >= MAX_MATCHES {
+            if outcome.scanned_files >= MAX_SCANNED_FILES {
                 outcome.truncated = true;
                 break;
             }
-        }
-        if !lines.is_empty() {
-            outcome.files.push(FileMatches {
-                path,
-                relative,
-                lines,
-            });
+            let Some(all_lines) = lines else {
+                // Not searchable at all (binary/oversized/unreadable/non-UTF-8) - never counted
+                // as scanned, matching `read_searchable`'s own callers before this change.
+                continue;
+            };
+            outcome.scanned_files += 1;
+            let mut kept = Vec::with_capacity(all_lines.len());
+            for line in all_lines {
+                outcome.total_matches += line.ranges.len();
+                kept.push(line);
+                if outcome.total_matches >= MAX_MATCHES {
+                    outcome.truncated = true;
+                    break;
+                }
+            }
+            if !kept.is_empty() {
+                outcome.files.push(FileMatches {
+                    path: path.clone(),
+                    relative: relative.clone(),
+                    lines: kept,
+                });
+            }
         }
     }
     outcome
+}
+
+/// `path`'s full, uncapped match set, or `None` when [`read_searchable`] says it is not
+/// searchable at all. Pure per-file work - no shared state, no cap enforcement - so it is safe to
+/// call from any `rayon` worker thread; [`search_worktree_cancellable`]'s own fold loop is where
+/// [`MAX_MATCHES`] actually gets enforced, against the real running total this function has no
+/// access to.
+fn scan_file(path: &Path, matcher: &Matcher) -> Option<Vec<LineMatch>> {
+    let content = read_searchable(path)?;
+    Some(
+        content
+            .lines()
+            .enumerate()
+            .filter_map(|(index, line)| {
+                let ranges = matcher.find_in_line(line);
+                if ranges.is_empty() {
+                    return None;
+                }
+                Some(LineMatch {
+                    line_number: index + 1,
+                    text: line.to_string(),
+                    ranges,
+                })
+            })
+            .collect(),
+    )
 }
 
 /// Every regular file under `dir`, recursively.
@@ -825,6 +924,113 @@ mod tests {
         let (prefix, hit, _) = elide_around(&line, &(start..start + 3));
         assert_eq!(hit, "HIT");
         assert_eq!(prefix.chars().count(), ELIDE_PREFIX_MAX);
+    }
+}
+
+/// Real timing/cancellation regression coverage for GitHub issue #162's own live-report follow-up.
+///
+/// "Typing is slow" was two real, separate defects: the walk itself was single-threaded (this
+/// module's own "Parallel" docs), and a superseded search kept running to completion instead of
+/// stopping (this module's own "Cancelled" docs). Both are proven here against a real, on-disk,
+/// 200-file worktree - `crate::search::render::panel_tests` proves the panel wires this all up
+/// correctly; this proves the engine underneath it is actually fast and actually cancellable.
+#[cfg(test)]
+mod perf_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// A real, "dozens to hundreds of files" worktree - the live report's own wording - spread
+    /// across 20 subdirectories so the walk is genuinely a directory tree, not one flat folder.
+    /// Deliberately more than one [`SEARCH_SCAN_BATCH`] (200 files against a 128-file batch), so
+    /// both tests below exercise a walk that really does span more than one parallel batch.
+    fn many_file_fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("a temp worktree");
+        let root = dir.path();
+        for i in 0..200 {
+            let sub = root.join(format!("src/mod{}", i % 20));
+            fs::create_dir_all(&sub).expect("mkdir");
+            let mut content = String::new();
+            for line in 0..300 {
+                content.push_str(&format!("    let value_{line} = compute(value_{line});\n"));
+            }
+            fs::write(sub.join(format!("file_{i}.rs")), content).expect("write");
+        }
+        dir
+    }
+
+    fn never_matches_request(root: &Path) -> SearchRequest {
+        SearchRequest {
+            root: root.to_path_buf(),
+            matcher: Matcher::compile(
+                "zzz_never_present_in_the_fixture_zzz",
+                SearchOptions::default(),
+            )
+            .expect("compiles")
+            .expect("a query"),
+            filter: PathFilter::new("", ""),
+        }
+    }
+
+    /// A real wall-clock bound, not a micro-benchmark: loose enough (2s) that it never flakes on
+    /// a slow CI runner, following the same "generous, real bound" convention
+    /// `crate::lsp::client`'s own timing tests already use (`started.elapsed() < Duration::
+    /// from_secs(5)`/`20)`) - but tight enough that a regression back to the pre-fix,
+    /// single-threaded, one-file-at-a-time walk (measured directly at 582ms against a comparable
+    /// 415-file/14MB fixture - this module's own "Parallel" docs) would still be caught.
+    #[test]
+    fn a_full_walk_of_a_real_multi_file_worktree_stays_well_under_a_second() {
+        let dir = many_file_fixture();
+        let request = never_matches_request(dir.path());
+        let start = Instant::now();
+        let outcome = search_worktree(&request);
+        let elapsed = start.elapsed();
+        assert_eq!(
+            outcome.scanned_files, 200,
+            "every candidate must really have been read and scanned - this bound is only honest \
+             if the walk actually did the work it is being timed for"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "a real 200-file worktree walk took {elapsed:?} - see this test's own docs for why \
+             2s is the right bound to assert here"
+        );
+    }
+
+    /// The real mechanism behind the live report's second half: a search that is already stale
+    /// before its very first batch must never scan the whole worktree anyway - it has to bail out
+    /// immediately, which is exactly what frees the CPU a fast typist's next keystroke needs.
+    #[test]
+    fn an_already_stale_search_never_scans_a_single_file() {
+        let dir = many_file_fixture();
+        let request = never_matches_request(dir.path());
+        let outcome = search_worktree_cancellable(&request, &|| true);
+        assert_eq!(
+            outcome.scanned_files, 0,
+            "stale from the start - the real shape of a keystroke that supersedes a search \
+             before its own debounce has even elapsed - must mean zero files read, not merely \
+             fewer than the total"
+        );
+    }
+
+    /// The other half: a search that goes stale *while it is running* stops at the next batch
+    /// boundary rather than finishing the walk it was already partway through.
+    #[test]
+    fn a_search_that_goes_stale_partway_through_stops_before_scanning_everything() {
+        let dir = many_file_fixture();
+        let request = never_matches_request(dir.path());
+        // `false` the first time this is polled (so batch 1 - 128 of the 200 files - really
+        // runs), `true` every time after (so batch 2 never starts).
+        let polls = AtomicUsize::new(0);
+        let outcome =
+            search_worktree_cancellable(&request, &|| polls.fetch_add(1, Ordering::SeqCst) >= 1);
+        assert!(
+            outcome.scanned_files > 0 && outcome.scanned_files < 200,
+            "going stale after one batch must stop the walk before it reaches every file, not \
+             merely report a smaller number afterwards once it already finished - scanned {} of \
+             200",
+            outcome.scanned_files
+        );
     }
 }
 

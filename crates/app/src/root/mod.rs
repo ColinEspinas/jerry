@@ -479,15 +479,34 @@ pub struct AdeApp {
     /// toggles, per-file collapse, and the last completed search - see
     /// `crate::search::state::SearchPanel`.
     pub(crate) search: crate::search::state::SearchPanel,
-    /// The result tree's own scroll handle. A plain `gpui::ScrollHandle` rather than a
-    /// `UniformListScrollHandle` like the file tree's: the tree is two-level with per-file
-    /// collapse, so its rows are not uniform in count *or* height, which is exactly what
-    /// `uniform_list` requires. The result cap (`crate::search::engine::MAX_MATCHES`) is what
-    /// bounds how many rows this can ever hold.
-    pub(crate) search_scroll_handle: gpui::ScrollHandle,
-    /// The in-flight debounced search - superseded rather than cancelled, with a generation
-    /// guard on the result, so a slow walk cannot overwrite a newer, faster one.
+    /// The result tree's own real virtualized-list state (GitHub issue #162's own live-report
+    /// follow-up: with many results shown, the panel used to build every file row and every match
+    /// row unconditionally, on every render, exactly the eager-`.children(...)` gap the rail's own
+    /// `Self::rail_list_state` was fixed for). `gpui::ListState`, not a `UniformListScrollHandle`:
+    /// the tree is two-level with per-file collapse, so its rows are not uniform in count *or*
+    /// height. `crate::search::render::AdeApp::render_search_body`'s own `gpui::list` builds only
+    /// the rows its viewport (plus `crate::search::render::SEARCH_LIST_OVERDRAW`) actually covers.
+    /// The result cap (`crate::search::engine::MAX_MATCHES`) still bounds how many rows this can
+    /// ever hold in total - it just no longer means every one of them is built on every frame.
+    pub(crate) search_list_state: gpui::ListState,
+    /// The in-flight debounced search - superseded rather than cancelled at the `gpui::Task`
+    /// level, with a generation guard on the result so a slow walk cannot overwrite a newer,
+    /// faster one. The walk *itself* cooperatively cancels via [`Self::search_generation`] - see
+    /// that field's own docs for why a generation guard on the result alone was not enough.
     pub(crate) _search_task: Option<Task<()>>,
+    /// A real, cross-thread mirror of `self.search.generation`
+    /// (`crate::search::state::SearchPanel::generation`) - GitHub issue #162's own live-report
+    /// follow-up. Before this, a superseded search kept running to completion on the background
+    /// executor even after a newer keystroke's own debounce fired and started a second one: the
+    /// generation guard only discarded the *result*, so a fast typist against a large-enough
+    /// worktree could pile up several full walks competing for CPU at once, each one slowing down
+    /// the one that would actually answer the query on screen. `crate::search::render::AdeApp::
+    /// start_search` bumps this alongside `self.search.generation`, and `crate::search::engine::
+    /// search_worktree_cancellable` polls it (via the `is_stale` closure) once per scan batch, so
+    /// a superseded walk stops within one batch of being superseded rather than running to the
+    /// end. Plain `u64`, not the panel's own type, so `crate::search::engine` stays GPUI-free and
+    /// thread-agnostic - this is the one `Arc<AtomicU64>` cell that crosses into it.
+    pub(crate) search_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// The in-flight Replace all / per-file replace.
     pub(crate) _search_replace_task: Option<Task<()>>,
     /// The `mod+F` find bar over the focused file view, or `None` while it is closed

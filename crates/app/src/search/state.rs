@@ -139,6 +139,163 @@ impl CompletedSearch {
     }
 }
 
+/// One flattened row in the Search panel's two-level result tree - the real fix for a live report
+/// (GitHub issue #162's own follow-up) that the panel became "very slow" and "lags" once a search
+/// returned a lot of results.
+///
+/// `crate::search::render::AdeApp::render_search_body` used to build every file row and every
+/// match row under it unconditionally, on every render - up to `crate::search::engine::
+/// MAX_MATCHES` (2,000) match rows plus one file row per matching file, regardless of how many of
+/// them the panel's own viewport could actually show. [`flatten_search_list_items`] turns a
+/// [`SearchOutcome`] plus the panel's own collapse state into the real flat sequence
+/// `render_search_body`'s `gpui::list` (GPUI's own variable-row-height virtualized list - a file
+/// row and a match row are different heights, and a file's own match-row count is not uniform
+/// across files either, both of which rule out `uniform_list`) renders only the items its
+/// viewport (plus a small overdraw margin) actually covers - mirroring `crate::rail::state::
+/// RailListItem`'s identical fix for the rail's own worktree list (GitHub issue #364).
+///
+/// Deliberately index-only rather than cloning row data into every item, for the same reason
+/// `RailListItem` is: cheap to rebuild fresh on every render, with exactly one place -
+/// `crate::search::render::AdeApp::render_search_list_item` - that ever resolves one back into
+/// real row data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchListItem {
+    /// One matching file's own header row - its name, its chip, its match count.
+    FileRow { file_index: usize },
+    /// One match row: `outcome.files[file_index].lines[line_index]`'s `hit_index`'th hit. Never
+    /// emitted for a collapsed file - see [`flatten_search_list_items`]'s own gate.
+    MatchRow {
+        file_index: usize,
+        line_index: usize,
+        hit_index: usize,
+    },
+}
+
+/// Flattens `outcome`'s files (and, for every file not in `collapsed`, its match rows) into the
+/// real sequence `crate::search::render::AdeApp::render_search_body`'s `gpui::list` renders - see
+/// [`SearchListItem`]'s own docs for why this exists at all.
+pub fn flatten_search_list_items(
+    outcome: &SearchOutcome,
+    collapsed: &HashSet<PathBuf>,
+) -> Vec<SearchListItem> {
+    let mut items = Vec::new();
+    for (file_index, file) in outcome.files.iter().enumerate() {
+        items.push(SearchListItem::FileRow { file_index });
+        if collapsed.contains(&file.path) {
+            continue;
+        }
+        for (line_index, line) in file.lines.iter().enumerate() {
+            for hit_index in 0..line.ranges.len() {
+                items.push(SearchListItem::MatchRow {
+                    file_index,
+                    line_index,
+                    hit_index,
+                });
+            }
+        }
+    }
+    items
+}
+
+#[cfg(test)]
+mod flatten_tests {
+    use super::*;
+    use crate::search::engine::{FileMatches, LineMatch};
+
+    fn file(relative: &str, lines: Vec<(usize, usize)>) -> FileMatches {
+        FileMatches {
+            path: PathBuf::from("/wt").join(relative),
+            relative: relative.to_string(),
+            lines: lines
+                .into_iter()
+                .map(|(line_number, hits)| LineMatch {
+                    line_number,
+                    text: "hit hit".to_string(),
+                    ranges: (0..hits).map(|i| i..i + 1).collect(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn an_empty_outcome_flattens_to_no_items() {
+        assert_eq!(
+            flatten_search_list_items(&SearchOutcome::default(), &HashSet::new()),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn every_file_gets_a_row_and_every_hit_gets_its_own_row_in_order() {
+        let outcome = SearchOutcome {
+            files: vec![
+                file("a.rs", vec![(1, 2)]),
+                file("b.rs", vec![(3, 1), (5, 1)]),
+            ],
+            total_matches: 4,
+            truncated: false,
+            scanned_files: 2,
+        };
+        let items = flatten_search_list_items(&outcome, &HashSet::new());
+        assert_eq!(
+            items,
+            vec![
+                SearchListItem::FileRow { file_index: 0 },
+                SearchListItem::MatchRow {
+                    file_index: 0,
+                    line_index: 0,
+                    hit_index: 0
+                },
+                SearchListItem::MatchRow {
+                    file_index: 0,
+                    line_index: 0,
+                    hit_index: 1
+                },
+                SearchListItem::FileRow { file_index: 1 },
+                SearchListItem::MatchRow {
+                    file_index: 1,
+                    line_index: 0,
+                    hit_index: 0
+                },
+                SearchListItem::MatchRow {
+                    file_index: 1,
+                    line_index: 1,
+                    hit_index: 0
+                },
+            ],
+            "one row per match, in file/line/hit order - not the eager tree's own nesting, but \
+             the same rows in the same reading order"
+        );
+    }
+
+    #[test]
+    fn a_collapsed_file_still_gets_its_own_row_but_none_of_its_matches_do() {
+        let outcome = SearchOutcome {
+            files: vec![file("a.rs", vec![(1, 3)]), file("b.rs", vec![(2, 1)])],
+            total_matches: 4,
+            truncated: false,
+            scanned_files: 2,
+        };
+        let collapsed: HashSet<PathBuf> = [PathBuf::from("/wt/a.rs")].into_iter().collect();
+        let items = flatten_search_list_items(&outcome, &collapsed);
+        assert_eq!(
+            items,
+            vec![
+                SearchListItem::FileRow { file_index: 0 },
+                SearchListItem::FileRow { file_index: 1 },
+                SearchListItem::MatchRow {
+                    file_index: 1,
+                    line_index: 0,
+                    hit_index: 0
+                },
+            ],
+            "a collapsed file draws its own header row and nothing underneath it - the same rule \
+             the old eager tree drew, `crate::search::render::AdeApp::render_search_file`'s own \
+             `if open`"
+        );
+    }
+}
+
 /// What the panel's body is showing right now - `REVISION-2026-08-14.md` §5's table, plus the two
 /// states a static mock cannot have. See this module's own docs.
 #[derive(Debug, Clone, PartialEq, Eq)]

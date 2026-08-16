@@ -302,6 +302,7 @@ dependencies = [
  "notify",
  "pty-core",
  "rand 0.9.5",
+ "rayon",
  "regex",
  "reqwest",
  "rodio",
