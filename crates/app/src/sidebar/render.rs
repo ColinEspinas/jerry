@@ -4578,69 +4578,25 @@ mod virtualization_tests {
     use crate::root::focus::palette_focus_tests;
     use gpui::TestAppContext;
     use std::fs;
-    use std::process::Command;
-    use tempfile::TempDir;
+    use test_support::{git, seed_empty_repo_at};
 
-    /// `.output()`, not `.status()`: `status()` inherits stdout/stderr, so seeding a 40-file
-    /// repository below dumped forty `create mode 100644 f-NN.txt` lines into the test output.
-    fn git(dir: &std::path::Path, args: &[&str]) {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    /// Before this revision's fix, every one of the first
-    /// 500 (the since-removed `MAX_RENDERED_FILE_ENTRIES` cap) visible rows was built, laid out and painted
-    /// on *every* frame - including all the ones below the fold - which measured, against real
-    /// `gpui::FrameTiming` data on this repository's own tree, as ~145ms of a ~200ms
-    /// `Window::draw`.
-    #[gpui::test]
-    fn a_file_tree_row_far_below_the_viewport_is_never_painted(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
-        // Deliberately more rows than any plausible test viewport can show at
-        // `theme::band::TREE_ROW` (22px) each, but fewer than
-        // the since-removed `MAX_RENDERED_FILE_ENTRIES` cap, so this measured virtualization
-        // alone even back when that cap still existed.
-        for index in 0..300 {
-            fs::write(repo.path().join(format!("file-{index:03}.txt")), "x\n").expect("write");
-        }
-        let (_app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        cx.run_until_parked();
-
-        assert!(
-            cx.debug_bounds("file-tree-row-file-000.txt").is_some(),
-            "the first file-tree row must really paint - if it doesn't, this test proves \
-             nothing about virtualization, only that the tree is empty"
-        );
-        assert!(
-            cx.debug_bounds("file-tree-row-file-299.txt").is_none(),
-            "the 300th file-tree row is far below any plausible viewport, so a virtualized \
-             list must never build it as an element at all"
-        );
-    }
-
-    /// The other half of "is it really virtualized": a row that legitimately isn't painted yet
-    /// must still be reachable. This scrolls the real list with a real
-    /// `gpui::ScrollWheelEvent` and asserts the row that was previously absent genuinely
-    /// materializes - which simultaneously proves the list still scrolls at all after
+    /// Both halves of "is it really virtualized": a row far below the viewport is never built as
+    /// an element at all (before this revision's fix every one of the first 500 visible rows was
+    /// built, laid out and painted on *every* frame, which measured as ~145ms of a ~200ms
+    /// `Window::draw` against real `gpui::FrameTiming` data on this repository's own tree), and a
+    /// row that legitimately isn't painted yet must still be reachable. The scroll uses a real
+    /// `gpui::ScrollWheelEvent`, which simultaneously proves the list still scrolls at all after
     /// `Self::render_right_sidebar` stopped wrapping it in its own `overflow_y_scroll()`
     /// container, the one behaviour that change could plausibly have broken.
     #[gpui::test]
     fn scrolling_the_virtualized_file_tree_materializes_a_row_that_was_not_painted(
         cx: &mut TestAppContext,
     ) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = fixtures::temp_root();
         for index in 0..300 {
-            fs::write(repo.path().join(format!("file-{index:03}.txt")), "x\n").expect("write");
+            fs::write(repo.join(format!("file-{index:03}.txt")), "x\n").expect("write");
         }
-        let (_app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (_app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
         let first_row = cx
@@ -4684,10 +4640,10 @@ mod virtualization_tests {
     /// that is what the two "far below the viewport" tests and the scroll test are for.
     #[gpui::test]
     fn expanding_and_collapsing_a_directory_adds_and_removes_its_children(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
-        fs::create_dir(repo.path().join("src")).expect("mkdir");
-        fs::write(repo.path().join("src/only.rs"), "fn main() {}\n").expect("write");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (_repo_dir, repo) = fixtures::temp_root();
+        fs::create_dir(repo.join("src")).expect("mkdir");
+        fs::write(repo.join("src/only.rs"), "fn main() {}\n").expect("write");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
         assert!(
@@ -4699,7 +4655,7 @@ mod virtualization_tests {
             "nothing is expanded on first open, so a nested child must not paint"
         );
 
-        let src_dir = repo.path().join("src");
+        let src_dir = repo.join("src");
         app.update(cx, |app, cx| {
             app.toggle_dir_expanded(src_dir.clone(), cx);
         });
@@ -4735,29 +4691,23 @@ mod virtualization_tests {
     /// fails loudly rather than silently passing for the wrong reason.
     #[gpui::test]
     fn a_changes_row_far_below_the_viewport_is_never_painted(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
-        git(repo.path(), &["init", "-b", "main"]);
-        git(repo.path(), &["config", "user.email", "test@example.com"]);
-        git(repo.path(), &["config", "user.name", "Test User"]);
+        let (_repo_dir, repo) = fixtures::temp_root();
+        seed_empty_repo_at(&repo);
         for index in 0..40 {
-            fs::write(repo.path().join(format!("f-{index:02}.txt")), "base\n").expect("write");
+            fs::write(repo.join(format!("f-{index:02}.txt")), "base\n").expect("write");
         }
-        git(repo.path(), &["add", "."]);
-        git(repo.path(), &["commit", "-m", "initial"]);
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "initial"]);
         // A real feature branch, so this hits `wt_core::diff::DiffBase::Diff` against a real
         // merge-base rather than `DiffBase::NoBase`'s uncommitted-vs-HEAD fallback (GitHub issue
         // #108) - the same setup this crate's existing real-diff tests use, and the shape this
         // test's 40 changed rows need to exercise virtualization against.
-        git(repo.path(), &["checkout", "-b", "feature"]);
+        git(&repo, &["checkout", "-b", "feature"]);
         for index in 0..40 {
-            fs::write(
-                repo.path().join(format!("f-{index:02}.txt")),
-                "base\nchanged\n",
-            )
-            .expect("write");
+            fs::write(repo.join(format!("f-{index:02}.txt")), "base\nchanged\n").expect("write");
         }
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         app.update_in(cx, |app, window, cx| {
             app.set_right_sidebar_view(RightSidebarView::Changes, window, cx);
         });
@@ -4795,17 +4745,17 @@ mod virtualization_tests {
     /// silently re-checking a value against itself.
     #[gpui::test]
     fn file_tree_row_and_header_actions_clear_the_real_scrollbar(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
-        fs::create_dir(repo.path().join("src")).expect("mkdir");
-        fs::write(repo.path().join("src/main.rs"), "//\n").expect("write");
+        let (_repo_dir, repo) = fixtures::temp_root();
+        fs::create_dir(repo.join("src")).expect("mkdir");
+        fs::write(repo.join("src/main.rs"), "//\n").expect("write");
         // Enough flat files that the tree genuinely overflows its viewport and the real overlay
         // scrollbar actually renders - `render_vertical_scrollbar` returns `None`, painting
         // nothing at all, when the list doesn't overflow (see that function's own early return
         // on `max_offset <= 0.5`).
         for index in 0..300 {
-            fs::write(repo.path().join(format!("file-{index:03}.txt")), "x\n").expect("write");
+            fs::write(repo.join(format!("file-{index:03}.txt")), "x\n").expect("write");
         }
-        let (_app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (_app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
         let scrollbar = cx.debug_bounds("file-tree-scrollbar").expect(
@@ -4824,7 +4774,7 @@ mod virtualization_tests {
         // a selector that must embed a real runtime path (see `crate::root::focus`'s own tests)
         // is a deliberate, test-only leak via `Box::leak`.
         let row_selector: &'static str = Box::leak(
-            format!("file-tree-new-file-{}", repo.path().join("src").display()).into_boxed_str(),
+            format!("file-tree-new-file-{}", repo.join("src").display()).into_boxed_str(),
         );
         let row_button = cx
             .debug_bounds(row_selector)
@@ -4861,21 +4811,7 @@ mod change_row_selection_tests {
     use super::*;
     use crate::root::focus::palette_focus_tests;
     use gpui::TestAppContext;
-    use std::process::Command;
-    use tempfile::TempDir;
-
-    fn git(dir: &std::path::Path, args: &[&str]) {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    use test_support::{git, seed_empty_repo_at};
 
     /// Same real-diff shape `virtualization_tests::a_changes_row_far_below_the_viewport_is_never_painted`
     /// already establishes (a real feature branch, so this hits `wt_core::diff::DiffBase::Diff`,
@@ -4884,17 +4820,15 @@ mod change_row_selection_tests {
     fn the_selection_edge_is_a_real_element_painted_regardless_of_selection(
         cx: &mut TestAppContext,
     ) {
-        let repo = TempDir::new().expect("tempdir");
-        git(repo.path(), &["init", "-b", "main"]);
-        git(repo.path(), &["config", "user.email", "test@example.com"]);
-        git(repo.path(), &["config", "user.name", "Test User"]);
-        std::fs::write(repo.path().join("a.txt"), "base\n").expect("write");
-        git(repo.path(), &["add", "."]);
-        git(repo.path(), &["commit", "-m", "initial"]);
-        git(repo.path(), &["checkout", "-b", "feature"]);
-        std::fs::write(repo.path().join("a.txt"), "base\nchanged\n").expect("write");
+        let (_repo_dir, repo) = fixtures::temp_root();
+        seed_empty_repo_at(&repo);
+        std::fs::write(repo.join("a.txt"), "base\n").expect("write");
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "initial"]);
+        git(&repo, &["checkout", "-b", "feature"]);
+        std::fs::write(repo.join("a.txt"), "base\nchanged\n").expect("write");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         app.update_in(cx, |app, window, cx| {
             app.set_right_sidebar_view(RightSidebarView::Changes, window, cx);
         });
@@ -4980,12 +4914,12 @@ mod fold_state_tests {
     }
 
     /// `src/app/` + `src/lib/` + a root-level file, the shape every test below expands into.
-    fn seed_tree(repo: &TempDir) {
-        fs::create_dir_all(repo.path().join("src/app")).expect("mkdir");
-        fs::create_dir_all(repo.path().join("src/lib")).expect("mkdir");
-        fs::write(repo.path().join("src/app/main.rs"), "fn main() {}\n").expect("write");
-        fs::write(repo.path().join("src/lib/util.rs"), "pub fn u() {}\n").expect("write");
-        fs::write(repo.path().join("README.md"), "hi\n").expect("write");
+    fn seed_tree(repo: &Path) {
+        fs::create_dir_all(repo.join("src/app")).expect("mkdir");
+        fs::create_dir_all(repo.join("src/lib")).expect("mkdir");
+        fs::write(repo.join("src/app/main.rs"), "fn main() {}\n").expect("write");
+        fs::write(repo.join("src/lib/util.rs"), "pub fn u() {}\n").expect("write");
+        fs::write(repo.join("README.md"), "hi\n").expect("write");
     }
 
     fn expanded_names(app: &AdeApp) -> Vec<String> {
@@ -5003,15 +4937,12 @@ mod fold_state_tests {
     /// its root-level entries.
     #[gpui::test]
     fn a_worktree_opened_for_the_first_time_starts_fully_collapsed(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = fixtures::temp_root();
         let state_dir = TempDir::new().expect("tempdir");
         seed_tree(&repo);
 
-        let (app, cx) = open_app_with_state_dir(
-            cx,
-            repo.path().to_path_buf(),
-            state_dir.path().join("settings.toml"),
-        );
+        let (app, cx) =
+            open_app_with_state_dir(cx, repo.clone(), state_dir.path().join("settings.toml"));
         cx.run_until_parked();
 
         assert!(app.read_with(cx, |app, _| app.expanded_dirs.is_empty()));
@@ -5035,18 +4966,17 @@ mod fold_state_tests {
     /// cache handed between the two instances.
     #[gpui::test]
     fn expanded_folders_are_restored_exactly_after_a_simulated_reload(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = fixtures::temp_root();
         let state_dir = TempDir::new().expect("tempdir");
         seed_tree(&repo);
         let settings_path = state_dir.path().join("settings.toml");
         let fold_path = state_dir.path().join("file-tree-state.toml");
 
-        let (app, cx) =
-            open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path.clone());
+        let (app, cx) = open_app_with_state_dir(cx, repo.clone(), settings_path.clone());
         cx.run_until_parked();
         app.update(cx, |app, cx| {
-            app.toggle_dir_expanded(repo.path().join("src"), cx);
-            app.toggle_dir_expanded(repo.path().join("src/app"), cx);
+            app.toggle_dir_expanded(repo.join("src"), cx);
+            app.toggle_dir_expanded(repo.join("src/app"), cx);
         });
         cx.run_until_parked();
 
@@ -5055,15 +4985,10 @@ mod fold_state_tests {
             "expanding a folder must be recorded on disk immediately - not on a clean exit, \
              which is exactly what this test never performs"
         );
-        assert_eq!(
-            FoldState::load_at(&fold_path)
-                .expanded_dirs(repo.path())
-                .len(),
-            2
-        );
+        assert_eq!(FoldState::load_at(&fold_path).expanded_dirs(&repo).len(), 2);
 
         // The "relaunch": a brand-new `AdeApp` reading that same real file.
-        let (reloaded, cx) = open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path);
+        let (reloaded, cx) = open_app_with_state_dir(cx, repo.clone(), settings_path);
         cx.run_until_parked();
 
         assert_eq!(
@@ -5086,23 +5011,21 @@ mod fold_state_tests {
     /// `src/` share one fold-state file, and one's expansion must never open the other's.
     #[gpui::test]
     fn fold_state_from_one_worktree_never_leaks_into_another(cx: &mut TestAppContext) {
-        let worktree_a = TempDir::new().expect("tempdir");
-        let worktree_b = TempDir::new().expect("tempdir");
+        let (_worktree_a_dir, worktree_a) = fixtures::temp_root();
+        let (_worktree_b_dir, worktree_b) = fixtures::temp_root();
         let state_dir = TempDir::new().expect("tempdir");
         seed_tree(&worktree_a);
         seed_tree(&worktree_b);
         let settings_path = state_dir.path().join("settings.toml");
 
-        let (app_a, cx) =
-            open_app_with_state_dir(cx, worktree_a.path().to_path_buf(), settings_path.clone());
+        let (app_a, cx) = open_app_with_state_dir(cx, worktree_a.clone(), settings_path.clone());
         cx.run_until_parked();
         app_a.update(cx, |app, cx| {
-            app.toggle_dir_expanded(worktree_a.path().join("src"), cx);
+            app.toggle_dir_expanded(worktree_a.join("src"), cx);
         });
         cx.run_until_parked();
 
-        let (app_b, cx) =
-            open_app_with_state_dir(cx, worktree_b.path().to_path_buf(), settings_path);
+        let (app_b, cx) = open_app_with_state_dir(cx, worktree_b.clone(), settings_path);
         cx.run_until_parked();
 
         assert!(
@@ -5115,7 +5038,7 @@ mod fold_state_tests {
         let fold_path = state_dir.path().join("file-tree-state.toml");
         assert_eq!(
             FoldState::load_at(&fold_path)
-                .expanded_dirs(worktree_a.path())
+                .expanded_dirs(&worktree_a)
                 .len(),
             1
         );
@@ -5131,45 +5054,42 @@ mod fold_state_tests {
     /// genuinely re-reads the file and merges can preserve it.
     #[gpui::test]
     fn a_second_instances_saves_never_erase_the_first_instances_worktree(cx: &mut TestAppContext) {
-        let repo_a = TempDir::new().expect("tempdir");
-        let repo_b = TempDir::new().expect("tempdir");
+        let (_repo_a_dir, repo_a) = fixtures::temp_root();
+        let (_repo_b_dir, repo_b) = fixtures::temp_root();
         let state_dir = TempDir::new().expect("tempdir");
         seed_tree(&repo_a);
         seed_tree(&repo_b);
         let settings_path = state_dir.path().join("settings.toml");
         let fold_path = state_dir.path().join("file-tree-state.toml");
 
-        let (app_a, cx) =
-            open_app_with_state_dir(cx, repo_a.path().to_path_buf(), settings_path.clone());
+        let (app_a, cx) = open_app_with_state_dir(cx, repo_a.clone(), settings_path.clone());
         cx.run_until_parked();
 
         // Instance B starts here, snapshotting a file that knows nothing about A yet.
-        let (app_b, cx) =
-            open_app_with_state_dir(cx, repo_b.path().to_path_buf(), settings_path.clone());
+        let (app_b, cx) = open_app_with_state_dir(cx, repo_b.clone(), settings_path.clone());
         cx.run_until_parked();
 
         app_a.update(cx, |app, cx| {
-            app.toggle_dir_expanded(repo_a.path().join("src"), cx);
+            app.toggle_dir_expanded(repo_a.join("src"), cx);
         });
         cx.run_until_parked();
         // ...and now B writes, from its stale whole-file snapshot.
         app_b.update(cx, |app, cx| {
-            app.toggle_dir_expanded(repo_b.path().join("src"), cx);
+            app.toggle_dir_expanded(repo_b.join("src"), cx);
         });
         cx.run_until_parked();
 
         let on_disk = FoldState::load_at(&fold_path);
         assert_eq!(
-            on_disk.expanded_dirs(repo_a.path()).len(),
+            on_disk.expanded_dirs(&repo_a).len(),
             1,
             "the second instance's save must merge, not clobber - repository A's fold state is \
              gone here if the write is a plain whole-file one"
         );
-        assert_eq!(on_disk.expanded_dirs(repo_b.path()).len(), 1);
+        assert_eq!(on_disk.expanded_dirs(&repo_b).len(), 1);
 
         // And a real relaunch of A sees its own state, which is what the user actually notices.
-        let (reloaded_a, cx) =
-            open_app_with_state_dir(cx, repo_a.path().to_path_buf(), settings_path);
+        let (reloaded_a, cx) = open_app_with_state_dir(cx, repo_a.clone(), settings_path);
         cx.run_until_parked();
         assert_eq!(
             reloaded_a.read_with(cx, |app, _| expanded_names(app)),
@@ -5181,28 +5101,27 @@ mod fold_state_tests {
     /// surfaces, and the surviving entries are untouched.
     #[gpui::test]
     fn a_stale_entry_for_a_deleted_folder_is_pruned_silently(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = fixtures::temp_root();
         let state_dir = TempDir::new().expect("tempdir");
         seed_tree(&repo);
         let settings_path = state_dir.path().join("settings.toml");
         let fold_path = state_dir.path().join("file-tree-state.toml");
 
-        let (app, cx) =
-            open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path.clone());
+        let (app, cx) = open_app_with_state_dir(cx, repo.clone(), settings_path.clone());
         cx.run_until_parked();
         app.update(cx, |app, cx| {
-            app.toggle_dir_expanded(repo.path().join("src"), cx);
-            app.toggle_dir_expanded(repo.path().join("src/app"), cx);
-            app.toggle_dir_expanded(repo.path().join("src/lib"), cx);
+            app.toggle_dir_expanded(repo.join("src"), cx);
+            app.toggle_dir_expanded(repo.join("src/app"), cx);
+            app.toggle_dir_expanded(repo.join("src/lib"), cx);
         });
         cx.run_until_parked();
 
         // An agent deletes one of them from underneath the running app.
-        fs::remove_dir_all(repo.path().join("src/lib")).expect("remove");
+        fs::remove_dir_all(repo.join("src/lib")).expect("remove");
 
         // The "relaunch" - which is also where the prune happens, against the freshly walked
         // tree.
-        let (reloaded, cx) = open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path);
+        let (reloaded, cx) = open_app_with_state_dir(cx, repo.clone(), settings_path);
         cx.run_until_parked();
 
         assert_eq!(
@@ -5216,7 +5135,7 @@ mod fold_state_tests {
         );
         let on_disk = FoldState::load_at(&fold_path);
         assert_eq!(
-            on_disk.expanded_dirs(repo.path()).len(),
+            on_disk.expanded_dirs(&repo).len(),
             2,
             "the prune must be written back to the file, not just applied in memory"
         );
@@ -5226,26 +5145,23 @@ mod fold_state_tests {
     /// causes, via `create_new_file`'s own reload) must not reset fold state.
     #[gpui::test]
     fn reloading_the_same_worktrees_tree_keeps_the_fold_state(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = fixtures::temp_root();
         let state_dir = TempDir::new().expect("tempdir");
         seed_tree(&repo);
 
-        let (app, cx) = open_app_with_state_dir(
-            cx,
-            repo.path().to_path_buf(),
-            state_dir.path().join("settings.toml"),
-        );
+        let (app, cx) =
+            open_app_with_state_dir(cx, repo.clone(), state_dir.path().join("settings.toml"));
         cx.run_until_parked();
         app.update(cx, |app, cx| {
-            app.toggle_dir_expanded(repo.path().join("src"), cx);
-            app.toggle_dir_expanded(repo.path().join("src/app"), cx);
+            app.toggle_dir_expanded(repo.join("src"), cx);
+            app.toggle_dir_expanded(repo.join("src/app"), cx);
         });
         cx.run_until_parked();
 
         // A file appears and another disappears underneath the running app, then the tree is
         // re-walked - neither touches any directory that was expanded.
-        fs::write(repo.path().join("src/app/new.rs"), "//\n").expect("write");
-        fs::remove_file(repo.path().join("README.md")).expect("remove");
+        fs::write(repo.join("src/app/new.rs"), "//\n").expect("write");
+        fs::remove_file(repo.join("README.md")).expect("remove");
         app.update(cx, |app, cx| {
             let root = app.file_tree_root.clone();
             app.load_file_tree(root, cx);
@@ -5267,17 +5183,16 @@ mod fold_state_tests {
     /// reload rather than springing back open.
     #[gpui::test]
     fn collapse_all_clears_both_the_tree_and_the_saved_state(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = fixtures::temp_root();
         let state_dir = TempDir::new().expect("tempdir");
         seed_tree(&repo);
         let settings_path = state_dir.path().join("settings.toml");
 
-        let (app, cx) =
-            open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path.clone());
+        let (app, cx) = open_app_with_state_dir(cx, repo.clone(), settings_path.clone());
         cx.run_until_parked();
         app.update(cx, |app, cx| {
-            app.toggle_dir_expanded(repo.path().join("src"), cx);
-            app.toggle_dir_expanded(repo.path().join("src/app"), cx);
+            app.toggle_dir_expanded(repo.join("src"), cx);
+            app.toggle_dir_expanded(repo.join("src/app"), cx);
         });
         cx.run_until_parked();
         assert!(cx.debug_bounds("file-tree-row-main.rs").is_some());
@@ -5292,7 +5207,7 @@ mod fold_state_tests {
         assert!(app.read_with(cx, |app, _| app.expanded_dirs.is_empty()));
         assert!(cx.debug_bounds("file-tree-row-main.rs").is_none());
 
-        let (reloaded, cx) = open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path);
+        let (reloaded, cx) = open_app_with_state_dir(cx, repo.clone(), settings_path);
         cx.run_until_parked();
         assert!(
             reloaded.read_with(cx, |app, _| app.expanded_dirs.is_empty()),
@@ -5306,14 +5221,13 @@ mod fold_state_tests {
     /// ones, so they survive a reload.
     #[gpui::test]
     fn revealing_a_file_expands_its_ancestors_and_records_them(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = fixtures::temp_root();
         let state_dir = TempDir::new().expect("tempdir");
         seed_tree(&repo);
         let settings_path = state_dir.path().join("settings.toml");
-        let target = repo.path().join("src/app/main.rs");
+        let target = repo.join("src/app/main.rs");
 
-        let (app, cx) =
-            open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path.clone());
+        let (app, cx) = open_app_with_state_dir(cx, repo.clone(), settings_path.clone());
         cx.run_until_parked();
         assert!(
             cx.debug_bounds("file-tree-row-main.rs").is_none(),
@@ -5351,7 +5265,7 @@ mod fold_state_tests {
             );
         });
 
-        let (reloaded, cx) = open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path);
+        let (reloaded, cx) = open_app_with_state_dir(cx, repo.clone(), settings_path);
         cx.run_until_parked();
         assert_eq!(
             reloaded.read_with(cx, |app, _| expanded_names(app)),
@@ -5364,16 +5278,13 @@ mod fold_state_tests {
     /// go-to-definition does when it lands in a folder nobody has expanded) reveals it too.
     #[gpui::test]
     fn opening_a_file_directly_reveals_it_in_the_tree(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = fixtures::temp_root();
         let state_dir = TempDir::new().expect("tempdir");
         seed_tree(&repo);
-        let target = repo.path().join("src/app/main.rs");
+        let target = repo.join("src/app/main.rs");
 
-        let (app, cx) = open_app_with_state_dir(
-            cx,
-            repo.path().to_path_buf(),
-            state_dir.path().join("settings.toml"),
-        );
+        let (app, cx) =
+            open_app_with_state_dir(cx, repo.clone(), state_dir.path().join("settings.toml"));
         cx.run_until_parked();
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(target.clone(), window, cx);
@@ -5394,21 +5305,18 @@ mod fold_state_tests {
     /// no cap - while staying virtualized (the row far below the viewport is never built).
     #[gpui::test]
     fn a_large_directory_renders_completely_with_no_truncation_row(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = fixtures::temp_root();
         let state_dir = TempDir::new().expect("tempdir");
-        fs::create_dir(repo.path().join("big")).expect("mkdir");
+        fs::create_dir(repo.join("big")).expect("mkdir");
         for index in 0..800 {
-            fs::write(repo.path().join(format!("big/f-{index:03}.txt")), "x\n").expect("write");
+            fs::write(repo.join(format!("big/f-{index:03}.txt")), "x\n").expect("write");
         }
 
-        let (app, cx) = open_app_with_state_dir(
-            cx,
-            repo.path().to_path_buf(),
-            state_dir.path().join("settings.toml"),
-        );
+        let (app, cx) =
+            open_app_with_state_dir(cx, repo.clone(), state_dir.path().join("settings.toml"));
         cx.run_until_parked();
         app.update(cx, |app, cx| {
-            app.toggle_dir_expanded(repo.path().join("big"), cx);
+            app.toggle_dir_expanded(repo.join("big"), cx);
         });
         cx.run_until_parked();
 
@@ -5456,78 +5364,6 @@ mod fold_state_tests {
         );
     }
 
-    /// GitHub issue #160, end to end through the real app: a tree with more entries than the
-    /// removed 20,000-entry cap loads *completely* into the sidebar, and the "Stopped at N
-    /// entries - load more" row it used to grow instead is gone.
-    ///
-    /// This is the expensive fixture (21,200 real files and folders on disk) but it is the only
-    /// honest way to test the thing the issue asks for: a smaller tree would pass identically
-    /// before and after the change.
-    #[gpui::test]
-    fn a_tree_past_the_removed_cap_loads_every_entry_with_no_load_more_row(
-        cx: &mut TestAppContext,
-    ) {
-        const DIRS: usize = 200;
-        const FILES_PER_DIR: usize = 105;
-        const EXPECTED: usize = DIRS + DIRS * FILES_PER_DIR;
-
-        let repo = TempDir::new().expect("tempdir");
-        let state_dir = TempDir::new().expect("tempdir");
-        for d in 0..DIRS {
-            let sub = repo.path().join(format!("d-{d:03}"));
-            fs::create_dir(&sub).expect("mkdir");
-            for f in 0..FILES_PER_DIR {
-                fs::write(sub.join(format!("f-{f:03}.txt")), "x\n").expect("write");
-            }
-        }
-
-        let (app, cx) = open_app_with_state_dir(
-            cx,
-            repo.path().to_path_buf(),
-            state_dir.path().join("settings.toml"),
-        );
-        cx.run_until_parked();
-
-        assert_eq!(
-            app.read_with(cx, |app, _| app.file_tree.len()),
-            EXPECTED,
-            "the walk used to stop at 20,000 entries - every folder and file must now load"
-        );
-        assert!(
-            app.read_with(cx, |app, _| app.file_tree_complete),
-            "and a walk that reached everything is a complete inventory, so fold-state pruning \
-             may trust it"
-        );
-        assert!(
-            cx.debug_bounds("file-tree-show-all").is_none(),
-            "the 'Stopped at N entries - load more' row must not exist any more"
-        );
-
-        // The palette's own candidate list is derived from the same walk, on the background
-        // executor now that it is unbounded - it must cover the whole tree, not the first 20,000.
-        assert_eq!(
-            app.read_with(cx, |app, _| app.palette_file_candidates.len()),
-            DIRS * FILES_PER_DIR,
-            "one candidate per file (directories are not candidates), across the whole tree"
-        );
-
-        // A folder well past the old cut-off must expand and render for real, not just be
-        // counted: `d-199` starts at entry ~21,000.
-        let last_dir = repo.path().join(format!("d-{:03}", DIRS - 1));
-        app.update(cx, |app, cx| app.toggle_dir_expanded(last_dir.clone(), cx));
-        cx.run_until_parked();
-        assert!(
-            app.read_with(cx, |app, _| {
-                app.file_tree
-                    .visible_entries(&app.expanded_dirs)
-                    .iter()
-                    .any(|entry| entry.path == last_dir.join("f-104.txt"))
-            }),
-            "the last file of the last directory is ~1,200 entries past the removed cap and must \
-             be a real, visible row"
-        );
-    }
-
     /// CRITICAL 2: the canonicalized worktree key is resolved once per real root change and
     /// cached, because `worktree_key` calls the blocking `std::fs::canonicalize` and the callers
     /// are clicks and per-ancestor reveals. What's asserted here is the part that would actually
@@ -5548,11 +5384,11 @@ mod fold_state_tests {
     #[cfg(unix)]
     #[gpui::test]
     fn the_cached_worktree_key_is_canonical_and_records_through_a_symlink(cx: &mut TestAppContext) {
-        let real = TempDir::new().expect("tempdir");
+        let (_real_dir, real) = fixtures::temp_root();
         let link_parent = TempDir::new().expect("tempdir");
         seed_tree(&real);
         let link = link_parent.path().join("linked-worktree");
-        std::os::unix::fs::symlink(real.path(), &link).expect("symlink");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
         let state_dir = TempDir::new().expect("tempdir");
 
         let (app, cx) =
@@ -5567,22 +5403,19 @@ mod fold_state_tests {
         );
         assert_eq!(
             app.read_with(cx, |app, _| app.file_tree_root.clone()),
-            real.path(),
+            real,
             "opening through a symlink must root the tree at the resolved path, so nothing this \
              app walks or spawns from it carries the unresolved one"
         );
 
         app.update_in(cx, |app, window, cx| {
-            app.open_palette_file_result(real.path().join("src/app/main.rs"), window, cx);
+            app.open_palette_file_result(real.join("src/app/main.rs"), window, cx);
         });
         cx.run_until_parked();
 
         // Reopening against the *real* path must see what was recorded through the symlink.
-        let (reloaded, cx) = open_app_with_state_dir(
-            cx,
-            real.path().to_path_buf(),
-            state_dir.path().join("settings.toml"),
-        );
+        let (reloaded, cx) =
+            open_app_with_state_dir(cx, real.clone(), state_dir.path().join("settings.toml"));
         cx.run_until_parked();
         assert_eq!(
             reloaded.read_with(cx, |app, _| expanded_names(app)),
@@ -5600,7 +5433,7 @@ mod fold_state_tests {
     /// `create_dir_all` inside `FoldState::save_at` fails on every attempt.
     #[gpui::test]
     fn a_failed_fold_state_write_is_requeued_rather_than_dropped(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = fixtures::temp_root();
         let state_dir = TempDir::new().expect("tempdir");
         seed_tree(&repo);
         let blocker = state_dir.path().join("not-a-directory");
@@ -5610,12 +5443,11 @@ mod fold_state_tests {
         )
         .expect("write");
 
-        let (app, cx) =
-            open_app_with_state_dir(cx, repo.path().to_path_buf(), blocker.join("settings.toml"));
+        let (app, cx) = open_app_with_state_dir(cx, repo.clone(), blocker.join("settings.toml"));
         cx.run_until_parked();
 
         app.update(cx, |app, cx| {
-            app.toggle_dir_expanded(repo.path().join("src"), cx);
+            app.toggle_dir_expanded(repo.join("src"), cx);
         });
         cx.run_until_parked();
 
@@ -5648,28 +5480,22 @@ mod fold_state_tests {
     fn an_incomplete_walk_never_prunes_fold_state(cx: &mut TestAppContext) {
         use std::os::unix::fs::PermissionsExt;
 
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = fixtures::temp_root();
         let state_dir = TempDir::new().expect("tempdir");
-        let outer = repo.path().join("outer");
+        let outer = repo.join("outer");
         fs::create_dir(&outer).expect("mkdir");
         fs::create_dir(outer.join("zzz")).expect("mkdir");
         fs::write(outer.join("zzz/inside.txt"), "x\n").expect("write");
         let settings_path = state_dir.path().join("settings.toml");
         let fold_path = state_dir.path().join("file-tree-state.toml");
 
-        let (app, cx) =
-            open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path.clone());
+        let (app, cx) = open_app_with_state_dir(cx, repo.clone(), settings_path.clone());
         cx.run_until_parked();
         app.update(cx, |app, cx| {
             app.toggle_dir_expanded(outer.join("zzz"), cx);
         });
         cx.run_until_parked();
-        assert_eq!(
-            FoldState::load_at(&fold_path)
-                .expanded_dirs(repo.path())
-                .len(),
-            1
-        );
+        assert_eq!(FoldState::load_at(&fold_path).expanded_dirs(&repo).len(), 1);
 
         fs::set_permissions(&outer, fs::Permissions::from_mode(0o000)).expect("chmod");
         if fs::read_dir(&outer).is_ok() {
@@ -5679,7 +5505,7 @@ mod fold_state_tests {
             return;
         }
 
-        let (reloaded, cx) = open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path);
+        let (reloaded, cx) = open_app_with_state_dir(cx, repo.clone(), settings_path);
         cx.run_until_parked();
 
         let complete = reloaded.read_with(cx, |app, _| app.file_tree_complete);
@@ -5700,9 +5526,7 @@ mod fold_state_tests {
         );
 
         assert_eq!(
-            FoldState::load_at(&fold_path)
-                .expanded_dirs(repo.path())
-                .len(),
+            FoldState::load_at(&fold_path).expanded_dirs(&repo).len(),
             1,
             "an incomplete listing is not evidence that a folder is gone"
         );
@@ -5724,7 +5548,6 @@ mod indent_guide_tests {
     use crate::root::focus::palette_focus_tests;
     use gpui::TestAppContext;
     use std::fs;
-    use tempfile::TempDir;
 
     fn close_enough(a: f32, b: f32) -> bool {
         (a - b).abs() < 1.0
@@ -5733,87 +5556,22 @@ mod indent_guide_tests {
     /// `a/b/c/deep.txt`, with the whole chain expanded, plus a sibling file at each level.
     fn open_deep_tree<'a>(
         cx: &'a mut TestAppContext,
-        repo: &TempDir,
+        repo: &Path,
     ) -> (gpui::Entity<AdeApp>, &'a mut gpui::VisualTestContext) {
-        fs::create_dir_all(repo.path().join("a/b/c")).expect("mkdir");
-        fs::write(repo.path().join("a/b/c/deep.txt"), "x\n").expect("write");
-        fs::write(repo.path().join("a/b/mid.txt"), "x\n").expect("write");
-        fs::write(repo.path().join("a/top.txt"), "x\n").expect("write");
+        fs::create_dir_all(repo.join("a/b/c")).expect("mkdir");
+        fs::write(repo.join("a/b/c/deep.txt"), "x\n").expect("write");
+        fs::write(repo.join("a/b/mid.txt"), "x\n").expect("write");
+        fs::write(repo.join("a/top.txt"), "x\n").expect("write");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.to_path_buf());
         cx.run_until_parked();
         app.update(cx, |app, cx| {
-            app.toggle_dir_expanded(repo.path().join("a"), cx);
-            app.toggle_dir_expanded(repo.path().join("a/b"), cx);
-            app.toggle_dir_expanded(repo.path().join("a/b/c"), cx);
+            app.toggle_dir_expanded(repo.join("a"), cx);
+            app.toggle_dir_expanded(repo.join("a/b"), cx);
+            app.toggle_dir_expanded(repo.join("a/b/c"), cx);
         });
         cx.run_until_parked();
         (app, cx)
-    }
-
-    /// GitHub issue #406 (regression): indent guides must render in the neutral resting colour
-    /// regardless of selection, focus, or which file is open - reported with a screenshot of an
-    /// expanded folder ("work_surface") whose children's connecting guide painted accent-blue
-    /// even though nothing in that subtree was selected or hovered. "don't color the lines in
-    /// the file explorer, let them neutral color like not selected."
-    ///
-    /// This used to be a real, deliberate feature: guides along the *open* file's own ancestor
-    /// chain painted `theme::tree::INDENT_GUIDE_ACTIVE` (GitHub issue #127), surviving even when
-    /// focus left the tree entirely (`Self::open_file_view` moves focus to the editor, not the
-    /// tree) - exactly the scenario this test reproduces, since that's precisely the state a real
-    /// user hits just by opening a file and starting to edit it. The fix removed that branch
-    /// outright rather than merely disabling it, so there is only ever one guide selector now -
-    /// no `-active-`/`-idle-` distinction to regress back into.
-    #[gpui::test]
-    fn indent_guides_stay_neutral_even_when_a_descendant_file_is_open_and_focus_leaves_the_tree(
-        cx: &mut TestAppContext,
-    ) {
-        let repo = TempDir::new().expect("tempdir");
-        let (app, cx) = open_deep_tree(cx, &repo);
-
-        app.update_in(cx, |app, window, cx| {
-            app.open_file_view(repo.path().join("a/b/c/deep.txt"), window, cx);
-        });
-        cx.run_until_parked();
-        app.update_in(cx, |app, window, _cx| {
-            assert!(
-                !app.tree_focus_handle.is_focused(window),
-                "premise: opening a file via the normal path focuses the editor, not the tree"
-            );
-        });
-        for level in 0..3 {
-            assert!(
-                cx.debug_bounds(match level {
-                    0 => "file-tree-guide-deep.txt-0",
-                    1 => "file-tree-guide-deep.txt-1",
-                    _ => "file-tree-guide-deep.txt-2",
-                })
-                .is_some(),
-                "the open file's own ancestor guides must still render at level {level} - just \
-                 never in a distinct colour"
-            );
-        }
-        assert!(
-            cx.debug_bounds("file-tree-guide-active-deep.txt-0")
-                .is_none(),
-            "no guide may ever render under the old accent-colour selector, even for the open \
-             file's own chain, with focus on the editor"
-        );
-
-        app.update_in(cx, |app, window, cx| {
-            app.focus_file_tree(window, cx);
-        });
-        cx.run_until_parked();
-        assert!(
-            cx.debug_bounds("file-tree-guide-active-deep.txt-0")
-                .is_none(),
-            "and still none once the tree regains focus - selecting/focusing the open file's own \
-             row must not recolour its ancestor guides either"
-        );
-        assert!(
-            cx.debug_bounds("file-tree-guide-deep.txt-0").is_some(),
-            "the guide itself must still be there, just neutral"
-        );
     }
 
     /// One guide per nesting level, each at exactly its level's chevron offset from the row's
@@ -5822,7 +5580,7 @@ mod indent_guide_tests {
     fn each_row_draws_one_guide_per_level_aligned_with_that_levels_chevron(
         cx: &mut TestAppContext,
     ) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = fixtures::temp_root();
         let (_app, cx) = open_deep_tree(cx, &repo);
 
         assert!(
@@ -5864,7 +5622,7 @@ mod indent_guide_tests {
     /// rather than a dashed one.
     #[gpui::test]
     fn guides_on_consecutive_rows_join_with_no_gap(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = fixtures::temp_root();
         let (_app, cx) = open_deep_tree(cx, &repo);
 
         // The three consecutive rows `c`, `deep.txt`, `mid.txt` (in that render order - `c`'s
@@ -5912,23 +5670,19 @@ mod indent_guide_tests {
     /// anything other than the row's own depth would land on the wrong row here.
     #[gpui::test]
     fn guides_stay_aligned_with_their_own_rows_after_the_list_recycles(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
-        fs::create_dir_all(repo.path().join("nested/inner")).expect("mkdir");
+        let (_repo_dir, repo) = fixtures::temp_root();
+        fs::create_dir_all(repo.join("nested/inner")).expect("mkdir");
         // Enough rows inside the nested folder to fill several viewports, so scrolling genuinely
         // recycles row elements rather than merely translating them.
         for index in 0..300 {
-            fs::write(
-                repo.path().join(format!("nested/inner/f-{index:03}.txt")),
-                "x\n",
-            )
-            .expect("write");
+            fs::write(repo.join(format!("nested/inner/f-{index:03}.txt")), "x\n").expect("write");
         }
         let (_app, cx) = {
-            let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+            let (app, cx) = palette_focus_tests::open_test_app(cx, repo.to_path_buf());
             cx.run_until_parked();
             app.update(cx, |app, cx| {
-                app.toggle_dir_expanded(repo.path().join("nested"), cx);
-                app.toggle_dir_expanded(repo.path().join("nested/inner"), cx);
+                app.toggle_dir_expanded(repo.join("nested"), cx);
+                app.toggle_dir_expanded(repo.join("nested/inner"), cx);
             });
             cx.run_until_parked();
             (app, cx)
@@ -5992,16 +5746,22 @@ mod indent_guide_tests {
     /// fix, `elsewhere.txt`'s shared `a` ancestor guide would have painted accent-coloured (it's
     /// on the open file's chain) while its own `a/other` guide stayed neutral - exactly the kind
     /// of partially-coloured subtree the original report showed a screenshot of.
+    ///
+    /// Both focus states are checked in one pass, because both are states a real user sits in:
+    /// `Self::open_file_view` moves focus to the editor (which is where you are the moment you
+    /// start typing), and the tree may then be focused again. The accent branch used to survive
+    /// either way; the fix removed it outright, so there is only ever one guide selector now -
+    /// no `-active-`/`-idle-` distinction to regress back into.
     #[gpui::test]
     fn no_rows_guides_are_ever_recoloured_by_a_sibling_subtrees_open_file(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = fixtures::temp_root();
         // A second branch at the same depth as `a/b`, so there is a row that shares only a
         // partial ancestor chain with the file that ends up open.
-        fs::create_dir_all(repo.path().join("a/other")).expect("mkdir");
-        fs::write(repo.path().join("a/other/elsewhere.txt"), "x\n").expect("write");
+        fs::create_dir_all(repo.join("a/other")).expect("mkdir");
+        fs::write(repo.join("a/other/elsewhere.txt"), "x\n").expect("write");
         let (app, cx) = open_deep_tree(cx, &repo);
         app.update(cx, |app, cx| {
-            app.toggle_dir_expanded(repo.path().join("a/other"), cx);
+            app.toggle_dir_expanded(repo.join("a/other"), cx);
         });
         cx.run_until_parked();
 
@@ -6011,7 +5771,27 @@ mod indent_guide_tests {
         );
 
         app.update_in(cx, |app, window, cx| {
-            app.open_file_view(repo.path().join("a/b/c/deep.txt"), window, cx);
+            app.open_file_view(repo.join("a/b/c/deep.txt"), window, cx);
+        });
+        cx.run_until_parked();
+        app.update_in(cx, |app, window, _cx| {
+            assert!(
+                !app.tree_focus_handle.is_focused(window),
+                "premise: opening a file via the normal path focuses the editor, not the tree"
+            );
+        });
+        assert!(
+            cx.debug_bounds("file-tree-guide-deep.txt-0").is_some(),
+            "the open file's own ancestor guides still render with focus on the editor"
+        );
+        assert!(
+            cx.debug_bounds("file-tree-guide-active-deep.txt-0")
+                .is_none(),
+            "and none of them under the old accent-colour selector, focus on the editor being \
+             exactly the state a user typing in a file sits in"
+        );
+
+        app.update_in(cx, |app, window, cx| {
             app.focus_file_tree(window, cx);
         });
         cx.run_until_parked();
@@ -6047,12 +5827,12 @@ mod indent_guide_tests {
     /// that could survive them.
     #[gpui::test]
     fn collapsing_removes_the_hidden_rows_guides_too(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = fixtures::temp_root();
         let (app, cx) = open_deep_tree(cx, &repo);
         assert!(cx.debug_bounds("file-tree-guide-deep.txt-2").is_some());
 
         app.update(cx, |app, cx| {
-            app.toggle_dir_expanded(repo.path().join("a/b"), cx);
+            app.toggle_dir_expanded(repo.join("a/b"), cx);
         });
         cx.run_until_parked();
 
@@ -6078,38 +5858,10 @@ mod commit_composer_tests {
     use super::*;
     use crate::root::focus::palette_focus_tests;
     use gpui::TestAppContext;
-    use std::process::Command;
     use tempfile::TempDir;
+    use test_support::{git, git_output, seed_empty_repo_at};
 
-    /// `.output()`, not `.status()` - see `virtualization_tests::git`'s own comment for why.
-    fn git(dir: &std::path::Path, args: &[&str]) {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn git_output(dir: &std::path::Path, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
-    }
-
-    fn commit_count(dir: &std::path::Path) -> usize {
+    fn commit_count(dir: &Path) -> usize {
         git_output(dir, &["rev-list", "--count", "HEAD"])
             .parse()
             .expect("git rev-list --count must print a real integer")
@@ -6120,19 +5872,17 @@ mod commit_composer_tests {
     /// `virtualization_tests::a_changes_row_far_below_the_viewport_is_never_painted` already
     /// establishes, so this hits `wt_core::diff::DiffBase::Diff` against a real merge-base
     /// rather than `DiffBase::NoBase`'s uncommitted-vs-HEAD fallback (GitHub issue #108).
-    fn changes_test_repo() -> TempDir {
-        let repo = TempDir::new().expect("tempdir");
-        git(repo.path(), &["init", "-b", "main"]);
-        git(repo.path(), &["config", "user.email", "test@example.com"]);
-        git(repo.path(), &["config", "user.name", "Test User"]);
-        std::fs::write(repo.path().join("a.txt"), "one\ntwo\nthree\n").expect("write a.txt");
-        std::fs::write(repo.path().join("b.txt"), "uno\ndos\ntres\n").expect("write b.txt");
-        git(repo.path(), &["add", "."]);
-        git(repo.path(), &["commit", "-m", "initial"]);
-        git(repo.path(), &["checkout", "-b", "feature"]);
-        std::fs::write(repo.path().join("a.txt"), "one\ntwo\nthree\nfour\n").expect("write a.txt");
-        std::fs::write(repo.path().join("b.txt"), "uno\ndos\ntres\ncuatro\n").expect("write b.txt");
-        repo
+    fn changes_test_repo() -> (TempDir, PathBuf) {
+        let (dir, repo) = fixtures::temp_root();
+        seed_empty_repo_at(&repo);
+        std::fs::write(repo.join("a.txt"), "one\ntwo\nthree\n").expect("write a.txt");
+        std::fs::write(repo.join("b.txt"), "uno\ndos\ntres\n").expect("write b.txt");
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "initial"]);
+        git(&repo, &["checkout", "-b", "feature"]);
+        std::fs::write(repo.join("a.txt"), "one\ntwo\nthree\nfour\n").expect("write a.txt");
+        std::fs::write(repo.join("b.txt"), "uno\ndos\ntres\ncuatro\n").expect("write b.txt");
+        (dir, repo)
     }
 
     /// GitHub issue #220's exact shape: a feature branch carrying **one real commit** since its
@@ -6141,33 +5891,29 @@ mod commit_composer_tests {
     /// against that merge-base, so it lists *both* files and `DiffFile` alone cannot tell them
     /// apart - which is precisely what used to make the committed one render an actionable,
     /// unchecked "stage me" checkbox.
-    fn repo_with_a_committed_and_a_dirty_file() -> TempDir {
-        let repo = TempDir::new().expect("tempdir");
-        git(repo.path(), &["init", "-b", "main"]);
-        git(repo.path(), &["config", "user.email", "test@example.com"]);
-        git(repo.path(), &["config", "user.name", "Test User"]);
-        std::fs::write(repo.path().join("dirty.txt"), "one\ntwo\n").expect("write dirty.txt");
-        git(repo.path(), &["add", "."]);
-        git(repo.path(), &["commit", "-m", "initial"]);
-        git(repo.path(), &["checkout", "-b", "feature"]);
-        std::fs::write(repo.path().join("committed.txt"), "committed\n")
-            .expect("write committed.txt");
-        git(repo.path(), &["add", "committed.txt"]);
+    fn repo_with_a_committed_and_a_dirty_file() -> (TempDir, PathBuf) {
+        let (dir, repo) = fixtures::temp_root();
+        seed_empty_repo_at(&repo);
+        std::fs::write(repo.join("dirty.txt"), "one\ntwo\n").expect("write dirty.txt");
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "initial"]);
+        git(&repo, &["checkout", "-b", "feature"]);
+        std::fs::write(repo.join("committed.txt"), "committed\n").expect("write committed.txt");
+        git(&repo, &["add", "committed.txt"]);
         git(
-            repo.path(),
+            &repo,
             &["commit", "-m", "a real commit on the feature branch"],
         );
         // ...and only now a real, still-uncommitted edit to the other file.
-        std::fs::write(repo.path().join("dirty.txt"), "one\ntwo\nthree\n")
-            .expect("modify dirty.txt");
-        repo
+        std::fs::write(repo.join("dirty.txt"), "one\ntwo\nthree\n").expect("modify dirty.txt");
+        (dir, repo)
     }
 
     fn open_changes_view<'a>(
         cx: &'a mut TestAppContext,
-        repo: &TempDir,
+        repo: &Path,
     ) -> (gpui::Entity<AdeApp>, &'a mut gpui::VisualTestContext) {
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.set_right_sidebar_view(RightSidebarView::Changes, window, cx);
         });
@@ -6200,7 +5946,7 @@ mod commit_composer_tests {
     /// vertically centered in the field.
     #[gpui::test]
     fn message_caret_hugs_the_real_text_and_is_vertically_centered(cx: &mut TestAppContext) {
-        let repo = changes_test_repo();
+        let (_repo_dir, repo) = changes_test_repo();
         let (_app, cx) = open_changes_view(cx, &repo);
 
         let field = cx
@@ -6266,7 +6012,7 @@ mod commit_composer_tests {
     fn the_composer_reflects_real_staged_count_diffstat_branch_and_message(
         cx: &mut TestAppContext,
     ) {
-        let repo = changes_test_repo();
+        let (_repo_dir, repo) = changes_test_repo();
         let (app, cx) = open_changes_view(cx, &repo);
 
         assert_eq!(
@@ -6337,12 +6083,16 @@ mod commit_composer_tests {
         );
     }
 
+    /// A commit needs both halves - something staged *and* a message the user typed ("a normal
+    /// message input that the user has to fill", not an optional one with a fallback) - so the
+    /// primary button is a genuine no-op with either one missing.
     #[gpui::test]
-    fn the_primary_button_is_a_genuine_no_op_with_nothing_staged(cx: &mut TestAppContext) {
-        let repo = changes_test_repo();
+    fn the_primary_button_is_a_genuine_no_op_until_something_is_staged_and_typed(
+        cx: &mut TestAppContext,
+    ) {
+        let (_repo_dir, repo) = changes_test_repo();
         let (app, cx) = open_changes_view(cx, &repo);
-
-        let commits_before = commit_count(repo.path());
+        let commits_before = commit_count(&repo);
 
         let bounds = cx
             .debug_bounds("commit-composer-primary")
@@ -6351,7 +6101,7 @@ mod commit_composer_tests {
         cx.run_until_parked();
 
         assert_eq!(
-            commit_count(repo.path()),
+            commit_count(&repo),
             commits_before,
             "a real click on the primary button with nothing staged must never create a real \
              commit"
@@ -6371,16 +6121,8 @@ mod commit_composer_tests {
             "a disabled click must never even set the real \"committing…\" status - proof the \
              operation truly never started, not just that it already finished"
         );
-    }
 
-    /// The other half of the same "genuine no-op" rule: something staged but no message typed
-    /// must also refuse to commit - "a normal message input that the user has to fill", not an
-    /// optional one with a fallback.
-    #[gpui::test]
-    fn the_primary_button_is_a_genuine_no_op_with_nothing_typed(cx: &mut TestAppContext) {
-        let repo = changes_test_repo();
-        let (app, cx) = open_changes_view(cx, &repo);
-
+        // Now the other half: something really staged, still nothing typed.
         app.update(cx, |app, cx| {
             app.toggle_staged(PathBuf::from("a.txt"), cx);
         });
@@ -6390,7 +6132,6 @@ mod commit_composer_tests {
             "premise: something is staged, but no message has been typed"
         );
 
-        let commits_before = commit_count(repo.path());
         let bounds = cx
             .debug_bounds("commit-composer-primary")
             .expect("the primary button must really paint even with no message");
@@ -6398,14 +6139,14 @@ mod commit_composer_tests {
         cx.run_until_parked();
 
         assert_eq!(
-            commit_count(repo.path()),
+            commit_count(&repo),
             commits_before,
             "a real click on the primary button with something staged but no message must never \
              create a real commit"
         );
         assert!(
             app.read_with(cx, |app, _| app.worktree_history_status.is_none()),
-            "a disabled click must never even set the real \"committing…\" status"
+            "and still never sets the real \"committing…\" status"
         );
     }
 
@@ -6416,7 +6157,7 @@ mod commit_composer_tests {
     /// after_the_text_once_typed` proves the rail filter's own field is real.
     #[gpui::test]
     fn clicking_the_message_box_and_typing_really_edits_it(cx: &mut TestAppContext) {
-        let repo = changes_test_repo();
+        let (_repo_dir, repo) = changes_test_repo();
         let (app, cx) = open_changes_view(cx, &repo);
 
         app.update(cx, |app, cx| {
@@ -6472,7 +6213,7 @@ mod commit_composer_tests {
     /// for the reverse order (stage first, then type).
     #[gpui::test]
     fn typing_before_staging_survives_a_later_stage(cx: &mut TestAppContext) {
-        let repo = changes_test_repo();
+        let (_repo_dir, repo) = changes_test_repo();
         let (app, cx) = open_changes_view(cx, &repo);
 
         assert!(
@@ -6560,7 +6301,7 @@ mod commit_composer_tests {
     /// of the input".
     #[gpui::test]
     fn focusing_the_commit_message_starts_the_real_shared_blink_loop(cx: &mut TestAppContext) {
-        let repo = changes_test_repo();
+        let (_repo_dir, repo) = changes_test_repo();
         let (app, cx) = open_changes_view(cx, &repo);
         // `on_focus`/`on_blur` only fire while GPUI considers the window itself "active" - see
         // `focusing_the_rail_filter_starts_the_real_shared_blink_loop`'s own docs.
@@ -6595,7 +6336,7 @@ mod commit_composer_tests {
     /// parallel piece of state the primary button never reads.
     #[gpui::test]
     fn a_real_commit_writes_the_users_own_edited_message(cx: &mut TestAppContext) {
-        let repo = changes_test_repo();
+        let (_repo_dir, repo) = changes_test_repo();
         let (app, cx) = open_changes_view(cx, &repo);
 
         app.update(cx, |app, cx| {
@@ -6617,13 +6358,8 @@ mod commit_composer_tests {
         cx.simulate_click(primary.center(), gpui::Modifiers::none());
         cx.run_until_parked();
 
-        let log = std::process::Command::new("git")
-            .args(["log", "-1", "--format=%s"])
-            .current_dir(repo.path())
-            .output()
-            .expect("real git log");
         assert_eq!(
-            String::from_utf8_lossy(&log.stdout).trim(),
+            git_output(&repo, &["log", "-1", "--format=%s"]),
             "REWRITTEN",
             "the real commit on disk must carry the user's own typed message verbatim"
         );
@@ -6633,7 +6369,7 @@ mod commit_composer_tests {
     /// the very first `Ctrl+Z` after clicking in must not blank a message the user never typed.
     #[gpui::test]
     fn focusing_the_message_field_is_not_itself_an_undoable_step(cx: &mut TestAppContext) {
-        let repo = changes_test_repo();
+        let (_repo_dir, repo) = changes_test_repo();
         let (app, cx) = open_changes_view(cx, &repo);
 
         app.update(cx, |app, cx| {
@@ -6668,7 +6404,7 @@ mod commit_composer_tests {
     /// must never put any text in the box or take any away from what the user actually typed.
     #[gpui::test]
     fn staging_never_writes_anything_into_the_message_box(cx: &mut TestAppContext) {
-        let repo = changes_test_repo();
+        let (_repo_dir, repo) = changes_test_repo();
         let (app, cx) = open_changes_view(cx, &repo);
 
         assert_eq!(
@@ -6709,7 +6445,7 @@ mod commit_composer_tests {
     fn clicking_the_primary_button_reaches_the_real_commit_staged_files_action(
         cx: &mut TestAppContext,
     ) {
-        let repo = changes_test_repo();
+        let (_repo_dir, repo) = changes_test_repo();
         let (app, cx) = open_changes_view(cx, &repo);
 
         let a_path = PathBuf::from("a.txt");
@@ -6719,7 +6455,7 @@ mod commit_composer_tests {
         cx.run_until_parked();
         type_commit_message(cx, "update a.txt");
 
-        let commits_before = commit_count(repo.path());
+        let commits_before = commit_count(&repo);
 
         let bounds = cx
             .debug_bounds("commit-composer-primary")
@@ -6728,7 +6464,7 @@ mod commit_composer_tests {
         cx.run_until_parked();
 
         assert_eq!(
-            commit_count(repo.path()),
+            commit_count(&repo),
             commits_before + 1,
             "a real click on the wired primary button must create exactly one real git commit \
              via wt_core::undo::commit_paths"
@@ -6755,7 +6491,7 @@ mod commit_composer_tests {
     fn clicking_the_menu_toggle_genuinely_opens_and_closes_the_commit_menu(
         cx: &mut TestAppContext,
     ) {
-        let repo = changes_test_repo();
+        let (_repo_dir, repo) = changes_test_repo();
         let (app, cx) = open_changes_view(cx, &repo);
 
         assert!(
@@ -6808,7 +6544,7 @@ mod commit_composer_tests {
         // No `origin` in this fixture, deliberately: the commit half must really happen and the
         // push half must fail *loudly*, with git's own words on the status line. A row that
         // silently swallowed an unreachable remote would be the worst of both worlds.
-        let repo = changes_test_repo();
+        let (_repo_dir, repo) = changes_test_repo();
         let (app, cx) = open_changes_view(cx, &repo);
         app.update(cx, |app, cx| {
             app.toggle_staged(PathBuf::from("a.txt"), cx);
@@ -6816,19 +6552,19 @@ mod commit_composer_tests {
         cx.run_until_parked();
         type_commit_message(cx, "update a.txt");
 
-        let commits_before = commit_count(repo.path());
+        let commits_before = commit_count(&repo);
         app.update(cx, |app, cx| {
             app.run_commit_menu_action(CommitMenuAction::CommitAndPush, cx);
         });
         cx.run_until_parked();
 
         assert_eq!(
-            commit_count(repo.path()),
+            commit_count(&repo),
             commits_before + 1,
             "the commit half of `Commit and push` must really create a commit object"
         );
         assert_eq!(
-            git_output(repo.path(), &["show", "--format=", "--name-only", "HEAD"]),
+            git_output(&repo, &["show", "--format=", "--name-only", "HEAD"]),
             "a.txt",
             "and it must contain exactly the staged path, not the whole worktree"
         );
@@ -6844,7 +6580,7 @@ mod commit_composer_tests {
 
     #[gpui::test]
     fn commit_all_files_really_commits_the_unstaged_ones_too(cx: &mut TestAppContext) {
-        let repo = changes_test_repo();
+        let (_repo_dir, repo) = changes_test_repo();
         let (app, cx) = open_changes_view(cx, &repo);
 
         // Nothing staged at all: this is the row's whole point - it stages the rest first.
@@ -6853,20 +6589,20 @@ mod commit_composer_tests {
             "premise: nothing is staged, so a plain `Commit` could not do this"
         );
         type_commit_message(cx, "commit everything");
-        let commits_before = commit_count(repo.path());
+        let commits_before = commit_count(&repo);
         app.update(cx, |app, cx| {
             app.run_commit_menu_action(CommitMenuAction::CommitAllFiles, cx);
         });
         cx.run_until_parked();
 
-        assert_eq!(commit_count(repo.path()), commits_before + 1);
-        let committed = git_output(repo.path(), &["show", "--format=", "--name-only", "HEAD"]);
+        assert_eq!(commit_count(&repo), commits_before + 1);
+        let committed = git_output(&repo, &["show", "--format=", "--name-only", "HEAD"]);
         assert!(
             committed.contains("a.txt") && committed.contains("b.txt"),
             "both changed files must be in the commit - got {committed:?}"
         );
         assert_eq!(
-            git_output(repo.path(), &["status", "--porcelain"]),
+            git_output(&repo, &["status", "--porcelain"]),
             "",
             "and the worktree must really be clean afterwards"
         );
@@ -6874,9 +6610,9 @@ mod commit_composer_tests {
 
     #[gpui::test]
     fn amend_last_commit_really_rewrites_the_tip_without_adding_a_commit(cx: &mut TestAppContext) {
-        let repo = changes_test_repo();
-        git(repo.path(), &["add", "b.txt"]);
-        git(repo.path(), &["commit", "-m", "a commit worth amending"]);
+        let (_repo_dir, repo) = changes_test_repo();
+        git(&repo, &["add", "b.txt"]);
+        git(&repo, &["commit", "-m", "a commit worth amending"]);
         let (app, cx) = open_changes_view(cx, &repo);
 
         app.update(cx, |app, cx| {
@@ -6884,38 +6620,37 @@ mod commit_composer_tests {
         });
         cx.run_until_parked();
 
-        let commits_before = commit_count(repo.path());
-        let tip_before = git_output(repo.path(), &["rev-parse", "HEAD"]);
+        let commits_before = commit_count(&repo);
+        let tip_before = git_output(&repo, &["rev-parse", "HEAD"]);
         app.update(cx, |app, cx| {
             app.run_commit_menu_action(CommitMenuAction::AmendLastCommit, cx);
         });
         cx.run_until_parked();
 
         assert_eq!(
-            commit_count(repo.path()),
+            commit_count(&repo),
             commits_before,
             "an amend must not add a commit - that would be a plain commit wearing the wrong name"
         );
         assert_ne!(
-            git_output(repo.path(), &["rev-parse", "HEAD"]),
+            git_output(&repo, &["rev-parse", "HEAD"]),
             tip_before,
             "but it must really rewrite the tip object"
         );
         assert_eq!(
-            git_output(repo.path(), &["log", "-1", "--format=%s"]),
+            git_output(&repo, &["log", "-1", "--format=%s"]),
             "a commit worth amending",
             "keeping the tip's own message: this row amends, it does not reword"
         );
         assert!(
-            git_output(repo.path(), &["show", "--format=", "--name-only", "HEAD"])
-                .contains("a.txt"),
+            git_output(&repo, &["show", "--format=", "--name-only", "HEAD"]).contains("a.txt"),
             "and the staged file must really be inside the amended tip now"
         );
     }
 
     #[gpui::test]
     fn stash_staged_files_really_stashes_the_staged_half_only(cx: &mut TestAppContext) {
-        let repo = changes_test_repo();
+        let (_repo_dir, repo) = changes_test_repo();
         let (app, cx) = open_changes_view(cx, &repo);
         app.update(cx, |app, cx| {
             app.toggle_staged(PathBuf::from("a.txt"), cx);
@@ -6923,28 +6658,28 @@ mod commit_composer_tests {
         cx.run_until_parked();
         type_commit_message(cx, "stash this");
 
-        let commits_before = commit_count(repo.path());
+        let commits_before = commit_count(&repo);
         app.update(cx, |app, cx| {
             app.run_commit_menu_action(CommitMenuAction::StashStaged, cx);
         });
         cx.run_until_parked();
 
         assert_eq!(
-            commit_count(repo.path()),
+            commit_count(&repo),
             commits_before,
             "stashing is not committing"
         );
         assert!(
-            !git_output(repo.path(), &["stash", "list"]).is_empty(),
+            !git_output(&repo, &["stash", "list"]).is_empty(),
             "a real stash entry must exist"
         );
         assert_eq!(
-            std::fs::read_to_string(repo.path().join("a.txt")).expect("read a.txt"),
+            std::fs::read_to_string(repo.join("a.txt")).expect("read a.txt"),
             "one\ntwo\nthree\n",
             "the staged edit must be gone from the working tree"
         );
         assert_eq!(
-            std::fs::read_to_string(repo.path().join("b.txt")).expect("read b.txt"),
+            std::fs::read_to_string(repo.join("b.txt")).expect("read b.txt"),
             "uno\ndos\ntres\ncuatro\n",
             "and the unstaged edit must be untouched - the row's hint says `keeps the worktree \
              clean`, not `throws away everything`"
@@ -6957,7 +6692,7 @@ mod commit_composer_tests {
     fn a_commit_menu_row_with_nothing_staged_is_disabled_and_does_nothing_when_clicked(
         cx: &mut TestAppContext,
     ) {
-        let repo = changes_test_repo();
+        let (_repo_dir, repo) = changes_test_repo();
         let (app, cx) = open_changes_view(cx, &repo);
         assert!(
             app.read_with(cx, |app, _| app.staged_files.is_empty()),
@@ -6988,7 +6723,7 @@ mod commit_composer_tests {
              with nothing staged - and there really are changed files here"
         );
 
-        let commits_before = commit_count(repo.path());
+        let commits_before = commit_count(&repo);
         let disabled = cx
             .debug_bounds("commit-menu-row-stash-staged-files-disabled")
             .expect("the disabled row must really paint");
@@ -6996,12 +6731,12 @@ mod commit_composer_tests {
         cx.run_until_parked();
 
         assert_eq!(
-            commit_count(repo.path()),
+            commit_count(&repo),
             commits_before,
             "a disabled row must really be a no-op, not merely look like one"
         );
         assert!(
-            git_output(repo.path(), &["stash", "list"]).is_empty(),
+            git_output(&repo, &["stash", "list"]).is_empty(),
             "and it must certainly not have stashed anything"
         );
     }
@@ -7013,7 +6748,7 @@ mod commit_composer_tests {
     /// point that is genuinely outside the composer and genuinely inside the window.
     #[gpui::test]
     fn a_real_click_far_outside_the_composer_closes_the_commit_menu(cx: &mut TestAppContext) {
-        let repo = changes_test_repo();
+        let (_repo_dir, repo) = changes_test_repo();
         let (app, cx) = open_changes_view(cx, &repo);
 
         let composer = cx
@@ -7065,7 +6800,7 @@ mod commit_composer_tests {
     /// primary commit button row.
     #[gpui::test]
     fn the_commit_menu_popover_really_paints_anchored_to_the_composer(cx: &mut TestAppContext) {
-        let repo = changes_test_repo();
+        let (_repo_dir, repo) = changes_test_repo();
         let (app, cx) = open_changes_view(cx, &repo);
 
         let toggle = cx
@@ -7117,7 +6852,7 @@ mod commit_composer_tests {
     /// (GitHub issue #176).
     #[gpui::test]
     fn leaving_the_changes_view_really_closes_the_commit_menu(cx: &mut TestAppContext) {
-        let repo = changes_test_repo();
+        let (_repo_dir, repo) = changes_test_repo();
         let (app, cx) = open_changes_view(cx, &repo);
 
         let toggle = cx
@@ -7164,7 +6899,7 @@ mod commit_composer_tests {
     /// between, since the refresh always lands on the same real data either way.
     #[gpui::test]
     fn returning_to_an_already_loaded_changes_view_never_blanks_it(cx: &mut TestAppContext) {
-        let repo = changes_test_repo();
+        let (_repo_dir, repo) = changes_test_repo();
         let (app, cx) = open_changes_view(cx, &repo);
 
         // Premise: the first load already landed, so every scope really is `Loaded`.
@@ -7241,8 +6976,8 @@ mod commit_composer_tests {
     /// `Self::reset_repo_scoped_state`'s own docs guard against, not a flash worth avoiding.
     #[gpui::test]
     fn switching_worktrees_still_blanks_the_changes_view_synchronously(cx: &mut TestAppContext) {
-        let repo_a = changes_test_repo();
-        let repo_b = changes_test_repo();
+        let (_repo_a_dir, repo_a) = changes_test_repo();
+        let (_repo_b_dir, repo_b) = changes_test_repo();
         let (app, cx) = open_changes_view(cx, &repo_a);
 
         app.read_with(cx, |app, _| {
@@ -7253,7 +6988,7 @@ mod commit_composer_tests {
         });
 
         app.update_in(cx, |app, window, cx| {
-            app.load_diff(repo_b.path().to_path_buf(), cx);
+            app.load_diff(repo_b.clone(), cx);
             let _ = window;
         });
 
@@ -7282,7 +7017,7 @@ mod commit_composer_tests {
     /// is the test that fails the moment the sweep stops covering a surface.
     #[gpui::test]
     fn opening_the_commit_menu_closes_an_already_open_plus_menu(cx: &mut TestAppContext) {
-        let repo = changes_test_repo();
+        let (_repo_dir, repo) = changes_test_repo();
         let (app, cx) = open_changes_view(cx, &repo);
 
         app.update(cx, |app, cx| {
@@ -7321,7 +7056,7 @@ mod commit_composer_tests {
     fn opening_the_commit_menu_blocks_a_real_click_on_the_primary_button_underneath(
         cx: &mut TestAppContext,
     ) {
-        let repo = changes_test_repo();
+        let (_repo_dir, repo) = changes_test_repo();
         let (app, cx) = open_changes_view(cx, &repo);
 
         let a_path = PathBuf::from("a.txt");
@@ -7344,7 +7079,7 @@ mod commit_composer_tests {
              scrim's own click-blocking, not a no-op"
         );
 
-        let commits_before = commit_count(repo.path());
+        let commits_before = commit_count(&repo);
 
         // The scrim spans the composer's full bounds (`top(0)/left(0)/right(0)/bottom(0)` on a
         // `.relative()` parent) - including the still-visible primary-button row underneath the
@@ -7358,7 +7093,7 @@ mod commit_composer_tests {
         cx.run_until_parked();
 
         assert_eq!(
-            commit_count(repo.path()),
+            commit_count(&repo),
             commits_before,
             "a click on the primary button's own screen position, while the scrim covers it, \
              must not reach the real commit action painted underneath"
@@ -7369,7 +7104,7 @@ mod commit_composer_tests {
     fn the_popover_blocks_a_click_even_where_it_paints_above_the_composers_own_bounds(
         cx: &mut TestAppContext,
     ) {
-        let repo = changes_test_repo();
+        let (_repo_dir, repo) = changes_test_repo();
         let (app, cx) = open_changes_view(cx, &repo);
 
         let a_path = PathBuf::from("a.txt");
@@ -7428,13 +7163,13 @@ mod commit_composer_tests {
     /// for this codebase's staging-adjacent tests.
     #[gpui::test]
     fn toggle_staged_really_stages_and_unstages_the_real_git_index(cx: &mut TestAppContext) {
-        let repo = changes_test_repo();
+        let (_repo_dir, repo) = changes_test_repo();
         let (app, cx) = open_changes_view(cx, &repo);
         let a_path = PathBuf::from("a.txt");
 
         // Sanity check the real starting state: a.txt is really modified but not staged.
         assert_eq!(
-            git_output(repo.path(), &["status", "--porcelain", "a.txt"]),
+            git_output(&repo, &["status", "--porcelain", "a.txt"]),
             "M a.txt",
             "sanity check: a.txt must start out modified but genuinely unstaged"
         );
@@ -7445,7 +7180,7 @@ mod commit_composer_tests {
         cx.run_until_parked();
 
         assert_eq!(
-            git_output(repo.path(), &["status", "--porcelain", "a.txt"]),
+            git_output(&repo, &["status", "--porcelain", "a.txt"]),
             "M  a.txt",
             "checking the box must really stage a.txt in the real git index (two-space \
              porcelain form), not just flip an in-memory flag"
@@ -7461,7 +7196,7 @@ mod commit_composer_tests {
         cx.run_until_parked();
 
         assert_eq!(
-            git_output(repo.path(), &["status", "--porcelain", "a.txt"]),
+            git_output(&repo, &["status", "--porcelain", "a.txt"]),
             "M a.txt",
             "unchecking the box must really unstage a.txt in the real git index - back to the \
              one-space, working-tree-only porcelain form - not merely forget about it in memory \
@@ -7481,10 +7216,10 @@ mod commit_composer_tests {
     fn a_file_already_staged_in_real_git_before_the_worktree_is_ever_loaded_reads_as_staged(
         cx: &mut TestAppContext,
     ) {
-        let repo = changes_test_repo();
+        let (_repo_dir, repo) = changes_test_repo();
         // Stages a.txt with a real, direct `git add` *before* the app ever opens this worktree -
         // standing in for a user's own shell or an agent CLI having staged it first.
-        git(repo.path(), &["add", "a.txt"]);
+        git(&repo, &["add", "a.txt"]);
 
         let (app, cx) = open_changes_view(cx, &repo);
 
@@ -7509,10 +7244,10 @@ mod commit_composer_tests {
     fn switching_to_a_worktree_with_something_already_staged_in_real_git_shows_it_as_staged(
         cx: &mut TestAppContext,
     ) {
-        let repo = changes_test_repo();
-        let second_wt = repo.path().join("second-wt");
+        let (_repo_dir, repo) = changes_test_repo();
+        let second_wt = &repo.join("second-wt");
         git(
-            repo.path(),
+            &repo,
             &[
                 "worktree",
                 "add",
@@ -7523,7 +7258,7 @@ mod commit_composer_tests {
         );
         std::fs::write(second_wt.join("c.txt"), "real change\n").expect("write c.txt");
         // Staged in the *second* worktree's own real index, before Jerry ever selects it.
-        git(&second_wt, &["add", "c.txt"]);
+        git(second_wt.as_path(), &["add", "c.txt"]);
 
         let (app, cx) = open_changes_view(cx, &repo);
         assert!(
@@ -7534,7 +7269,7 @@ mod commit_composer_tests {
         let index = app.read_with(cx, |app, _| {
             app.worktrees
                 .iter()
-                .position(|item| item.path == second_wt)
+                .position(|item| item.path == *second_wt)
                 .expect("the newly created second worktree must be in the real worktree list")
         });
         app.update_in(cx, |app, window, cx| {
@@ -7563,7 +7298,7 @@ mod commit_composer_tests {
     fn a_committed_file_is_in_the_against_main_section_not_the_uncommitted_one(
         cx: &mut TestAppContext,
     ) {
-        let repo = repo_with_a_committed_and_a_dirty_file();
+        let (_repo_dir, repo) = repo_with_a_committed_and_a_dirty_file();
         let (app, cx) = open_changes_view(cx, &repo);
 
         assert!(
@@ -7626,7 +7361,7 @@ mod commit_composer_tests {
     /// stageable without having to subtract already-committed files back out again.
     #[gpui::test]
     fn the_composer_counts_only_the_uncommitted_scope_in_its_denominator(cx: &mut TestAppContext) {
-        let repo = repo_with_a_committed_and_a_dirty_file();
+        let (_repo_dir, repo) = repo_with_a_committed_and_a_dirty_file();
         let (app, cx) = open_changes_view(cx, &repo);
 
         assert!(
@@ -7650,7 +7385,7 @@ mod commit_composer_tests {
         cx.run_until_parked();
 
         assert_eq!(
-            git_output(repo.path(), &["status", "--porcelain", "dirty.txt"]),
+            git_output(&repo, &["status", "--porcelain", "dirty.txt"]),
             "M  dirty.txt",
             "sanity check: that really staged it in the real git index"
         );
@@ -7667,7 +7402,7 @@ mod commit_composer_tests {
     fn committing_a_staged_file_moves_it_out_of_uncommitted_and_into_against_main(
         cx: &mut TestAppContext,
     ) {
-        let repo = repo_with_a_committed_and_a_dirty_file();
+        let (_repo_dir, repo) = repo_with_a_committed_and_a_dirty_file();
         let (app, cx) = open_changes_view(cx, &repo);
 
         app.update(cx, |app, cx| {
@@ -7680,13 +7415,13 @@ mod commit_composer_tests {
         );
         type_commit_message(cx, "commit the dirty file");
 
-        let commits_before = commit_count(repo.path());
+        let commits_before = commit_count(&repo);
         app.update(cx, |app, cx| {
             app.commit_staged_files(cx);
         });
         cx.run_until_parked();
         assert_eq!(
-            commit_count(repo.path()),
+            commit_count(&repo),
             commits_before + 1,
             "sanity check: a real commit must actually have happened"
         );
@@ -7741,17 +7476,15 @@ mod commit_composer_tests {
     /// `.max_w(px(120.0))` cap, not a hand-inspected snapshot.
     #[gpui::test]
     fn a_deeply_nested_path_does_not_overflow_the_change_row(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
-        git(repo.path(), &["init", "-b", "main"]);
-        git(repo.path(), &["config", "user.email", "test@example.com"]);
-        git(repo.path(), &["config", "user.name", "Test User"]);
-        std::fs::write(repo.path().join("base.txt"), "base\n").expect("write base.txt");
-        git(repo.path(), &["add", "."]);
-        git(repo.path(), &["commit", "-m", "initial"]);
+        let (_repo_dir, repo) = fixtures::temp_root();
+        seed_empty_repo_at(&repo);
+        std::fs::write(repo.join("base.txt"), "base\n").expect("write base.txt");
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "initial"]);
 
         // Twelve real nested directories, each with a long, realistic segment name - the exact
         // shape of path this issue was filed against, not a contrived worst case.
-        let nested_dir = repo.path().join(
+        let nested_dir = repo.join(
             [
                 "crates",
                 "app",
@@ -7776,7 +7509,7 @@ mod commit_composer_tests {
         let (_app, cx) = open_changes_view(cx, &repo);
 
         let relative = nested_file
-            .strip_prefix(repo.path())
+            .strip_prefix(&repo)
             .expect("nested file is under the repo root")
             .display()
             .to_string();
@@ -7821,53 +7554,38 @@ mod changes_sections_tests {
     use crate::root::focus::palette_focus_tests;
     use crate::sidebar::sections::{ChangesSection, SectionRow};
     use gpui::TestAppContext;
-    use std::process::Command;
     use tempfile::TempDir;
-
-    fn git(dir: &std::path::Path, args: &[&str]) {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    use test_support::{git, seed_empty_repo_at};
 
     /// A feature branch that genuinely populates all four scopes at once: two commits of its own
     /// (Commits), two still-uncommitted edits (Uncommitted), and therefore four paths that differ
     /// from `main` (Against main).
-    fn four_scope_repo() -> TempDir {
-        let repo = TempDir::new().expect("tempdir");
-        git(repo.path(), &["init", "-b", "main"]);
-        git(repo.path(), &["config", "user.email", "test@example.com"]);
-        git(repo.path(), &["config", "user.name", "Test User"]);
-        std::fs::write(repo.path().join("dirty-a.txt"), "one\n").expect("write");
-        std::fs::write(repo.path().join("dirty-b.txt"), "one\n").expect("write");
-        git(repo.path(), &["add", "."]);
-        git(repo.path(), &["commit", "-m", "initial"]);
-        git(repo.path(), &["checkout", "-b", "feature"]);
+    fn four_scope_repo() -> (TempDir, PathBuf) {
+        let (dir, repo) = fixtures::temp_root();
+        seed_empty_repo_at(&repo);
+        std::fs::write(repo.join("dirty-a.txt"), "one\n").expect("write");
+        std::fs::write(repo.join("dirty-b.txt"), "one\n").expect("write");
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "initial"]);
+        git(&repo, &["checkout", "-b", "feature"]);
 
-        std::fs::write(repo.path().join("done-a.txt"), "committed a\n").expect("write");
-        git(repo.path(), &["add", "done-a.txt"]);
-        git(repo.path(), &["commit", "-m", "first branch commit"]);
-        std::fs::write(repo.path().join("done-b.txt"), "committed b\n").expect("write");
-        git(repo.path(), &["add", "done-b.txt"]);
-        git(repo.path(), &["commit", "-m", "second branch commit"]);
+        std::fs::write(repo.join("done-a.txt"), "committed a\n").expect("write");
+        git(&repo, &["add", "done-a.txt"]);
+        git(&repo, &["commit", "-m", "first branch commit"]);
+        std::fs::write(repo.join("done-b.txt"), "committed b\n").expect("write");
+        git(&repo, &["add", "done-b.txt"]);
+        git(&repo, &["commit", "-m", "second branch commit"]);
 
-        std::fs::write(repo.path().join("dirty-a.txt"), "one\ntwo\n").expect("write");
-        std::fs::write(repo.path().join("dirty-b.txt"), "one\ntwo\n").expect("write");
-        repo
+        std::fs::write(repo.join("dirty-a.txt"), "one\ntwo\n").expect("write");
+        std::fs::write(repo.join("dirty-b.txt"), "one\ntwo\n").expect("write");
+        (dir, repo)
     }
 
     fn open_changes_view<'a>(
         cx: &'a mut TestAppContext,
-        repo: &TempDir,
+        repo: &Path,
     ) -> (gpui::Entity<AdeApp>, &'a mut gpui::VisualTestContext) {
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.set_right_sidebar_view(RightSidebarView::Changes, window, cx);
         });
@@ -7890,7 +7608,7 @@ mod changes_sections_tests {
     fn the_panel_is_four_sections_with_runs_and_uncommitted_open_by_default(
         cx: &mut TestAppContext,
     ) {
-        let repo = four_scope_repo();
+        let (_repo_dir, repo) = four_scope_repo();
         let (_app, cx) = open_changes_view(cx, &repo);
 
         // Two dirty paths, two commits of this branch's own, four paths against `main`.
@@ -7942,7 +7660,7 @@ mod changes_sections_tests {
     fn the_tab_is_called_changes_and_uncommitted_is_one_of_its_four_sections(
         cx: &mut TestAppContext,
     ) {
-        let repo = four_scope_repo();
+        let (_repo_dir, repo) = four_scope_repo();
         let (app, cx) = open_changes_view(cx, &repo);
 
         // Index 1 of the right sidebar's own two-segment toggle - the segment the panel is
@@ -7982,7 +7700,7 @@ mod changes_sections_tests {
 
     #[gpui::test]
     fn every_section_header_count_equals_the_number_of_rows_it_renders(cx: &mut TestAppContext) {
-        let repo = four_scope_repo();
+        let (_repo_dir, repo) = four_scope_repo();
         let (app, cx) = open_changes_view(cx, &repo);
         open_every_section(&app, cx);
 
@@ -8049,7 +7767,7 @@ mod changes_sections_tests {
     #[gpui::test]
     fn checkboxes_exist_only_in_the_uncommitted_section(cx: &mut TestAppContext) {
         // `REVISION-2026-08-14.md` §9, box 1.
-        let repo = four_scope_repo();
+        let (_repo_dir, repo) = four_scope_repo();
         let (app, cx) = open_changes_view(cx, &repo);
         open_every_section(&app, cx);
 
@@ -8090,7 +7808,7 @@ mod changes_sections_tests {
 
     #[gpui::test]
     fn collapsing_a_section_unpaints_its_rows_and_keeps_its_count(cx: &mut TestAppContext) {
-        let repo = four_scope_repo();
+        let (_repo_dir, repo) = four_scope_repo();
         let (app, cx) = open_changes_view(cx, &repo);
         assert!(cx.debug_bounds("change-row-dirty-a.txt").is_some());
 
@@ -8128,7 +7846,7 @@ mod changes_sections_tests {
         // should not appear on the changes tab under against master") and confirmed against
         // `Jerry.dc.html` line 1422's own `baseRows` - a synthetic one-entry array, never a
         // per-file loop. Against main's only real body row is its context card.
-        let repo = four_scope_repo();
+        let (_repo_dir, repo) = four_scope_repo();
         let (app, cx) = open_changes_view(cx, &repo);
         open_every_section(&app, cx);
 
@@ -8174,13 +7892,11 @@ mod changes_sections_tests {
         // `+319 −145` and Uncommitted `+319 −145` agree exactly." The provenance is recorded
         // through the store's real `PreToolUse`/write/`PostToolUse` door, exactly as the hook
         // layer drives it - no fabricated attribution.
-        let repo = TempDir::new().expect("tempdir");
-        git(repo.path(), &["init", "-b", "main"]);
-        git(repo.path(), &["config", "user.email", "test@example.com"]);
-        git(repo.path(), &["config", "user.name", "Test User"]);
-        std::fs::write(repo.path().join("agent.txt"), "one\n").expect("write");
-        git(repo.path(), &["add", "."]);
-        git(repo.path(), &["commit", "-m", "initial"]);
+        let (_repo_dir, repo) = fixtures::temp_root();
+        seed_empty_repo_at(&repo);
+        std::fs::write(repo.join("agent.txt"), "one\n").expect("write");
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "initial"]);
 
         let (app, cx) = open_changes_view(cx, &repo);
         let agent_id = app
@@ -8204,15 +7920,14 @@ mod changes_sections_tests {
                 agent.spawned_at_unix,
             ))
         });
-        let file = repo.path().join("agent.txt");
+        let file = repo.join("agent.txt");
         app.update(cx, |app, _cx| {
-            app.line_provenance.begin_agent_edit(repo.path(), &file);
+            app.line_provenance.begin_agent_edit(&repo, &file);
         });
         std::fs::write(&file, "one\ntwo\nthree\n").expect("agent writes");
         app.update_in(cx, |app, window, cx| {
-            app.line_provenance
-                .record_agent_edit(repo.path(), &file, &key);
-            app.load_diff(repo.path().to_path_buf(), cx);
+            app.line_provenance.record_agent_edit(&repo, &file, &key);
+            app.load_diff(repo.clone(), cx);
             let _ = window;
         });
         cx.run_until_parked();
@@ -8267,7 +7982,7 @@ mod changes_sections_tests {
         // Audit I2: the header count equals the rendered row count, and switching agent focus
         // changes neither. Before the union, the header read one agent's set while the rows read
         // another's - two sources able to disagree on screen.
-        let repo = four_scope_repo();
+        let (_repo_dir, repo) = four_scope_repo();
         let (app, cx) = open_changes_view(cx, &repo);
         let first = app
             .read_with(cx, |app, _| app.agents.active_id())
@@ -8278,7 +7993,7 @@ mod changes_sections_tests {
         let second = app.update_in(cx, |app, window, cx| {
             app.agents.spawn(
                 ProcessKind::claude(),
-                repo.path().to_path_buf(),
+                repo.clone(),
                 12.0,
                 None,
                 None,
@@ -8347,7 +8062,7 @@ mod changes_sections_tests {
         // The mock's sad path (`STAGE-A-SELFCHECK.md`): "a live run and a frozen run render side
         // by side in the Runs section […] both rows verifiable in one screen." The ended run here
         // is a genuinely exited process, not a flag.
-        let repo = four_scope_repo();
+        let (_repo_dir, repo) = four_scope_repo();
         let (app, cx) = open_changes_view(cx, &repo);
         let live = app
             .read_with(cx, |app, _| app.agents.active_id())
@@ -8363,7 +8078,7 @@ mod changes_sections_tests {
         let ended = app.update_in(cx, |app, window, cx| {
             app.agents.spawn(
                 ProcessKind::Shell,
-                repo.path().to_path_buf(),
+                repo.clone(),
                 12.0,
                 Some("/bin/false"),
                 None,
@@ -8377,27 +8092,22 @@ mod changes_sections_tests {
         cx.run_until_parked();
         // A real OS process really has to exit, which takes real wall-clock time - so this waits
         // on the genuine `is_running()` transition rather than assuming it, and gives up loudly
-        // rather than asserting against a process that never died.
-        let mut exited = false;
-        for _ in 0..200 {
+        // rather than asserting against a process that never died. The pane notices its child's
+        // real pty EOF on its own poll timer, and this context's executor is deterministic - so
+        // each poll has to advance the clock as well as let real time pass, which is why the
+        // condition drives the executor rather than merely reading a flag.
+        let exited = test_support::wait_until(std::time::Duration::from_secs(4), || {
             app.update(cx, |_app, cx| cx.notify());
             cx.run_until_parked();
-            if app.read_with(cx, |app, cx| {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(50));
+            app.read_with(cx, |app, cx| {
                 app.agents
                     .iter()
                     .find(|agent| agent.id == ended)
                     .is_some_and(|agent| !agent.pane.read(cx).is_running())
-            }) {
-                exited = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            // The pane notices its child's real pty EOF on its own poll timer, and this context's
-            // executor is deterministic - so real time has to be given to the child *and* the
-            // clock has to be advanced for the poll that observes it.
-            cx.executor()
-                .advance_clock(std::time::Duration::from_millis(50));
-        }
+            })
+        });
         assert!(
             exited,
             "premise: the `/bin/false` agent must really have exited, or this test would be \
@@ -8453,46 +8163,31 @@ mod change_row_tests {
     use crate::root::focus::palette_focus_tests;
     use crate::sidebar::changes::StatusLetter;
     use gpui::TestAppContext;
-    use std::process::Command;
     use tempfile::TempDir;
-
-    fn git(dir: &std::path::Path, args: &[&str]) {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    use test_support::{git, seed_empty_repo_at};
 
     /// One worktree holding one of each real git status at once: `added.txt` is brand new,
     /// `modified.txt` has an edit, `deleted.txt` is gone. §4j's whole point is that all three -
     /// not only the two exceptions - carry a mark.
-    fn mixed_status_repo() -> TempDir {
-        let repo = TempDir::new().expect("tempdir");
-        git(repo.path(), &["init", "-b", "main"]);
-        git(repo.path(), &["config", "user.email", "test@example.com"]);
-        git(repo.path(), &["config", "user.name", "Test User"]);
-        std::fs::write(repo.path().join("modified.txt"), "one\n").expect("write");
-        std::fs::write(repo.path().join("deleted.txt"), "gone\n").expect("write");
-        git(repo.path(), &["add", "."]);
-        git(repo.path(), &["commit", "-m", "initial"]);
+    fn mixed_status_repo() -> (TempDir, PathBuf) {
+        let (dir, repo) = fixtures::temp_root();
+        seed_empty_repo_at(&repo);
+        std::fs::write(repo.join("modified.txt"), "one\n").expect("write");
+        std::fs::write(repo.join("deleted.txt"), "gone\n").expect("write");
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "initial"]);
 
-        std::fs::write(repo.path().join("modified.txt"), "one\ntwo\n").expect("write");
-        std::fs::remove_file(repo.path().join("deleted.txt")).expect("delete");
-        std::fs::write(repo.path().join("added.txt"), "brand new\n").expect("write");
-        repo
+        std::fs::write(repo.join("modified.txt"), "one\ntwo\n").expect("write");
+        std::fs::remove_file(repo.join("deleted.txt")).expect("delete");
+        std::fs::write(repo.join("added.txt"), "brand new\n").expect("write");
+        (dir, repo)
     }
 
     fn open_changes_view<'a>(
         cx: &'a mut TestAppContext,
-        repo: &TempDir,
+        repo: &Path,
     ) -> (gpui::Entity<AdeApp>, &'a mut gpui::VisualTestContext) {
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.set_right_sidebar_view(RightSidebarView::Changes, window, cx);
         });
@@ -8506,7 +8201,7 @@ mod change_row_tests {
     fn every_row_carries_gits_own_status_letter_including_the_modified_one(
         cx: &mut TestAppContext,
     ) {
-        let repo = mixed_status_repo();
+        let (_repo_dir, repo) = mixed_status_repo();
         let (_app, cx) = open_changes_view(cx, &repo);
 
         assert!(
@@ -8530,7 +8225,7 @@ mod change_row_tests {
     /// different widths on the rest.
     #[gpui::test]
     fn the_letter_column_is_fixed_width_and_ahead_of_the_name(cx: &mut TestAppContext) {
-        let repo = mixed_status_repo();
+        let (_repo_dir, repo) = mixed_status_repo();
         let (_app, cx) = open_changes_view(cx, &repo);
 
         let added = cx
@@ -8565,7 +8260,7 @@ mod change_row_tests {
     /// toolbar - through a real row click that really opens the file.
     #[gpui::test]
     fn the_file_header_above_the_diff_carries_the_same_letter(cx: &mut TestAppContext) {
-        let repo = mixed_status_repo();
+        let (_repo_dir, repo) = mixed_status_repo();
         let (app, cx) = open_changes_view(cx, &repo);
 
         let row = cx
@@ -8591,7 +8286,7 @@ mod change_row_tests {
     /// for marking one.
     #[gpui::test]
     fn opening_a_file_moves_its_name_from_unseen_to_seen(cx: &mut TestAppContext) {
-        let repo = mixed_status_repo();
+        let (_repo_dir, repo) = mixed_status_repo();
         let (_app, cx) = open_changes_view(cx, &repo);
 
         assert!(
@@ -8624,7 +8319,7 @@ mod change_row_tests {
     /// it too.
     #[gpui::test]
     fn seen_and_staged_are_two_independent_maps(cx: &mut TestAppContext) {
-        let repo = mixed_status_repo();
+        let (_repo_dir, repo) = mixed_status_repo();
         let (app, cx) = open_changes_view(cx, &repo);
 
         // Opening marks seen and must not stage.
@@ -8665,7 +8360,7 @@ mod change_row_tests {
     /// see `AdeApp::handle_toggle_change_seen_action`'s own docs.
     #[gpui::test]
     fn v_unmarks_a_seen_file_and_marks_an_unseen_one(cx: &mut TestAppContext) {
-        let repo = mixed_status_repo();
+        let (_repo_dir, repo) = mixed_status_repo();
         let (app, cx) = open_changes_view(cx, &repo);
 
         let row = cx
@@ -8702,38 +8397,11 @@ mod change_row_tests {
         );
     }
 
-    /// The binding the footer's `V` keycap advertises has to be a real, registered one - the same
-    /// honesty guard `the_file_tree_footer_only_advertises_real_registered_bindings` applies to
-    /// `F2`. A keycap for a shortcut nothing is bound to is worse than no keycap.
-    #[test]
-    fn the_changes_footer_only_advertises_a_really_registered_binding() {
-        let bindings = crate::default_key_bindings();
-        let binding = bindings
-            .iter()
-            .find(|binding| binding.action().name() == "app::ToggleChangeSeen")
-            .expect("`ToggleChangeSeen` must have a real registered binding");
-        let keystrokes = binding.keystrokes();
-        assert_eq!(keystrokes.len(), 1, "one plain keystroke, no chord");
-        let keystroke = &keystrokes[0];
-        assert_eq!(
-            keystroke.key(),
-            CHANGES_SEEN_SPEC,
-            "the footer prints the keycap for {CHANGES_SEEN_SPEC:?}, so that is what has to be \
-             bound"
-        );
-        let modifiers = keystroke.modifiers();
-        assert!(
-            !modifiers.control && !modifiers.alt && !modifiers.platform && !modifiers.shift,
-            "a bare `V`, exactly as §4i's legend prints it - a binding that silently gained a \
-             modifier would leave the keycap advertising a keystroke nobody can trigger"
-        );
-    }
-
     /// §4i: the bar is "revealed by row state (`hov`), so nothing shifts and nothing is
     /// permanently occluded" - so it must genuinely not exist at rest.
     #[gpui::test]
     fn the_hover_bar_is_absent_until_the_row_is_hovered(cx: &mut TestAppContext) {
-        let repo = mixed_status_repo();
+        let (_repo_dir, repo) = mixed_status_repo();
         let (_app, cx) = open_changes_view(cx, &repo);
 
         assert!(
@@ -8762,7 +8430,7 @@ mod change_row_tests {
     /// correction the design made after its own first cut.
     #[gpui::test]
     fn the_hover_bar_is_two_icons_floating_above_the_rows_top_edge(cx: &mut TestAppContext) {
-        let repo = mixed_status_repo();
+        let (_repo_dir, repo) = mixed_status_repo();
         let (_app, cx) = open_changes_view(cx, &repo);
 
         let row = cx
@@ -8795,8 +8463,8 @@ mod change_row_tests {
     /// second click commits." The first click must therefore leave the file completely untouched.
     #[gpui::test]
     fn the_first_discard_click_only_arms_the_confirm_and_changes_nothing(cx: &mut TestAppContext) {
-        let repo = mixed_status_repo();
-        let before = std::fs::read_to_string(repo.path().join("modified.txt")).expect("read");
+        let (_repo_dir, repo) = mixed_status_repo();
+        let before = std::fs::read_to_string(repo.join("modified.txt")).expect("read");
         let (app, cx) = open_changes_view(cx, &repo);
 
         let row = cx
@@ -8821,7 +8489,7 @@ mod change_row_tests {
             "and the plain icon is gone - one control, one state, not both at once"
         );
         assert_eq!(
-            std::fs::read_to_string(repo.path().join("modified.txt")).expect("read"),
+            std::fs::read_to_string(repo.join("modified.txt")).expect("read"),
             before,
             "arming must not touch the file: this is the one irreversible action in the panel"
         );
@@ -8835,7 +8503,7 @@ mod change_row_tests {
     /// exactly what `HEAD` has.
     #[gpui::test]
     fn the_second_discard_click_really_throws_the_files_changes_away(cx: &mut TestAppContext) {
-        let repo = mixed_status_repo();
+        let (_repo_dir, repo) = mixed_status_repo();
         let (_app, cx) = open_changes_view(cx, &repo);
 
         let row = cx
@@ -8856,13 +8524,13 @@ mod change_row_tests {
         cx.run_until_parked();
 
         assert_eq!(
-            std::fs::read_to_string(repo.path().join("modified.txt")).expect("read"),
+            std::fs::read_to_string(repo.join("modified.txt")).expect("read"),
             "one\n",
             "the file is back to exactly what HEAD has - a real `git checkout HEAD -- <path>`, \
              not a UI-only flag"
         );
         assert!(
-            std::fs::read_to_string(repo.path().join("added.txt")).is_ok(),
+            std::fs::read_to_string(repo.join("added.txt")).is_ok(),
             "and every other dirty path is untouched"
         );
     }
@@ -8871,7 +8539,7 @@ mod change_row_tests {
     /// can never be left sitting one stray click away from destroying an agent's work.
     #[gpui::test]
     fn leaving_the_row_cancels_an_armed_discard(cx: &mut TestAppContext) {
-        let repo = mixed_status_repo();
+        let (_repo_dir, repo) = mixed_status_repo();
         let (app, cx) = open_changes_view(cx, &repo);
 
         let row = cx
@@ -8910,7 +8578,7 @@ mod change_row_tests {
     /// outside the row's own hitbox (see `AdeApp::change_row_hover`'s docs).
     #[gpui::test]
     fn moving_onto_the_bars_overhang_keeps_it_open(cx: &mut TestAppContext) {
-        let repo = mixed_status_repo();
+        let (_repo_dir, repo) = mixed_status_repo();
         let (_app, cx) = open_changes_view(cx, &repo);
 
         let row = cx
@@ -8943,7 +8611,7 @@ mod change_row_tests {
     /// `SeenFiles` map the rows read, not to a second tally of its own.
     #[gpui::test]
     fn the_section_header_counts_seen_off_the_same_map_the_rows_read(cx: &mut TestAppContext) {
-        let repo = mixed_status_repo();
+        let (_repo_dir, repo) = mixed_status_repo();
         let (_app, cx) = open_changes_view(cx, &repo);
 
         assert!(
@@ -8965,17 +8633,21 @@ mod change_row_tests {
         );
     }
 
-    /// The ride-along §4i's legend asks for: a real `V` keycap in the panel footer, and - the
-    /// honesty half - no keycap at all while the binding has nothing to act on.
+    /// The ride-along §4i's legend asks for - real keycaps in the panel footer - plus the honesty
+    /// half: neither `Jerry.dc.html`'s `space stage` nor its `V mark seen` chip may advertise
+    /// itself while its binding has nothing to act on.
     #[gpui::test]
-    fn the_footer_shows_the_v_keycap_only_while_the_binding_is_live(cx: &mut TestAppContext) {
-        let repo = mixed_status_repo();
+    fn the_footer_shows_a_keycap_only_while_its_binding_is_live(cx: &mut TestAppContext) {
+        let (_repo_dir, repo) = mixed_status_repo();
         let (_app, cx) = open_changes_view(cx, &repo);
 
-        assert!(
-            cx.debug_bounds("changes-footer-seen-hint").is_none(),
-            "with no file open, `V` would do nothing - so the strip advertises nothing"
-        );
+        for hint in ["changes-footer-seen-hint", "changes-footer-stage-hint"] {
+            assert!(
+                cx.debug_bounds(hint).is_none(),
+                "{hint}: with no file open the keystroke would do nothing, so the strip \
+                 advertises nothing"
+            );
+        }
 
         let row = cx
             .debug_bounds("change-row-modified.txt")
@@ -8983,33 +8655,13 @@ mod change_row_tests {
         cx.simulate_click(row.center(), gpui::Modifiers::none());
         cx.run_until_parked();
 
-        assert!(
-            cx.debug_bounds("changes-footer-seen-hint").is_some(),
-            "with a real file open, the keycap appears and really does something"
-        );
-    }
-
-    /// The same honesty half for `Jerry.dc.html`'s *first* `changesHints` entry, `space stage`.
-    #[gpui::test]
-    fn the_footer_shows_the_space_keycap_only_while_the_binding_is_live(cx: &mut TestAppContext) {
-        let repo = mixed_status_repo();
-        let (_app, cx) = open_changes_view(cx, &repo);
-
-        assert!(
-            cx.debug_bounds("changes-footer-stage-hint").is_none(),
-            "with no file open, `space` would do nothing - so the strip advertises nothing"
-        );
-
-        let row = cx
-            .debug_bounds("change-row-modified.txt")
-            .expect("the modified row");
-        cx.simulate_click(row.center(), gpui::Modifiers::none());
-        cx.run_until_parked();
-
-        assert!(
-            cx.debug_bounds("changes-footer-stage-hint").is_some(),
-            "with a real uncommitted file open, the keycap appears and really does something"
-        );
+        for hint in ["changes-footer-seen-hint", "changes-footer-stage-hint"] {
+            assert!(
+                cx.debug_bounds(hint).is_some(),
+                "{hint}: with a real uncommitted file open, the keycap appears and really does \
+                 something"
+            );
+        }
     }
 
     /// The live bug this fixes: the footer used to open with the sentence `click a file to open
@@ -9025,7 +8677,7 @@ mod change_row_tests {
     fn the_footers_first_child_is_the_stage_keycap_at_the_bands_own_left_padding(
         cx: &mut TestAppContext,
     ) {
-        let repo = mixed_status_repo();
+        let (_repo_dir, repo) = mixed_status_repo();
         let (_app, cx) = open_changes_view(cx, &repo);
 
         let row = cx
@@ -9063,7 +8715,7 @@ mod change_row_tests {
     fn space_stages_and_unstages_the_open_change_through_the_real_key_binding(
         cx: &mut TestAppContext,
     ) {
-        let repo = mixed_status_repo();
+        let (_repo_dir, repo) = mixed_status_repo();
         let (app, cx) = open_changes_view(cx, &repo);
         cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
 
@@ -9119,21 +8771,19 @@ mod change_row_tests {
     /// rather than two that can drift.
     #[gpui::test]
     fn space_does_nothing_for_a_file_with_no_uncommitted_row(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
-        git(repo.path(), &["init", "-b", "main"]);
-        git(repo.path(), &["config", "user.email", "test@example.com"]);
-        git(repo.path(), &["config", "user.name", "Test User"]);
-        std::fs::write(repo.path().join("dirty.txt"), "one\n").expect("write");
-        git(repo.path(), &["add", "."]);
-        git(repo.path(), &["commit", "-m", "initial"]);
-        git(repo.path(), &["checkout", "-b", "feature"]);
-        std::fs::write(repo.path().join("committed.txt"), "committed\n").expect("write");
-        git(repo.path(), &["add", "committed.txt"]);
+        let (_repo_dir, repo) = fixtures::temp_root();
+        seed_empty_repo_at(&repo);
+        std::fs::write(repo.join("dirty.txt"), "one\n").expect("write");
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "initial"]);
+        git(&repo, &["checkout", "-b", "feature"]);
+        std::fs::write(repo.join("committed.txt"), "committed\n").expect("write");
+        git(&repo, &["add", "committed.txt"]);
         git(
-            repo.path(),
+            &repo,
             &["commit", "-m", "a real commit on the feature branch"],
         );
-        std::fs::write(repo.path().join("dirty.txt"), "one\ntwo\n").expect("modify");
+        std::fs::write(repo.join("dirty.txt"), "one\ntwo\n").expect("modify");
 
         let (app, cx) = open_changes_view(cx, &repo);
         assert!(
@@ -9169,13 +8819,13 @@ mod change_row_tests {
         );
     }
 
-    /// The binding the footer's `space` keycap advertises has to be a real, registered one, with
-    /// the *same* scope `V` beside it carries - read off `V`'s own binding rather than restated,
-    /// so the two hints in one strip cannot come to mean different surfaces. The `!file-editor`
-    /// conjunct is load-bearing in a way it is not for `V`: in the editable File view a space is
-    /// a character to type.
+    /// Both bindings the footer's keycaps advertise have to be real, registered ones - a keycap
+    /// for a shortcut nothing is bound to is worse than no keycap - and both have to carry the
+    /// *same* scope, so the two hints in one strip cannot come to mean different surfaces. The
+    /// `!file-editor` conjunct is load-bearing for `space` in a way it is not for `V`: in the
+    /// editable File view a space is a character to type.
     #[test]
-    fn the_changes_footers_space_hint_only_advertises_a_really_registered_binding() {
+    fn the_changes_footers_hints_only_advertise_really_registered_bindings() {
         let bindings = crate::default_key_bindings();
         let find = |name: &str| {
             bindings
@@ -9186,20 +8836,28 @@ mod change_row_tests {
         let stage = find("app::ToggleChangeStaged");
         let seen = find("app::ToggleChangeSeen");
 
-        let keystrokes = stage.keystrokes();
-        assert_eq!(keystrokes.len(), 1, "one plain keystroke, no chord");
-        let keystroke = &keystrokes[0];
-        assert_eq!(
-            keystroke.key(),
-            CHANGES_STAGE_SPEC,
-            "the footer prints the keycap for {CHANGES_STAGE_SPEC:?}, so that is what has to be \
-             bound"
-        );
-        let modifiers = keystroke.modifiers();
-        assert!(
-            !modifiers.control && !modifiers.alt && !modifiers.platform && !modifiers.shift,
-            "a bare `space`, exactly as `Jerry.dc.html`'s `changesHints` prints it"
-        );
+        for (binding, spec) in [(stage, CHANGES_STAGE_SPEC), (seen, CHANGES_SEEN_SPEC)] {
+            let keystrokes = binding.keystrokes();
+            assert_eq!(
+                keystrokes.len(),
+                1,
+                "{spec:?}: one plain keystroke, no chord"
+            );
+            let keystroke = &keystrokes[0];
+            assert_eq!(
+                keystroke.key(),
+                spec,
+                "the footer prints the keycap for {spec:?}, so that is what has to be bound"
+            );
+            let modifiers = keystroke.modifiers();
+            assert!(
+                !modifiers.control && !modifiers.alt && !modifiers.platform && !modifiers.shift,
+                "{spec:?} is printed bare in `Jerry.dc.html`'s `changesHints`, so a binding that \
+                 silently gained a modifier would leave the keycap advertising a keystroke nobody \
+                 can trigger"
+            );
+        }
+
         let predicate = |binding: &gpui::KeyBinding| {
             binding
                 .predicate()
@@ -9226,7 +8884,7 @@ mod change_row_tests {
     /// `FileChangeStatus` the diff really produced for these three files.
     #[gpui::test]
     fn the_rows_letter_is_the_status_the_real_diff_reports(cx: &mut TestAppContext) {
-        let repo = mixed_status_repo();
+        let (_repo_dir, repo) = mixed_status_repo();
         let (app, cx) = open_changes_view(cx, &repo);
 
         let letters = app.read_with(cx, |app, _| {

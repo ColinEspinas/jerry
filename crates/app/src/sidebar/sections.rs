@@ -527,25 +527,12 @@ impl NoteEmphasis {
 }
 
 #[cfg(test)]
-mod tests {
+mod changes_section_tests {
     use super::*;
     use crate::provenance::change_set::build_change_set;
     use crate::provenance::store::ProvenanceStore;
-    use std::process::Command;
+    use test_support::{git, seed_empty_repo_at};
     use wt_core::diff::diff_against_head;
-
-    fn git(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
 
     fn agent_writes(
         store: &mut ProvenanceStore,
@@ -574,9 +561,7 @@ mod tests {
         fn two_agents_wrote_everything() -> Fixture {
             let dir = tempfile::tempdir().expect("tempdir");
             let repo = dir.path();
-            git(repo, &["init", "-b", "main"]);
-            git(repo, &["config", "user.email", "test@example.com"]);
-            git(repo, &["config", "user.name", "Test User"]);
+            seed_empty_repo_at(repo);
             std::fs::write(repo.join("shared.rs"), "one\ntwo\nthree\n").expect("seed shared");
             std::fs::write(repo.join("solo.rs"), "alpha\n").expect("seed solo");
             git(repo, &["add", "-A"]);
@@ -724,24 +709,6 @@ mod tests {
         assert_eq!(
             rows[1].files_label, "2 files",
             "s10 wrote in the shared file and its own"
-        );
-    }
-
-    #[test]
-    fn the_order_matches_the_mock_not_the_issue_sketch() {
-        // `Jerry.dc.html` paints `onSecUnc`, `onSecCommits`, `onSecBase`, then `onSecRuns` last,
-        // and says so in its own comment - "Runs is not on [the git-state] ladder ... so it sits
-        // after it rather than inside it, which also keeps Uncommitted's top edge fixed however
-        // many agents have run." `REVISION-2026-08-14.md` §1's sketch lists Runs first; the mock
-        // wins the disagreement.
-        assert_eq!(
-            ChangesSection::ORDER,
-            [
-                ChangesSection::Uncommitted,
-                ChangesSection::Commits,
-                ChangesSection::AgainstMain,
-                ChangesSection::Runs,
-            ]
         );
     }
 

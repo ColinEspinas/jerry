@@ -45,9 +45,6 @@ use std::path::{Path, PathBuf};
 
 use gpui::Rgba;
 
-#[cfg(test)]
-use crate::theme;
-
 /// One row in the flattened file tree: a real filesystem entry, its path, and its depth
 /// (0 = direct child of the tree root) for indentation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -358,8 +355,11 @@ pub fn indent_guide_x(level: usize) -> f32 {
 const CARET_WIDTH: f32 = 8.0;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod file_tree_walk_tests {
+    use crate::sidebar::file_tree::{build_file_tree, directory_paths, FileTree, MAX_DEPTH};
+    use std::collections::HashSet;
+    use std::fs;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
     fn tree_of(root: &Path) -> FileTree {
@@ -473,32 +473,10 @@ mod tests {
         assert!(listing.partial);
     }
 
-    /// The listing has to hold hundreds of entries in a single directory without any cap of its
-    /// own - the sidebar's virtualized list is what keeps that cheap to render, not a cut-off
-    /// here (issue #18 §4).
-    #[test]
-    fn a_large_directory_is_listed_completely() {
-        let dir = TempDir::new().expect("tempdir");
-        for index in 0..800 {
-            fs::write(dir.path().join(format!("f-{index:03}.txt")), "x").expect("write");
-        }
-
-        let listing = build_file_tree(dir.path()).expect("build_file_tree");
-
-        assert_eq!(listing.tree.len(), 800);
-        assert!(listing.is_complete());
-        let expanded = HashSet::new();
-        assert_eq!(
-            listing.tree.visible_entries(&expanded).len(),
-            800,
-            "every entry in a flat directory is visible with nothing expanded, and none of them \
-             may be dropped by a render cap"
-        );
-    }
-
     /// GitHub issue #160, at the level the walk itself decides it: a tree with more entries than
     /// the removed 20,000-entry default cap must come back whole, with no truncation flag left
-    /// anywhere to hang a "load more" row off.
+    /// anywhere to hang a "load more" row off, and no render cap dropping any of it either
+    /// (issue #18 §4 - the sidebar's virtualized list is what keeps a big tree cheap to draw).
     ///
     /// Built as a wide, shallow fan (200 directories x 105 files) rather than 21,000 files in one
     /// folder, so it also exercises the recursive descent the old budget used to cut short
@@ -533,6 +511,12 @@ mod tests {
             listing.is_complete(),
             "and a walk that reached everything is a complete inventory"
         );
+        assert_eq!(
+            listing.tree.visible_entries(&HashSet::new()).len(),
+            DIRS,
+            "with nothing expanded every one of the directory rows is visible, and no render cap \
+             may drop any of them"
+        );
         // The last directory's last file is the entry furthest past the old cut-off; naming it
         // proves the walk really continued rather than merely counting to a bigger number.
         let last = dir
@@ -544,6 +528,98 @@ mod tests {
             "{} is ~1,000 entries past the removed cap and must still be present",
             last.display()
         );
+    }
+
+    #[test]
+    fn directory_paths_collects_every_directory_and_no_files() {
+        let dir = TempDir::new().expect("tempdir");
+        fs::create_dir(dir.path().join("sub")).expect("mkdir");
+        fs::create_dir(dir.path().join("sub/deeper")).expect("mkdir");
+        fs::write(dir.path().join("sub/nested.txt"), "n").expect("write");
+
+        let dirs = directory_paths(&tree_of(dir.path()));
+
+        assert_eq!(dirs.len(), 2);
+        assert!(dirs.contains(&dir.path().join("sub")));
+        assert!(dirs.contains(&dir.path().join("sub/deeper")));
+    }
+}
+
+#[cfg(test)]
+mod tree_visibility_tests {
+    use crate::sidebar::file_tree::{
+        build_file_tree, visible_indices_by_depth, FileTree, FileTreeEntry,
+    };
+    use std::collections::HashSet;
+    use std::fs;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    fn entry(name: &str, depth: usize, is_dir: bool) -> FileTreeEntry {
+        FileTreeEntry {
+            path: PathBuf::from(name),
+            name: name.to_string(),
+            depth,
+            is_dir,
+        }
+    }
+
+    /// `sub/` holding `nested.txt` and `deeper/`, `deeper/` holding `deepest.txt`, plus a
+    /// root-level `a.txt` and an `empty-dir/` with nothing in it - one shape every expansion case
+    /// below reads out of.
+    fn sample_tree() -> FileTree {
+        FileTree::new(vec![
+            entry("empty-dir", 0, true),
+            entry("sub", 0, true),
+            entry("nested.txt", 1, false),
+            entry("deeper", 1, true),
+            entry("deepest.txt", 2, false),
+            entry("a.txt", 0, false),
+        ])
+    }
+
+    fn visible_names(tree: &FileTree, expanded: &[&str]) -> Vec<String> {
+        let expanded: HashSet<PathBuf> = expanded.iter().map(PathBuf::from).collect();
+        tree.visible_entries(&expanded)
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect()
+    }
+
+    /// Issue #18 §1's default state and the rules that grow out of it, over one tree: absence
+    /// from the expanded set means collapsed, expansion reveals only the folder's own immediate
+    /// children, and a stale deep expansion never punches a hole through a collapsed ancestor.
+    #[test]
+    fn expanding_reveals_exactly_the_expanded_folders_own_children() {
+        let tree = sample_tree();
+        for (expanded, expected) in [
+            (&[][..], &["empty-dir", "sub", "a.txt"][..]),
+            (
+                &["sub"][..],
+                &["empty-dir", "sub", "nested.txt", "deeper", "a.txt"][..],
+            ),
+            (
+                &["sub", "deeper"][..],
+                &[
+                    "empty-dir",
+                    "sub",
+                    "nested.txt",
+                    "deeper",
+                    "deepest.txt",
+                    "a.txt",
+                ][..],
+            ),
+            // `deeper` is expanded but its own parent is not - it must stay hidden regardless.
+            (&["deeper"][..], &["empty-dir", "sub", "a.txt"][..]),
+            // Expanding a folder with no children reveals nothing extra.
+            (&["empty-dir"][..], &["empty-dir", "sub", "a.txt"][..]),
+        ] {
+            assert_eq!(
+                visible_names(&tree, expanded),
+                expected,
+                "expanded {expanded:?}"
+            );
+        }
     }
 
     /// The span-based skip must agree with the depth-scan it replaced on a real, nested tree -
@@ -560,7 +636,7 @@ mod tests {
         fs::write(dir.path().join("e/leaf.txt"), "x").expect("write");
         fs::write(dir.path().join("root.txt"), "x").expect("write");
 
-        let tree = tree_of(dir.path());
+        let tree = build_file_tree(dir.path()).expect("build_file_tree").tree;
         let dirs: Vec<PathBuf> = tree
             .iter()
             .filter(|entry| entry.is_dir)
@@ -582,173 +658,43 @@ mod tests {
             );
         }
     }
+}
+
+#[cfg(test)]
+mod lang_chip_tests {
+    use crate::sidebar::file_tree::lang_chip_for_name;
+    use crate::theme;
+    use gpui::Rgba;
 
     fn same(a: Rgba, b: Rgba) -> bool {
         a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a
     }
 
+    /// One table over the whole mapping: each documented extension's own chip, the neutral
+    /// fallback for an unrecognized one and for a name with no extension at all, and the
+    /// case-insensitive match.
     #[test]
-    fn each_documented_extension_gets_its_own_chip() {
-        let rs = lang_chip_for_name("main.rs");
-        assert_eq!(rs.label, "rs");
-        assert!(same(rs.fg, theme::lang::RS.0.into()));
-        assert!(same(rs.bg, theme::lang::RS.1.into()));
-
-        let toml = lang_chip_for_name("Cargo.toml");
-        assert_eq!(toml.label, "to");
-        assert!(same(toml.fg, theme::lang::TOML.0.into()));
-
-        let md = lang_chip_for_name("README.md");
-        assert_eq!(md.label, "md");
-        assert!(same(md.fg, theme::lang::MD.0.into()));
-
-        let sql = lang_chip_for_name("schema.sql");
-        assert_eq!(sql.label, "sq");
-        assert!(same(sql.fg, theme::lang::SQL.0.into()));
-    }
-
-    #[test]
-    fn an_unrecognized_extension_gets_the_neutral_fallback_chip() {
-        let chip = lang_chip_for_name("image.png");
-        assert_eq!(chip.label, ".");
-        assert!(same(chip.fg, theme::lang::UNKNOWN.0.into()));
-        assert!(same(chip.bg, theme::lang::UNKNOWN.1.into()));
-    }
-
-    #[test]
-    fn extension_matching_is_case_insensitive() {
-        let upper = lang_chip_for_name("Notes.MD");
-        assert_eq!(upper.label, "md");
-    }
-
-    #[test]
-    fn a_name_with_no_extension_gets_the_fallback_chip() {
-        let chip = lang_chip_for_name("Makefile");
-        assert_eq!(chip.label, ".");
-    }
-
-    fn entry(name: &str, depth: usize, is_dir: bool) -> FileTreeEntry {
-        FileTreeEntry {
-            path: PathBuf::from(name),
-            name: name.to_string(),
-            depth,
-            is_dir,
+    fn every_name_gets_its_documented_chip_or_the_neutral_fallback() {
+        for (name, label, colors) in [
+            ("main.rs", "rs", theme::lang::RS),
+            ("Cargo.toml", "to", theme::lang::TOML),
+            ("README.md", "md", theme::lang::MD),
+            ("schema.sql", "sq", theme::lang::SQL),
+            ("Notes.MD", "md", theme::lang::MD),
+            ("image.png", ".", theme::lang::UNKNOWN),
+            ("Makefile", ".", theme::lang::UNKNOWN),
+        ] {
+            let chip = lang_chip_for_name(name);
+            assert_eq!(chip.label, label, "{name}");
+            assert!(same(chip.fg, colors.0.into()), "{name} foreground");
+            assert!(same(chip.bg, colors.1.into()), "{name} background");
         }
     }
+}
 
-    /// Hand-built fixtures go through the same [`FileTree::new`] every real walk does, so the
-    /// subtree spans under test are always the derived ones - there is deliberately no way to
-    /// hand-write a span.
-    fn tree(entries: Vec<FileTreeEntry>) -> FileTree {
-        FileTree::new(entries)
-    }
-
-    /// Issue #18 §1's default state, at the level it's actually decided: nothing expanded means
-    /// root-level entries only.
-    #[test]
-    fn nothing_expanded_shows_only_root_level_entries() {
-        let entries = tree(vec![
-            entry("sub", 0, true),
-            entry("nested.txt", 1, false),
-            entry("a.txt", 0, false),
-        ]);
-        let visible = entries.visible_entries(&HashSet::new());
-        let names: Vec<&str> = visible.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec!["sub", "a.txt"]);
-    }
-
-    #[test]
-    fn expanding_a_directory_reveals_only_its_own_immediate_subtree() {
-        let entries = tree(vec![
-            entry("sub", 0, true),
-            entry("nested.txt", 1, false),
-            entry("deeper", 1, true),
-            entry("deepest.txt", 2, false),
-            entry("a.txt", 0, false),
-        ]);
-        let mut expanded = HashSet::new();
-        expanded.insert(PathBuf::from("sub"));
-
-        let visible = entries.visible_entries(&expanded);
-        let names: Vec<&str> = visible.iter().map(|e| e.name.as_str()).collect();
-        // "deeper" shows because its parent is expanded, but its own children stay hidden until
-        // it is expanded too.
-        assert_eq!(names, vec!["sub", "nested.txt", "deeper", "a.txt"]);
-    }
-
-    #[test]
-    fn expanding_a_whole_chain_reveals_the_deepest_entry() {
-        let entries = tree(vec![
-            entry("sub", 0, true),
-            entry("deeper", 1, true),
-            entry("deepest.txt", 2, false),
-        ]);
-        let mut expanded = HashSet::new();
-        expanded.insert(PathBuf::from("sub"));
-        expanded.insert(PathBuf::from("deeper"));
-
-        let visible = entries.visible_entries(&expanded);
-        let names: Vec<&str> = visible.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec!["sub", "deeper", "deepest.txt"]);
-    }
-
-    /// A stale deep expansion (e.g. one restored from disk whose parent the user has since
-    /// collapsed) must never punch a hole through a collapsed ancestor.
-    #[test]
-    fn an_expanded_directory_under_a_collapsed_ancestor_stays_hidden() {
-        let entries = tree(vec![
-            entry("sub", 0, true),
-            entry("deeper", 1, true),
-            entry("deepest.txt", 2, false),
-            entry("a.txt", 0, false),
-        ]);
-        let mut expanded = HashSet::new();
-        expanded.insert(PathBuf::from("deeper"));
-
-        let visible = entries.visible_entries(&expanded);
-        let names: Vec<&str> = visible.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec!["sub", "a.txt"]);
-    }
-
-    #[test]
-    fn expanding_a_directory_with_no_children_reveals_nothing_extra() {
-        let entries = tree(vec![entry("empty-dir", 0, true), entry("a.txt", 0, false)]);
-        let mut expanded = HashSet::new();
-        expanded.insert(PathBuf::from("empty-dir"));
-
-        let visible = entries.visible_entries(&expanded);
-        assert_eq!(visible.len(), 2);
-    }
-
-    #[test]
-    fn visible_entries_on_a_real_tree_matches_manual_filtering() {
-        let dir = TempDir::new().expect("tempdir");
-        fs::create_dir(dir.path().join("sub")).expect("mkdir");
-        fs::write(dir.path().join("sub/nested.txt"), "n").expect("write");
-        fs::write(dir.path().join("a.txt"), "a").expect("write");
-
-        let entries = tree_of(dir.path());
-        let mut expanded = HashSet::new();
-        expanded.insert(dir.path().join("sub"));
-
-        let visible = entries.visible_entries(&expanded);
-        let names: Vec<&str> = visible.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec!["sub", "nested.txt", "a.txt"]);
-    }
-
-    #[test]
-    fn directory_paths_collects_every_directory_and_no_files() {
-        let dir = TempDir::new().expect("tempdir");
-        fs::create_dir(dir.path().join("sub")).expect("mkdir");
-        fs::create_dir(dir.path().join("sub/deeper")).expect("mkdir");
-        fs::write(dir.path().join("sub/nested.txt"), "n").expect("write");
-
-        let dirs = directory_paths(&tree_of(dir.path()));
-
-        assert_eq!(dirs.len(), 2);
-        assert!(dirs.contains(&dir.path().join("sub")));
-        assert!(dirs.contains(&dir.path().join("sub/deeper")));
-    }
+#[cfg(test)]
+mod indent_geometry_tests {
+    use crate::sidebar::file_tree::indent_guide_x;
 
     #[test]
     fn indent_guides_line_up_with_each_levels_expand_chevron() {
