@@ -1201,6 +1201,18 @@ impl AdeApp {
     }
 
     /// Opens the file a match row points at, in the editor, scrolled to that line.
+    ///
+    /// `line_number` is [`engine::LineMatch::line_number`], already 1-based - the exact number the
+    /// row itself prints (see this row's own leading `line_number.to_string()` label and its
+    /// `"{path}:{line_number}"` tooltip above). [`Self::open_file_at_line`] (`crate::code_surface::
+    /// lsp_ui`) already takes a 1-based line and does its own internal conversion for the editor's
+    /// 0-based scroll target - every other real caller (`Self::trigger_goto_definition`'s own
+    /// `target_range.start.line as usize + 1`, the Problems row's `problem.line`, a terminal
+    /// `path:line` link's parsed `line`) passes it a real 1-based line number for exactly that
+    /// reason. A live report ("result is line 482 but when clicking it goes to line 481") was this
+    /// function subtracting 1 *again* before handing off an already-1-based number to a callee
+    /// that subtracts its own 1 - the real fix is passing `line_number` straight through, not
+    /// re-adding a compensating `+1` here to paper over the double subtraction.
     fn open_search_match(
         &mut self,
         path: PathBuf,
@@ -1208,9 +1220,7 @@ impl AdeApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // 1-based on screen, 0-based in the editor - converted here, once, rather than at either
-        // end where it would be one more place to get wrong.
-        self.open_file_at_line(path, line_number.saturating_sub(1), window, cx);
+        self.open_file_at_line(path, line_number, window, cx);
     }
 }
 
@@ -1603,6 +1613,99 @@ mod panel_tests {
             cx.debug_bounds("search-fold-all").is_some(),
             "one file closed still leaves results, so fold-all still exists"
         );
+    }
+
+    /// Real coverage for a live report: "no loading indicator either so it is weird" - typing a
+    /// query with a real, in-flight search still running (behind `SEARCH_DEBOUNCE`, then the
+    /// background walk itself) must visibly say so, not silently keep showing whatever the panel
+    /// last painted. `BodyState::Searching` and its own count-row/body text already exist
+    /// (`SearchPanel::body_state`/`count_label`/`body_message`) - this proves the *render* layer
+    /// really reaches them while a search is genuinely still in flight, not only once it has
+    /// already settled, which is all `type_and_settle`'s own helper (used by every other panel
+    /// test) ever exercises.
+    #[gpui::test]
+    fn a_real_in_flight_search_shows_the_searching_state_not_a_stale_or_blank_one(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = fixture_repo();
+        let (app, cx) = open_search(cx, &repo);
+
+        // First, a real completed search - so the second one below has real, different-looking
+        // stale results it could wrongly keep showing if `body_state` were not actually driving
+        // the render.
+        type_and_settle(cx, "refresh_token");
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.search.body_state(), BodyState::Results);
+        });
+        assert!(cx.debug_bounds("search-match-0-1-0").is_some());
+
+        // A second keystroke starts a new generation. Only `simulate_input` +
+        // `run_until_parked` runs here - deliberately not `type_and_settle`'s own extra
+        // `advance_clock(SEARCH_DEBOUNCE * 2)` - so this really is mid-`SEARCH_DEBOUNCE`, before
+        // the background walk has even started, the way every real keystroke's first frame is.
+        cx.simulate_input("2");
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.search.body_state(),
+                BodyState::Searching,
+                "a real in-flight search must report itself as searching, not silently keep the \
+                 previous query's completed state"
+            );
+            assert_eq!(
+                app.search.count_label(),
+                "searching\u{2026}",
+                "the count row must say so, not show the previous query's stale count"
+            );
+        });
+        assert!(
+            cx.debug_bounds("search-message").is_some(),
+            "the body must really paint the searching sentence"
+        );
+        assert!(
+            cx.debug_bounds("search-match-0-1-0").is_none(),
+            "the previous query's result tree must not still be on screen while a newer, \
+             different query is in flight - that would look identical to the search having \
+             silently hung rather than started"
+        );
+    }
+
+    /// Real regression coverage for a live report: "when we click on a search result the line we
+    /// go to is one line less than what we select (result is line 482 but when clicking it goes
+    /// to line 481)". `Self::open_search_match` used to subtract 1 from the row's own, already
+    /// 1-based `line_number` before handing it to `Self::open_file_at_line` - which itself already
+    /// expects (and converts) a 1-based line, exactly as `Self::trigger_goto_definition` and the
+    /// Problems row both already pass it. The fixture below deliberately puts its one match well
+    /// past line 1, so a real off-by-one lands on visibly the wrong line rather than accidentally
+    /// clamping to a valid one.
+    #[gpui::test]
+    fn clicking_a_match_row_opens_the_file_on_exactly_the_line_it_reports(cx: &mut TestAppContext) {
+        let repo = TempDir::new().expect("tempdir");
+        let mut content = String::new();
+        for line in 1..=41 {
+            content.push_str(&format!("// padding line {line}\n"));
+        }
+        content.push_str("let refresh_token = store.issue(&sid)?;\n"); // real line 42
+        std::fs::write(repo.path().join("deep.rs"), &content).expect("write");
+
+        let (app, cx) = open_search(cx, &repo);
+        type_and_settle(cx, "refresh_token");
+        assert!(
+            cx.debug_bounds("search-match-0-42-0").is_some(),
+            "the row must really report line 42, matching the fixture's own real line"
+        );
+
+        click(cx, "search-match-0-42-0");
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.code_cursor,
+                Some(42),
+                "a result reported as line 42 must open on real line 42, not 41"
+            );
+        });
     }
 
     #[gpui::test]

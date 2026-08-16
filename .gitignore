@@ -1,4 +1,13 @@
 target/
+# A shared `CARGO_TARGET_DIR` some worktrees point at to avoid recompiling the whole workspace
+# per worktree - a real build directory exactly like `target/` above, just outside it. Missing
+# here is the same class of bug `wt_core::review::MAX_UNTRACKED_SNAPSHOT_BYTES` documents hitting
+# once already (a 19 GB, 21,471-file untracked-and-unignored build directory) and that
+# `search::engine`'s own worktree walk hit again for the same reason: any tool that trusts
+# `.gitignore` to mean "not real content" - `git add -A`, this repo's own review-baseline
+# snapshot, and now the Search panel's `git ls-files --exclude-standard` walk - silently treats
+# an unignored build directory as real, searchable/stageable content instead.
+.shared-target/
 .claude/scratch/
 # Windows/WSL alternate-data-stream marker files left behind by files downloaded/copied
 # from a Windows filesystem.

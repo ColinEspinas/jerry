@@ -32,6 +32,7 @@ pub mod rewrite;
 pub mod run_drift;
 pub mod stage;
 pub mod undo;
+pub mod worktree_files;
 
 pub use error::{Error, GitExit};
 
