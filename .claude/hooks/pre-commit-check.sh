@@ -41,8 +41,15 @@ if [ -z "$FAIL" ] && command -v cargo &>/dev/null; then
 fi
 # `cargo-nextest` is a separate binary, not part of a rustup toolchain: a contributor who hasn't
 # run `/setup` yet skips this step rather than being blocked by it, per this file's exit contract.
-if [ -z "$FAIL" ] && command -v cargo-nextest &>/dev/null; then
-  cargo nextest run --workspace >/tmp/jerry-precommit-nextest.log 2>&1 || FAIL="nextest"
+# The skip is announced, not silent - a gate that quietly drops its only behavioural check reads as
+# a passing gate.
+if [ -z "$FAIL" ] && command -v cargo &>/dev/null; then
+  if command -v cargo-nextest &>/dev/null; then
+    cargo nextest run --workspace >/tmp/jerry-precommit-nextest.log 2>&1 || FAIL="nextest"
+  else
+    echo "pre-commit-check: cargo-nextest missing - tests NOT run for this commit." >&2
+    echo "  cargo install cargo-nextest --locked   (or run /setup)" >&2
+  fi
 fi
 
 if [ -n "$FAIL" ]; then

@@ -115,11 +115,9 @@ jobs:
   # skips ignored tests unless asked for them (`--run-ignored`, which only the `external` job
   # below passes).
   #
-  # `nextest`, not `cargo test`, because the reason the suite could not be in CI at all was that
-  # one test blocking on a language server that never answers froze the whole run with no way to
-  # attribute it (issue #348 observed 2,808 of ~2,900 tests logged, then 13+ minutes of nothing).
-  # nextest runs each test in its own process and enforces `.config/nextest.toml`'s
-  # `slow-timeout`, so that failure mode is now a named, killed test instead of a dead run.
+  # `nextest`, not `cargo test`: each test runs in its own process under `.config/nextest.toml`'s
+  # `slow-timeout`, so a test that blocks forever is a named, killed failure rather than a run
+  # that never ends.
   linux-test:
     name: Linux (test)
     runs-on: ubuntu-latest
@@ -360,26 +358,17 @@ jobs:
         with:
           tool: cargo-nextest@0.9.143
 
-      # Version pinning, per this project's "same version we verified against, not latest"
-      # convention (`crates/app/Cargo.toml`'s `tree-sitter`/`alacritty_terminal` comments):
+      # Pinned to the version verified against, not latest, per `crates/app/Cargo.toml`'s
+      # `tree-sitter`/`alacritty_terminal` convention. `@vue/language-server@3.3.8` is the version
+      # `crate::language`'s module docs were written against.
       #
-      # - `@vue/language-server@3.3.8` is a real, established pin. `crate::language`'s own module
-      #   docs record the live investigation done against exactly that version, and issue #348
-      #   re-confirmed the Vue test passes against it (2.15s).
+      # `typescript-language-server` and `pyright` are deliberately unpinned: no version is
+      # recorded anywhere in the repo for the tests that use them, and a guessed pin looks
+      # authoritative while hiding drift. TODO(#426): the "Resolved server versions" step prints
+      # what npm resolved on each nightly run - bisect from a passing run, then pin.
       #
-      # - `typescript-language-server` and `pyright` are deliberately NOT pinned, and this is a
-      #   known gap rather than an oversight. `git blame` on all four of their tests
-      #   (`crates/app/src/lsp/client.rs`, commits b0c08523 / e75f9dd3 / 06b06dac / 1aa4cd54)
-      #   names no version in any commit message or nearby comment, and nothing else in the repo
-      #   records one. Issue #348 established the negative half only: `typescript-language-server`
-      #   5.3.0 ("latest" at the time) fails those tests fast. Guessing a pin from that is worse
-      #   than leaving it unpinned - a wrong pin looks authoritative and hides the drift.
-      #   TODO(#426): the "Resolved server versions" step below prints what npm actually resolved
-      #   on each nightly run. Bisect from a run where these tests pass, then pin here.
-      #
-      # `gopls` is deliberately absent: `crate::language`'s registry gives Go `lsp: None` and
-      # `gopls` is PATH-detection-only on the Settings page, so no test in this workspace ever
-      # spawns it. Installing it would be cargo-culting issue #348's list.
+      # `gopls` is absent because no test spawns it: `crate::language` gives Go `lsp: None`, and
+      # the Settings page only detects it on PATH.
       - name: Install language servers
         run: |
           npm install -g \
