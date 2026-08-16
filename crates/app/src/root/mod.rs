@@ -222,6 +222,10 @@ actions!(
         EditorEscape,
         TextUndo,
         TextRedo,
+        TextCopy,
+        TextCut,
+        TextPaste,
+        TextSelectAll,
         CloseFocusedTab,
         FileTreeRename,
         FileTreeCopy,
@@ -1343,6 +1347,26 @@ pub struct AdeApp {
     /// only ever read for a row-click hit test, and a scrolled-away row can't be clicked), so this
     /// is cleared wholesale only on a worktree switch, not pruned every frame.
     pub(crate) file_view_row_layout: HashMap<usize, (gpui::Bounds<Pixels>, gpui::ShapedLine)>,
+    /// The same idea as [`Self::file_view_row_layout`], for the app's hand-rolled single-line
+    /// inputs (GitHub issue #336): every `widgets::render_simple_input_row` captures its own real
+    /// painted bounds and shaped line here each frame, and its click/drag handlers read them back
+    /// to hit-test a pointer x into a real byte offset (`gpui::LineLayout::closest_index_for_x`).
+    /// Keyed by the row's own `widgets::SimpleInput::caret_selector` - see that field's own docs
+    /// for why the caret selector rather than the text one. Transient/best-effort in exactly
+    /// the same way: an entry for a field no longer on screen is simply never refreshed, and can
+    /// never be read because it can't be clicked.
+    pub(crate) simple_input_layout:
+        HashMap<gpui::SharedString, (gpui::Bounds<Pixels>, gpui::ShapedLine)>,
+    /// Which single-line input a real click-drag selection is currently in progress in - the
+    /// `caret_selector` key of [`Self::simple_input_layout`], or `None` when no button is down.
+    ///
+    /// Needed because the drag has to keep extending the selection while the pointer is *outside*
+    /// the field (dragging past its right edge is how a user selects to the end of a query that
+    /// overflows its box), which a hover-filtered `on_mouse_move` listener cannot see - so the
+    /// move/up listeners are registered window-wide (`gpui::Window::on_mouse_event`, the same
+    /// mechanism Zed's own editor element uses for this) and this is what tells them the drag is
+    /// really theirs.
+    pub(crate) simple_input_drag: Option<gpui::SharedString>,
     /// GitHub issue #202: which code blocks the user has currently collapsed, keyed by absolute
     /// path, each value a set of 0-based [`code_surface::fold::FoldRange::start_line`]s.
     ///

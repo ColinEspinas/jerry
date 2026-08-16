@@ -9,12 +9,34 @@
 use super::{flow, NoteAnchor, NoteMark};
 use crate::provenance::render::author_style;
 use crate::provenance::Author;
-use crate::root::widgets::{render_keycap_row, text_tooltip, KeycapSize, SimpleInput};
+use crate::root::widgets::{
+    render_keycap_row, text_tooltip, KeycapSize, SimpleInput, SimpleInputCaret, TextFieldHandle,
+};
 use crate::root::{plural, AdeApp};
 use crate::theme;
 use crate::{keymap, work_surface};
 use gpui::prelude::*;
 use gpui::{div, font, px, rems, ClickEvent, Context, IntoElement, SharedString};
+
+/// The open note card's own [`TextFieldHandle`] - what click/drag selection and GitHub issue
+/// #336's four clipboard/select-all actions act on. `None` whenever no card is open for typing,
+/// and its `on_changed` mirrors `AdeApp::handle_note_key_down`'s own follow-up exactly: the note's
+/// stored text is updated and a persist is scheduled, so a pasted note survives a restart just
+/// like a typed one.
+fn note_draft_handle() -> TextFieldHandle {
+    TextFieldHandle::new(|app: &mut AdeApp| app.note_draft.as_mut().map(|draft| &mut draft.field))
+        .on_changed(|app: &mut AdeApp, cx| {
+            let Some(draft) = app.note_draft.as_ref() else {
+                return;
+            };
+            let worktree = draft.worktree.clone();
+            let at = draft.at.clone();
+            let text = draft.field.as_str().to_string();
+            app.review_notes
+                .set_text(&worktree, &at.path, at.anchor, &text);
+            app.schedule_review_notes_persist(&worktree, cx);
+        })
+}
 
 /// The bar's fixed second line, **verbatim** from `Jerry.dc.html` and from `STAGE-A-CHANGELOG.md`
 /// §1's own row for this feature: *"A notes bar above the hunks: count, the line `one prompt,
@@ -120,18 +142,22 @@ impl AdeApp {
     fn render_note_input_node(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         self.note_draft.as_ref()?;
         Some(
-            div()
-                .id("diff-note-input")
-                .debug_selector(|| "diff-note-input".to_string())
-                .flex_none()
-                .w(px(0.0))
-                .h(px(0.0))
-                .track_focus(&self.note_focus_handle)
-                .key_context("text-input")
-                .on_action(cx.listener(Self::handle_note_text_undo))
-                .on_action(cx.listener(Self::handle_note_text_redo))
-                .on_key_down(cx.listener(Self::handle_note_key_down))
-                .into_any_element(),
+            self.wire_text_input_actions(
+                div()
+                    .id("diff-note-input")
+                    .debug_selector(|| "diff-note-input".to_string())
+                    .flex_none()
+                    .w(px(0.0))
+                    .h(px(0.0))
+                    .track_focus(&self.note_focus_handle)
+                    .key_context("text-input")
+                    .on_action(cx.listener(Self::handle_note_text_undo))
+                    .on_action(cx.listener(Self::handle_note_text_redo))
+                    .on_key_down(cx.listener(Self::handle_note_key_down)),
+                note_draft_handle(),
+                cx,
+            )
+            .into_any_element(),
         )
     }
 
@@ -431,6 +457,11 @@ impl AdeApp {
             Some(draft) if editing => draft.field.caret(),
             _ => text.len(),
         };
+        // Same rule as the caret: only the card really being typed into can show a selection.
+        let text_selection = match &self.note_draft {
+            Some(draft) if editing => draft.field.selection(),
+            _ => 0..0,
+        };
         let mark = note.map(|note| note.mark()).unwrap_or(NoteMark::Draft);
         // The honest half of the draft/sent history: a card that has been sent and then edited
         // can still say what the agent really was told.
@@ -510,18 +541,27 @@ impl AdeApp {
                     // Only a card being typed into gets a caret at all; the pinned cards
                     // around it are read-only text, so they render the same row with the
                     // caret suppressed by a focus handle that is not theirs to hold.
-                    .child(self.render_simple_input_row(SimpleInput {
-                        caret_selector: SharedString::from(caret_selector),
-                        text_selector: SharedString::from(text_selector),
-                        focus_handle: editing.then_some(&self.note_focus_handle),
-                        text: &text,
-                        caret_offset: text_caret,
-                        placeholder: NOTE_PLACEHOLDER,
-                        font: theme::font::SANS,
-                        text_size: px(11.5),
-                        text_color: theme::notes::CARD_FG,
-                        placeholder_color: theme::notes::CARD_PLACEHOLDER,
-                    }))
+                    .child(self.render_simple_input_row(
+                        SimpleInput {
+                            caret_selector: SharedString::from(caret_selector),
+                            text_selector: SharedString::from(text_selector),
+                            focus_handle: editing.then_some(&self.note_focus_handle),
+                            text: &text,
+                            caret_offset: text_caret,
+                            selection: text_selection,
+                            placeholder: NOTE_PLACEHOLDER,
+                            font: theme::font::SANS,
+                            text_size: px(11.5),
+                            text_color: theme::notes::CARD_FG,
+                            placeholder_color: theme::notes::CARD_PLACEHOLDER,
+                            caret: SimpleInputCaret::default(),
+                            // Only the card really being edited is pointer-editable; the pinned
+                            // ones around it are read-only text, exactly as their suppressed
+                            // caret already says.
+                            field: editing.then(note_draft_handle),
+                        },
+                        cx,
+                    ))
                     .child(
                         div()
                             .debug_selector(move || mark_selector)

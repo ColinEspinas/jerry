@@ -2,8 +2,8 @@ use super::*;
 use crate::root::plural;
 use crate::root::scrollbar;
 use crate::root::widgets::{
-    hover_keycap_row, menu_popover_chrome, render_env_chip, render_keycap_row, KeycapSize,
-    SimpleInput,
+    self, hover_keycap_row, menu_popover_chrome, render_env_chip, render_keycap_row, KeycapSize,
+    SimpleInput, TextFieldHandle,
 };
 use crate::settings::widgets::ChoiceOption;
 use crate::sound::SoundEventKind;
@@ -1075,72 +1075,82 @@ impl AdeApp {
                     .debug_selector(|| "settings-shell-status".to_string()),
             )
             .child(
-                div()
-                    .id("settings-shell-input")
-                    .debug_selector(|| "settings-shell-input".to_string())
-                    .track_focus(&self.shell_focus_handle)
-                    // See `crate::default_key_bindings`' `TextUndo`/`TextRedo` docs for why the
-                    // tag and the listeners both live on this exact node.
-                    .key_context("text-input")
-                    .on_action(cx.listener(Self::handle_settings_shell_text_undo))
-                    .on_action(cx.listener(Self::handle_settings_shell_text_redo))
-                    .on_key_down(cx.listener(Self::handle_settings_shell_key_down))
-                    .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
-                        window.focus(&this.shell_focus_handle, cx);
-                        this.open_shell_suggestions(cx);
-                    }))
-                    // The field's real, window-space painted bounds, for positioning the
-                    // suggestion dropdown - the same `gpui::canvas` idiom
-                    // `Self::plus_button_bounds` uses, and for the same reason: the dropdown is a
-                    // top-level sibling in `AdeApp::render`, so it needs the field's position in
-                    // window space, not in this row's own coordinate system.
-                    .child({
-                        let this = cx.entity();
-                        gpui::canvas(
-                            move |bounds, _window, cx| {
-                                this.update(cx, |this, _cx| {
-                                    this.shell_field_bounds = bounds;
-                                });
-                            },
-                            |_, _, _, _| {},
-                        )
-                        .absolute()
-                        .size_full()
-                    })
-                    .cursor_pointer()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    // No decorative gap before the caret - see
-                    // `crate::rail::render::AdeApp::render_rail_filter_row`'s own
-                    // comment for why (live report: it read as a gap between the
-                    // typed text and where it's actually being typed).
-                    .h(px(20.0))
-                    .w(px(168.0))
-                    .px(px(7.0))
-                    .rounded(theme::radius::BUTTON)
-                    .border_1()
-                    .border_color(theme::border::CARD_FIELD)
-                    .bg(theme::surface::CARD_SUNK)
-                    // Caret placement and text sizing both through
-                    // `AdeApp::render_simple_input_row`, which owns that structure for every
-                    // simple input in this app. This field was the *second* live instance of the
-                    // bug that helper exists to make unrepeatable: `.flex_1().min_w_0()` sat on
-                    // the text element, so inside this fixed 168px box the text's layout box
-                    // filled the whole field whatever the shell path said, and the caret after it
-                    // sat pinned to the right-hand border instead of against the last character.
-                    .child(self.render_simple_input_row(SimpleInput {
+                self.wire_text_input_actions(
+                    div()
+                        .id("settings-shell-input")
+                        .debug_selector(|| "settings-shell-input".to_string())
+                        .track_focus(&self.shell_focus_handle)
+                        // See `crate::default_key_bindings`' `TextUndo`/`TextRedo` docs for why
+                        // the tag and the listeners both live on this exact node.
+                        .key_context("text-input")
+                        .on_action(cx.listener(Self::handle_settings_shell_text_undo))
+                        .on_action(cx.listener(Self::handle_settings_shell_text_redo))
+                        .on_key_down(cx.listener(Self::handle_settings_shell_key_down)),
+                    shell_input_handle(),
+                    cx,
+                )
+                .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+                    window.focus(&this.shell_focus_handle, cx);
+                    this.open_shell_suggestions(cx);
+                }))
+                // The field's real, window-space painted bounds, for positioning the
+                // suggestion dropdown - the same `gpui::canvas` idiom
+                // `Self::plus_button_bounds` uses, and for the same reason: the dropdown is a
+                // top-level sibling in `AdeApp::render`, so it needs the field's position in
+                // window space, not in this row's own coordinate system.
+                .child({
+                    let this = cx.entity();
+                    gpui::canvas(
+                        move |bounds, _window, cx| {
+                            this.update(cx, |this, _cx| {
+                                this.shell_field_bounds = bounds;
+                            });
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .size_full()
+                })
+                .cursor_pointer()
+                .flex_none()
+                .flex()
+                .items_center()
+                // No decorative gap before the caret - see
+                // `crate::rail::render::AdeApp::render_rail_filter_row`'s own
+                // comment for why (live report: it read as a gap between the
+                // typed text and where it's actually being typed).
+                .h(px(20.0))
+                .w(px(168.0))
+                .px(px(7.0))
+                .rounded(theme::radius::BUTTON)
+                .border_1()
+                .border_color(theme::border::CARD_FIELD)
+                .bg(theme::surface::CARD_SUNK)
+                // Caret placement and text sizing both through
+                // `AdeApp::render_simple_input_row`, which owns that structure for every
+                // simple input in this app. This field was the *second* live instance of the
+                // bug that helper exists to make unrepeatable: `.flex_1().min_w_0()` sat on
+                // the text element, so inside this fixed 168px box the text's layout box
+                // filled the whole field whatever the shell path said, and the caret after it
+                // sat pinned to the right-hand border instead of against the last character.
+                .child(self.render_simple_input_row(
+                    SimpleInput {
                         caret_selector: "settings-shell-caret".into(),
                         text_selector: "settings-shell-text".into(),
                         focus_handle: Some(&self.shell_focus_handle),
                         text: if has_shell { &shell } else { "" },
                         caret_offset: self.shell_input.caret(),
+                        selection: self.shell_input.selection(),
                         placeholder: &placeholder,
                         font: theme::font::MONO,
                         text_size: self.ui_text_size(10.5),
                         text_color: theme::text::BODY,
                         placeholder_color: theme::text::GHOST,
-                    })),
+                        caret: widgets::SimpleInputCaret::default(),
+                        field: Some(shell_input_handle()),
+                    },
+                    cx,
+                )),
             )
     }
 
@@ -1164,21 +1174,29 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         let keystroke = &event.keystroke;
-        if keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.alt {
+        // GitHub issue #336: `widgets::text_editing_modifiers` rather than a flat "any modifier
+        // means not ours" - see `crate::rail::render::AdeApp::handle_filter_key_down`'s own note.
+        let Some(modifiers) = widgets::text_editing_modifiers(&keystroke.key, &keystroke.modifiers)
+        else {
             return;
-        }
+        };
         self.reset_caret_blink(cx);
         let escaped = keystroke.key.as_str() == "escape";
         let changed = match keystroke.key.as_str() {
-            "backspace" => self.shell_input.backspace(Instant::now()),
             // Clearing the field is itself a real, meaningful edit here (it means "go back to the
             // system default"), so it persists like any other - and is undoable, like every other
             // simple input's `Esc`.
             "escape" => self.shell_input.clear(Instant::now()),
-            _ => match keystroke.key_char.as_deref() {
-                Some(text) if !text.is_empty() => self.shell_input.insert_str(text, Instant::now()),
-                _ => false,
-            },
+            // GitHub issue #336: the whole `TextField` vocabulary rather than the
+            // backspace/insert half this used to hand-roll - caret movement, selection extension,
+            // word-wise movement and Delete all arrive here at once, for this field and the two
+            // below it.
+            key => self.shell_input.handle_editing_key(
+                key,
+                keystroke.key_char.as_deref(),
+                modifiers,
+                Instant::now(),
+            ),
         };
         if changed {
             self.apply_shell_input(cx);
@@ -2042,61 +2060,60 @@ impl AdeApp {
                     .child("Generate from colour"),
             )
             .child(
-                div()
-                    .id("settings-theme-seed-input")
-                    .debug_selector(|| "settings-theme-seed-input".to_string())
-                    .track_focus(&self.theme_seed_focus_handle)
-                    // See `crate::default_key_bindings`' `TextUndo`/`TextRedo` docs for why the
-                    // tag and the listeners both live on this exact node.
-                    .key_context("text-input")
-                    .on_action(cx.listener(Self::handle_theme_seed_text_undo))
-                    .on_action(cx.listener(Self::handle_theme_seed_text_redo))
-                    .on_key_down(cx.listener(Self::handle_theme_seed_key_down))
-                    .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
-                        window.focus(&this.theme_seed_focus_handle, cx);
-                    }))
-                    .cursor_pointer()
-                    .flex()
-                    .items_center()
-                    // No decorative gap before the caret - see
-                    // `crate::rail::render::AdeApp::render_rail_filter_row`'s own
-                    // comment for why (live report: it read as a gap between the
-                    // typed text and where it's actually being typed).
-                    .h(px(20.0))
-                    .w(px(96.0))
-                    .px(px(7.0))
-                    .rounded(theme::radius::BUTTON)
-                    .border_1()
-                    .border_color(theme::border::CARD_FIELD)
-                    .bg(theme::surface::CARD_SUNK)
-                    .when(!has_seed, |el| {
-                        el.child(self.render_simple_input_caret(
-                            "settings-theme-seed-caret",
-                            &self.theme_seed_focus_handle,
-                        ))
-                    })
-                    .child(
-                        div()
-                            .font(font(theme::font::MONO))
-                            .text_size(px(10.5))
-                            .text_color(if has_seed {
-                                theme::text::BODY
-                            } else {
-                                theme::text::GHOST
-                            })
-                            .child(if has_seed {
-                                seed.clone()
-                            } else {
-                                "#rrggbb".to_string()
-                            })
-                            .debug_selector(|| "settings-theme-seed-text".to_string()),
-                    )
-                    .when(has_seed, |el| {
-                        el.child(self.render_simple_input_caret(
-                            "settings-theme-seed-caret",
-                            &self.theme_seed_focus_handle,
-                        ))
-                    }),
+                self.wire_text_input_actions(
+                    div()
+                        .id("settings-theme-seed-input")
+                        .debug_selector(|| "settings-theme-seed-input".to_string())
+                        .track_focus(&self.theme_seed_focus_handle)
+                        // See `crate::default_key_bindings`' `TextUndo`/`TextRedo` docs for why
+                        // the tag and the listeners both live on this exact node.
+                        .key_context("text-input")
+                        .on_action(cx.listener(Self::handle_theme_seed_text_undo))
+                        .on_action(cx.listener(Self::handle_theme_seed_text_redo))
+                        .on_key_down(cx.listener(Self::handle_theme_seed_key_down)),
+                    theme_seed_input_handle(),
+                    cx,
+                )
+                .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+                    window.focus(&this.theme_seed_focus_handle, cx);
+                }))
+                .cursor_pointer()
+                .flex()
+                .items_center()
+                // No decorative gap before the caret - see
+                // `crate::rail::render::AdeApp::render_rail_filter_row`'s own
+                // comment for why (live report: it read as a gap between the
+                // typed text and where it's actually being typed).
+                .h(px(20.0))
+                .w(px(96.0))
+                .px(px(7.0))
+                .rounded(theme::radius::BUTTON)
+                .border_1()
+                .border_color(theme::border::CARD_FIELD)
+                .bg(theme::surface::CARD_SUNK)
+                // GitHub issue #336: through the one helper that owns this structure, like
+                // every other simple input in the app, rather than the hand-assembled
+                // caret-before-placeholder / text / caret-after-text trio this row used to
+                // carry - which is exactly the duplication `render_simple_input_row` exists to
+                // end, and which had no selection highlight or hit-testing of its own.
+                .child(self.render_simple_input_row(
+                    SimpleInput {
+                        caret_selector: "settings-theme-seed-caret".into(),
+                        text_selector: "settings-theme-seed-text".into(),
+                        focus_handle: Some(&self.theme_seed_focus_handle),
+                        text: if has_seed { seed.as_str() } else { "" },
+                        caret_offset: self.theme_seed_input.caret(),
+                        selection: self.theme_seed_input.selection(),
+                        placeholder: "#rrggbb",
+                        font: theme::font::MONO,
+                        text_size: px(10.5),
+                        text_color: theme::text::BODY,
+                        placeholder_color: theme::text::GHOST,
+                        caret: widgets::SimpleInputCaret::default(),
+                        field: Some(theme_seed_input_handle()),
+                    },
+                    cx,
+                )),
             )
             // A real, live preview of the seed itself, so a typo is visible before clicking.
             .when(parse_seed_hex(&seed).is_some(), |el| {
@@ -2142,23 +2159,25 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         let keystroke = &event.keystroke;
-        if keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.alt {
+        // GitHub issue #336: `widgets::text_editing_modifiers` rather than a flat "any modifier
+        // means not ours" - see `crate::rail::render::AdeApp::handle_filter_key_down`'s own note.
+        let Some(modifiers) = widgets::text_editing_modifiers(&keystroke.key, &keystroke.modifiers)
+        else {
             return;
-        }
+        };
         self.reset_caret_blink(cx);
         let changed = match keystroke.key.as_str() {
-            "backspace" => self.theme_seed_input.backspace(Instant::now()),
             "escape" => self.theme_seed_input.clear(Instant::now()),
             "enter" => {
                 self.start_generate_theme_from_seed(cx);
                 return;
             }
-            _ => match keystroke.key_char.as_deref() {
-                Some(text) if !text.is_empty() => {
-                    self.theme_seed_input.insert_str(text, Instant::now())
-                }
-                _ => false,
-            },
+            key => self.theme_seed_input.handle_editing_key(
+                key,
+                keystroke.key_char.as_deref(),
+                modifiers,
+                Instant::now(),
+            ),
         };
         if changed {
             cx.notify();
@@ -2599,67 +2618,77 @@ impl AdeApp {
         total: usize,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        div()
-            .id("settings-keymap-filter")
-            .track_focus(&self.settings_keymap_filter_focus_handle)
-            // See `crate::default_key_bindings`' `TextUndo`/`TextRedo` docs for why the tag and
-            // the listener both live on this exact node.
-            .key_context("text-input")
-            .on_action(cx.listener(Self::handle_settings_keymap_filter_text_undo))
-            .on_action(cx.listener(Self::handle_settings_keymap_filter_text_redo))
-            .on_key_down(cx.listener(Self::handle_settings_keymap_filter_key_down))
-            .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
-                window.focus(&this.settings_keymap_filter_focus_handle, cx);
-            }))
-            .flex()
-            .items_center()
-            .gap(px(7.0))
-            .px(px(11.0))
-            .py(px(7.0))
-            .bg(theme::surface::CARD_SUNK)
-            .border_b_1()
-            .border_color(theme::border::CARD)
-            .child(
-                div()
-                    .font(font(theme::font::MONO))
-                    .text_size(px(11.0))
-                    .text_color(theme::text::GHOSTER)
-                    .child("/"),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .items_center()
-                    // No decorative gap before the caret - see
-                    // `crate::rail::render::AdeApp::render_rail_filter_row`'s own
-                    // comment for why (live report: it read as a gap between the
-                    // typed text and where it's actually being typed).
-                    // GitHub issue #45 / live report: same fix as
-                    // `crate::rail::render::AdeApp::render_rail_filter_row` - the caret sits
-                    // before the placeholder (real cursor position 0) while the filter is empty,
-                    // never appended after it.
-                    .child(self.render_simple_input_row(SimpleInput {
+        self.wire_text_input_actions(
+            div()
+                .id("settings-keymap-filter")
+                .track_focus(&self.settings_keymap_filter_focus_handle)
+                // See `crate::default_key_bindings`' `TextUndo`/`TextRedo` docs for why the tag
+                // and the listener both live on this exact node.
+                .key_context("text-input")
+                .on_action(cx.listener(Self::handle_settings_keymap_filter_text_undo))
+                .on_action(cx.listener(Self::handle_settings_keymap_filter_text_redo))
+                .on_key_down(cx.listener(Self::handle_settings_keymap_filter_key_down)),
+            settings_keymap_filter_handle(),
+            cx,
+        )
+        .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+            window.focus(&this.settings_keymap_filter_focus_handle, cx);
+        }))
+        .flex()
+        .items_center()
+        .gap(px(7.0))
+        .px(px(11.0))
+        .py(px(7.0))
+        .bg(theme::surface::CARD_SUNK)
+        .border_b_1()
+        .border_color(theme::border::CARD)
+        .child(
+            div()
+                .font(font(theme::font::MONO))
+                .text_size(px(11.0))
+                .text_color(theme::text::GHOSTER)
+                .child("/"),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .items_center()
+                // No decorative gap before the caret - see
+                // `crate::rail::render::AdeApp::render_rail_filter_row`'s own
+                // comment for why (live report: it read as a gap between the
+                // typed text and where it's actually being typed).
+                // GitHub issue #45 / live report: same fix as
+                // `crate::rail::render::AdeApp::render_rail_filter_row` - the caret sits
+                // before the placeholder (real cursor position 0) while the filter is empty,
+                // never appended after it.
+                .child(self.render_simple_input_row(
+                    SimpleInput {
                         caret_selector: "settings-keymap-filter-caret".into(),
                         text_selector: "settings-keymap-filter-text".into(),
                         focus_handle: Some(&self.settings_keymap_filter_focus_handle),
                         text: self.settings_keymap_filter.as_str(),
                         caret_offset: self.settings_keymap_filter.caret(),
+                        selection: self.settings_keymap_filter.selection(),
                         placeholder: &format!("filter {}", plural::count(total, "binding", None)),
                         font: theme::font::SANS,
                         text_size: px(11.0),
                         text_color: theme::text::DIM,
                         placeholder_color: theme::text::GHOST,
-                    })),
-            )
-            .child(
-                div()
-                    .font(font(theme::font::MONO))
-                    .text_size(px(10.0))
-                    .text_color(theme::text::GHOST)
-                    .child(format!("{shown} shown")),
-            )
+                        caret: widgets::SimpleInputCaret::default(),
+                        field: Some(settings_keymap_filter_handle()),
+                    },
+                    cx,
+                )),
+        )
+        .child(
+            div()
+                .font(font(theme::font::MONO))
+                .text_size(px(10.0))
+                .text_color(theme::text::GHOST)
+                .child(format!("{shown} shown")),
+        )
     }
 
     /// Same minimal append/backspace/escape-clears shape as [`Self::handle_filter_key_down`] -
@@ -2672,23 +2701,25 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         let keystroke = &event.keystroke;
-        if keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.alt {
+        // GitHub issue #336: `widgets::text_editing_modifiers` rather than a flat "any modifier
+        // means not ours" - see `crate::rail::render::AdeApp::handle_filter_key_down`'s own note.
+        let Some(modifiers) = widgets::text_editing_modifiers(&keystroke.key, &keystroke.modifiers)
+        else {
             return;
-        }
+        };
         // GitHub issue #27's "solid mid-keystroke" - see `crate::palette::render::AdeApp::
         // handle_palette_key_down`'s identical reasoning.
         self.reset_caret_blink(cx);
         let changed = match keystroke.key.as_str() {
-            "backspace" => self.settings_keymap_filter.backspace(Instant::now()),
             // A real, undoable step - see `crate::rail::AdeApp::handle_filter_key_down`'s own
             // identical `Esc` handling.
             "escape" => self.settings_keymap_filter.clear(Instant::now()),
-            _ => match keystroke.key_char.as_deref() {
-                Some(text) if !text.is_empty() => {
-                    self.settings_keymap_filter.insert_str(text, Instant::now())
-                }
-                _ => false,
-            },
+            key => self.settings_keymap_filter.handle_editing_key(
+                key,
+                keystroke.key_char.as_deref(),
+                modifiers,
+                Instant::now(),
+            ),
         };
         if changed {
             cx.notify();
@@ -4732,6 +4763,33 @@ impl AdeApp {
         self.apply_follow_system_appearance(appearance, cx);
         cx.notify();
     }
+}
+
+/// The Settings › Terminal shell field's own [`TextFieldHandle`] - what click/drag selection and
+/// GitHub issue #336's four clipboard/select-all actions act on, carrying exactly the follow-up
+/// work `AdeApp::handle_settings_shell_key_down` already runs after a keystroke: the new value is
+/// persisted immediately, and the suggestion dropdown is re-opened against it.
+fn shell_input_handle() -> TextFieldHandle {
+    TextFieldHandle::new(|app: &mut AdeApp| Some(&mut app.shell_input)).on_changed(
+        |app: &mut AdeApp, cx| {
+            app.apply_shell_input(cx);
+            app.open_shell_suggestions(cx);
+        },
+    )
+}
+
+/// The Settings › Keybindings filter field's own handle. No `on_changed`: the filtered list is
+/// derived from the field at render time, so a `cx.notify()` - which every caller of this already
+/// does - is the whole of the follow-up work.
+fn settings_keymap_filter_handle() -> TextFieldHandle {
+    TextFieldHandle::new(|app: &mut AdeApp| Some(&mut app.settings_keymap_filter))
+}
+
+/// The "Generate from colour" seed field's own handle. No `on_changed` for the same reason
+/// [`settings_keymap_filter_handle`] has none: the live colour swatch beside the field is derived
+/// from it at render time, so `cx.notify()` is all the follow-up there is.
+fn theme_seed_input_handle() -> TextFieldHandle {
+    TextFieldHandle::new(|app: &mut AdeApp| Some(&mut app.theme_seed_input))
 }
 
 /// Parses the "Generate from colour" seed input's own text into a real `0xrrggbb` value -

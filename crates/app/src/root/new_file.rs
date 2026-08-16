@@ -92,44 +92,51 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         let keystroke = &event.keystroke;
-        if keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.alt {
+        // GitHub issue #336: `widgets::text_editing_modifiers` rather than a flat "any modifier
+        // means not ours" - see `crate::rail::render::AdeApp::handle_filter_key_down`'s own note.
+        let Some(modifiers) = widgets::text_editing_modifiers(&keystroke.key, &keystroke.modifiers)
+        else {
             return;
-        }
+        };
         match keystroke.key.as_str() {
             "escape" => {
                 self.cancel_new_file(window, cx);
                 cx.stop_propagation();
+                return;
             }
             "enter" => {
                 self.create_new_file(window, cx);
                 cx.stop_propagation();
+                return;
             }
-            "backspace" => {
-                if let Some(input) = self.new_file_input.as_mut() {
-                    input.name.backspace(Instant::now());
-                    // GitHub issue #27's "solid mid-keystroke" - see `crate::rail::render::
-                    // AdeApp::handle_filter_key_down`'s identical reasoning. Missing here
-                    // (GitHub issue #45) is exactly why this field never blinked.
-                    self.reset_caret_blink(cx);
-                    cx.notify();
-                    cx.stop_propagation();
-                }
-            }
-            _ => {
-                if let Some(text) = keystroke
-                    .key_char
-                    .as_deref()
-                    .filter(|text| !text.is_empty())
-                {
-                    if let Some(input) = self.new_file_input.as_mut() {
-                        input.name.insert_str(text, Instant::now());
-                        self.reset_caret_blink(cx);
-                        cx.notify();
-                        cx.stop_propagation();
-                    }
-                }
-            }
+            _ => {}
         }
+        let Some(input) = self.new_file_input.as_mut() else {
+            return;
+        };
+        // GitHub issue #336: the whole `TextField` vocabulary through the one shared entry point,
+        // rather than the backspace/insert pair this prompt used to hand-roll.
+        if input.name.handle_editing_key(
+            &keystroke.key,
+            keystroke.key_char.as_deref(),
+            modifiers,
+            Instant::now(),
+        ) {
+            // GitHub issue #27's "solid mid-keystroke" - see `crate::rail::render::
+            // AdeApp::handle_filter_key_down`'s identical reasoning. Missing here
+            // (GitHub issue #45) is exactly why this field never blinked.
+            self.reset_caret_blink(cx);
+            cx.notify();
+            cx.stop_propagation();
+        }
+    }
+
+    /// The "New file" name prompt's own field handle - what click/drag selection and GitHub issue
+    /// #336's four clipboard/select-all actions act on. `None` whenever the prompt is closed.
+    fn new_file_name_handle() -> widgets::TextFieldHandle {
+        widgets::TextFieldHandle::new(|app: &mut AdeApp| {
+            app.new_file_input.as_mut().map(|input| &mut input.name)
+        })
     }
 
     /// `TextUndo`/`TextRedo` for the "New file" name prompt (GitHub issue #17). Clears the
@@ -187,6 +194,11 @@ impl AdeApp {
             .as_ref()
             .map(|input| input.name.caret())
             .unwrap_or_default();
+        let name_selection = self
+            .new_file_input
+            .as_ref()
+            .map(|input| input.name.selection())
+            .unwrap_or(0..0);
         let parent_label = self
             .new_file_input
             .as_ref()
@@ -221,88 +233,99 @@ impl AdeApp {
                 this.cancel_new_file(window, cx);
             }))
             .child(
-                div()
-                    .id("new-file-panel")
-                    .track_focus(&self.new_file_focus_handle)
-                    // See `crate::default_key_bindings`' `TextUndo`/`TextRedo` docs for why the
-                    // tag and the listeners both live on this exact node.
-                    .key_context("text-input")
-                    .on_action(cx.listener(Self::handle_new_file_text_undo))
-                    .on_action(cx.listener(Self::handle_new_file_text_redo))
-                    .on_key_down(cx.listener(Self::handle_new_file_key_down))
-                    .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
-                        cx.stop_propagation();
-                    }))
-                    .flex()
-                    .flex_col()
-                    .gap(px(6.0))
-                    .w(px(320.0))
-                    .p(px(12.0))
-                    .bg(theme::surface::PALETTE)
-                    .border_1()
-                    .border_color(theme::border::POPOVER)
-                    .rounded(theme::radius::CARD)
-                    .child(
-                        div()
-                            .font(font(theme::font::SANS))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_size(px(11.5))
-                            .text_color(theme::text::HEADING)
-                            .child("New file"),
-                    )
-                    .child(
-                        div()
-                            .font(font(theme::font::MONO))
-                            .text_size(px(9.5))
-                            .text_color(theme::text::FAINTER)
-                            .child(parent_label),
-                    )
-                    .child(
-                        div()
-                            .px(px(8.0))
-                            .py(px(5.0))
-                            .rounded(theme::radius::CHIP)
-                            .bg(theme::surface::SEGMENT_TRACK)
-                            .flex()
-                            .items_center()
-                            // GitHub issue #45 / live report: this prompt had no caret element
-                            // at all before this - just the typed name or its placeholder, no
-                            // insertion-point indicator, and `new_file_focus_handle` was never
-                            // wired into `crate::root::caret_blink` either (see
-                            // `Self::new_with_settings`'s own comment on the fix). The caret and
-                            // the text around it now come from the one helper that owns that
-                            // structure - see `AdeApp::render_simple_input_row`.
-                            .child(self.render_simple_input_row(widgets::SimpleInput {
+                self.wire_text_input_actions(
+                    div()
+                        .id("new-file-panel")
+                        .track_focus(&self.new_file_focus_handle)
+                        // See `crate::default_key_bindings`' `TextUndo`/`TextRedo` docs for why
+                        // the tag and the listeners both live on this exact node.
+                        .key_context("text-input")
+                        .on_action(cx.listener(Self::handle_new_file_text_undo))
+                        .on_action(cx.listener(Self::handle_new_file_text_redo))
+                        .on_key_down(cx.listener(Self::handle_new_file_key_down)),
+                    Self::new_file_name_handle(),
+                    cx,
+                )
+                .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                }))
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .w(px(320.0))
+                .p(px(12.0))
+                .bg(theme::surface::PALETTE)
+                .border_1()
+                .border_color(theme::border::POPOVER)
+                .rounded(theme::radius::CARD)
+                .child(
+                    div()
+                        .font(font(theme::font::SANS))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_size(px(11.5))
+                        .text_color(theme::text::HEADING)
+                        .child("New file"),
+                )
+                .child(
+                    div()
+                        .font(font(theme::font::MONO))
+                        .text_size(px(9.5))
+                        .text_color(theme::text::FAINTER)
+                        .child(parent_label),
+                )
+                .child(
+                    div()
+                        .px(px(8.0))
+                        .py(px(5.0))
+                        .rounded(theme::radius::CHIP)
+                        .bg(theme::surface::SEGMENT_TRACK)
+                        .flex()
+                        .items_center()
+                        // GitHub issue #45 / live report: this prompt had no caret element
+                        // at all before this - just the typed name or its placeholder, no
+                        // insertion-point indicator, and `new_file_focus_handle` was never
+                        // wired into `crate::root::caret_blink` either (see
+                        // `Self::new_with_settings`'s own comment on the fix). The caret and
+                        // the text around it now come from the one helper that owns that
+                        // structure - see `AdeApp::render_simple_input_row`.
+                        .child(self.render_simple_input_row(
+                            widgets::SimpleInput {
                                 caret_selector: "new-file-caret".into(),
                                 text_selector: "new-file-name-text".into(),
                                 focus_handle: Some(&self.new_file_focus_handle),
                                 text: &name,
                                 caret_offset: name_caret,
+                                selection: name_selection.clone(),
                                 placeholder: "file-name.ext",
                                 font: theme::font::MONO,
                                 text_size: px(11.5),
                                 // One colour for both: this prompt has never dimmed its
-                                // placeholder, and the migration is not the place to change that.
+                                // placeholder, and the migration is not the place to change
+                                // that.
                                 text_color: theme::text::BODY,
                                 placeholder_color: theme::text::BODY,
-                            })),
-                    )
-                    .when_some(self.new_file_error.clone(), |el, error| {
-                        el.child(
-                            div()
-                                .font(font(theme::font::SANS))
-                                .text_size(px(10.5))
-                                .text_color(theme::status::FAIL)
-                                .child(error),
-                        )
-                    })
-                    .child(
+                                caret: widgets::SimpleInputCaret::default(),
+                                field: Some(Self::new_file_name_handle()),
+                            },
+                            cx,
+                        )),
+                )
+                .when_some(self.new_file_error.clone(), |el, error| {
+                    el.child(
                         div()
                             .font(font(theme::font::SANS))
-                            .text_size(px(10.0))
-                            .text_color(theme::text::GHOST)
-                            .child("enter to create \u{b7} esc to cancel"),
-                    ),
+                            .text_size(px(10.5))
+                            .text_color(theme::status::FAIL)
+                            .child(error),
+                    )
+                })
+                .child(
+                    div()
+                        .font(font(theme::font::SANS))
+                        .text_size(px(10.0))
+                        .text_color(theme::text::GHOST)
+                        .child("enter to create \u{b7} esc to cancel"),
+                ),
             )
     }
 

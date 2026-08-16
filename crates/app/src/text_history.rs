@@ -601,6 +601,57 @@ impl TextHistory {
     }
 }
 
+/// A character's real class for word-wise caret movement and double-click word selection (GitHub
+/// issue #27, GitHub issue #336) - shared by [`TextField`] and
+/// `crate::code_surface::edit_buffer::EditBuffer`, so the app's simple single-line inputs and its
+/// full code editor agree on where a word starts and ends rather than each hand-classifying its
+/// own way. See [`TextField::previous_word_boundary`]'s own docs for why this app hand-classifies
+/// rather than using `unicode_segmentation`'s UAX #29 word boundaries for this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WordClass {
+    Whitespace,
+    /// A letter, digit, or underscore - grouped together so `foo_bar123` is one real word, not
+    /// three.
+    Word,
+    /// Anything else (`.`, `(`, `)`, `-`, ...) - a real code editor's own word-navigation stops
+    /// at these individually from surrounding word text, but groups a *run* of them together
+    /// (`()` is one hop, not two), matching this app's own real test coverage.
+    Punctuation,
+}
+
+pub fn word_class(ch: char) -> WordClass {
+    if ch.is_whitespace() {
+        WordClass::Whitespace
+    } else if ch.is_alphanumeric() || ch == '_' {
+        WordClass::Word
+    } else {
+        WordClass::Punctuation
+    }
+}
+
+/// The modifier state one keystroke carries into [`TextField::handle_editing_key`], in this
+/// module's own GPUI-free vocabulary rather than `gpui::Modifiers`.
+///
+/// Two booleans rather than the raw platform modifier set on purpose: *which* physical key means
+/// "word-wise" differs by platform (Alt on macOS, Ctrl everywhere else) and that is a decision
+/// about keyboards, not about text, so it belongs at the GPUI boundary
+/// (`crate::root::widgets::text_editing_modifiers`) and not in here. Everything below this line
+/// only ever needs to know "extend the selection?" and "move by word?".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EditingModifiers {
+    /// Shift: extend the selection from its existing anchor rather than collapsing/moving it.
+    pub extend: bool,
+    /// The platform's word-wise modifier: move/extend a whole word at a time.
+    pub word: bool,
+}
+
+impl EditingModifiers {
+    /// No modifiers at all - an ordinary, unmodified keystroke.
+    pub fn none() -> Self {
+        Self::default()
+    }
+}
+
 /// One of the app's hand-rolled single-line text inputs (the command-palette query, the rail
 /// agent filter, the Settings › Keybindings filter, the New file name prompt, the file
 /// tree's inline New File / New Folder / Rename editor - `crate::sidebar::tree_ops::TreeInlineEdit`,
@@ -618,31 +669,57 @@ impl TextHistory {
 /// four real fields is where the old shape stops being defensible - a user *will* arrow back into
 /// a mistyped query rather than backspacing out eight characters of a regex to fix the first one.
 ///
-/// So [`Self::caret`] is a real byte offset into [`Self::as_str`], always on a grapheme-cluster
-/// boundary, and every edit happens *there*: [`Self::insert_str`] splices at it,
-/// [`Self::backspace`]/[`Self::delete_forward`] remove the cluster on either side of it, and
-/// [`Self::move_left`]/[`Self::move_right`]/[`Self::move_to_start`]/[`Self::move_to_end`] move it
-/// without recording anything. [`Self::handle_editing_key`] is all of that behind one call, so a
-/// call site gets the whole vocabulary rather than whichever half it remembered to wire.
+/// ## A real selection (GitHub issue #336)
 ///
-/// Undo/redo restore the caret too, from the [`SelectionSnapshot`]s the history already carried -
-/// which is what makes the coalescing policy's own "a caret jump is a group boundary" rule mean
-/// something here for the first time: arrowing away mid-burst now really does start a new step.
+/// The version of this type that issue #162 left behind carried exactly one `caret: usize` and
+/// said, in this docstring, that selection was "deliberately not implemented". GitHub issue #336
+/// is the live report that ended that: "Text inputs do not have selection and standard
+/// copy/paste/cut."
 ///
-/// Deliberately **not** implemented: selection (and therefore selection-replacing typing, cut, or
-/// shift-arrow). Nothing in these fields needs it, `crate::code_surface::edit_buffer::EditBuffer`
-/// is what a surface that does needs, and half a selection model is worse than none.
+/// So the state below is a real **anchor/head** pair, in exactly the shape
+/// `vendor/zed/crates/gpui/examples/input.rs`'s own `TextInput` and this app's own
+/// `crate::code_surface::edit_buffer::EditBuffer` already use: an ordered
+/// [`Self::selection`] range plus a [`Self::selection_reversed`] flag saying which end the caret
+/// is really sitting on. That is the same information an explicit `(anchor, head)` pair carries -
+/// a selection can be built in either direction - stored so that the common questions ("what is
+/// selected?", "is anything selected?") are answered without a `min`/`max` at every call site,
+/// and so a [`SelectionSnapshot`] round-trips through it with no conversion at all. A *collapsed*
+/// selection (`start == end`) is the ordinary single-caret case, which is why every pre-#336
+/// caller keeps working unchanged.
 ///
-/// The `String` and the caret are private on purpose: every mutation has to go through a method
-/// that records and that re-clamps the caret, so a future call site physically cannot bypass the
-/// history or leave the caret mid-cluster the way bare `pub` fields would allow. That is the same
-/// silent-divergence bug class this project's own audits keep finding.
+/// Everything else follows from that one pair:
+///
+/// - [`Self::insert_str`] **replaces** the selection rather than splicing beside it, and
+///   [`Self::backspace`]/[`Self::delete_forward`] delete the whole selection when there is one -
+///   the standard behaviour of every real text input.
+/// - [`Self::move_left`] and friends **collapse** to the near edge instead of moving, again
+///   standard; [`Self::select_left`] and friends extend from the anchor.
+/// - [`Self::copy`]/[`Self::cut`]/[`Self::paste`] are the pure halves of Ctrl/Cmd+C/X/V; the real
+///   OS clipboard lives at the GPUI boundary (`crate::root::widgets`), so this module stays
+///   GPUI-free and directly unit-testable.
+/// - Undo/redo restore the whole [`SelectionSnapshot`], not just the caret - so undoing a
+///   type-over-a-selection really does put the selection back, which is what makes a second
+///   Ctrl+Z land where the user expects.
+///
+/// Word boundaries come from the shared [`word_class`] above rather than a second, subtly
+/// different classification of this module's own - the same anti-drift discipline that put the
+/// coalescing policy here in the first place.
+///
+/// The `String` and the selection are private on purpose: every mutation has to go through a
+/// method that records and that re-clamps to a real grapheme boundary, so a future call site
+/// physically cannot bypass the history or leave the caret mid-cluster the way bare `pub` fields
+/// would allow. That is the same silent-divergence bug class this project's own audits keep
+/// finding.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct TextField {
     text: String,
-    /// A byte offset into [`Self::text`], always `<= text.len()` and always on a grapheme
-    /// boundary.
-    caret: usize,
+    /// The selected byte range, always ordered (`start <= end`), always within [`Self::text`], and
+    /// always with both ends on a grapheme boundary. Collapsed (`start == end`) is a plain caret.
+    selection: Range<usize>,
+    /// `true` when the selection was extended leftward from its anchor, i.e. the visible caret
+    /// sits at `selection.start` rather than `selection.end`. Always `false` while the selection
+    /// is collapsed, so two equal selections never compare unequal over an invisible flag.
+    selection_reversed: bool,
     history: TextHistory,
 }
 
@@ -662,7 +739,8 @@ impl TextField {
     /// false until the user genuinely changes something.
     pub fn seeded(text: &str) -> Self {
         Self {
-            caret: text.len(),
+            selection: text.len()..text.len(),
+            selection_reversed: false,
             text: text.to_string(),
             history: TextHistory::new(),
         }
@@ -676,17 +754,53 @@ impl TextField {
         self.text.is_empty()
     }
 
-    /// Where the insertion point really is, as a byte offset into [`Self::as_str`]. What
-    /// `crate::root::widgets::SimpleInput` splits the rendered text at.
+    /// Where the insertion point really is, as a byte offset into [`Self::as_str`] - the *active*
+    /// end of [`Self::selection`], which is its start while the selection was dragged leftward.
+    /// What `crate::root::widgets::SimpleInput` draws the caret bar at.
     pub fn caret(&self) -> usize {
-        self.caret
+        if self.selection_reversed {
+            self.selection.start
+        } else {
+            self.selection.end
+        }
+    }
+
+    /// The real selected byte range - collapsed (empty) when there is only a caret.
+    pub fn selection(&self) -> Range<usize> {
+        self.selection.clone()
+    }
+
+    /// Which end of [`Self::selection`] the caret sits on - see the field's own docs.
+    pub fn selection_reversed(&self) -> bool {
+        self.selection_reversed
+    }
+
+    /// `true` when there is a real, non-collapsed selection - what "copy would copy something"
+    /// and "this Backspace deletes a range, not a character" both mean.
+    pub fn has_selection(&self) -> bool {
+        !self.selection.is_empty()
+    }
+
+    /// The really-selected text, or `""` while the selection is collapsed.
+    pub fn selected_text(&self) -> &str {
+        &self.text[self.selection.clone()]
+    }
+
+    /// The anchor - the end of the selection the caret is *not* on, i.e. where a Shift+click or a
+    /// drag would extend from. Equal to [`Self::caret`] while collapsed.
+    pub fn anchor(&self) -> usize {
+        if self.selection_reversed {
+            self.selection.end
+        } else {
+            self.selection.start
+        }
     }
 
     /// The text before and after the caret - the two spans a rendered row draws the caret bar
     /// between, so no call site has to slice on a byte offset itself and risk panicking mid-
     /// cluster.
     pub fn split_at_caret(&self) -> (&str, &str) {
-        self.text.split_at(self.caret)
+        self.text.split_at(self.caret())
     }
 
     /// The grapheme boundary at or just before `offset`, clamped into the text. A single-line
@@ -705,140 +819,398 @@ impl TextField {
             .unwrap_or(0)
     }
 
-    /// The grapheme boundary strictly before the caret, or `None` at the very start.
-    fn previous_boundary(&self) -> Option<usize> {
+    /// The grapheme boundary strictly before `offset`, or `None` at the very start.
+    fn previous_boundary(&self, offset: usize) -> Option<usize> {
         self.text
             .grapheme_indices(true)
             .rev()
-            .find(|(index, _)| *index < self.caret)
+            .find(|(index, _)| *index < offset)
             .map(|(index, _)| index)
     }
 
-    /// The grapheme boundary strictly after the caret, or `None` at the very end.
-    fn next_boundary(&self) -> Option<usize> {
+    /// The grapheme boundary strictly after `offset`, or `None` at the very end.
+    fn next_boundary(&self, offset: usize) -> Option<usize> {
         self.text
             .grapheme_indices(true)
-            .find(|(index, grapheme)| index + grapheme.len() > self.caret)
+            .find(|(index, grapheme)| index + grapheme.len() > offset)
             .map(|(index, grapheme)| index + grapheme.len())
     }
 
-    /// Moves the caret one grapheme cluster left. Returns whether it really moved, so a caller can
-    /// tell "the view needs repainting" from "this keystroke did nothing and should keep
-    /// propagating".
-    pub fn move_left(&mut self) -> bool {
-        match self.previous_boundary() {
-            Some(offset) => {
-                self.caret = offset;
-                true
+    /// The real word boundary just before `offset` - a maximal run of same-[`WordClass`]
+    /// characters, skipping over runs of whitespace rather than stopping on them. Ported from
+    /// `crate::code_surface::edit_buffer::EditBuffer::previous_word_boundary` minus its
+    /// line-scoping (a single-line field has exactly one line), and sharing that method's own
+    /// [`word_class`] so the two surfaces cannot drift.
+    ///
+    /// Deliberately *not* `unicode_segmentation::UnicodeSegmentation::split_word_bound_indices`
+    /// (this type's own grapheme-boundary methods' crate): UAX #29's word boundaries are designed
+    /// for natural-language prose and keep e.g. `foo.bar` as one unbroken word, which is wrong for
+    /// the paths, branch names, globs and regexes these fields actually hold.
+    fn previous_word_boundary(&self, offset: usize) -> usize {
+        let chars: Vec<(usize, char)> = self.text.char_indices().collect();
+        let mut cursor = chars.iter().rposition(|&(index, _)| index < offset);
+        while let Some(pos) = cursor {
+            if word_class(chars[pos].1) == WordClass::Whitespace {
+                cursor = pos.checked_sub(1);
+            } else {
+                break;
             }
+        }
+        let Some(mut start) = cursor else {
+            return 0;
+        };
+        let class = word_class(chars[start].1);
+        while start > 0 && word_class(chars[start - 1].1) == class {
+            start -= 1;
+        }
+        chars[start].0
+    }
+
+    /// The mirror of [`Self::previous_word_boundary`].
+    fn next_word_boundary(&self, offset: usize) -> usize {
+        let chars: Vec<(usize, char)> = self.text.char_indices().collect();
+        let mut cursor = chars.iter().position(|&(index, _)| index >= offset);
+        while let Some(pos) = cursor {
+            if word_class(chars[pos].1) == WordClass::Whitespace {
+                cursor = (pos + 1 < chars.len()).then_some(pos + 1);
+            } else {
+                break;
+            }
+        }
+        let Some(mut end) = cursor else {
+            return self.text.len();
+        };
+        let class = word_class(chars[end].1);
+        while end + 1 < chars.len() && word_class(chars[end + 1].1) == class {
+            end += 1;
+        }
+        chars[end].0 + chars[end].1.len_utf8()
+    }
+
+    /// The maximal same-[`WordClass`] run touching `offset` - what a real double-click selects.
+    /// `offset` landing on whitespace returns `None` (a plain caret there rather than a fabricated
+    /// "word" that isn't really there), matching
+    /// `crate::code_surface::edit_buffer::EditBuffer::select_word_at`'s own rule.
+    pub fn word_range_at(&self, offset: usize) -> Option<Range<usize>> {
+        let offset = self.boundary_at_or_before(offset.min(self.text.len()));
+        let chars: Vec<(usize, char)> = self.text.char_indices().collect();
+        // The char the click actually landed on/just before - the first char whose byte range
+        // contains `offset`, or (a click right at the text's real end) the last char there is.
+        let pos = chars
+            .iter()
+            .position(|&(index, ch)| offset < index + ch.len_utf8())
+            .or_else(|| chars.len().checked_sub(1))?;
+        let class = word_class(chars[pos].1);
+        if class == WordClass::Whitespace {
+            return None;
+        }
+        let mut start = pos;
+        while start > 0 && word_class(chars[start - 1].1) == class {
+            start -= 1;
+        }
+        let mut end = pos;
+        while end + 1 < chars.len() && word_class(chars[end + 1].1) == class {
+            end += 1;
+        }
+        Some(chars[start].0..chars[end].0 + chars[end].1.len_utf8())
+    }
+
+    /// The real selection right now, as the history's own snapshot shape.
+    fn snapshot(&self) -> SelectionSnapshot {
+        SelectionSnapshot::of(&self.selection, self.selection_reversed)
+    }
+
+    /// Puts the selection back from a history snapshot, re-clamped into the *current* text and
+    /// onto real grapheme boundaries - defensive, since a snapshot describes the text as it was
+    /// when it was taken.
+    fn restore(&mut self, snapshot: SelectionSnapshot) {
+        let mut start = self.boundary_at_or_before(snapshot.start.min(self.text.len()));
+        let mut end = self.boundary_at_or_before(snapshot.end.min(self.text.len()));
+        if start > end {
+            std::mem::swap(&mut start, &mut end);
+        }
+        self.selection = start..end;
+        self.selection_reversed = snapshot.reversed && start != end;
+    }
+
+    /// Collapses the selection to a caret at the grapheme boundary at or before `offset` - the
+    /// real target of a plain click, and of `Left`/`Right`/`Home`/`End` once a selection exists.
+    /// Returns whether anything actually moved.
+    pub fn move_to(&mut self, offset: usize) -> bool {
+        let offset = self.boundary_at_or_before(offset.min(self.text.len()));
+        let changed = self.selection != (offset..offset);
+        self.selection = offset..offset;
+        self.selection_reversed = false;
+        changed
+    }
+
+    /// Extends the selection to `offset` from whichever end is currently anchored, flipping
+    /// [`Self::selection_reversed`] if the selection crosses over itself - the drag/Shift+click/
+    /// Shift+arrow primitive, ported from `vendor/zed/crates/gpui/examples/input.rs`'s own
+    /// `TextInput::select_to` (and identical to
+    /// `crate::code_surface::edit_buffer::EditBuffer::select_to`).
+    pub fn select_to(&mut self, offset: usize) -> bool {
+        let offset = self.boundary_at_or_before(offset.min(self.text.len()));
+        let before = (self.selection.clone(), self.selection_reversed);
+        if self.selection_reversed {
+            self.selection.start = offset;
+        } else {
+            self.selection.end = offset;
+        }
+        if self.selection.end < self.selection.start {
+            self.selection_reversed = !self.selection_reversed;
+            self.selection = self.selection.end..self.selection.start;
+        }
+        if self.selection.is_empty() {
+            self.selection_reversed = false;
+        }
+        before != (self.selection.clone(), self.selection_reversed)
+    }
+
+    /// `Ctrl/Cmd+A`.
+    pub fn select_all(&mut self) -> bool {
+        let whole = 0..self.text.len();
+        let changed = self.selection != whole || self.selection_reversed;
+        self.selection = whole;
+        self.selection_reversed = false;
+        changed
+    }
+
+    /// Double-click: selects the word under `offset` ([`Self::word_range_at`]), or just places a
+    /// caret there when `offset` is on whitespace.
+    pub fn select_word_at(&mut self, offset: usize) -> bool {
+        match self.word_range_at(offset) {
+            Some(range) => {
+                let changed = self.selection != range || self.selection_reversed;
+                self.selection = range;
+                self.selection_reversed = false;
+                changed
+            }
+            None => self.move_to(offset),
+        }
+    }
+
+    /// Moves the caret one grapheme cluster left, **collapsing** an active selection to its left
+    /// edge instead - which is what every real text input does, and why a plain arrow key is not
+    /// just "extend with `shift` unset". Returns whether it really moved, so a caller can tell
+    /// "the view needs repainting" from "this keystroke did nothing and should keep propagating".
+    pub fn move_left(&mut self) -> bool {
+        if self.has_selection() {
+            return self.move_to(self.selection.start);
+        }
+        match self.previous_boundary(self.caret()) {
+            Some(offset) => self.move_to(offset),
             None => false,
         }
     }
 
     /// The mirror of [`Self::move_left`].
     pub fn move_right(&mut self) -> bool {
-        match self.next_boundary() {
-            Some(offset) => {
-                self.caret = offset;
-                true
-            }
+        if self.has_selection() {
+            return self.move_to(self.selection.end);
+        }
+        match self.next_boundary(self.caret()) {
+            Some(offset) => self.move_to(offset),
             None => false,
         }
     }
 
     pub fn move_to_start(&mut self) -> bool {
-        let moved = self.caret != 0;
-        self.caret = 0;
-        moved
+        self.move_to(0)
     }
 
     pub fn move_to_end(&mut self) -> bool {
-        let moved = self.caret != self.text.len();
-        self.caret = self.text.len();
-        moved
+        self.move_to(self.text.len())
+    }
+
+    /// Ctrl/Alt+Left - one whole word left, collapsing any selection.
+    pub fn move_word_left(&mut self) -> bool {
+        let from = if self.has_selection() {
+            self.selection.start
+        } else {
+            self.caret()
+        };
+        self.move_to(self.previous_word_boundary(from))
+    }
+
+    /// Ctrl/Alt+Right - one whole word right, collapsing any selection.
+    pub fn move_word_right(&mut self) -> bool {
+        let from = if self.has_selection() {
+            self.selection.end
+        } else {
+            self.caret()
+        };
+        self.move_to(self.next_word_boundary(from))
+    }
+
+    /// Shift+Left.
+    pub fn select_left(&mut self) -> bool {
+        match self.previous_boundary(self.caret()) {
+            Some(offset) => self.select_to(offset),
+            None => false,
+        }
+    }
+
+    /// Shift+Right.
+    pub fn select_right(&mut self) -> bool {
+        match self.next_boundary(self.caret()) {
+            Some(offset) => self.select_to(offset),
+            None => false,
+        }
+    }
+
+    /// Shift+Home.
+    pub fn select_to_start(&mut self) -> bool {
+        self.select_to(0)
+    }
+
+    /// Shift+End.
+    pub fn select_to_end(&mut self) -> bool {
+        self.select_to(self.text.len())
+    }
+
+    /// Ctrl/Alt+Shift+Left.
+    pub fn select_word_left(&mut self) -> bool {
+        self.select_to(self.previous_word_boundary(self.caret()))
+    }
+
+    /// Ctrl/Alt+Shift+Right.
+    pub fn select_word_right(&mut self) -> bool {
+        self.select_to(self.next_word_boundary(self.caret()))
     }
 
     /// Puts the caret at the grapheme boundary at or before `offset` - for a caller that has a
-    /// real byte offset of its own (a click hit-test) rather than an arrow key.
+    /// real byte offset of its own (a click hit-test) rather than an arrow key. An alias of
+    /// [`Self::move_to`], kept for the pre-#336 name.
     pub fn set_caret(&mut self, offset: usize) -> bool {
-        let clamped = self.boundary_at_or_before(offset);
-        let moved = clamped != self.caret;
-        self.caret = clamped;
-        moved
+        self.move_to(offset)
     }
 
-    /// Splices `text` in at the caret, recording it as ordinary typing and leaving the caret after
-    /// what was inserted. Returns whether anything changed.
+    /// The one splice every edit below goes through: replaces `range` with `inserted`, records it
+    /// with the real selection on either side, and leaves a collapsed caret after what was
+    /// inserted. `range` must already be a real, ordered, in-bounds grapheme-boundary range -
+    /// every caller here derives it from [`Self::selection`] or from a boundary method.
+    fn replace_range_recorded(
+        &mut self,
+        range: Range<usize>,
+        inserted: &str,
+        kind: EditKind,
+        now: Instant,
+    ) {
+        let removed = self.text[range.clone()].to_string();
+        let before = self.snapshot();
+        self.text.replace_range(range.clone(), inserted);
+        let caret = range.start + inserted.len();
+        self.selection = caret..caret;
+        self.selection_reversed = false;
+        let after = self.snapshot();
+        self.history.record(
+            TextEdit {
+                at: range.start,
+                removed,
+                inserted: inserted.to_string(),
+            },
+            before,
+            after,
+            kind,
+            now,
+        );
+    }
+
+    /// Splices `text` in **over the current selection** (or at the caret when collapsed),
+    /// recording it as ordinary typing and leaving the caret after what was inserted. Returns
+    /// whether anything changed.
     pub fn insert_str(&mut self, text: &str, now: Instant) -> bool {
-        if text.is_empty() {
+        if text.is_empty() && !self.has_selection() {
             return false;
         }
-        let at = self.caret;
-        let before = SelectionSnapshot::caret(at);
-        self.text.insert_str(at, text);
-        self.caret = at + text.len();
-        let after = SelectionSnapshot::caret(self.caret);
-        self.history.record(
-            TextEdit {
-                at,
-                removed: String::new(),
-                inserted: text.to_string(),
-            },
-            before,
-            after,
-            EditKind::Type,
+        // [`EditKind::for_replacement`] rather than a flat [`EditKind::Type`]: inserting the empty
+        // string *over a selection* is a deletion, and mislabelling it would let it coalesce with
+        // a typing burst on either side of it. Not reachable from `handle_editing_key` (which
+        // never passes an empty `key_char`), but this is a `pub` primitive and the honest kind
+        // costs nothing.
+        self.replace_range_recorded(
+            self.selection.clone(),
+            text,
+            EditKind::for_replacement(text),
             now,
         );
         true
     }
 
-    /// Removes the grapheme cluster **before** the caret - Backspace. Returns whether anything was
-    /// removed.
+    /// Removes the selection if there is one, else the grapheme cluster **before** the caret -
+    /// Backspace, exactly as every real text input behaves. Returns whether anything was removed.
     pub fn backspace(&mut self, now: Instant) -> bool {
-        let Some(at) = self.previous_boundary() else {
+        if self.has_selection() {
+            self.replace_range_recorded(self.selection.clone(), "", EditKind::Delete, now);
+            return true;
+        }
+        let caret = self.caret();
+        let Some(at) = self.previous_boundary(caret) else {
             return false;
         };
-        let removed = self.text[at..self.caret].to_string();
-        let before = SelectionSnapshot::caret(self.caret);
-        self.text.replace_range(at..self.caret, "");
-        self.caret = at;
-        let after = SelectionSnapshot::caret(at);
-        self.history.record(
-            TextEdit {
-                at,
-                removed,
-                inserted: String::new(),
-            },
-            before,
-            after,
-            EditKind::Delete,
-            now,
-        );
+        self.replace_range_recorded(at..caret, "", EditKind::Delete, now);
         true
     }
 
-    /// Removes the grapheme cluster **after** the caret - Delete. The caret does not move, which
-    /// is exactly why this cannot share a coalescing group with [`Self::backspace`] by accident:
-    /// their `before`/`after` snapshots differ.
+    /// Removes the selection if there is one, else the grapheme cluster **after** the caret -
+    /// Delete. With no selection the caret does not move, which is exactly why this cannot share a
+    /// coalescing group with [`Self::backspace`] by accident: their `before`/`after` snapshots
+    /// differ.
     pub fn delete_forward(&mut self, now: Instant) -> bool {
-        let Some(end) = self.next_boundary() else {
+        if self.has_selection() {
+            self.replace_range_recorded(self.selection.clone(), "", EditKind::Delete, now);
+            return true;
+        }
+        let caret = self.caret();
+        let Some(end) = self.next_boundary(caret) else {
             return false;
         };
-        let at = self.caret;
-        let removed = self.text[at..end].to_string();
-        let before = SelectionSnapshot::caret(at);
-        self.text.replace_range(at..end, "");
-        self.history.record(
-            TextEdit {
-                at,
-                removed,
-                inserted: String::new(),
-            },
-            before,
-            SelectionSnapshot::caret(at),
-            EditKind::Delete,
+        self.replace_range_recorded(caret..end, "", EditKind::Delete, now);
+        true
+    }
+
+    /// The pure half of Ctrl/Cmd+C: the text a copy would put on the real clipboard, or `None`
+    /// with nothing selected. The clipboard itself lives at the GPUI boundary - see this type's
+    /// own docs.
+    pub fn copy(&self) -> Option<String> {
+        self.has_selection()
+            .then(|| self.selected_text().to_string())
+    }
+
+    /// The pure half of Ctrl/Cmd+X: removes the selection and hands back what it held, as one
+    /// sealed undo step on both sides (a cut is a discrete, deliberate action, not part of a
+    /// backspace run on either side of it - the same reasoning
+    /// `crate::code_surface::editing::AdeApp::handle_editor_cut_action` already applies).
+    pub fn cut(&mut self, now: Instant) -> Option<String> {
+        let text = self.copy()?;
+        self.history.seal();
+        self.replace_range_recorded(self.selection.clone(), "", EditKind::Delete, now);
+        self.history.seal();
+        Some(text)
+    }
+
+    /// The pure half of Ctrl/Cmd+V: replaces the selection (or inserts at the caret) with real
+    /// clipboard content, as its own sealed undo step in both directions - a paste is one of
+    /// GitHub issue #17's four named group boundaries.
+    ///
+    /// Newlines are flattened to spaces: these are one-line fields, and a `\n` in one would render
+    /// as an unpaintable box and corrupt every offset the row's own hit-testing derives. The same
+    /// choice `vendor/zed/crates/gpui/examples/input.rs`'s own `TextInput::paste` makes
+    /// (`text.replace("\n", " ")`), and for the same reason.
+    pub fn paste(&mut self, text: &str, now: Instant) -> bool {
+        let flattened = text.replace(['\n', '\r'], " ");
+        if flattened.is_empty() && !self.has_selection() {
+            return false;
+        }
+        self.history.seal();
+        self.replace_range_recorded(
+            self.selection.clone(),
+            &flattened,
+            EditKind::Programmatic,
             now,
         );
+        self.history.seal();
         true
     }
 
@@ -850,12 +1222,13 @@ impl TextField {
         if self.text == text {
             return false;
         }
-        let before = SelectionSnapshot::caret(self.caret);
+        let before = self.snapshot();
         let after = SelectionSnapshot::caret(text.len());
         self.history
             .record_replacement(&self.text, text, before, after, now);
         self.text = text.to_string();
-        self.caret = self.text.len();
+        self.selection = self.text.len()..self.text.len();
+        self.selection_reversed = false;
         true
     }
 
@@ -869,18 +1242,27 @@ impl TextField {
     /// [`TextHistory::reset`]'s own docs.
     pub fn reset(&mut self) {
         self.text.clear();
-        self.caret = 0;
+        self.selection = 0..0;
+        self.selection_reversed = false;
         self.history.reset();
+    }
+
+    /// Closes the current undo group, so the next recorded edit always starts a fresh one - the
+    /// caller-driven half of this module's coalescing policy, for a boundary only the call site
+    /// knows about. See [`TextHistory::seal`].
+    pub fn seal_history(&mut self) {
+        self.history.seal();
     }
 
     pub fn can_undo(&self) -> bool {
         self.history.can_undo()
     }
 
-    /// Steps one group back, restoring the caret the group recorded as its `before`. Returns
-    /// whether anything was actually undone - `false` both for an empty history and (defensively)
-    /// for a group that doesn't match the current text, which leaves the text, the caret and the
-    /// cursor untouched rather than corrupting any of them.
+    /// Steps one group back, restoring the whole selection the group recorded as its `before` -
+    /// not just the caret, so undoing a type-over-a-selection really does put the selection back.
+    /// Returns whether anything was actually undone - `false` both for an empty history and
+    /// (defensively) for a group that doesn't match the current text, which leaves the text, the
+    /// selection and the cursor untouched rather than corrupting any of them.
     pub fn undo(&mut self) -> bool {
         let Some(group) = self.history.peek_undo() else {
             return false;
@@ -893,12 +1275,12 @@ impl TextField {
             }
         }
         self.text = candidate;
-        self.caret = self.boundary_at_or_before(group.before.start);
+        self.restore(group.before);
         self.history.commit_undo();
         true
     }
 
-    /// The mirror of [`Self::undo`], restoring the group's `after` caret.
+    /// The mirror of [`Self::undo`], restoring the group's `after` selection.
     pub fn redo(&mut self) -> bool {
         let Some(group) = self.history.peek_redo() else {
             return false;
@@ -910,7 +1292,7 @@ impl TextField {
             }
         }
         self.text = candidate;
-        self.caret = self.boundary_at_or_before(group.after.start);
+        self.restore(group.after);
         self.history.commit_redo();
         true
     }
@@ -919,21 +1301,59 @@ impl TextField {
     /// vocabulary rather than whichever half it remembered to wire - which is precisely how these
     /// fields ended up append/backspace-only for eight surfaces in the first place.
     ///
-    /// `key`/`key_char` come straight off `gpui::Keystroke`. Returns whether anything changed
-    /// (text *or* caret), i.e. whether the caller should `cx.notify()` and stop propagation.
+    /// `key`/`key_char` come straight off `gpui::Keystroke`; `modifiers` is
+    /// `crate::root::widgets::text_editing_modifiers`' own translation of that keystroke's real
+    /// modifier set (see [`EditingModifiers`] for why the platform decision lives there and not
+    /// here). Returns whether anything changed (text *or* selection), i.e. whether the caller
+    /// should `cx.notify()` and stop propagation.
     ///
     /// Deliberately does **not** handle `escape`, `enter`, `tab` or the arrow keys' `up`/`down`:
     /// every one of those means something different per surface (cancel, accept, move a list
     /// selection), and a shared default would silently take them away from the handler that owns
-    /// them. A caller matches its own keys first and falls through to this.
-    pub fn handle_editing_key(&mut self, key: &str, key_char: Option<&str>, now: Instant) -> bool {
+    /// them. A caller matches its own keys first and falls through to this. Clipboard and
+    /// select-all are not here either - those arrive as real, rebindable
+    /// `crate::root::TextCopy`/`TextCut`/`TextPaste`/`TextSelectAll` actions rather than as
+    /// hard-coded keystrokes, and only the action path can reach the OS clipboard.
+    pub fn handle_editing_key(
+        &mut self,
+        key: &str,
+        key_char: Option<&str>,
+        modifiers: EditingModifiers,
+        now: Instant,
+    ) -> bool {
         match key {
-            "left" => self.move_left(),
-            "right" => self.move_right(),
-            "home" => self.move_to_start(),
-            "end" => self.move_to_end(),
+            "left" => match (modifiers.extend, modifiers.word) {
+                (false, false) => self.move_left(),
+                (false, true) => self.move_word_left(),
+                (true, false) => self.select_left(),
+                (true, true) => self.select_word_left(),
+            },
+            "right" => match (modifiers.extend, modifiers.word) {
+                (false, false) => self.move_right(),
+                (false, true) => self.move_word_right(),
+                (true, false) => self.select_right(),
+                (true, true) => self.select_word_right(),
+            },
+            "home" => {
+                if modifiers.extend {
+                    self.select_to_start()
+                } else {
+                    self.move_to_start()
+                }
+            }
+            "end" => {
+                if modifiers.extend {
+                    self.select_to_end()
+                } else {
+                    self.move_to_end()
+                }
+            }
             "backspace" => self.backspace(now),
             "delete" => self.delete_forward(now),
+            // `modifiers.word` is the platform's Ctrl/Alt: a modified letter is an application
+            // shortcut, never text to insert, even on the platforms where the OS still hands one a
+            // `key_char`.
+            _ if modifiers.word => false,
             _ => match key_char {
                 Some(text) if !text.is_empty() => self.insert_str(text, now),
                 _ => false,
@@ -1442,7 +1862,7 @@ mod tests {
     /// `handle_editing_key`'s character arm receives it.
     fn type_into(field: &mut TextField, text: &str, now: Instant) {
         for ch in text.chars() {
-            field.handle_editing_key("", Some(&ch.to_string()), now);
+            field.handle_editing_key("", Some(&ch.to_string()), EditingModifiers::none(), now);
         }
     }
 
@@ -1460,7 +1880,7 @@ mod tests {
         let now = t0();
         type_into(&mut field, "refresh_token", now);
         for _ in 0.."_token".len() {
-            assert!(field.handle_editing_key("left", None, now));
+            assert!(field.handle_editing_key("left", None, EditingModifiers::none(), now));
         }
         assert_eq!(field.split_at_caret(), ("refresh", "_token"));
         type_into(&mut field, "ed", now);
@@ -1478,15 +1898,15 @@ mod tests {
         let mut field = TextField::new();
         let now = t0();
         type_into(&mut field, "abcd", now);
-        field.handle_editing_key("left", None, now);
-        field.handle_editing_key("left", None, now);
+        field.handle_editing_key("left", None, EditingModifiers::none(), now);
+        field.handle_editing_key("left", None, EditingModifiers::none(), now);
         assert_eq!(field.split_at_caret(), ("ab", "cd"));
 
-        assert!(field.handle_editing_key("backspace", None, now));
+        assert!(field.handle_editing_key("backspace", None, EditingModifiers::none(), now));
         assert_eq!(field.as_str(), "acd");
         assert_eq!(field.caret(), 1);
 
-        assert!(field.handle_editing_key("delete", None, now));
+        assert!(field.handle_editing_key("delete", None, EditingModifiers::none(), now));
         assert_eq!(field.as_str(), "ad");
         assert_eq!(field.caret(), 1, "Delete never moves the caret");
     }
@@ -1496,14 +1916,14 @@ mod tests {
         let mut field = TextField::new();
         let now = t0();
         type_into(&mut field, "abc", now);
-        assert!(field.handle_editing_key("home", None, now));
+        assert!(field.handle_editing_key("home", None, EditingModifiers::none(), now));
         assert_eq!(field.caret(), 0);
         assert!(
-            !field.handle_editing_key("home", None, now),
+            !field.handle_editing_key("home", None, EditingModifiers::none(), now),
             "a key that moves nothing must report so, or the caller stops propagating a \
              keystroke it did not use"
         );
-        assert!(field.handle_editing_key("end", None, now));
+        assert!(field.handle_editing_key("end", None, EditingModifiers::none(), now));
         assert_eq!(field.caret(), 3);
     }
 
@@ -1515,9 +1935,9 @@ mod tests {
         let cluster = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
         field.insert_str(cluster, now);
         field.insert_str("x", now);
-        assert!(field.handle_editing_key("left", None, now));
+        assert!(field.handle_editing_key("left", None, EditingModifiers::none(), now));
         assert_eq!(field.caret(), cluster.len());
-        assert!(field.handle_editing_key("left", None, now));
+        assert!(field.handle_editing_key("left", None, EditingModifiers::none(), now));
         assert_eq!(
             field.caret(),
             0,
@@ -1525,9 +1945,9 @@ mod tests {
         );
 
         field.move_to_end();
-        assert!(field.handle_editing_key("backspace", None, now));
+        assert!(field.handle_editing_key("backspace", None, EditingModifiers::none(), now));
         assert_eq!(field.as_str(), cluster);
-        assert!(field.handle_editing_key("backspace", None, now));
+        assert!(field.handle_editing_key("backspace", None, EditingModifiers::none(), now));
         assert_eq!(
             field.as_str(),
             "",
@@ -1542,7 +1962,7 @@ mod tests {
         let now = t0();
         type_into(&mut field, "abc", now);
         assert_eq!(field.history_len(), 1);
-        field.handle_editing_key("home", None, now);
+        field.handle_editing_key("home", None, EditingModifiers::none(), now);
         type_into(&mut field, "X", now);
         assert_eq!(
             field.history_len(),
@@ -1614,7 +2034,7 @@ mod tests {
         let now = t0();
         for key in ["escape", "enter", "tab", "up", "down"] {
             assert!(
-                !field.handle_editing_key(key, None, now),
+                !field.handle_editing_key(key, None, EditingModifiers::none(), now),
                 "`{key}` means something different on every surface - a shared default would \
                  silently take it away from the handler that owns it"
             );
@@ -2026,5 +2446,424 @@ mod tests {
             assert!(apply_inverse(&mut text, edit));
         }
         assert_eq!(text, "one\ntwo\nthree\n");
+    }
+
+    // GitHub issue #336: a real selection. Before this, `TextField` carried exactly one
+    // `caret: usize` and its own docs said selection was "deliberately not implemented".
+
+    fn shift() -> EditingModifiers {
+        EditingModifiers {
+            extend: true,
+            word: false,
+        }
+    }
+
+    fn word() -> EditingModifiers {
+        EditingModifiers {
+            extend: false,
+            word: true,
+        }
+    }
+
+    fn word_shift() -> EditingModifiers {
+        EditingModifiers {
+            extend: true,
+            word: true,
+        }
+    }
+
+    #[test]
+    fn a_fresh_field_has_a_collapsed_selection_which_is_just_a_caret() {
+        let mut field = TextField::new();
+        type_into(&mut field, "origin/main", t0());
+        assert!(!field.has_selection());
+        assert_eq!(field.selection(), field.caret()..field.caret());
+        assert_eq!(field.selected_text(), "");
+        assert_eq!(field.copy(), None, "nothing selected means nothing to copy");
+    }
+
+    #[test]
+    fn shift_right_extends_and_shift_left_shrinks_the_same_selection() {
+        let mut field = TextField::new();
+        let now = t0();
+        type_into(&mut field, "origin/main", now);
+        field.move_to_start();
+
+        assert!(field.select_right());
+        assert!(field.select_right());
+        assert!(field.select_right());
+        assert_eq!(field.selected_text(), "ori");
+        assert_eq!(field.caret(), 3, "the caret is the moving end");
+        assert_eq!(
+            field.anchor(),
+            0,
+            "the anchor stayed where the selection began"
+        );
+        assert!(!field.selection_reversed());
+
+        assert!(field.select_left());
+        assert_eq!(
+            field.selected_text(),
+            "or",
+            "shrinking back is the same one primitive, not a separate case"
+        );
+    }
+
+    #[test]
+    fn a_selection_built_leftward_is_really_reversed_and_crosses_over_cleanly() {
+        let mut field = TextField::new();
+        let now = t0();
+        type_into(&mut field, "origin/main", now);
+        field.move_to(6);
+
+        assert!(field.select_left());
+        assert!(field.select_left());
+        assert_eq!(field.selected_text(), "in");
+        assert!(
+            field.selection_reversed(),
+            "extended leftward, so the caret is on the range's start"
+        );
+        assert_eq!(field.caret(), 4);
+        assert_eq!(field.anchor(), 6);
+
+        // ...and dragging back past the anchor flips it rather than producing an inverted range:
+        // the anchor (6) stays put and the caret crosses to the far side of it.
+        field.select_to(9);
+        assert_eq!(field.selected_text(), "/ma");
+        assert!(!field.selection_reversed());
+        assert_eq!(field.caret(), 9);
+        assert_eq!(field.anchor(), 6);
+    }
+
+    #[test]
+    fn a_plain_arrow_key_collapses_a_selection_to_its_near_edge_rather_than_moving() {
+        let mut field = TextField::new();
+        let now = t0();
+        type_into(&mut field, "origin/main", now);
+        field.move_to(2);
+        field.select_to(6);
+        assert_eq!(field.selected_text(), "igin");
+
+        // Left collapses to the *start*, and lands exactly there - not one grapheme further left,
+        // which is what a naive "collapse then move" would do and what no real text input does.
+        assert!(field.move_left());
+        assert!(!field.has_selection());
+        assert_eq!(field.caret(), 2);
+
+        field.select_to(6);
+        assert!(field.move_right());
+        assert!(!field.has_selection());
+        assert_eq!(field.caret(), 6, "Right collapses to the end");
+    }
+
+    #[test]
+    fn select_all_selects_the_whole_field_and_a_plain_key_replaces_it() {
+        let mut field = TextField::new();
+        let now = t0();
+        type_into(&mut field, "origin/main", now);
+        assert!(field.select_all());
+        assert_eq!(field.selected_text(), "origin/main");
+        assert!(
+            !field.select_all(),
+            "selecting all twice is a real no-op, so a caller can stop propagating honestly"
+        );
+
+        assert!(field.insert_str("x", now));
+        assert_eq!(
+            field.as_str(),
+            "x",
+            "typing over a selection replaces it, it does not splice beside it"
+        );
+        assert_eq!(field.caret(), 1);
+        assert!(!field.has_selection());
+    }
+
+    #[test]
+    fn backspace_and_delete_with_a_selection_remove_the_whole_range() {
+        let now = t0();
+        let mut backspaced = TextField::new();
+        type_into(&mut backspaced, "origin/main", now);
+        backspaced.move_to(0);
+        backspaced.select_to(7);
+        assert!(backspaced.backspace(now));
+        assert_eq!(backspaced.as_str(), "main");
+        assert_eq!(backspaced.caret(), 0);
+
+        let mut deleted = TextField::new();
+        type_into(&mut deleted, "origin/main", now);
+        deleted.move_to(0);
+        deleted.select_to(7);
+        assert!(deleted.delete_forward(now));
+        assert_eq!(
+            deleted.as_str(),
+            "main",
+            "Delete with a selection removes the selection, not the character after it"
+        );
+    }
+
+    #[test]
+    fn a_double_click_selects_the_word_under_the_pointer_and_nothing_in_whitespace() {
+        let mut field = TextField::new();
+        let now = t0();
+        type_into(&mut field, "fix the flaky test", now);
+
+        assert!(field.select_word_at(5));
+        assert_eq!(field.selected_text(), "the");
+
+        // `.`/`/` are punctuation, which is its own class - `foo.bar` is two words, matching the
+        // code editor's own `word_class` (this is literally the same function).
+        let mut path = TextField::new();
+        type_into(&mut path, "src/app/main.rs", now);
+        assert!(path.select_word_at(9));
+        assert_eq!(path.selected_text(), "main");
+
+        // A double-click on whitespace selects nothing and just places a caret.
+        assert!(field.select_word_at(3));
+        assert!(!field.has_selection());
+        assert_eq!(field.caret(), 3);
+    }
+
+    #[test]
+    fn word_wise_movement_hops_whole_words_and_shift_extends_over_them() {
+        let mut field = TextField::new();
+        let now = t0();
+        type_into(&mut field, "origin/feature-branch", now);
+        field.move_to_end();
+
+        assert!(field.move_word_left());
+        assert_eq!(field.caret(), "origin/feature-".len(), "back over `branch`");
+        assert!(field.move_word_left());
+        assert_eq!(
+            field.caret(),
+            "origin/feature".len(),
+            "a run of punctuation is its own hop - `word_class`'s own documented rule, shared \
+             verbatim with the code editor"
+        );
+        assert!(field.move_word_left());
+        assert_eq!(field.caret(), "origin/".len(), "back over `feature`");
+
+        field.move_to_start();
+        assert!(field.select_word_right());
+        assert_eq!(
+            field.selected_text(),
+            "origin",
+            "Ctrl+Shift+Right extends over a whole word rather than one grapheme"
+        );
+    }
+
+    #[test]
+    fn copy_leaves_the_field_alone_and_cut_removes_exactly_the_selected_range() {
+        let now = t0();
+        let mut field = TextField::new();
+        type_into(&mut field, "origin/main", now);
+        field.move_to(0);
+        field.select_to(6);
+
+        assert_eq!(field.copy().as_deref(), Some("origin"));
+        assert_eq!(field.as_str(), "origin/main", "copy never edits");
+        assert!(
+            field.has_selection(),
+            "...and never collapses the selection"
+        );
+
+        assert_eq!(field.cut(now).as_deref(), Some("origin"));
+        assert_eq!(field.as_str(), "/main");
+        assert_eq!(field.caret(), 0);
+        assert!(!field.has_selection());
+        assert_eq!(field.cut(now), None, "nothing selected, nothing cut");
+    }
+
+    #[test]
+    fn paste_replaces_a_selection_and_a_copy_then_paste_round_trips_the_same_text() {
+        let now = t0();
+        let mut field = TextField::new();
+        type_into(&mut field, "origin/main", now);
+        field.move_to(0);
+        field.select_to(6);
+        let copied = field.copy().expect("a real selection was copied");
+
+        // Paste over a *different* selection: the whole range goes, the clipboard text lands.
+        field.move_to(7);
+        field.select_to(11);
+        assert!(field.paste(&copied, now));
+        assert_eq!(field.as_str(), "origin/origin");
+        assert_eq!(field.caret(), "origin/origin".len());
+
+        // ...and a collapsed paste inserts at the caret.
+        field.move_to(0);
+        assert!(field.paste("upstream-", now));
+        assert_eq!(field.as_str(), "upstream-origin/origin");
+    }
+
+    #[test]
+    fn a_pasted_newline_becomes_a_space_rather_than_an_unpaintable_line_break() {
+        let mut field = TextField::new();
+        assert!(field.paste("first\nsecond\r\nthird", t0()));
+        assert_eq!(
+            field.as_str(),
+            "first second  third",
+            "these are one-line fields; a real `\\n` in one would corrupt every offset the row's \
+             own hit-testing derives from it"
+        );
+    }
+
+    #[test]
+    fn undo_after_typing_over_a_selection_restores_the_selection_itself_not_just_a_caret() {
+        let now = t0();
+        let mut field = TextField::new();
+        type_into(&mut field, "origin/main", now);
+        field.move_to(0);
+        field.select_to(6);
+        assert!(field.insert_str("upstream", now));
+        assert_eq!(field.as_str(), "upstream/main");
+
+        assert!(field.undo());
+        assert_eq!(field.as_str(), "origin/main");
+        assert_eq!(
+            field.selection(),
+            0..6,
+            "the whole selection comes back, which is what makes a second Ctrl+Z land where the \
+             user expects rather than at a bare caret"
+        );
+        assert_eq!(field.selected_text(), "origin");
+
+        assert!(field.redo());
+        assert_eq!(field.as_str(), "upstream/main");
+        assert_eq!(
+            field.selection(),
+            8..8,
+            "redo restores the collapsed caret the edit really left behind"
+        );
+    }
+
+    #[test]
+    fn undo_after_a_cut_puts_the_cut_text_and_its_selection_back() {
+        let now = t0();
+        let mut field = TextField::new();
+        type_into(&mut field, "origin/main", now);
+        field.move_to(7);
+        field.select_to(11);
+        assert_eq!(field.cut(now).as_deref(), Some("main"));
+        assert_eq!(field.as_str(), "origin/");
+
+        assert!(field.undo());
+        assert_eq!(field.as_str(), "origin/main");
+        assert_eq!(field.selection(), 7..11);
+    }
+
+    #[test]
+    fn a_paste_is_its_own_undo_step_on_both_sides_of_a_typing_burst() {
+        let now = t0();
+        let mut field = TextField::new();
+        type_into(&mut field, "abc", now);
+        assert_eq!(field.history_len(), 1);
+        assert!(field.paste("XY", now));
+        assert_eq!(
+            field.history_len(),
+            2,
+            "a paste never joins the burst before it"
+        );
+        type_into(&mut field, "def", now);
+        assert_eq!(
+            field.history_len(),
+            3,
+            "...and the burst after it never joins the paste"
+        );
+        assert!(field.undo());
+        assert_eq!(field.as_str(), "abcXY");
+        assert!(field.undo());
+        assert_eq!(field.as_str(), "abc");
+    }
+
+    #[test]
+    fn a_selection_change_between_two_keystrokes_starts_a_new_undo_step() {
+        let now = t0();
+        let mut field = TextField::new();
+        type_into(&mut field, "abc", now);
+        assert_eq!(field.history_len(), 1);
+        // No text edit at all here - only the selection moved.
+        assert!(field.select_left());
+        type_into(&mut field, "d", now);
+        assert_eq!(
+            field.history_len(),
+            2,
+            "the module's own 'a caret jump is a group boundary' rule covers selection changes \
+             for free, because the check is full-snapshot equality"
+        );
+    }
+
+    #[test]
+    fn handle_editing_key_routes_shift_and_word_modifiers_to_the_right_primitive() {
+        let now = t0();
+        let mut field = TextField::new();
+        type_into(&mut field, "origin/main", now);
+
+        field.move_to_start();
+        assert!(field.handle_editing_key("right", None, shift(), now));
+        assert_eq!(field.selected_text(), "o");
+        assert!(field.handle_editing_key("end", None, shift(), now));
+        assert_eq!(field.selected_text(), "origin/main");
+        assert!(field.handle_editing_key("home", None, shift(), now));
+        assert!(
+            !field.has_selection(),
+            "Shift+Home from a selection anchored at 0 collapses it back onto that anchor"
+        );
+
+        field.move_to_end();
+        assert!(field.handle_editing_key("left", None, word(), now));
+        assert_eq!(field.caret(), "origin/".len());
+        assert!(field.handle_editing_key("left", None, word_shift(), now));
+        assert_eq!(field.selected_text(), "/");
+
+        // A word-modified letter is an application shortcut, never text to insert.
+        let before = field.as_str().to_string();
+        assert!(!field.handle_editing_key("a", Some("a"), word(), now));
+        assert_eq!(field.as_str(), before);
+    }
+
+    #[test]
+    fn every_selection_edge_lands_on_a_real_grapheme_boundary() {
+        let now = t0();
+        let mut field = TextField::new();
+        // A flag is one grapheme cluster made of two 4-byte scalars.
+        type_into(&mut field, "caf\u{e9}\u{1f1eb}\u{1f1f7}x", now);
+        field.move_to_start();
+        assert!(field.select_right());
+        assert!(field.select_right());
+        assert!(field.select_right());
+        assert!(field.select_right());
+        assert_eq!(field.selected_text(), "caf\u{e9}");
+        assert!(field.select_right());
+        assert_eq!(
+            field.selected_text(),
+            "caf\u{e9}\u{1f1eb}\u{1f1f7}",
+            "one Shift+Right crosses the whole flag cluster, never half of it"
+        );
+
+        // An out-of-range or mid-cluster offset from a click hit-test is clamped, never a panic.
+        field.move_to(usize::MAX);
+        assert_eq!(field.caret(), field.as_str().len());
+        field.move_to(0);
+        field.select_to(5);
+        assert!(field.as_str().is_char_boundary(field.selection().end));
+    }
+
+    #[test]
+    fn seeded_and_set_both_leave_a_collapsed_selection_at_the_end() {
+        let seeded = TextField::seeded("main.rs");
+        assert!(!seeded.has_selection());
+        assert_eq!(seeded.caret(), "main.rs".len());
+
+        let mut field = TextField::new();
+        let now = t0();
+        type_into(&mut field, "abc", now);
+        field.select_all();
+        assert!(field.set("xyz", now));
+        assert!(
+            !field.has_selection(),
+            "a programmatic replacement leaves a caret, not a selection over text the user \
+             never selected"
+        );
+        assert_eq!(field.caret(), 3);
     }
 }

@@ -7,6 +7,7 @@ use super::*;
 use crate::root::scrollbar;
 use crate::root::widgets::{
     menu_popover_chrome, modal_scrim_bg, render_sidebar_message, render_status_letter, SimpleInput,
+    SimpleInputCaret, TextFieldHandle,
 };
 use crate::settings::widgets;
 use crate::sidebar::changes;
@@ -1173,23 +1174,25 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         let keystroke = &event.keystroke;
-        if keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.alt {
+        // GitHub issue #336: `widgets::text_editing_modifiers` rather than a flat "any modifier
+        // means not ours" - see `crate::rail::render::AdeApp::handle_filter_key_down`'s own note.
+        let Some(modifiers) =
+            crate::root::widgets::text_editing_modifiers(&keystroke.key, &keystroke.modifiers)
+        else {
             return;
-        }
+        };
         // GitHub issue #27's "solid mid-keystroke" - see `crate::rail::render::AdeApp::
         // handle_filter_key_down`'s identical reasoning. Missing here (GitHub issue #45) is
         // exactly why this field never blinked in the first place.
         self.reset_caret_blink(cx);
         let changed = match keystroke.key.as_str() {
-            "backspace" => self.graph_state.branches_filter.backspace(Instant::now()),
             "escape" => self.graph_state.branches_filter.clear(Instant::now()),
-            _ => match keystroke.key_char.as_deref() {
-                Some(text) if !text.is_empty() => self
-                    .graph_state
-                    .branches_filter
-                    .insert_str(text, Instant::now()),
-                _ => false,
-            },
+            key => self.graph_state.branches_filter.handle_editing_key(
+                key,
+                keystroke.key_char.as_deref(),
+                modifiers,
+                Instant::now(),
+            ),
         };
         if changed {
             cx.notify();
@@ -1229,50 +1232,43 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         let keystroke = &event.keystroke;
-        if keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.alt {
+        // GitHub issue #336: `widgets::text_editing_modifiers` rather than a flat "any modifier
+        // means not ours" - see `crate::rail::render::AdeApp::handle_filter_key_down`'s own note.
+        let Some(modifiers) =
+            crate::root::widgets::text_editing_modifiers(&keystroke.key, &keystroke.modifiers)
+        else {
             return;
-        }
+        };
         match keystroke.key.as_str() {
             "escape" => {
                 self.cancel_graph_branch_prompt(window, cx);
                 cx.stop_propagation();
+                return;
             }
             "enter" => {
                 self.commit_graph_branch_prompt(window, cx);
                 cx.stop_propagation();
+                return;
             }
-            "backspace" => {
-                if self.graph_state.branch_prompt.is_some() {
-                    self.graph_state
-                        .branch_prompt_name
-                        .backspace(Instant::now());
-                    if let Some(open) = self.graph_state.branch_prompt.as_mut() {
-                        open.error = None;
-                    }
-                    self.reset_caret_blink(cx);
-                    cx.notify();
-                    cx.stop_propagation();
-                }
+            _ => {}
+        }
+        if self.graph_state.branch_prompt.is_none() {
+            return;
+        }
+        // GitHub issue #336: the whole `TextField` vocabulary through the one shared entry point,
+        // rather than the backspace/insert pair this prompt used to hand-roll.
+        if self.graph_state.branch_prompt_name.handle_editing_key(
+            &keystroke.key,
+            keystroke.key_char.as_deref(),
+            modifiers,
+            Instant::now(),
+        ) {
+            if let Some(open) = self.graph_state.branch_prompt.as_mut() {
+                open.error = None;
             }
-            _ => {
-                if let Some(text) = keystroke
-                    .key_char
-                    .as_deref()
-                    .filter(|text| !text.is_empty())
-                {
-                    if self.graph_state.branch_prompt.is_some() {
-                        self.graph_state
-                            .branch_prompt_name
-                            .insert_str(text, Instant::now());
-                        if let Some(open) = self.graph_state.branch_prompt.as_mut() {
-                            open.error = None;
-                        }
-                        self.reset_caret_blink(cx);
-                        cx.notify();
-                        cx.stop_propagation();
-                    }
-                }
-            }
+            self.reset_caret_blink(cx);
+            cx.notify();
+            cx.stop_propagation();
         }
     }
 
@@ -1360,90 +1356,92 @@ impl AdeApp {
                 this.cancel_graph_branch_prompt(window, cx);
             }))
             .child(
-                div()
-                    .id("graph-branch-prompt-panel")
-                    .track_focus(&self.graph_state.branch_prompt_focus_handle)
-                    .key_context("text-input")
-                    .on_action(cx.listener(Self::handle_graph_branch_prompt_text_undo))
-                    .on_action(cx.listener(Self::handle_graph_branch_prompt_text_redo))
-                    .on_key_down(cx.listener(Self::handle_graph_branch_prompt_key_down))
-                    .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
-                        cx.stop_propagation();
-                    }))
-                    .flex()
-                    .flex_col()
-                    .gap(px(6.0))
-                    .w(px(320.0))
-                    .p(px(12.0))
-                    .bg(theme::surface::PALETTE)
-                    .border_1()
-                    .border_color(theme::border::POPOVER)
-                    .rounded(theme::radius::CARD)
-                    .child(
+                self.wire_text_input_actions(
+                    div()
+                        .id("graph-branch-prompt-panel")
+                        .track_focus(&self.graph_state.branch_prompt_focus_handle)
+                        .key_context("text-input")
+                        .on_action(cx.listener(Self::handle_graph_branch_prompt_text_undo))
+                        .on_action(cx.listener(Self::handle_graph_branch_prompt_text_redo))
+                        .on_key_down(cx.listener(Self::handle_graph_branch_prompt_key_down)),
+                    branch_prompt_name_handle(),
+                    cx,
+                )
+                .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                }))
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .w(px(320.0))
+                .p(px(12.0))
+                .bg(theme::surface::PALETTE)
+                .border_1()
+                .border_color(theme::border::POPOVER)
+                .rounded(theme::radius::CARD)
+                .child(
+                    div()
+                        .font(font(theme::font::SANS))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_size(px(11.5))
+                        .text_color(theme::text::HEADING)
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "graph-branch-prompt-subtitle".to_string())
+                        .font(font(theme::font::MONO))
+                        .text_size(px(9.5))
+                        .text_color(theme::text::FAINTER)
+                        .child(subtitle),
+                )
+                .child(
+                    div()
+                        .px(px(8.0))
+                        .py(px(5.0))
+                        .rounded(theme::radius::CHIP)
+                        .bg(theme::surface::SEGMENT_TRACK)
+                        .flex()
+                        .items_center()
+                        // GitHub issue #336: through the one helper that owns this structure,
+                        // like every other simple input in the app - which is also what gives
+                        // this prompt a selection highlight and real click-to-position for the
+                        // first time.
+                        .child(self.render_simple_input_row(
+                            SimpleInput {
+                                caret_selector: "graph-branch-prompt-caret".into(),
+                                text_selector: "graph-branch-prompt-text".into(),
+                                focus_handle: Some(&self.graph_state.branch_prompt_focus_handle),
+                                text: if has_name { name.as_str() } else { "" },
+                                caret_offset: self.graph_state.branch_prompt_name.caret(),
+                                selection: self.graph_state.branch_prompt_name.selection(),
+                                placeholder: "branch-name",
+                                font: theme::font::MONO,
+                                text_size: px(11.5),
+                                text_color: theme::text::BODY,
+                                placeholder_color: theme::text::GHOST,
+                                caret: SimpleInputCaret::default(),
+                                field: Some(branch_prompt_name_handle()),
+                            },
+                            cx,
+                        )),
+                )
+                .when_some(prompt.and_then(|prompt| prompt.error), |el, error| {
+                    el.child(
                         div()
                             .font(font(theme::font::SANS))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_size(px(11.5))
-                            .text_color(theme::text::HEADING)
-                            .child(title),
+                            .text_size(px(10.5))
+                            .text_color(theme::status::FAIL)
+                            .child(error),
                     )
-                    .child(
-                        div()
-                            .debug_selector(|| "graph-branch-prompt-subtitle".to_string())
-                            .font(font(theme::font::MONO))
-                            .text_size(px(9.5))
-                            .text_color(theme::text::FAINTER)
-                            .child(subtitle),
-                    )
-                    .child(
-                        div()
-                            .px(px(8.0))
-                            .py(px(5.0))
-                            .rounded(theme::radius::CHIP)
-                            .bg(theme::surface::SEGMENT_TRACK)
-                            .flex()
-                            .items_center()
-                            // No decorative gap before the caret - see
-                            // `crate::rail::render::AdeApp::render_rail_filter_row`'s own
-                            // comment for why (live report: it read as a gap between the
-                            // typed text and where it's actually being typed).
-                            .font(font(theme::font::MONO))
-                            .text_size(px(11.5))
-                            .text_color(theme::text::BODY)
-                            .when(!has_name, |el| {
-                                el.child(self.render_simple_input_caret(
-                                    "graph-branch-prompt-caret",
-                                    &self.graph_state.branch_prompt_focus_handle,
-                                ))
-                            })
-                            .child(if has_name {
-                                name
-                            } else {
-                                "branch-name".to_string()
-                            })
-                            .when(has_name, |el| {
-                                el.child(self.render_simple_input_caret(
-                                    "graph-branch-prompt-caret",
-                                    &self.graph_state.branch_prompt_focus_handle,
-                                ))
-                            }),
-                    )
-                    .when_some(prompt.and_then(|prompt| prompt.error), |el, error| {
-                        el.child(
-                            div()
-                                .font(font(theme::font::SANS))
-                                .text_size(px(10.5))
-                                .text_color(theme::status::FAIL)
-                                .child(error),
-                        )
-                    })
-                    .child(
-                        div()
-                            .font(font(theme::font::SANS))
-                            .text_size(px(10.0))
-                            .text_color(theme::text::GHOST)
-                            .child(footer),
-                    ),
+                })
+                .child(
+                    div()
+                        .font(font(theme::font::SANS))
+                        .text_size(px(10.0))
+                        .text_color(theme::text::GHOST)
+                        .child(footer),
+                ),
             )
     }
 }
@@ -1453,6 +1451,32 @@ impl AdeApp {
 /// two-collection shape rather than unifying into one `Tab` enum (see that function's docs, and
 /// this project's own note that a forced unification wasn't the right call here). Rendered only
 /// while `AdeApp::graph_tab_open` is `true`.
+/// The Branches panel filter's own [`TextFieldHandle`] - what click/drag selection and GitHub
+/// issue #336's four clipboard/select-all actions act on. No `on_changed`: the filtered branch
+/// list is derived from the field at render time.
+fn branches_filter_handle() -> TextFieldHandle {
+    TextFieldHandle::new(|app: &mut AdeApp| Some(&mut app.graph_state.branches_filter))
+}
+
+/// The "Create branch here" / rename prompt's own field handle. `None` whenever the prompt is
+/// closed, and its `on_changed` clears the prompt's stale validation error exactly as
+/// `AdeApp::handle_graph_branch_prompt_key_down` does after a keystroke - a pasted name has just
+/// as much right to clear "that name already exists" as a typed one.
+fn branch_prompt_name_handle() -> TextFieldHandle {
+    TextFieldHandle::new(|app: &mut AdeApp| {
+        if app.graph_state.branch_prompt.is_some() {
+            Some(&mut app.graph_state.branch_prompt_name)
+        } else {
+            None
+        }
+    })
+    .on_changed(|app: &mut AdeApp, _cx| {
+        if let Some(open) = app.graph_state.branch_prompt.as_mut() {
+            open.error = None;
+        }
+    })
+}
+
 pub(crate) fn render_graph_tab(app: &AdeApp, cx: &mut Context<AdeApp>) -> gpui::AnyElement {
     let is_active = app.graph_tab_active;
     let colors = work_surface::tab_colors(is_active);
@@ -3063,53 +3087,63 @@ impl AdeApp {
         count: usize,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        div()
-            .id("graph-branches-filter")
-            .track_focus(&self.graph_state.branches_filter_focus_handle)
-            .key_context("text-input")
-            .on_action(cx.listener(Self::handle_branches_filter_text_undo))
-            .on_action(cx.listener(Self::handle_branches_filter_text_redo))
-            .on_key_down(cx.listener(Self::handle_branches_filter_key_down))
-            .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
-                window.focus(&this.graph_state.branches_filter_focus_handle, cx);
-            }))
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap(px(6.0))
-            .px(px(10.0))
-            .h(theme::graph::BRANCHES_FILTER_ROW)
-            .border_b_1()
-            .border_color(theme::border::RAIL_INNER)
-            .child(
-                div()
-                    .font(font(theme::font::MONO))
-                    .text_size(px(10.5))
-                    .text_color(theme::text::GHOST)
-                    .child("/"),
-            )
-            // Caret placement, the empty/typed ordering and the flex structure around them all
-            // through the one helper that owns them - see
-            // `AdeApp::render_simple_input_row`'s own docs.
-            .child(self.render_simple_input_row(SimpleInput {
+        self.wire_text_input_actions(
+            div()
+                .id("graph-branches-filter")
+                .track_focus(&self.graph_state.branches_filter_focus_handle)
+                .key_context("text-input")
+                .on_action(cx.listener(Self::handle_branches_filter_text_undo))
+                .on_action(cx.listener(Self::handle_branches_filter_text_redo))
+                .on_key_down(cx.listener(Self::handle_branches_filter_key_down)),
+            branches_filter_handle(),
+            cx,
+        )
+        .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+            window.focus(&this.graph_state.branches_filter_focus_handle, cx);
+        }))
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .px(px(10.0))
+        .h(theme::graph::BRANCHES_FILTER_ROW)
+        .border_b_1()
+        .border_color(theme::border::RAIL_INNER)
+        .child(
+            div()
+                .font(font(theme::font::MONO))
+                .text_size(px(10.5))
+                .text_color(theme::text::GHOST)
+                .child("/"),
+        )
+        // Caret placement, the empty/typed ordering and the flex structure around them all
+        // through the one helper that owns them - see
+        // `AdeApp::render_simple_input_row`'s own docs.
+        .child(self.render_simple_input_row(
+            SimpleInput {
                 caret_selector: "graph-branches-filter-caret".into(),
                 text_selector: "graph-branches-filter-text".into(),
                 focus_handle: Some(&self.graph_state.branches_filter_focus_handle),
                 text: self.graph_state.branches_filter.as_str(),
                 caret_offset: self.graph_state.branches_filter.caret(),
+                selection: self.graph_state.branches_filter.selection(),
                 placeholder: "filter branches",
                 font: theme::font::MONO,
                 text_size: px(10.5),
                 text_color: theme::text::DIM,
                 placeholder_color: theme::text::GHOST,
-            }))
-            .child(
-                div()
-                    .font(font(theme::font::MONO))
-                    .text_size(px(10.0))
-                    .text_color(theme::text::GHOST)
-                    .child(format!("{count}")),
-            )
+                caret: SimpleInputCaret::default(),
+                field: Some(branches_filter_handle()),
+            },
+            cx,
+        ))
+        .child(
+            div()
+                .font(font(theme::font::MONO))
+                .text_size(px(10.0))
+                .text_color(theme::text::GHOST)
+                .child(format!("{count}")),
+        )
     }
 
     fn current_graph(&self) -> Option<&Graph> {

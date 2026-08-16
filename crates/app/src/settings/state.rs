@@ -587,6 +587,11 @@ pub(crate) fn action_label(action: &dyn gpui::Action) -> Option<&'static str> {
         "app::EditorEscape" => Some("Editor: move focus out"),
         "app::TextUndo" => Some("Text: undo"),
         "app::TextRedo" => Some("Text: redo"),
+        // GitHub issue #336's real clipboard/select-all for every single-line text input.
+        "app::TextCopy" => Some("Text: copy selection"),
+        "app::TextCut" => Some("Text: cut selection"),
+        "app::TextPaste" => Some("Text: paste"),
+        "app::TextSelectAll" => Some("Text: select all"),
         "app::CloseFocusedTab" => Some("Close focused tab"),
         "app::FileTreeRename" => Some("Files tree: rename"),
         "app::FileTreeCopy" => Some("Files tree: copy"),
@@ -1886,6 +1891,10 @@ mod tests {
                 "Text: undo",
                 "Text: redo",
                 "Text: redo",
+                "Text: copy selection",
+                "Text: cut selection",
+                "Text: paste",
+                "Text: select all",
                 "Go to definition",
                 "New terminal",
                 "New agent pane",
@@ -2115,6 +2124,12 @@ mod tests {
         // and nothing was bound to it. All three of those now also carry `&& !text-input`, since
         // issue #288's pinned note card is a real text input *inside* the `"diff"` node that
         // `"file-editor"` does not cover.
+        // GitHub issue #336 added 4 more scoped bindings: `TextCopy`/`TextCut`/`TextPaste`/
+        // `TextSelectAll` (`mod+C`/`mod+X`/`mod+V`/`mod+A`) under
+        // `Some("text-input && !file-editor && !merge-editor")` - the same `"text-input"` tag
+        // `TextUndo`/`TextRedo` above carry, with the two editor surfaces excluded because their
+        // own `Editor*` actions already own those exact keystrokes there at the same predicate
+        // depth (see `crate::default_key_bindings`' own entry).
         let bindings = crate::default_key_bindings();
         let rows = keybinding_rows(&bindings, &[]);
         assert!(!rows.is_empty());
@@ -2122,7 +2137,7 @@ mod tests {
             rows.iter().filter(|row| row.context != "global").collect();
         assert_eq!(
             scoped.len(),
-            86,
+            90,
             "expected `] -> NextChangedFile` (1) plus every real Editor* binding (19) plus \
              every real Completions* binding (5) plus every real merge-editor binding (18) plus \
              TextUndo/TextRedo (3, GitHub issue #17) plus every real \
@@ -2135,7 +2150,8 @@ mod tests {
              every real interactive-rebase plan binding (6, GitHub issue #304) plus every \
              real review-note binding (2, GitHub issue #288) plus `space -> \
              ToggleChangeStaged` (1, the Changes footer's own `space stage` hint) plus \
-             `mod+F -> FindInFile` (1, GitHub issue #162's in-file find) to be scoped, \
+             `mod+F -> FindInFile` (1, GitHub issue #162's in-file find) plus \
+             TextCopy/TextCut/TextPaste/TextSelectAll (4, GitHub issue #336) to be scoped, \
              not global"
         );
         assert!(

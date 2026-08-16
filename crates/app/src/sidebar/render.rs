@@ -5,9 +5,11 @@ use crate::root::scrollbar;
 use crate::root::widgets::{
     hover_bg, menu_popover_chrome, render_committed_tag, render_disclosure_caret,
     render_keycap_row, render_sidebar_message, render_status_letter, text_tooltip, KeycapSize,
+    SimpleInput, SimpleInputCaret, TextFieldHandle,
 };
 use crate::settings::widgets::ChoiceOption;
 use crate::worktree_history::flow as worktree_history;
+use gpui::SharedString;
 use std::time::Instant;
 
 /// How much extra the Changes panel's `gpui::list` measures above and below the viewport.
@@ -20,6 +22,27 @@ pub(crate) const CHANGES_LIST_OVERDRAW: gpui::Pixels = px(48.0);
 
 /// git's own conventional short form of a commit id, for a label that only has room for one.
 /// Never a hand-picked width elsewhere in this file - one length, defined once.
+/// The commit composer's own [`TextFieldHandle`] - what click/drag selection and GitHub issue
+/// #336's four clipboard/select-all actions act on. No `on_changed`: the composer's buttons all
+/// read `AdeApp::commit_message` directly at render time.
+fn commit_message_handle() -> TextFieldHandle {
+    TextFieldHandle::new(|app: &mut AdeApp| Some(&mut app.commit_message))
+}
+
+/// The file tree's inline New File / New Folder / Rename name editor's own field handle. `None`
+/// whenever no editor is open, and its `on_changed` clears the stale rejection hint exactly as
+/// `crate::sidebar::tree_ops::AdeApp::handle_tree_key_down` does after a keystroke.
+fn tree_inline_edit_handle() -> TextFieldHandle {
+    TextFieldHandle::new(|app: &mut AdeApp| {
+        app.tree_inline_edit.as_mut().map(|edit| &mut edit.name)
+    })
+    .on_changed(|app: &mut AdeApp, _cx| {
+        if let Some(edit) = app.tree_inline_edit.as_mut() {
+            edit.error = None;
+        }
+    })
+}
+
 fn short_sha(sha: &str) -> String {
     sha.chars().take(7).collect()
 }
@@ -498,19 +521,21 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         let keystroke = &event.keystroke;
-        if keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.alt {
+        // GitHub issue #336: `widgets::text_editing_modifiers` rather than a flat "any modifier
+        // means not ours" - see `crate::rail::render::AdeApp::handle_filter_key_down`'s own note.
+        // This is still what lets `mod+enter` reach the composer's own commit action from inside
+        // the field rather than being typed into it.
+        let Some(modifiers) =
+            crate::root::widgets::text_editing_modifiers(&keystroke.key, &keystroke.modifiers)
+        else {
             return;
-        }
-        let changed = match keystroke.key.as_str() {
-            "backspace" => self.commit_message.backspace(Instant::now()),
-            _ => match keystroke.key_char.as_deref() {
-                Some(text) if !text.is_empty() => {
-                    self.commit_message.insert_str(text, Instant::now())
-                }
-                _ => false,
-            },
         };
-        if changed {
+        if self.commit_message.handle_editing_key(
+            &keystroke.key,
+            keystroke.key_char.as_deref(),
+            modifiers,
+            Instant::now(),
+        ) {
             cx.notify();
             cx.stop_propagation();
         }
@@ -1020,7 +1045,7 @@ impl AdeApp {
         // issue #105).
         let key_context =
             crate::keymap_overrides::file_tree_key_context(self.tree_inline_edit.is_some());
-        div()
+        let shell = div()
             .id("file-tree-shell")
             .key_context(key_context)
             .track_focus(&self.tree_focus_handle)
@@ -1033,7 +1058,14 @@ impl AdeApp {
             .on_action(cx.listener(Self::handle_file_tree_redo_action))
             .on_action(cx.listener(Self::handle_tree_text_undo))
             .on_action(cx.listener(Self::handle_tree_text_redo))
-            .on_key_down(cx.listener(Self::handle_tree_key_down))
+            .on_key_down(cx.listener(Self::handle_tree_key_down));
+        // GitHub issue #336's four clipboard/select-all actions, on the same node the
+        // `"text-input"` word above lives on. They are only ever *reachable* while an inline name
+        // editor is open, since that word only appears then - and `tree_inline_edit_handle`
+        // independently answers `None` when it is not, so a stray dispatch is a real no-op rather
+        // than an edit to a field that isn't there.
+        let shell = self
+            .wire_text_input_actions(shell, tree_inline_edit_handle(), cx)
             .flex()
             .flex_col()
             .flex_1()
@@ -1082,8 +1114,8 @@ impl AdeApp {
                 .absolute()
                 .size_full()
             })
-            .child(body)
-            .into_any_element()
+            .child(body);
+        shell.into_any_element()
     }
 
     /// The rows [`Self::render_file_tree`]'s `uniform_list` will build, and the indent depth the
@@ -1149,7 +1181,7 @@ impl AdeApp {
     fn render_tree_inline_edit_row(
         &self,
         depth: usize,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let Some(edit) = self.tree_inline_edit.as_ref() else {
             return div().into_any_element();
@@ -1185,23 +1217,29 @@ impl AdeApp {
                     .child(edit.kind.title()),
             )
             .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .text_color(theme::text::STRONG)
-                    // A real caret glyph, so an empty field still reads as "type here" rather
-                    // than as a blank row - blinking (GitHub issue #27), same shared loop
-                    // (`Self::tree_focus_handle` is wired into `crate::root::caret_blink` too) the
-                    // code editor's/palette's own carets use. Same reasoning as the palette's own
-                    // caret for why no separate "unfocused" case is needed here: this row only
-                    // renders while `Self::tree_inline_edit` is genuinely open and
-                    // `tree_focus_handle` is its own real focus target for that whole time.
-                    .child(if self.caret_blink_visible {
-                        format!("{name}\u{2502}")
-                    } else {
-                        name
-                    }),
+                // GitHub issue #336: a real caret *bar* at the real insertion point, through the
+                // one helper that owns that structure - not the `\u{2502}` glyph appended to the
+                // text this row used to draw, which could only ever sit at the end of the name
+                // however far back the user had arrowed, and which no selection highlight or
+                // click hit-testing could be built on.
+                self.render_simple_input_row(
+                    SimpleInput {
+                        caret_selector: "file-tree-inline-edit-caret".into(),
+                        text_selector: "file-tree-inline-edit-text".into(),
+                        focus_handle: Some(&self.tree_focus_handle),
+                        text: &name,
+                        caret_offset: edit.name.caret(),
+                        selection: edit.name.selection(),
+                        placeholder: "",
+                        font: theme::font::MONO,
+                        text_size: self.ui_text_size(11.5),
+                        text_color: theme::text::STRONG,
+                        placeholder_color: theme::text::GHOST,
+                        caret: SimpleInputCaret::default(),
+                        field: Some(tree_inline_edit_handle()),
+                    },
+                    cx,
+                ),
             )
             .when_some(edit.error.clone(), |el, error| {
                 el.child(
@@ -3661,79 +3699,77 @@ impl AdeApp {
             .child(
                 // The message box - a normal text input the user fills in themselves, nothing
                 // pre-drafted (see `Self::staged_commit_message`'s own docs).
-                div()
-                    .id("commit-composer-message")
-                    .debug_selector(|| "commit-composer-message-field".to_string())
-                    .flex_none()
-                    .border_1()
-                    .border_color(theme::border::CARD)
-                    .rounded(theme::radius::CARD_SM)
-                    .bg(theme::surface::CARD_SUNK)
-                    .px(px(9.0))
-                    .py(px(7.0))
-                    .track_focus(&self.commit_message_focus_handle)
-                    .key_context("text-input")
-                    .on_action(cx.listener(Self::handle_commit_message_text_undo))
-                    .on_action(cx.listener(Self::handle_commit_message_text_redo))
-                    .on_key_down(cx.listener(Self::handle_commit_message_key_down))
-                    .cursor_text()
-                    // Live report ("carret is not centered verticaly, when typing it goes to the
-                    // right side of the input"): this row used to be `.items_start()` with
-                    // `.flex_1().min_w_0()` on the *text* div below. `flex_1` stretched the text
-                    // div's layout box across the whole field, so the caret - a `flex_none`
-                    // sibling rendered *after* it in DOM order once the message is non-empty -
-                    // sat pinned at the field's right edge instead of adjacent to the last glyph,
-                    // and `items_start` top-aligned the 14px caret bar against the 17px text
-                    // line. Now the exact structure every working simple input uses
-                    // (`Self::render_rail_filter_row`'s caret+text wrapper, `Self::
-                    // render_new_file_prompt`'s name box): an `items_center` row whose text div is
-                    // intrinsically sized, so the caret sits right next to the real text.
-                    //
-                    // No decorative gap before the caret - see
-                    // `crate::rail::render::AdeApp::render_rail_filter_row`'s own comment for why
-                    // (live report: it read as a gap between the typed text and where it's
-                    // actually being typed). This field was written while that 2px gap was still
-                    // on every other input in the app; it goes here for the same reason it went
-                    // everywhere else.
-                    .flex()
-                    .items_center()
-                    .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
-                        this.focus_commit_message(window, cx);
-                    }))
-                    // Mirrors `Self::render_rail_filter_row`'s own fix exactly (GitHub issue #45):
-                    // a caret pinned unconditionally *after* this child sits glued to the end of
-                    // the placeholder when the field is empty, instead of at the real cursor
-                    // position (0, before any text at all). It belongs before the placeholder
-                    // when empty and after the real message once there is any.
-                    .when(message.is_empty(), |el| {
-                        el.child(self.render_simple_input_caret(
-                            "commit-composer-message-caret",
-                            &self.commit_message_focus_handle,
-                        ))
-                    })
-                    .child(
-                        div()
-                            .debug_selector(move || message_selector)
-                            .font(font(theme::font::SANS))
-                            .text_size(px(11.5))
-                            .line_height(px(17.0))
-                            .text_color(if message.is_empty() {
-                                theme::text::FAINT
-                            } else {
-                                theme::text::STRONG
-                            })
-                            .child(if message.is_empty() {
-                                "commit message".to_string()
-                            } else {
-                                message.clone()
-                            }),
-                    )
-                    .when(!message.is_empty(), |el| {
-                        el.child(self.render_simple_input_caret(
-                            "commit-composer-message-caret",
-                            &self.commit_message_focus_handle,
-                        ))
-                    }),
+                self.wire_text_input_actions(
+                    div()
+                        .id("commit-composer-message")
+                        .debug_selector(|| "commit-composer-message-field".to_string())
+                        .flex_none()
+                        .border_1()
+                        .border_color(theme::border::CARD)
+                        .rounded(theme::radius::CARD_SM)
+                        .bg(theme::surface::CARD_SUNK)
+                        .px(px(9.0))
+                        .py(px(7.0))
+                        .track_focus(&self.commit_message_focus_handle)
+                        .key_context("text-input")
+                        .on_action(cx.listener(Self::handle_commit_message_text_undo))
+                        .on_action(cx.listener(Self::handle_commit_message_text_redo))
+                        .on_key_down(cx.listener(Self::handle_commit_message_key_down)),
+                    commit_message_handle(),
+                    cx,
+                )
+                .cursor_text()
+                // Live report ("carret is not centered verticaly, when typing it goes to the
+                // right side of the input"): this row used to be `.items_start()` with
+                // `.flex_1().min_w_0()` on the *text* div below. `flex_1` stretched the text
+                // div's layout box across the whole field, so the caret - a `flex_none`
+                // sibling rendered *after* it in DOM order once the message is non-empty -
+                // sat pinned at the field's right edge instead of adjacent to the last glyph,
+                // and `items_start` top-aligned the 14px caret bar against the 17px text
+                // line. Now the exact structure every working simple input uses
+                // (`Self::render_rail_filter_row`'s caret+text wrapper, `Self::
+                // render_new_file_prompt`'s name box): an `items_center` row whose text div is
+                // intrinsically sized, so the caret sits right next to the real text.
+                //
+                // No decorative gap before the caret - see
+                // `crate::rail::render::AdeApp::render_rail_filter_row`'s own comment for why
+                // (live report: it read as a gap between the typed text and where it's
+                // actually being typed). This field was written while that 2px gap was still
+                // on every other input in the app; it goes here for the same reason it went
+                // everywhere else.
+                .flex()
+                .items_center()
+                .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+                    this.focus_commit_message(window, cx);
+                }))
+                // Mirrors `Self::render_rail_filter_row`'s own fix exactly (GitHub issue #45):
+                // a caret pinned unconditionally *after* this child sits glued to the end of
+                // the placeholder when the field is empty, instead of at the real cursor
+                // position (0, before any text at all). It belongs before the placeholder
+                // when empty and after the real message once there is any.
+                // GitHub issue #336: through the one helper that owns this structure, like
+                // every other simple input in the app - which is also what gives the composer
+                // a real caret *position* (it used to pin the bar to the end of the message
+                // whatever the user had arrowed back to), a selection highlight, and real
+                // click-to-position.
+                .child(self.render_simple_input_row(
+                    SimpleInput {
+                        caret_selector: "commit-composer-message-caret".into(),
+                        text_selector: SharedString::from(message_selector),
+                        focus_handle: Some(&self.commit_message_focus_handle),
+                        text: &message,
+                        caret_offset: self.commit_message.caret(),
+                        selection: self.commit_message.selection(),
+                        placeholder: "commit message",
+                        font: theme::font::SANS,
+                        text_size: px(11.5),
+                        text_color: theme::text::STRONG,
+                        placeholder_color: theme::text::FAINT,
+                        caret: SimpleInputCaret::default(),
+                        field: Some(commit_message_handle()),
+                    },
+                    cx,
+                )),
             )
             .child(
                 // Primary action + split-button menu + right-aligned target branch.

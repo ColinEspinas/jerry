@@ -255,9 +255,14 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         let keystroke = &event.keystroke;
-        if keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.alt {
+        // GitHub issue #336: the modifier check is `widgets::text_editing_modifiers`' now, not a
+        // flat "any of Ctrl/Alt/Cmd means not ours" - word-wise Ctrl+Left/Right (Alt on macOS) is
+        // real text editing that this used to refuse, and Shift is the extend-selection modifier
+        // rather than something to ignore.
+        let Some(modifiers) = widgets::text_editing_modifiers(&keystroke.key, &keystroke.modifiers)
+        else {
             return;
-        }
+        };
         // GitHub issue #27's "solid mid-keystroke" - see `crate::palette::render::AdeApp::
         // handle_palette_key_down`'s identical reasoning.
         self.reset_caret_blink(cx);
@@ -268,6 +273,7 @@ impl AdeApp {
             key => self.filter_query.handle_editing_key(
                 key,
                 keystroke.key_char.as_deref(),
+                modifiers,
                 Instant::now(),
             ),
         };
@@ -936,7 +942,7 @@ impl AdeApp {
         view: rail_strip::SidebarView,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        div()
+        let row = div()
             .id("rail-filter-row")
             .track_focus(&self.filter_focus_handle)
             // See `crate::default_key_bindings`' `TextUndo`/`TextRedo` docs for why the tag and
@@ -944,7 +950,10 @@ impl AdeApp {
             .key_context("text-input")
             .on_action(cx.listener(Self::handle_filter_text_undo))
             .on_action(cx.listener(Self::handle_filter_text_redo))
-            .on_key_down(cx.listener(Self::handle_filter_key_down))
+            .on_key_down(cx.listener(Self::handle_filter_key_down));
+        // GitHub issue #336's four clipboard/select-all actions, on the same node and for the same
+        // structural-routing reason the two undo actions above are.
+        self.wire_text_input_actions(row, Self::filter_query_handle(), cx)
             .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
                 window.focus(&this.filter_focus_handle, cx);
             }))
@@ -964,22 +973,40 @@ impl AdeApp {
                     .text_color(theme::text::GHOST)
                     .child("/"),
             )
-            .child(self.render_simple_input_row(SimpleInput {
-                caret_selector: "rail-filter-caret".into(),
-                text_selector: "rail-filter-text".into(),
-                focus_handle: Some(&self.filter_focus_handle),
-                text: self.filter_query.as_str(),
-                caret_offset: self.filter_query.caret(),
-                placeholder: match view {
-                    rail_strip::SidebarView::Worktrees => "filter worktrees and agents",
-                    rail_strip::SidebarView::Problems => "filter problems",
-                    rail_strip::SidebarView::History => "filter runs",
+            .child(self.render_simple_input_row(
+                SimpleInput {
+                    caret_selector: "rail-filter-caret".into(),
+                    text_selector: "rail-filter-text".into(),
+                    focus_handle: Some(&self.filter_focus_handle),
+                    text: self.filter_query.as_str(),
+                    caret_offset: self.filter_query.caret(),
+                    selection: self.filter_query.selection(),
+                    placeholder: match view {
+                        rail_strip::SidebarView::Worktrees => "filter worktrees and agents",
+                        rail_strip::SidebarView::Problems => "filter problems",
+                        rail_strip::SidebarView::History => "filter runs",
+                    },
+                    font: theme::font::MONO,
+                    text_size: self.ui_text_size(10.5),
+                    text_color: theme::text::DIM,
+                    placeholder_color: theme::text::GHOST,
+                    caret: widgets::SimpleInputCaret::default(),
+                    field: Some(Self::filter_query_handle()),
                 },
-                font: theme::font::MONO,
-                text_size: self.ui_text_size(10.5),
-                text_color: theme::text::DIM,
-                placeholder_color: theme::text::GHOST,
-            }))
+                cx,
+            ))
+    }
+
+    /// The rail filter's own field handle - what click/drag selection and the four clipboard
+    /// actions act on, and the same "an edit disarms the pending confirmations" work
+    /// [`Self::handle_filter_key_down`] does for an ordinary keystroke.
+    fn filter_query_handle() -> widgets::TextFieldHandle {
+        widgets::TextFieldHandle::new(|app: &mut AdeApp| Some(&mut app.filter_query)).on_changed(
+            |app: &mut AdeApp, _cx| {
+                app.prune_confirm_armed = false;
+                app.discard_confirm_armed = None;
+            },
+        )
     }
 
     /// Builds this rail's repo groups fresh from live state every render (cheap: no I/O, just
@@ -5487,6 +5514,383 @@ mod rail_virtualization_tests {
              (see `crate::rail::state::RailListItem`'s own docs) is exactly what made the rail \
              slow to hover with many rows open before this fix, and exactly what real \
              virtualization has to stay correct under"
+        );
+    }
+}
+
+/// GitHub issue #336 ("Text inputs do not have selection and standard copy/paste/cut"), driven the
+/// way a user drives it: real simulated clicks, drags and keystrokes into a real focused field,
+/// with the real system clipboard on the other end of Ctrl/Cmd+C.
+///
+/// The rail filter is the surface under test because it is the plainest of the app's thirteen
+/// `"text-input"` nodes - one field, one focus handle, no modal, no debounce - so what these
+/// assert is the shared plumbing (`crate::root::widgets::AdeApp::render_simple_input_row`,
+/// `wire_text_input_actions`, `crate::text_history::TextField`) that every one of the other twelve
+/// goes through, not anything the rail owns. The per-surface half - that each field really passes
+/// its own `TextFieldHandle` - is what `crate::keymap_overrides::real_context_stacks`' own
+/// enumeration plus the scoping matrix in `crate::undo_scoping_matrix_tests` covers.
+#[cfg(test)]
+mod rail_filter_selection_tests {
+    use super::*;
+    use crate::root::focus::palette_focus_tests;
+    use gpui::TestAppContext;
+
+    fn secondary(key: &str) -> String {
+        if cfg!(target_os = "macos") {
+            format!("cmd-{key}")
+        } else {
+            format!("ctrl-{key}")
+        }
+    }
+
+    /// A focused rail filter holding `text`, with the real default key bindings live so the
+    /// clipboard actions can be reached by their real keystrokes rather than dispatched directly.
+    fn open_filter_with<'a>(
+        cx: &'a mut TestAppContext,
+        repo: &std::path::Path,
+        text: &str,
+    ) -> (gpui::Entity<AdeApp>, &'a mut gpui::VisualTestContext) {
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.to_path_buf());
+        cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
+        app.update_in(cx, |app, window, cx| {
+            window.focus(&app.filter_focus_handle, cx);
+        });
+        cx.simulate_input(text);
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.filter_query.as_str().to_string()),
+            text,
+            "sanity check: the field really holds what was typed into it"
+        );
+        (app, cx)
+    }
+
+    /// A real window-space point over byte `offset` of the filter's own painted text.
+    ///
+    /// Built from `AdeApp::simple_input_layout` - the `(bounds, ShapedLine)` pair the row's own
+    /// overlay recorded when it last painted - rather than from the text element's `debug_bounds`.
+    /// That matters: `SimpleInput::text_selector` sits on the row's *leading* half (see
+    /// `AdeApp::render_simple_input_row`'s own docs), so once the caret is anywhere but the end,
+    /// that element is only as wide as the text before the caret. The recorded layout always
+    /// describes the whole line, which is also exactly what the click handler itself hit-tests
+    /// against - so a point built here and the offset the app resolves it to cannot disagree by
+    /// construction.
+    fn point_at_offset(
+        app: &gpui::Entity<AdeApp>,
+        cx: &mut gpui::VisualTestContext,
+        offset: usize,
+    ) -> gpui::Point<gpui::Pixels> {
+        app.read_with(cx, |app, _| {
+            let (bounds, shaped) = app
+                .simple_input_layout
+                .get(&gpui::SharedString::from("rail-filter-caret"))
+                .expect("the filter row's own overlay must really have painted");
+            gpui::point(
+                bounds.origin.x + shaped.x_for_index(offset),
+                bounds.origin.y + bounds.size.height / 2.0,
+            )
+        })
+    }
+
+    /// A point genuinely *over* the glyph at `offset` - halfway into it, so a hit test resolves to
+    /// that byte rather than to whichever side of the boundary rounding happens to favour.
+    fn point_inside_glyph(
+        app: &gpui::Entity<AdeApp>,
+        cx: &mut gpui::VisualTestContext,
+        offset: usize,
+    ) -> gpui::Point<gpui::Pixels> {
+        let left = point_at_offset(app, cx, offset);
+        let right = point_at_offset(app, cx, offset + 1);
+        gpui::point((left.x + right.x) / 2.0, left.y)
+    }
+
+    #[gpui::test]
+    fn shift_arrow_extends_a_real_selection_and_a_plain_arrow_collapses_it(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = open_filter_with(cx, repo.path(), "origin");
+
+        cx.simulate_keystrokes("home shift-right shift-right shift-right");
+        assert_eq!(
+            app.read_with(cx, |app, _| app.filter_query.selected_text().to_string()),
+            "ori",
+            "three real Shift+Right keystrokes must extend a real three-grapheme selection"
+        );
+
+        cx.simulate_keystrokes("right");
+        assert!(
+            app.read_with(cx, |app, _| !app.filter_query.has_selection()),
+            "a plain arrow key collapses the selection rather than extending it"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.filter_query.caret()),
+            3,
+            "...and collapses to the selection's near edge, not one grapheme past it"
+        );
+    }
+
+    #[gpui::test]
+    fn a_real_click_places_the_caret_and_a_drag_selects_the_range_between(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = open_filter_with(cx, repo.path(), "origin/main");
+
+        // A click at the field's own text origin: byte 0, whatever the glyph metrics are.
+        let start = point_at_offset(&app, cx, 0);
+        cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.filter_query.caret()),
+            0,
+            "a real click at the text's own origin must place the caret at byte 0 - before this \
+             there was no click handling on these fields at all"
+        );
+
+        // ...then drag far past the field's right edge, which is exactly the gesture a
+        // hover-filtered `on_mouse_move` listener could not see (see
+        // `AdeApp::simple_input_overlay`'s own docs).
+        let far_right = gpui::point(start.x + px(4000.0), start.y);
+        cx.simulate_mouse_move(
+            far_right,
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.filter_query.selected_text().to_string()),
+            "origin/main",
+            "dragging past the right edge selects to the end of the real text"
+        );
+
+        cx.simulate_mouse_up(
+            far_right,
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        // With the button released, a bare pointer move must no longer touch the selection.
+        cx.simulate_mouse_move(start, None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.filter_query.selected_text().to_string()),
+            "origin/main",
+            "the drag ended on mouse-up; moving the pointer afterwards must not keep selecting"
+        );
+    }
+
+    #[gpui::test]
+    fn a_real_double_click_selects_the_word_under_the_pointer(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = open_filter_with(cx, repo.path(), "origin/main");
+        // Over the `a` of `main`, so the pointer is genuinely inside the second word.
+        let inside_second_word = point_inside_glyph(&app, cx, 8);
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: inside_second_word,
+            modifiers: gpui::Modifiers::default(),
+            button: gpui::MouseButton::Left,
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.filter_query.selected_text().to_string()),
+            "main",
+            "GPUI's own `MouseDownEvent::click_count` is what makes this a double-click - the \
+             field needs no timing of its own"
+        );
+    }
+
+    #[gpui::test]
+    fn a_shift_click_extends_from_the_existing_anchor(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = open_filter_with(cx, repo.path(), "origin/main");
+        let left_edge = point_at_offset(&app, cx, 0);
+        cx.simulate_mouse_down(
+            left_edge,
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.simulate_mouse_up(
+            left_edge,
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.filter_query.caret()),
+            0,
+            "sanity check: the first, unmodified click really moved the caret to byte 0"
+        );
+
+        let text_end = point_at_offset(&app, cx, "origin/main".len());
+        cx.simulate_mouse_down(text_end, gpui::MouseButton::Left, gpui::Modifiers::shift());
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.filter_query.selected_text().to_string()),
+            "origin/main",
+            "a Shift-held click extends from the caret the previous click left behind"
+        );
+    }
+
+    #[gpui::test]
+    fn select_all_then_copy_puts_the_real_text_on_the_real_clipboard(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = open_filter_with(cx, repo.path(), "origin/main");
+        // Seeded with something else first, so a green result cannot come from a clipboard that
+        // simply already said the right thing.
+        cx.update(|_window, cx| {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("stale".into()))
+        });
+
+        cx.simulate_keystrokes(&secondary("a"));
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.filter_query.selected_text().to_string()),
+            "origin/main",
+            "a real mod+A keystroke must reach TextSelectAll through the real key bindings"
+        );
+
+        cx.simulate_keystrokes(&secondary("c"));
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_window, cx| cx.read_from_clipboard().and_then(|item| item.text())),
+            Some("origin/main".to_string())
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.filter_query.as_str().to_string()),
+            "origin/main",
+            "a copy never edits the field"
+        );
+    }
+
+    #[gpui::test]
+    fn cut_removes_the_selection_and_paste_puts_it_back_somewhere_else(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = open_filter_with(cx, repo.path(), "origin/main");
+
+        cx.simulate_keystrokes("home shift-right shift-right shift-right");
+        cx.simulate_keystrokes(&secondary("x"));
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.filter_query.as_str().to_string()),
+            "gin/main",
+            "cut removes exactly the selected range"
+        );
+        assert_eq!(
+            cx.update(|_window, cx| cx.read_from_clipboard().and_then(|item| item.text())),
+            Some("ori".to_string())
+        );
+
+        cx.simulate_keystrokes("end");
+        cx.simulate_keystrokes(&secondary("v"));
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.filter_query.as_str().to_string()),
+            "gin/mainori",
+            "paste inserts the real clipboard content at the caret"
+        );
+
+        // ...and the whole cut+paste pair is undoable, one real step at a time.
+        cx.simulate_keystrokes(&secondary("z"));
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.filter_query.as_str().to_string()),
+            "gin/main",
+            "one Ctrl+Z undoes the paste and nothing more"
+        );
+        cx.simulate_keystrokes(&secondary("z"));
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.filter_query.as_str().to_string()),
+            "origin/main",
+            "the next one undoes the cut, selection and all"
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.filter_query.selected_text().to_string()),
+            "ori",
+            "undoing a cut restores the selection it removed, not just the text"
+        );
+    }
+
+    #[gpui::test]
+    fn paste_over_a_selection_replaces_it(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = open_filter_with(cx, repo.path(), "origin/main");
+        cx.update(|_window, cx| {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("upstream".into()))
+        });
+
+        cx.simulate_keystrokes(
+            "home shift-right shift-right shift-right shift-right shift-right shift-right",
+        );
+        cx.simulate_keystrokes(&secondary("v"));
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(cx, |app, _| app.filter_query.as_str().to_string()),
+            "upstream/main",
+            "a paste with a live selection replaces that whole range"
+        );
+    }
+
+    #[gpui::test]
+    fn backspace_over_a_selection_deletes_the_whole_range(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = open_filter_with(cx, repo.path(), "origin/main");
+        cx.simulate_keystrokes(&secondary("a"));
+        cx.simulate_keystrokes("backspace");
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.filter_query.is_empty()),
+            "one Backspace over a whole-field selection empties it, rather than removing one \
+             character from the end"
+        );
+    }
+
+    /// The selected range really is painted behind the glyphs, not merely tracked in state.
+    ///
+    /// Asserted through `AdeApp::simple_input_layout` - the `(bounds, ShapedLine)` pair the row's
+    /// own overlay records every frame, which is the *same* pair the selection quad's own
+    /// `x_for_index` edges are computed from and the same one every click hit-test reads. If the
+    /// overlay never painted, this entry does not exist at all and there is no quad either.
+    #[gpui::test]
+    fn the_selection_is_really_measured_from_the_row_that_painted_it(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = open_filter_with(cx, repo.path(), "origin/main");
+        cx.simulate_keystrokes(&secondary("a"));
+        cx.run_until_parked();
+
+        let key = gpui::SharedString::from("rail-filter-caret");
+        let (start_x, end_x, width) = app.read_with(cx, |app, _| {
+            let (_, shaped) = app.simple_input_layout.get(&key).expect(
+                "the filter row's own overlay must really have painted and recorded its \
+                         shaped line - without it there is no selection quad and no hit-testing",
+            );
+            let selection = app.filter_query.selection();
+            (
+                shaped.x_for_index(selection.start),
+                shaped.x_for_index(selection.end),
+                shaped.width,
+            )
+        });
+        assert_eq!(
+            start_x,
+            px(0.0),
+            "a whole-field selection starts at the text origin"
+        );
+        assert!(
+            end_x > px(0.0) && end_x == width,
+            "...and ends at the shaped line's own real right edge - got {end_x:?} vs {width:?}"
+        );
+
+        // The same shaped line is what a click hit-tests against, so the two can never disagree.
+        let hit = app.read_with(cx, |app, _| {
+            let (bounds, _) = app.simple_input_layout.get(&key).expect("still painted");
+            app.simple_input_offset_at(&key, gpui::point(bounds.origin.x + end_x, bounds.origin.y))
+        });
+        assert_eq!(
+            hit,
+            Some("origin/main".len()),
+            "clicking at the selection's own painted right edge hit-tests to the end of the text"
         );
     }
 }

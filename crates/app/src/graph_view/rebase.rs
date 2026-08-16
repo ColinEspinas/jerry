@@ -846,9 +846,13 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         let keystroke = &event.keystroke;
-        if keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.alt {
+        // GitHub issue #336: `widgets::text_editing_modifiers` rather than a flat "any modifier
+        // means not ours" - see `crate::rail::render::AdeApp::handle_filter_key_down`'s own note.
+        let Some(modifiers) =
+            crate::root::widgets::text_editing_modifiers(&keystroke.key, &keystroke.modifiers)
+        else {
             return;
-        }
+        };
         self.reset_caret_blink(cx);
         let Some(rebase_state) = self.graph_state.rebase.as_mut() else {
             return;
@@ -856,15 +860,12 @@ impl AdeApp {
         let Some(row) = rebase_state.plan.get_mut(row_index) else {
             return;
         };
-        let changed = match keystroke.key.as_str() {
-            "backspace" => row.reword_message.backspace(Instant::now()),
-            _ => match keystroke.key_char.as_deref() {
-                Some(text) if !text.is_empty() => {
-                    row.reword_message.insert_str(text, Instant::now())
-                }
-                _ => false,
-            },
-        };
+        let changed = row.reword_message.handle_editing_key(
+            &keystroke.key,
+            keystroke.key_char.as_deref(),
+            modifiers,
+            Instant::now(),
+        );
         if changed {
             cx.notify();
             cx.stop_propagation();

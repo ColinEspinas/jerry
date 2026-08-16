@@ -174,7 +174,11 @@ impl AdeApp {
     /// `crate::code_surface::editing::AdeApp::schedule_rehighlight` already uses, and the state is
     /// captured *inside* the task after the wait, so a coalesced write is a write of the newest
     /// content rather than of whatever was there when the first keystroke landed.
-    fn schedule_review_notes_persist(&mut self, worktree: &Path, cx: &mut Context<Self>) {
+    pub(in crate::review_notes) fn schedule_review_notes_persist(
+        &mut self,
+        worktree: &Path,
+        cx: &mut Context<Self>,
+    ) {
         self.write_review_notes(worktree, Some(REVIEW_NOTES_PERSIST_DEBOUNCE), cx);
     }
 
@@ -328,17 +332,20 @@ impl AdeApp {
         let keystroke = &event.keystroke;
         // The same guard `crate::sidebar::render::AdeApp::handle_commit_message_key_down` uses,
         // and it is what lets `mod+enter` reach `SendReviewNotes` from inside this very field
-        // rather than being typed into it.
-        if keystroke.modifiers.platform || keystroke.modifiers.control || keystroke.modifiers.alt {
+        // rather than being typed into it - through `widgets::text_editing_modifiers` since
+        // GitHub issue #336, so word-wise Ctrl+Left/Right is real editing here rather than a
+        // refused keystroke (see `crate::rail::render::AdeApp::handle_filter_key_down`'s note).
+        let Some(modifiers) =
+            crate::root::widgets::text_editing_modifiers(&keystroke.key, &keystroke.modifiers)
+        else {
             return;
-        }
-        let changed = match keystroke.key.as_str() {
-            "backspace" => draft.field.backspace(Instant::now()),
-            _ => match keystroke.key_char.as_deref() {
-                Some(text) if !text.is_empty() => draft.field.insert_str(text, Instant::now()),
-                _ => false,
-            },
         };
+        let changed = draft.field.handle_editing_key(
+            &keystroke.key,
+            keystroke.key_char.as_deref(),
+            modifiers,
+            Instant::now(),
+        );
         if !changed {
             return;
         }
