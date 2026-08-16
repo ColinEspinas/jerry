@@ -3,44 +3,48 @@
 <p align="center">
   <a href="https://github.com/ColinEspinas/jerry/releases/latest"><img src="https://img.shields.io/github/v/release/ColinEspinas/jerry?style=flat&label=release&color=5cb87f" alt="Latest release" /></a>
   <a href="https://github.com/ColinEspinas/jerry/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/ColinEspinas/jerry/ci.yml?style=flat&branch=master&label=CI" alt="CI status" /></a>
-  <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-74ade8?style=flat" alt="License: MIT OR Apache-2.0" /></a>
+  <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20or%20Apache--2.0-74ade8?style=flat" alt="License: MIT or Apache-2.0" /></a>
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux%20%7C%20Windows-4493F8?style=flat" alt="Supported platforms: macOS, Linux, Windows" />
   <a href="https://www.gpui.rs/"><img src="https://img.shields.io/badge/built%20with-GPUI-e2a336?style=flat" alt="Built with GPUI" /></a>
 </p>
 
 <p align="center">
-  <strong>Supervise a fleet of AI coding agents.</strong><br/>
-  Run Claude Code and Codex side by side — each in its own real git worktree, all in one window.
+  <strong>Run a team of AI coding agents without losing track of them.</strong><br/>
+  Each one gets its own branch, its own terminal, and its own diff — all in one window.
 </p>
 
 <h3 align="center"><a href="../../releases/latest"><ins>Download Jerry</ins></a></h3>
 
 <p align="center">
-  <img src="docs/images/hero.png" alt="Jerry: the session rail, an agent running in the work surface, and its diff on the right" width="960" />
+  <img src="docs/images/hero.png" alt="Jerry: the session rail on the left, an agent running in the middle, its diff on the right" width="960" />
 </p>
 
 <p align="center">
-  <sub><a href="#install">Install</a> &nbsp;·&nbsp; <a href="#supported-agents">Supported agents</a> &nbsp;·&nbsp; <a href="docs/architecture/overview.md">Architecture</a> &nbsp;·&nbsp; <a href="CONTRIBUTING.md">Contributing</a> &nbsp;·&nbsp; <a href="../../issues">Issues</a></sub>
+  <sub><a href="#how-it-works">How it works</a> &nbsp;·&nbsp; <a href="#features">Features</a> &nbsp;·&nbsp; <a href="#supported-agents">Agents</a> &nbsp;·&nbsp; <a href="#install">Install</a> &nbsp;·&nbsp; <a href="CONTRIBUTING.md">Contributing</a></sub>
 </p>
 
 > [!NOTE]
-> **Jerry is a working prototype, not a released product.** It does real work — real worktrees, real
-> agent processes, real `git` — but expect rough edges. [Open issues](../../issues) is the honest
-> list of what's in progress.
+> **Jerry is a working prototype, not a released product.** It does real work — real branches, real
+> agent processes, real `git` — but expect rough edges. [What's rough](#whats-rough) is the honest
+> list.
 
-## One window, every agent
+## How it works
 
-You already give each task its own agent. Jerry gives each agent its own **real git worktree** — a
-separate checkout on its own branch, not a sandbox and not a copy — then puts a terminal, a diff, an
-editor and a git graph around it.
+**1. Open a repo.** Jerry finds every worktree it has and lists them in the rail, grouped by repo.
 
-- **Every agent gets a worktree.** Two agents editing the same file never collide.
-- **Every session in one rail.** Status comes from the underlying git and process state, not from
-  what the agent says about itself.
-- **Review without leaving.** Diff against the detected base branch, drop line-anchored notes, send
-  them back to the agent that wrote the code.
-- **Fix it yourself when that's faster.** A real editor with LSP, in the same window.
-- **Resolve the merge in place.** Per-hunk accept/reject, or the conflict markers by hand.
+**2. Put an agent on one.** Right-click a worktree → **New agent here**, and your agent CLI starts up
+in that checkout. Do it again on another worktree, and another — they're on separate branches and
+separate files, so they can run at full speed without stepping on each other.
+
+**3. Come back and review.** See what each one changed, comment on the lines you don't like, send the
+notes back. Keep the work that landed; discard the rest.
+
+Everything Jerry touches is ordinary `git`. Nothing reaches your main checkout until you say so, and
+any branch it works with is inspectable — or undoable — from a plain terminal, with or without Jerry
+running.
+
+> Worktrees themselves are still created with `git worktree add`; Jerry picks them up from there. See
+> [what's rough](#whats-rough).
 
 ---
 
@@ -50,13 +54,14 @@ editor and a git graph around it.
 <tr>
 <td width="50%" valign="middle">
 
-### One worktree per session
+### Every agent gets its own branch
 
-Every session is a real `git worktree` on its own branch. The rail shows all of them at once, with
-status derived from the underlying git and process state — Claude Code reports structurally over a
-hook side-channel, other agents fall back to terminal-title and quiescence signals.
+Start a session and it gets a real git worktree — its own checkout, its own branch. Agents work at
+the same time without ever touching each other's files.
 
-[Source →](crates/app/src/rail/)
+The rail keeps every session in view and sorts them by what needs you most: waiting on input, failed,
+finished with changes to review, still running. That status is read from what the processes and the
+repo are actually doing — not from what an agent claims about itself.
 
 </td>
 <td width="50%">
@@ -64,31 +69,30 @@ hook side-channel, other agents fall back to terminal-title and quiescence signa
 </td>
 </tr>
 <tr>
-<td width="50%" valign="middle">
-
-### A real terminal, not a log pane
-
-The agent's own CLI runs in a real PTY, rendered through `alacritty_terminal` grid emulation —
-cursor-addressed redraw, so its live TUI behaves exactly as it does in your own terminal. Tabs are
-scoped per worktree, with a plain shell tab alongside the agents.
-
-[Source →](crates/app/src/work_surface/)
-
-</td>
 <td width="50%">
   <img src="docs/images/terminal.png" alt="An agent CLI running in the work surface" width="100%" />
+</td>
+<td width="50%" valign="middle">
+
+### The agent's real terminal
+
+Not a transcript, not a log view — the actual CLI, behaving exactly as it does in your own terminal,
+live interface and all. Anything you can do with the agent directly, you can do here.
+
+Each worktree gets its own tabs, plus a plain shell for when you want to run something yourself.
+
 </td>
 </tr>
 <tr>
 <td width="50%" valign="middle">
 
-### Diff, with notes that go back
+### Comment on the diff, send it back
 
-Review a session's changes against its automatically detected base branch. Line-anchored notes batch
-into a single prompt, get delivered to a *named* agent's PTY, and stay pinned afterwards so you can
-check the revision against what you actually asked for.
+See exactly what an agent changed. Leave notes on the lines you want reworked, then send them all at
+once — the agent gets them as one clear set of instructions instead of a dozen follow-up messages.
 
-[Source →](crates/app/src/review_notes/)
+Notes stay pinned to the diff afterwards, so you can check the next attempt against what you actually
+asked for.
 
 </td>
 <td width="50%">
@@ -96,111 +100,98 @@ check the revision against what you actually asked for.
 </td>
 </tr>
 <tr>
+<td width="50%">
+  <img src="docs/images/editor.png" alt="The code editor with inline errors and completions" width="100%" />
+</td>
 <td width="50%" valign="middle">
 
-### An editor with real language support
+### Fix it yourself when that's faster
 
-Full text editing — cursor, selection, IME — with `tree-sitter` highlighting and a hand-written LSP
-client behind it: hover, go-to-definition, diagnostics and completions from `rust-analyzer`,
-`typescript-language-server`, Vue Language Tools, `pyright` and `gopls`.
+Sometimes explaining the change takes longer than making it. A real editor is right there —
+autocomplete, go-to-definition, inline errors — across Rust, TypeScript, JavaScript, Python, Go and
+Vue.
 
-[Source →](crates/app/src/code_surface/)
+No switching windows to fix a typo an agent left behind.
 
-</td>
-<td width="50%">
-  <img src="docs/images/editor.png" alt="The code editor with LSP diagnostics and completions" width="100%" />
 </td>
 </tr>
 <tr>
 <td width="50%" valign="middle">
 
-### Merge conflicts, structurally
+### Merge conflicts without the dread
 
-Resolve a conflicted merge per hunk with accept/reject, or drop into the same editor and edit the
-conflict markers by hand. Both paths are the real resolution — whichever suits the conflict in front
-of you.
-
-[Source →](crates/app/src/merge/)
+When two sessions touch the same code, take either side hunk by hunk with a click — or edit the
+conflict by hand when it needs real thought. Same editor either way.
 
 </td>
 <td width="50%">
-  <img src="docs/images/conflicts.png" alt="Structural per-hunk merge conflict resolution" width="100%" />
+  <img src="docs/images/conflicts.png" alt="Per-hunk merge conflict resolution" width="100%" />
 </td>
 </tr>
 <tr>
-<td width="50%" valign="middle">
-
-### The git graph
-
-Commits, branches and worktrees in one view, with an interactive rebase mode whose plan you edit
-before anything runs.
-
-[Source →](crates/app/src/graph_view/)
-
-</td>
 <td width="50%">
   <img src="docs/images/graph.png" alt="The git graph tab" width="100%" />
+</td>
+<td width="50%" valign="middle">
+
+### See the whole history
+
+Every branch, commit and worktree in one picture, so you can tell at a glance what each agent has
+actually done. Rebase interactively when you want to tidy up before merging.
+
 </td>
 </tr>
 </table>
 
-**Also in the box:**
+### Everything else
 
-- **Undo/redo for worktree-level actions** — committing or discarding a session's changes is
-  reversible from the command palette's History group.
-- **Per-agent line provenance** — when two agents share a worktree, which one wrote each line.
-- **[Agent run history](crates/app/src/run_history/)** — a repo → worktree → run index with full
-  transcripts, and `--resume` to pick a previous Claude Code conversation back up.
-- **[Rate-limit budget readout](crates/app/src/budget/)** — per-provider 5h/7d usage, next to the
-  agent pane.
-- **[Search](crates/app/src/search/)** across the worktree, in the right panel.
-- **[Themes](docs/themes.md)** — six bundled, plus VS Code theme import. Plain TOML where every key
-  is optional and anything unset is inherited, so a three-line file is a complete theme.
-- **[Sounds](crates/app/src/sound/)** for agent events — off by default, end to end.
-- **[Self-update](crates/app/src/updater/)** from GitHub releases.
-- **Settings** for General, Agents, Worktrees, Appearance, Themes, Keybindings, Editor, Language
-  servers, Notifications and Integrations.
+- **Undo a commit, undo a discard.** The command palette's History group walks back the worktree
+  actions you'd otherwise have to redo by hand.
+- **Who wrote this line?** When two agents share a worktree, Jerry can tell you which one is
+  responsible for each line.
+- **Every past run, kept.** Browse previous sessions by repo and worktree, read the full transcript,
+  and pick a Claude Code conversation back up where it left off.
+- **Know your limits.** How much of each provider's 5-hour and weekly allowance you've used, right
+  next to the agent.
+- **Search** across a worktree without leaving the window.
+- **[Themes](docs/themes.md)** — six built in, or import one from VS Code. They're plain text files
+  where every setting is optional, so a three-line file is a complete theme.
+- **A sound when an agent finishes** — off until you turn it on.
+- **Updates from inside the app.**
 
 ---
 
 ## Supported agents
 
-<p>
-  <a href="https://claude.com/claude-code"><kbd><img src="https://www.google.com/s2/favicons?domain=claude.com&sz=64" alt="" width="16" valign="middle" /> Claude Code</kbd></a> &nbsp;
-  <a href="https://github.com/openai/codex"><kbd><img src="https://www.google.com/s2/favicons?domain=openai.com&sz=64" alt="" width="16" valign="middle" /> Codex</kbd></a> &nbsp;
-  <kbd>Plain shell</kbd>
-</p>
-
-| Agent | CLI | Status signal |
+| Agent | CLI | How Jerry tracks it |
 | --- | --- | --- |
-| **Claude Code** | `claude` | Structural, over a hook side-channel. `--resume` reattaches a previous conversation. |
-| **Codex** | `codex` | Inferred from terminal title and quiescence. |
-| *Plain shell* | your default shell | Not an agent — an ordinary terminal tab in the same worktree. |
+| **Claude Code** | `claude` | Directly — Claude Code reports its own state, so running/waiting/finished isn't guesswork. Past conversations can be resumed. |
+| **Codex** | `codex` | Inferred from what its terminal is doing. |
 
-Both CLIs are resolved on `$PATH` and spawned directly in the session's worktree. Jerry doesn't
-bundle, wrap or proxy either one, so you bring your own install and your own auth; **Settings ›
-Agents** tells you whether each is actually on your `$PATH`.
+Jerry runs the CLI **you** installed, in the session's worktree — your auth, your config, your
+version. It doesn't bundle, wrap or proxy anything, and **Settings › Agents** tells you whether each
+one is on your `PATH`.
 
-Unlike the tools Jerry is modelled on, this is a **short, explicit list, not "any CLI agent"** — each
-one is a real enum variant with its own spawn and status handling.
-[Cursor CLI support](https://github.com/ColinEspinas/jerry/issues/353) is open, not built.
+**More are coming.** Any coding agent that runs in a terminal fits this model, and the goal is to
+work with all of them. Today that's Claude Code and Codex; [Cursor](../../issues/353) is next. If
+yours is missing, [open an issue](../../issues/new) — that's how it gets prioritised.
 
 ---
 
 ## Install
 
-### Prebuilt binary
+### Download
 
-From the [latest release](../../releases/latest):
+Grab a build from the [latest release](../../releases/latest):
 
-| Platform | Asset |
+| Platform | File |
 | --- | --- |
-| macOS (Apple Silicon) | [`jerry-macos.tar.gz`](../../releases/latest) |
-| Linux (x86_64) | [`jerry-linux.tar.gz`](../../releases/latest) |
-| Windows (x86_64) | [`jerry-windows.zip`](../../releases/latest) |
+| macOS (Apple Silicon) | `jerry-macos.tar.gz` |
+| Linux (x86_64) | `jerry-linux.tar.gz` |
+| Windows (x86_64) | `jerry-windows.zip` |
 
-All three ship a binary every release, but maturity is uneven: macOS has been run locally on Apple
-Silicon, Linux builds and runs against both display servers, and Windows is build-verified in CI.
+Every release ships all three, but they're not equally proven: macOS is the one run day to day, Linux
+builds and runs against both Wayland and X11, and Windows is verified by CI.
 
 ### From source
 
@@ -210,10 +201,10 @@ cd jerry
 cargo run --release -p app [path-to-a-repo]
 ```
 
-Uses the toolchain pinned in [`rust-toolchain.toml`](rust-toolchain.toml). Build with `--release`
-unless you're actively recompiling — [`CLAUDE.md`](CLAUDE.md#commands) covers why a debug GPUI build
-isn't worth measuring. Linux needs real system dev packages before that build will succeed; macOS
-needs Xcode Command Line Tools, and Windows needs nothing extra:
+Uses the toolchain pinned in [`rust-toolchain.toml`](rust-toolchain.toml). Keep `--release` unless
+you're actively recompiling — [`CLAUDE.md`](CLAUDE.md#commands) explains why a debug build isn't
+worth measuring. Linux needs some system packages first; macOS needs Xcode Command Line Tools;
+Windows needs nothing extra.
 
 <details>
 <summary><strong>System dependencies</strong></summary>
@@ -251,13 +242,42 @@ you.
 
 ---
 
+## What Jerry won't do
+
+Three rules this project holds itself to, because they're the difference between a tool you can trust
+with your repo and one you can't.
+
+- **No sandboxes, no copies.** Jerry uses real `git worktree`. Every branch it makes is inspectable,
+  mergeable and undoable from any terminal, with or without Jerry installed.
+- **No wrapping your agent.** Jerry spawns the CLI you already installed and stays out of the
+  conversation — it never sits between you and the model, and never rewrites your prompts. The one
+  addition is a settings file passed to Claude Code so it can report its own status back.
+- **Nothing fake in the UI.** No button that looks wired up but isn't, no sample data standing in for
+  a real source. Where something isn't built yet, it says so.
+
+## What's rough
+
+An honest read of a prototype, rather than a status badge:
+
+- **You can't create a worktree from Jerry yet** — it attaches agents to worktrees that already
+  exist, so `git worktree add` still happens in a terminal. Related:
+  [#199](../../issues/199), [#198](../../issues/198).
+- The Git changes pane doesn't always reflect real status ([#415](../../issues/415)).
+- Interactive rebase has real bugs in its plan editing and its confirmations
+  ([#343](../../issues/343), [#344](../../issues/344)).
+- Review notes can't pick a target when a worktree has several agents ([#330](../../issues/330)).
+- Killing a process tree doesn't work on macOS ([#422](../../issues/422)).
+- The test suite isn't back in CI yet ([#426](../../issues/426)).
+
+[All open issues →](../../issues)
+
 ## Built with
 
 [GPUI](https://www.gpui.rs/) (Zed's UI framework) &nbsp;·&nbsp;
 [`alacritty_terminal`](https://github.com/zed-industries/alacritty) + `portable-pty` for terminal and
 PTY &nbsp;·&nbsp; [`gix`](https://crates.io/crates/gix) plus the real `git` CLI for version control
 &nbsp;·&nbsp; [`lsp-types`](https://crates.io/crates/lsp-types) with a hand-written client
-&nbsp;·&nbsp; `tree-sitter` (Rust, TypeScript/TSX, JavaScript, Python) for highlighting.
+&nbsp;·&nbsp; `tree-sitter` for highlighting.
 
 ## Contributing
 
@@ -271,14 +291,7 @@ split, and the reasoning for each, are in [`docs/architecture/`](docs/architectu
 a change moves from issue to merged PR is in
 [`docs/development-workflow.md`](docs/development-workflow.md).
 
-<a href="https://github.com/ColinEspinas/jerry/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=ColinEspinas/jerry" alt="Jerry contributors" />
-</a>
-
 ## License
 
-Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT)
-at your option, matching the license of GPUI and this project's other key dependencies.
-
-Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in
-this project by you shall be dual licensed as above, without any additional terms or conditions.
+**[MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) — your choice.** Contributions are covered by
+both unless you say otherwise.
