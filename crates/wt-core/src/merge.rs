@@ -1,20 +1,11 @@
-//! Merging a session worktree's branch into the repository's detected base branch: attempting the
-//! merge, reading conflicts from git's own markers, and resolving them back to disk.
+//! Merging a worktree's branch into the detected base branch, and resolving the conflicts.
 //!
-//! git can only check a branch out in one worktree at a time, so the merge cannot be staged in a
-//! temporary checkout. `git merge` takes a *ref*, though, so [`attempt_merge`] instead runs it in
-//! whichever worktree already has the base branch checked out, and refuses with
-//! [`Error::MergeBaseBranchNotCheckedOut`] if none does rather than fabricating one.
+//! git can only check a branch out in one worktree at a time, so [`attempt_merge`] runs in
+//! whichever worktree already has the base branch, rather than staging a temporary checkout.
 //!
-//! `--no-commit --no-ff` together, because `--no-commit` alone still auto-commits a fast-forward.
-//! Nothing here is ever auto-committed: [`complete_merge`] is always a separate step. "Already up
-//! to date" exits 0 without creating `MERGE_HEAD`, which is why that file, not the exit status,
-//! decides the outcome.
-//!
-//! `merge.conflictStyle=merge` is pinned so markers are always the two-way form this parser
-//! understands, never `diff3`.
-//!
-//! Performs blocking I/O throughout; see the crate-level docs.
+//! `--no-commit --no-ff` together, since `--no-commit` alone still auto-commits a fast-forward.
+//! "Already up to date" exits 0 without creating `MERGE_HEAD`, so that file decides the outcome
+//! rather than the exit status. `merge.conflictStyle=merge` is pinned to keep markers two-way.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -24,10 +15,8 @@ use crate::diff::detect_default_base;
 use crate::error::{Error, GitExit};
 use crate::{check_success, format_args, git_command, is_dirty, list_worktrees, open_repo};
 
-/// Where a merge ran, and against what, so a caller need not re-derive it.
-///
-/// The same meaning from either entry point: `base_branch` was merged **into**,
-/// `session_branch` merged **from**, and `base_worktree_path` is where `git merge` ran.
+/// Means the same from either entry point: `base_branch` was merged **into**, `session_branch`
+/// merged **from**, and `base_worktree_path` is where `git merge` ran.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeStart {
     pub base_branch: String,
@@ -56,8 +45,6 @@ pub enum MergeOutcome {
 ///
 /// Refuses with [`Error::MergeTargetDirty`] if that worktree is dirty. git often refuses too, but
 /// checking first gives callers one structured error instead of stderr to parse.
-///
-/// Performs blocking I/O.
 pub fn attempt_merge(
     repo_path: &Path,
     session_worktree_path: &Path,
@@ -112,8 +99,6 @@ pub fn attempt_merge(
 /// ([`Error::MergeTargetDetached`]), which git would otherwise merge onto silently; a dirty target
 /// ([`Error::MergeTargetDirty`]); and merging a branch into itself
 /// ([`Error::MergeSourceIsCurrentBranch`]). A nonexistent `source_branch` is left to git.
-///
-/// Performs blocking I/O.
 pub fn attempt_merge_into_current(
     target_worktree_path: &Path,
     source_branch: &str,
@@ -145,8 +130,6 @@ pub fn attempt_merge_into_current(
     Ok((start, outcome))
 }
 
-/// The single `git merge` invocation both entry points run, and the classification of its result.
-///
 /// `worktree_path` must already have the branch being merged *into* checked out, be clean, and not
 /// be `source_branch`'s own branch; each caller checks that itself.
 fn run_merge(worktree_path: &Path, source_branch: &str) -> Result<MergeOutcome, Error> {
@@ -175,7 +158,6 @@ fn run_merge(worktree_path: &Path, source_branch: &str) -> Result<MergeOutcome, 
 
     let conflicted_files = conflicted_files(worktree_path)?;
     if conflicted_files.is_empty() {
-        // A non-conflict failure: surface git's stderr rather than an empty conflict set.
         return Err(Error::GitCommand {
             args: format_args(&args),
             exit: GitExit::from_status(&output.status),
@@ -204,9 +186,6 @@ fn checked_out_branch(worktree_path: &Path) -> Result<Option<String>, Error> {
     Ok(head.referent_name().map(|name| name.shorten().to_string()))
 }
 
-/// Aborts an in-progress merge, restoring the worktree to its pre-merge state.
-///
-/// Performs blocking I/O.
 pub fn abort_merge(base_worktree_path: &Path) -> Result<(), Error> {
     let args: Vec<OsString> = vec!["merge".into(), "--abort".into()];
     let output = git_command(base_worktree_path, &args)
@@ -226,8 +205,6 @@ pub fn abort_merge(base_worktree_path: &Path) -> Result<(), Error> {
 /// Re-checks git's own ground truth first rather than trusting the caller: a marker parser only
 /// sees *text* conflicts, while a modify/delete or binary conflict leaves the index unmerged with
 /// no markers at all.
-///
-/// Performs blocking I/O.
 pub fn complete_merge(base_worktree_path: &Path) -> Result<(), Error> {
     if !merge_head_exists(base_worktree_path)? {
         return Err(Error::MergeNotInProgress {
@@ -251,8 +228,6 @@ pub fn complete_merge(base_worktree_path: &Path) -> Result<(), Error> {
 
 /// Whether the base branch's worktree has a merge in progress, for offering an abort after some
 /// other failure. `Ok(None)` if no base branch is detectable or checked out anywhere.
-///
-/// Performs blocking I/O.
 pub fn find_in_progress_merge(repo_path: &Path) -> Result<Option<PathBuf>, Error> {
     let repo = open_repo(repo_path)?;
     let Some((base_branch, _base_commit_id)) = detect_default_base(&repo)? else {
@@ -268,9 +243,6 @@ pub fn find_in_progress_merge(repo_path: &Path) -> Result<Option<PathBuf>, Error
     }
 }
 
-/// Whether `worktree_path` has a merge in progress, for a caller that already knows the path.
-///
-/// Performs blocking I/O.
 pub fn merge_head_exists(worktree_path: &Path) -> Result<bool, Error> {
     let args: Vec<OsString> = vec![
         "rev-parse".into(),
@@ -287,10 +259,8 @@ pub fn merge_head_exists(worktree_path: &Path) -> Result<bool, Error> {
     Ok(output.status.success())
 }
 
-/// Files git reports as unmerged in the index.
-///
-/// Pins `core.quotePath=false`: otherwise a non-ASCII path comes back octal-escaped, and
-/// [`load_conflicted_file`]/[`write_resolved_file`] would act on a wrongly-named file.
+/// The paths git reports as unmerged, with `core.quotePath=false` pinned: otherwise a non-ASCII
+/// path comes back octal-escaped and the load and write act on a wrongly-named file.
 fn conflicted_files(worktree_path: &Path) -> Result<Vec<PathBuf>, Error> {
     let args: Vec<OsString> = vec![
         "-c".into(),
@@ -351,7 +321,6 @@ fn find_worktree_with_branch(repo_path: &Path, branch: &str) -> Result<Option<Pa
 
 // --- Conflict marker parsing and resolution -------------------------------------------
 
-/// One conflict block parsed out of a file's `<<<<<<</=======/>>>>>>>` markers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConflictHunk {
     /// The label git wrote after `<<<<<<< `, typically `HEAD`.
@@ -886,7 +855,6 @@ mod tests {
         };
         assert_eq!(files, vec![PathBuf::from("new.txt")]);
 
-        // Not auto-committed: still mid-merge.
         assert!(
             status(repo.path()).contains("new.txt"),
             "new.txt should be staged but not yet committed"
@@ -907,7 +875,6 @@ mod tests {
             "working tree must be clean after completing"
         );
         assert!(repo.path().join("new.txt").is_file());
-        // `--no-ff` forces a merge commit even though this was fast-forwardable.
         assert_eq!(parent_count(repo.path(), "HEAD"), 2);
     }
 
@@ -915,7 +882,6 @@ mod tests {
     fn clean_non_fast_forward_three_way_merge_produces_a_real_merge_commit() {
         let repo = init_repo();
         let feature = add_worktree(repo.path(), "feature", "feature-wt");
-        // Diverge: base gets its own commit on a different file.
         fs::write(repo.path().join("base_only.txt"), "base work\n").expect("write");
         git(repo.path(), &["add", "base_only.txt"]);
         git(repo.path(), &["commit", "-m", "base commit"]);
@@ -981,12 +947,10 @@ mod tests {
         assert_eq!(conflicted_files, vec![PathBuf::from("shared.txt")]);
         assert_eq!(clean_files, vec![PathBuf::from("clean.txt")]);
 
-        // The conflict markers are on disk.
         let on_disk = fs::read_to_string(repo.path().join("shared.txt")).expect("read");
         assert!(on_disk.contains("<<<<<<< HEAD"));
         assert!(on_disk.contains("======="));
         assert!(on_disk.contains(">>>>>>> feature"));
-        // The auto-merged file already has the right content.
         let clean_on_disk = fs::read_to_string(repo.path().join("clean.txt")).expect("read");
         assert_eq!(clean_on_disk, "clean1\nclean2 changed by feature\n");
     }
@@ -1021,7 +985,6 @@ mod tests {
         };
         assert_eq!(conflicted_files, vec![PathBuf::from("shared.txt")]);
 
-        // Take-left.
         let mut file =
             load_conflicted_file(repo.path(), &conflicted_files[0]).expect("load_conflicted_file");
         assert_eq!(file.remaining_conflicts(), 1);
@@ -1040,7 +1003,6 @@ mod tests {
 
         abort_merge(repo.path()).expect("abort_merge");
 
-        // Take-right, from a fresh attempt.
         let (_start, outcome) = attempt_merge(repo.path(), &feature).expect("attempt_merge");
         let MergeOutcome::Conflicted {
             conflicted_files, ..
@@ -1056,7 +1018,6 @@ mod tests {
 
         abort_merge(repo.path()).expect("abort_merge");
 
-        // Take-both, from another fresh attempt.
         let (_start, outcome) = attempt_merge(repo.path(), &feature).expect("attempt_merge");
         let MergeOutcome::Conflicted {
             conflicted_files, ..
@@ -1179,7 +1140,6 @@ mod tests {
         git(&feature, &["add", "new.txt"]);
         git(&feature, &["commit", "-m", "feature commit"]);
 
-        // Dirty the base (main) worktree.
         fs::write(repo.path().join("base.txt"), "uncommitted change\n").expect("write");
 
         let err = attempt_merge(repo.path(), &feature)
@@ -1212,7 +1172,6 @@ mod tests {
         git(&feature, &["add", "new.txt"]);
         git(&feature, &["commit", "-m", "feature commit"]);
 
-        // The base worktree is detached, so `main` is checked out nowhere.
         git(repo.path(), &["checkout", "--detach", "HEAD"]);
 
         let err = attempt_merge(repo.path(), &feature)
@@ -1342,7 +1301,6 @@ mod tests {
             "",
             "working tree must be clean after completing"
         );
-        // `--no-ff` forces a merge commit even though this was fast-forwardable.
         assert_eq!(parent_count(repo.path(), "HEAD"), 2);
     }
 
@@ -1356,7 +1314,6 @@ mod tests {
             "feature work\n",
             "feature commit",
         );
-        // The target branch moves on too, so this is a genuine three-way merge.
         fs::write(repo.path().join("base_only.txt"), "base work\n").expect("write");
         git(repo.path(), &["add", "base_only.txt"]);
         git(repo.path(), &["commit", "-m", "base commit"]);
@@ -1419,7 +1376,6 @@ mod tests {
         assert_eq!(conflicted_files, vec![PathBuf::from("shared.txt")]);
         assert_eq!(clean_files, vec![PathBuf::from("clean.txt")]);
 
-        // The markers are on disk, in the two-way style this parser understands.
         let on_disk = fs::read_to_string(repo.path().join("shared.txt")).expect("read");
         assert!(on_disk.contains("<<<<<<< HEAD"));
         assert!(on_disk.contains("======="));
@@ -1578,8 +1534,6 @@ mod tests {
         );
     }
 
-    /// One side empty - base deletes the line, feature edits it - so `ours_start_line` lands on
-    /// the `=======` line. This is the "meaningless when empty" case callers must gate on.
     #[test]
     fn parse_conflict_segments_handles_a_genuinely_empty_side() {
         let text = "<<<<<<< HEAD\n=======\ntheirs line\n>>>>>>> feature\n";
@@ -1589,7 +1543,6 @@ mod tests {
         };
         assert!(hunk.ours.is_empty());
         assert_eq!(hunk.theirs, vec!["theirs line".to_string()]);
-        // "<<<<<<< HEAD"=1, "======="=2, "theirs line"=3, ">>>>>>> feature"=4.
         assert_eq!(
             hunk.ours_start_line, 2,
             "with zero ours lines, ours_start_line lands on the ======= line itself - the \
@@ -1598,8 +1551,6 @@ mod tests {
         assert_eq!(hunk.theirs_start_line, 3);
     }
 
-    /// Position tracking across a multi-hunk, multi-line-per-side conflict. A single-line hunk
-    /// would pass even with an off-by-one, so this fixture is deliberately larger.
     #[test]
     fn parse_conflict_segments_computes_real_start_lines_across_multiple_hunks() {
         let text = "line1\n\
@@ -1762,7 +1713,6 @@ line4\n";
         else {
             panic!("expected conflicts");
         };
-        // The bare, unquoted path - not `"caf\303\251.txt"`.
         assert_eq!(conflicted_files, vec![PathBuf::from("café.txt")]);
 
         let mut file = load_conflicted_file(repo.path(), &conflicted_files[0])
@@ -1770,12 +1720,10 @@ line4\n";
         resolve_hunk(&mut file, 1, ConflictChoice::Both).expect("resolve_hunk");
         write_resolved_file(repo.path(), &file).expect("write_resolved_file");
 
-        // The correctly-named file has the resolved content...
         assert_eq!(
             fs::read_to_string(repo.path().join("café.txt")).expect("read café.txt"),
             "line1\nBASE CHANGED\nFEATURE CHANGED\nline3\n"
         );
-        // ...and no wrongly-named file was created alongside it.
         let entries: Vec<String> = fs::read_dir(repo.path())
             .expect("read_dir")
             .filter_map(|entry| entry.ok())
@@ -1802,10 +1750,8 @@ line4\n";
         git(repo.path(), &["commit", "-m", "seed shared.txt"]);
         let feature = add_worktree(repo.path(), "feature", "feature-wt");
 
-        // Base deletes the file...
         git(repo.path(), &["rm", "-q", "shared.txt"]);
         git(repo.path(), &["commit", "-m", "base deletes shared.txt"]);
-        // ...while feature modifies it: a modify/delete conflict.
         fs::write(feature.join("shared.txt"), "modified by feature\n").expect("write");
         git(&feature, &["commit", "-am", "feature modifies shared.txt"]);
 
@@ -1830,7 +1776,6 @@ line4\n";
              already-resolved text file"
         );
 
-        // `complete_merge` must refuse too, though no resolution API was called for this file.
         let err = complete_merge(repo.path())
             .expect_err("complete_merge must refuse while shared.txt is still really unmerged");
         assert!(matches!(err, Error::MergeFilesStillConflicted { .. }));
@@ -1862,7 +1807,6 @@ line4\n";
         };
         assert_eq!(conflicted_files, vec![PathBuf::from("shared.bin")]);
 
-        // Confirm the premise: the content is valid UTF-8, so `from_utf8` would not catch it.
         let on_disk = fs::read(repo.path().join("shared.bin")).expect("read");
         assert!(
             String::from_utf8(on_disk).is_ok(),

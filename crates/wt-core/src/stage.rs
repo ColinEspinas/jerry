@@ -3,8 +3,6 @@
 //!
 //! [`stage_path`]/[`unstage_path`] mutate; [`staged_paths`] reads back, so a caller can re-derive
 //! its own state from the index rather than assuming a worktree starts with nothing staged.
-//!
-//! Performs blocking I/O throughout; see the crate-level docs.
 
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -14,8 +12,6 @@ use crate::error::Error;
 use crate::{check_success, run_git};
 
 /// Stages `path`, whether it is modified, untracked, or deleted - `git add` stages a deletion too.
-///
-/// Performs blocking I/O.
 pub fn stage_path(worktree_path: &Path, path: &Path) -> Result<(), Error> {
     let args: Vec<OsString> = vec!["add".into(), "--".into(), path.as_os_str().to_owned()];
     let output = run_git(worktree_path, &args)?;
@@ -25,8 +21,6 @@ pub fn stage_path(worktree_path: &Path, path: &Path) -> Result<(), Error> {
 /// Removes `path` from the index without touching the working tree; the inverse of [`stage_path`].
 ///
 /// Idempotent, so a caller need not check [`staged_paths`] first just to avoid an error.
-///
-/// Performs blocking I/O.
 pub fn unstage_path(worktree_path: &Path, path: &Path) -> Result<(), Error> {
     let args: Vec<OsString> = vec!["reset".into(), "--".into(), path.as_os_str().to_owned()];
     let output = run_git(worktree_path, &args)?;
@@ -47,8 +41,6 @@ pub fn unstage_path(worktree_path: &Path, path: &Path) -> Result<(), Error> {
 ///   survive.
 /// - `HEAD` does not: drop any index entry, then delete the file. `git checkout HEAD` has no blob
 ///   to restore here and fails. `--ignore-unmatch` covers the never-staged case.
-///
-/// Performs blocking I/O.
 pub fn discard_path(worktree_path: &Path, path: &Path) -> Result<(), Error> {
     if head_has_path(worktree_path, path)? {
         let args: Vec<OsString> = vec![
@@ -81,8 +73,6 @@ pub fn discard_path(worktree_path: &Path, path: &Path) -> Result<(), Error> {
     }
 }
 
-/// Whether `HEAD` holds a blob at `path`.
-///
 /// A repository with no commits answers `false`, which is correct: nothing in it has a committed
 /// state to go back to.
 fn head_has_path(worktree_path: &Path, path: &Path) -> Result<bool, Error> {
@@ -93,9 +83,6 @@ fn head_has_path(worktree_path: &Path, path: &Path) -> Result<bool, Error> {
     Ok(output.status.success())
 }
 
-/// The worktree-relative paths currently staged in the index.
-///
-/// Performs blocking I/O.
 pub fn staged_paths(worktree_path: &Path) -> Result<HashSet<PathBuf>, Error> {
     let args: Vec<OsString> = vec!["diff".into(), "--cached".into(), "--name-only".into()];
     let output = run_git(worktree_path, &args)?;
@@ -117,8 +104,6 @@ pub fn staged_paths(worktree_path: &Path) -> Result<HashSet<PathBuf>, Error> {
 /// A rename or copy contributes both of its paths. `--untracked-files=all`, not the `normal` that
 /// [`crate::is_dirty`] uses, because `normal` collapses an untracked directory to a single entry -
 /// leaving the files inside it absent, which every caller here would read as "clean".
-///
-/// Performs blocking I/O.
 pub fn dirty_paths(worktree_path: &Path) -> Result<HashSet<PathBuf>, Error> {
     let args: Vec<OsString> = vec![
         "status".into(),
@@ -131,8 +116,6 @@ pub fn dirty_paths(worktree_path: &Path) -> Result<HashSet<PathBuf>, Error> {
     Ok(parse_status_porcelain_z(&output.stdout))
 }
 
-/// Parses `git status --porcelain -z` into the set of paths it reports.
-///
 /// Records are `XY<space><path>`, NUL-terminated. A record existing at all means that path has a
 /// delta, so the column values need no interpreting - except `R`/`C`, which are followed by a
 /// second field holding the original path.
@@ -336,9 +319,6 @@ mod tests {
         );
     }
 
-    /// The regression this function exists for: a file changed by a real commit on this branch,
-    /// with no further edits, must not be reported as dirty, while a file with a real live edit
-    /// must be - even though `wt_core::diff::diff_against_base` lists both.
     #[test]
     fn dirty_paths_tells_a_committed_clean_file_apart_from_a_really_edited_one() {
         let repo = repo_with_a_committed_clean_file();
@@ -447,8 +427,6 @@ mod tests {
         );
     }
 
-    /// A path with a space in it is exactly what `core.quotePath`/quoting would mangle in
-    /// non-`-z` porcelain output (`"my file.txt"`, with real quotes). `-z` emits it raw.
     #[test]
     fn dirty_paths_handles_a_path_with_a_space_without_quoting_it() {
         let repo = init_repo();
@@ -520,9 +498,6 @@ mod tests {
         );
     }
 
-    /// The case plain `git checkout -- <path>` gets wrong: that restores the working tree from
-    /// the *index*, so an already-staged modification survives it untouched. `git checkout HEAD
-    /// -- <path>` is what really discards both halves.
     #[test]
     fn discard_path_also_drops_a_change_that_was_already_staged() {
         let repo = init_repo();
@@ -573,9 +548,6 @@ mod tests {
         );
     }
 
-    /// A file the agent created *and* staged: `git checkout HEAD -- <path>` would fail outright
-    /// (there is no blob at that path in `HEAD`), so this takes the `git rm --cached` + unlink
-    /// branch, and both halves have to really happen.
     #[test]
     fn discard_path_removes_a_staged_addition_from_both_the_index_and_the_disk() {
         let repo = init_repo();

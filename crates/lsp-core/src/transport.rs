@@ -380,7 +380,6 @@ mod tests {
 
     #[test]
     fn a_content_length_exactly_one_byte_over_the_cap_is_rejected() {
-        // A boundary case, proving the cap comparison is exact rather than off-by-one.
         let header = format!("Content-Length: {}\r\n\r\n", MAX_MESSAGE_BYTES + 1);
         let mut reader = BufReader::new(Cursor::new(header.into_bytes()));
         let result = read_message(&mut reader);
@@ -392,7 +391,6 @@ mod tests {
 
     #[test]
     fn a_real_in_bounds_multi_kilobyte_body_still_round_trips_through_the_streamed_read() {
-        // A body larger than the tiny fixtures elsewhere, so streaming cannot truncate it unseen.
         let large_string = "x".repeat(200_000);
         let value = serde_json::json!({ "payload": large_string });
         let mut buffer = Vec::new();
@@ -449,7 +447,6 @@ mod tests {
                     .spawn()
                     .expect("spawning a real `sleep` for its stdin pipe");
                 let stdin = child.stdin.take().expect("piped stdin");
-                // The same `O_NONBLOCK` production sets at spawn, which the bound requires.
                 use std::os::fd::AsRawFd;
                 let fd = stdin.as_raw_fd();
                 let flags = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFL).expect("F_GETFL");
@@ -467,7 +464,6 @@ mod tests {
             }
         }
 
-        /// A message fitting in the pipe buffer must not have been turned into a timeout.
         #[test]
         fn a_small_message_still_writes_straight_through() {
             let mut pipe = UndrainedPipe::new();
@@ -476,8 +472,6 @@ mod tests {
                 .expect("a message that fits in the pipe buffer must not time out");
         }
 
-        /// A frame far larger than the pipe buffer, to a peer that never reads, must give up on
-        /// the deadline and report the partial write that tells the caller the framer is desynced.
         #[test]
         fn an_oversized_message_to_a_peer_that_never_reads_times_out_and_reports_the_desync() {
             let mut pipe = UndrainedPipe::new();

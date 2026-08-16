@@ -28,8 +28,6 @@
 //!   safety, [`DiscardSnapshot::had_ignored_content`] records it so a caller can say what was not
 //!   preserved. `git stash push --all` would capture it, at the cost of sweeping whole build
 //!   directories into a git object.
-//!
-//! Performs blocking I/O throughout; see the crate-level docs.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -40,7 +38,6 @@ use crate::{
     open_repo, remove_worktree, run_git,
 };
 
-/// A successful commit, with enough state for undo/redo to act on it later.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitAllChangesOutcome {
     /// The branch at commit time, `None` when detached. Only consulted when [`Self::parent`] is
@@ -51,7 +48,6 @@ pub struct CommitAllChangesOutcome {
     pub parent: Option<String>,
 }
 
-/// Reads `HEAD`'s commit id. `Err` if it does not resolve to one.
 fn rev_parse_head(worktree_path: &Path) -> Result<String, Error> {
     let args: Vec<OsString> = vec!["rev-parse".into(), "HEAD".into()];
     let output = run_git(worktree_path, &args)?;
@@ -59,13 +55,10 @@ fn rev_parse_head(worktree_path: &Path) -> Result<String, Error> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Whether `HEAD` resolves to a commit - the "is this branch still unborn" identity guard.
 fn head_resolves(worktree_path: &Path) -> bool {
     rev_parse_head(worktree_path).is_ok()
 }
 
-/// Reads `commit`'s first parent, or `None` for a root commit.
-///
 /// Resolves `<commit>^`, not `HEAD^`: an agent running in this worktree can move `HEAD` at any
 /// time, but a commit's own parent is immutable once created.
 fn rev_parse_parent_of(worktree_path: &Path, commit: &str) -> Result<Option<String>, Error> {
@@ -84,7 +77,6 @@ fn rev_parse_parent_of(worktree_path: &Path, commit: &str) -> Result<Option<Stri
     ))
 }
 
-/// The checked-out branch, or `None` if `HEAD` is detached.
 fn current_branch(worktree_path: &Path) -> Result<Option<String>, Error> {
     let args: Vec<OsString> = vec![
         "symbolic-ref".into(),
@@ -105,8 +97,6 @@ fn current_branch(worktree_path: &Path) -> Result<Option<String>, Error> {
 ///
 /// Refuses with [`Error::NothingToCommit`] on a clean worktree, checked up front rather than
 /// parsed out of `git commit`'s stderr afterwards.
-///
-/// Performs blocking I/O.
 pub fn commit_all_changes(
     worktree_path: &Path,
     message: &str,
@@ -152,8 +142,6 @@ pub fn commit_all_changes(
 ///
 /// No undo counterpart yet - a partial commit is not wired into [`UndoableAction`], which is a
 /// gap rather than a fake undo.
-///
-/// Performs blocking I/O.
 pub fn commit_paths(
     worktree_path: &Path,
     paths: &[std::path::PathBuf],
@@ -200,8 +188,6 @@ pub fn commit_paths(
 /// The amended commit is a new object with a new id, and `parent` is the pre-amend tip's parent.
 /// No undo counterpart: the pre-amend commit is unreachable afterwards, so undoing would require
 /// having recorded its id beforehand.
-///
-/// Performs blocking I/O.
 pub fn amend_head_with_paths(
     worktree_path: &Path,
     paths: &[std::path::PathBuf],
@@ -248,8 +234,6 @@ pub fn amend_head_with_paths(
 /// Returns the stash commit id `refs/stash` now points at. Refuses with
 /// [`Error::NothingToCommit`] when nothing is staged, so there is no `None` for a caller to
 /// interpret.
-///
-/// Performs blocking I/O.
 pub fn stash_staged(worktree_path: &Path, message: &str) -> Result<String, Error> {
     if crate::stage::staged_paths(worktree_path)?.is_empty() {
         return Err(Error::NothingToCommit {
@@ -279,8 +263,6 @@ pub fn stash_staged(worktree_path: &Path, message: &str) -> Result<String, Error
 ///
 /// Identity guard: refuses with [`Error::HeadMovedSinceRecorded`] unless `outcome.commit` is
 /// still `HEAD`, which would otherwise discard whatever was committed on top since.
-///
-/// Performs blocking I/O.
 pub fn undo_commit_all_changes(
     worktree_path: &Path,
     outcome: &CommitAllChangesOutcome,
@@ -316,15 +298,11 @@ pub fn undo_commit_all_changes(
     }
 }
 
-/// Moves `HEAD` forward onto `outcome.commit` again after an undo.
-///
 /// `reset --soft` never deletes the commit object, so this stays valid unless something else
 /// collected it - in which case `git reset` fails rather than silently no-op'ing.
 ///
 /// Identity guard, symmetric with [`undo_commit_all_changes`]: refuses unless `HEAD` is still
 /// where the undo left it. A redo can discard newer work just as easily as an undo can.
-///
-/// Performs blocking I/O.
 pub fn redo_commit_all_changes(
     worktree_path: &Path,
     outcome: &CommitAllChangesOutcome,
@@ -414,8 +392,6 @@ pub enum UndoDiscardOutcome {
 /// [`DiscardSnapshot::had_ignored_content`] is populated either way.
 ///
 /// A removal that fails *after* a stash returns [`Error::DiscardRemovalFailedAfterStash`].
-///
-/// Performs blocking I/O.
 pub fn discard_worktree(repo_path: &Path, worktree_path: &Path) -> Result<DiscardSnapshot, Error> {
     let repo = open_repo(worktree_path)?;
     let before = describe_worktree(&repo, worktree_path.to_path_buf(), false, false, None)?;
@@ -472,7 +448,6 @@ fn is_main_worktree(worktree_path: &Path) -> Result<bool, Error> {
         source: Box::new(source),
     })?;
     let Some(main_path) = main_repo.work_dir() else {
-        // A bare repository has no main worktree at all.
         return Ok(false);
     };
     let main_canon = std::fs::canonicalize(main_path).unwrap_or_else(|_| main_path.to_path_buf());
@@ -551,8 +526,6 @@ fn push_and_capture_stash(worktree_path: &Path) -> Result<String, Error> {
 /// if something already occupies the path, and [`Error::DiscardBranchMovedOrReoccupied`] if the
 /// branch is gone, checked out elsewhere, or no longer at `snapshot.commit`. Recreating anyway
 /// would clobber whatever now holds that name, or resurrect stale content over newer work.
-///
-/// Performs blocking I/O.
 pub fn undo_discard_worktree(
     repo_path: &Path,
     worktree_path: &Path,
@@ -716,7 +689,6 @@ mod tests {
         let repo = init_repo();
         fs::write(repo.path().join("file.txt"), "changed\n").expect("modify");
         fs::write(repo.path().join("new.txt"), "new\n").expect("new file");
-        // Committed first so it has history, then deleted: covers the deleted-tracked-file case.
         fs::write(repo.path().join("to-delete.txt"), "bye\n").expect("write");
         git(repo.path(), &["add", "to-delete.txt"]);
         git(repo.path(), &["commit", "-m", "add to-delete.txt"]);
@@ -772,10 +744,8 @@ mod tests {
             outcome.commit,
             git_output(repo.path(), &["rev-parse", "HEAD"])
         );
-        // The committed file is clean...
         let status = git_output(repo.path(), &["status", "--porcelain", "file.txt"]);
         assert_eq!(status, "", "file.txt must be committed, not left staged");
-        // ...but the other change is untouched: still there, still uncommitted.
         let untouched_status = git_output(repo.path(), &["status", "--porcelain", "untouched.txt"]);
         assert!(
             untouched_status.contains("untouched.txt"),
@@ -784,16 +754,12 @@ mod tests {
         assert!(is_dirty(repo.path()).expect("is_dirty"));
     }
 
-    /// The sibling test above never stages `untouched.txt`, so a bare `git commit` has nothing to
-    /// sweep up and the failure mode goes unexercised. This one pre-stages another file, so it
-    /// passes only once the commit itself is pathspec-limited.
     #[test]
     fn commit_paths_never_commits_a_path_that_was_staged_by_something_else() {
         let repo = init_repo();
         fs::write(repo.path().join("file.txt"), "changed\n").expect("modify");
         fs::write(repo.path().join("also-staged.txt"), "staged elsewhere\n")
             .expect("write also-staged.txt");
-        // Something else in this worktree staged a different file first.
         git(repo.path(), &["add", "also-staged.txt"]);
 
         commit_paths(
@@ -860,7 +826,6 @@ mod tests {
             git_output(repo.path(), &["rev-parse", "HEAD"]),
             outcome.parent.clone().unwrap()
         );
-        // The working tree/index content itself must be untouched by the soft reset.
         assert_eq!(
             fs::read_to_string(repo.path().join("file.txt")).expect("read file.txt"),
             "changed\n"
@@ -881,14 +846,12 @@ mod tests {
         let outcome =
             commit_all_changes(repo.path(), "ade: keep all changes").expect("commit_all_changes");
 
-        // Something committed on top afterwards; the guard must refuse rather than discard it.
         fs::write(repo.path().join("file.txt"), "changed again\n").expect("modify again");
         git(repo.path(), &["add", "file.txt"]);
         git(repo.path(), &["commit", "-m", "a later, unrelated commit"]);
 
         let err = undo_commit_all_changes(repo.path(), &outcome).unwrap_err();
         assert!(matches!(err, Error::HeadMovedSinceRecorded { .. }));
-        // Nothing was touched: the later commit is still `HEAD`.
         assert_eq!(
             fs::read_to_string(repo.path().join("file.txt")).expect("read"),
             "changed again\n"
@@ -909,7 +872,6 @@ mod tests {
             git_output(repo.path(), &["rev-parse", "HEAD"]),
             outcome.commit
         );
-        // A soft reset never touches the working tree, so the content is unchanged throughout.
         assert_eq!(
             fs::read_to_string(repo.path().join("file.txt")).expect("read"),
             "changed\n"
@@ -928,7 +890,6 @@ mod tests {
             commit_all_changes(repo.path(), "ade: keep all changes").expect("commit_all_changes");
         undo_commit_all_changes(repo.path(), &outcome).expect("undo");
 
-        // A new, unrelated commit lands on top of the undo's parent before redo runs.
         fs::write(repo.path().join("other.txt"), "other\n").expect("write");
         git(repo.path(), &["add", "other.txt"]);
         git(
@@ -952,7 +913,6 @@ mod tests {
         let repo = init_repo();
         let commit_a = git_output(repo.path(), &["rev-parse", "HEAD"]);
 
-        // An interleaved commit lands on top of `A`.
         fs::write(
             repo.path().join("interleaved.txt"),
             "from another process\n",
@@ -963,7 +923,6 @@ mod tests {
         let commit_b = git_output(repo.path(), &["rev-parse", "HEAD"]);
         assert_ne!(commit_a, commit_b);
 
-        // The "keep all changes" commit runs on top of that.
         fs::write(repo.path().join("file.txt"), "changed by keep-all\n").expect("modify");
         let outcome =
             commit_all_changes(repo.path(), "ade: keep all changes").expect("commit_all_changes");
@@ -974,7 +933,6 @@ mod tests {
             "parent must be the real interleaved commit B, not the stale commit A further back"
         );
 
-        // Undoing must preserve the interleaved commit.
         undo_commit_all_changes(repo.path(), &outcome).expect("undo");
         assert_eq!(
             git_output(repo.path(), &["rev-parse", "HEAD"]),
@@ -985,7 +943,6 @@ mod tests {
             repo.path().join("interleaved.txt").exists(),
             "the real interleaved commit's content must survive the undo"
         );
-        // And the commit object itself is still reachable.
         assert_eq!(
             git_output(repo.path(), &["log", "--format=%H", "-1", &commit_b]),
             commit_b
@@ -1039,7 +996,6 @@ mod tests {
         assert_eq!(snapshot.branch.as_deref(), Some("session-a"));
         assert!(snapshot.stash.is_some());
         assert!(!wt_path.exists(), "the worktree directory must be gone");
-        // The branch itself must survive (only the worktree checkout was removed).
         assert_eq!(
             git_output(
                 repo.path(),
@@ -1077,7 +1033,6 @@ mod tests {
         let stash = snapshot.stash.clone().expect("dirty worktree must stash");
 
         assert!(!wt_path.exists());
-        // Applying from the main worktree - a different directory entirely - must still work.
         git(repo.path(), &["stash", "apply", &stash]);
         assert_eq!(
             fs::read_to_string(repo.path().join("scratch.txt")).expect("read restored file"),
@@ -1136,7 +1091,6 @@ mod tests {
         add_session_worktree(repo.path(), &wt_path, "session-d");
         let snapshot = discard_worktree(repo.path(), &wt_path).expect("discard_worktree");
 
-        // A plain directory is enough to occupy the path and trip the guard.
         fs::create_dir_all(&wt_path).expect("recreate the path with something unrelated");
 
         let err = undo_discard_worktree(repo.path(), &wt_path, &snapshot).unwrap_err();
@@ -1192,7 +1146,6 @@ mod tests {
         add_session_worktree(repo.path(), &wt_path, "session-g");
         let snapshot = discard_worktree(repo.path(), &wt_path).expect("discard_worktree");
 
-        // A brand new worktree reoccupies the same *branch* at a different path.
         let other_path = repo.path().join("session-g-reoccupied");
         add_worktree(repo.path(), &other_path, None, Some("session-g")).expect("recheckout");
 
@@ -1443,13 +1396,11 @@ mod tests {
             "expected DiscardSnapshotFailed, got {err:?}"
         );
 
-        // Nothing real must have been destroyed by a refused snapshot.
         assert!(
             wt_path.exists(),
             "a refused snapshot must not have removed the real worktree"
         );
         assert!(is_dirty(&wt_path).expect("is_dirty after refusal"));
-        // The unrelated stash must be completely untouched - never claimed as this snapshot's.
         assert_eq!(
             git_output(repo.path(), &["rev-parse", "--verify", "refs/stash"]),
             unrelated_stash

@@ -6,8 +6,6 @@
 //! This is the one place that answers "what does this worktree contain", so that callers do not
 //! hand-roll a directory walk - which descends into gitignored build output before it can discover
 //! there is nothing there. See `docs/architecture/decisions.md` §6.
-//!
-//! Performs blocking I/O; see the crate-level docs.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -30,8 +28,6 @@ pub struct WorktreeFileList {
     pub truncated: bool,
 }
 
-/// Lists every file `worktree_path` contains, as git sees it.
-///
 /// `Err` when this is not a git worktree, or `git` could not run at all; a caller that must work
 /// outside a repository needs its own fallback.
 pub fn list_worktree_files(worktree_path: &Path) -> Result<WorktreeFileList, Error> {

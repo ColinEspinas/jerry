@@ -1,21 +1,12 @@
-//! Review baselines: snapshotting a worktree's current state as a git tree, and diffing the
-//! working tree against one of those snapshots later.
+//! Review baselines: snapshotting a worktree as a git tree, and diffing against that later.
 //!
-//! A different question from [`crate::diff`], which asks how a branch differs from its merge-base.
-//! A review asks what changed *since the point I last looked*, so its base is a moment rather than
-//! a branch, and it advances only when the user says so. A worktree that already diverged from
-//! `main` has a large git diff and an empty review diff; both answers are correct.
+//! A different question from [`crate::diff`]: the base is a moment rather than a branch, so a
+//! worktree long diverged from `main` has a large git diff and an empty review diff. Everything
+//! downstream of the base point reuses [`crate::diff::compute_diff`].
 //!
-//! Everything downstream of the base point is shared, not duplicated: the same parser, types, and
-//! pinned `git diff` invocation ([`crate::diff::compute_diff`], which resolves a tree id exactly
-//! as it resolves a commit id).
-//!
-//! Snapshotting runs alongside a live agent issuing its own `git` commands, so it never touches
-//! the index, working tree, `HEAD` or stash - every mutation lands in a throwaway
-//! `GIT_INDEX_FILE`. It does write blobs and trees, which is unavoidable and purely additive, and
-//! [`anchor_tree`] keeps `git gc` from collecting a baseline still in use.
-//!
-//! Performs blocking I/O; see the crate-level docs.
+//! Snapshotting runs alongside a live agent, so it touches neither index, working tree, `HEAD`
+//! nor stash - every mutation lands in a throwaway `GIT_INDEX_FILE`. It does write blobs and
+//! trees; [`anchor_tree`] keeps `gc` off a baseline still in use.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -37,27 +28,18 @@ use crate::{check_success, format_args, git_command, run_git};
 /// the pathological case to seconds. Gitignored content is never counted.
 pub const MAX_UNTRACKED_SNAPSHOT_BYTES: u64 = 128 * 1024 * 1024;
 
-/// Companion cap on the *number* of untracked files.
-///
-/// Separate because per-file cost is not only bytes: each path costs a `stat`, an index entry and
-/// a loose object, so many tiny files slip under a byte cap while causing the same problem. Also
-/// lets [`measure_untracked`] stop early rather than stat an unbounded list to learn it is
-/// unbounded.
+/// A separate cap because per-file cost is not only bytes: each path costs a `stat`, an index
+/// entry and a loose object, so many tiny files slip under a byte cap causing the same problem.
 pub const MAX_UNTRACKED_SNAPSHOT_FILES: usize = 5_000;
 
-/// The ref namespace review baselines are anchored under.
-///
 /// Its own top-level namespace, the idiom `refs/stash` and `refs/notes/*` use: a baseline is
-/// neither branch nor tag, and putting it in either would surface this app's bookkeeping in
-/// `git branch`, in the graph tab, and in the user's own tooling. Refs outside the well-known
-/// namespaces are ignored by nearly everything while still protecting objects from `gc`.
+/// neither branch nor tag, and putting it in either would surface bookkeeping in `git branch` and
+/// in the user's own tooling. Refs outside the well-known namespaces still protect objects from
+/// `gc`.
 pub const REVIEW_REF_PREFIX: &str = "refs/jerry/review/";
 
-/// Whether a baseline captured the worktree's untracked files.
-///
-/// Travels with the baseline because it changes what a review *means*, and must be passed back to
-/// [`diff_against_tree`]/[`changed_paths_against_tree`]: measuring a tracked-only baseline under
-/// the other rules reports every pre-existing untracked file as a new addition.
+/// Must be passed back to [`diff_against_tree`]/[`changed_paths_against_tree`]: measuring a
+/// tracked-only baseline under the other rules reports every pre-existing untracked file as new.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UntrackedCoverage {
     /// Untracked, non-ignored files were captured with their content.
@@ -84,10 +66,8 @@ impl UntrackedCoverage {
     }
 }
 
-/// A captured baseline: the tree, and what it covers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeSnapshot {
-    /// The tree's hex object id.
     pub tree_id: String,
     pub untracked: UntrackedCoverage,
     /// Untracked, non-ignored files found at capture time, kept even when they were included so a
@@ -98,8 +78,6 @@ pub struct WorktreeSnapshot {
     pub untracked_bytes: u64,
 }
 
-/// Measures the untracked, non-ignored set: how many files, and how many bytes.
-///
 /// Measures exactly what a [`ShadowIndexContent::FullContent`] snapshot would hash, so gitignored
 /// content is excluded here too.
 ///
@@ -154,8 +132,6 @@ fn measure_untracked(worktree_path: &Path) -> Result<(usize, u64), Error> {
 ///
 /// Stages content rather than intent-to-add stubs, unlike [`crate::diff::diff_against_base`]:
 /// `git write-tree` needs a blob to name and refuses a stub outright.
-///
-/// Performs blocking I/O.
 pub fn snapshot_worktree_tree(worktree_path: &Path) -> Result<WorktreeSnapshot, Error> {
     let (untracked_files, untracked_bytes) = measure_untracked(worktree_path)?;
     let untracked = if untracked_files > MAX_UNTRACKED_SNAPSHOT_FILES
@@ -200,8 +176,6 @@ pub fn snapshot_worktree_tree(worktree_path: &Path) -> Result<WorktreeSnapshot, 
 ///
 /// Errors if `tree_id` is not hex or git cannot resolve it, so a garbage-collected baseline fails
 /// here rather than degrading into some other comparison.
-///
-/// Performs blocking I/O.
 pub fn diff_against_tree(
     worktree_path: &Path,
     tree_id: &str,
@@ -227,8 +201,6 @@ pub fn diff_against_tree(
 ///
 /// Capped at [`MAX_DIFF_OUTPUT_BYTES`]; a record truncated by the cap is dropped rather than
 /// returned as a path that was never reported.
-///
-/// Performs blocking I/O.
 pub fn changed_paths_against_tree(
     worktree_path: &Path,
     tree_id: &str,
@@ -318,8 +290,6 @@ fn check_review_ref(name: &str) -> Result<(), Error> {
 /// commit would add an object, an author identity and a timestamp for nothing.
 ///
 /// Refuses any `ref_name` outside [`REVIEW_REF_PREFIX`].
-///
-/// Performs blocking I/O.
 pub fn anchor_tree(worktree_path: &Path, ref_name: &str, tree_id: &str) -> Result<(), Error> {
     check_review_ref(ref_name)?;
     validate_object_id(tree_id, "baseline tree id")?;
@@ -336,8 +306,6 @@ pub fn anchor_tree(worktree_path: &Path, ref_name: &str, tree_id: &str) -> Resul
 ///
 /// Refuses any `ref_name` outside [`REVIEW_REF_PREFIX`] - without which a corrupted state file
 /// naming `refs/heads/main` would delete a branch.
-///
-/// Performs blocking I/O.
 pub fn delete_ref(worktree_path: &Path, ref_name: &str) -> Result<(), Error> {
     check_review_ref(ref_name)?;
 
@@ -401,8 +369,6 @@ mod tests {
         dir
     }
 
-    /// Nothing has changed since the baseline, so its review diff is empty - even though the same
-    /// worktree has a non-empty *git* diff. That is the whole distinction.
     #[test]
     fn a_fresh_snapshot_reports_no_review_changes_even_when_the_git_diff_is_not_empty() {
         let repo = init_repo();
@@ -439,7 +405,6 @@ mod tests {
         );
     }
 
-    /// An edit made after the snapshot must show up, with hunks, in the same shape a git diff has.
     #[test]
     fn changes_made_after_a_snapshot_show_up_in_the_review_diff_with_real_hunks() {
         let repo = init_repo();
@@ -471,8 +436,6 @@ mod tests {
         );
     }
 
-    /// An untracked file created after a snapshot is a change the reviewer needs to see, and the
-    /// case `git diff <object>` would miss without the shadow index.
     #[test]
     fn an_untracked_file_created_after_a_snapshot_is_reported_as_an_addition() {
         let repo = init_repo();
@@ -492,8 +455,6 @@ mod tests {
         assert_eq!(review.files[0].status, crate::diff::FileChangeStatus::Added);
     }
 
-    /// An already-untracked file must be captured with its content, so a later edit reads as a
-    /// modification rather than a whole-file addition. This is what `FullContent` buys.
     #[test]
     fn a_file_untracked_at_snapshot_time_is_captured_with_its_real_content() {
         let repo = init_repo();
@@ -526,13 +487,9 @@ mod tests {
         assert_eq!(added, vec!["line two"]);
     }
 
-    /// Snapshotting must not perturb anything git reports about a worktree an agent may be working
-    /// in. Compares `git status --porcelain`, `HEAD`, the index bytes and the stash across the
-    /// call.
     #[test]
     fn snapshotting_a_worktree_leaves_real_git_status_byte_identical() {
         let repo = init_repo();
-        // A mixed state: one staged change, one unstaged change, one untracked file.
         fs::write(repo.path().join("staged.txt"), "staged content\n").expect("write");
         git(repo.path(), &["add", "staged.txt"]);
         fs::write(repo.path().join("file.txt"), "hello\nunstaged edit\n").expect("write");
@@ -566,8 +523,6 @@ mod tests {
         assert_eq!(git_stdout(repo.path(), &["stash", "list"]), stash_before);
     }
 
-    /// Trees are content-addressed, so identical content must give the same id and changed content
-    /// a different one - the property advancing a baseline relies on.
     #[test]
     fn a_snapshot_id_tracks_real_content_not_the_time_it_was_taken() {
         let repo = init_repo();
@@ -586,7 +541,6 @@ mod tests {
         );
     }
 
-    /// The cheap path must agree exactly with the full diff's file list; it is the same answer.
     #[test]
     fn changed_paths_agrees_with_the_full_review_diffs_file_list() {
         let repo = init_repo();
@@ -641,7 +595,6 @@ mod tests {
             .filter(|shard| {
                 let name = shard.file_name();
                 let name = name.to_string_lossy();
-                // The fan-out directories; `info`/`pack` are not loose objects.
                 name.len() == 2 && name.bytes().all(|b| b.is_ascii_hexdigit())
             })
             .map(|shard| {
@@ -652,15 +605,9 @@ mod tests {
             .sum()
     }
 
-    /// An untracked set past [`MAX_UNTRACKED_SNAPSHOT_FILES`] must not be hashed into the object
-    /// database at all, falling back to a tracked-only baseline and saying so.
-    ///
-    /// Asserts on loose objects written, not just the returned flag: a correct flag over content
-    /// that still landed in `.git/objects` would be the same bug wearing a label.
     #[test]
     fn an_oversized_untracked_set_is_never_hashed_into_the_object_database() {
         let repo = init_repo();
-        // Past the file cap but tiny, which is exactly why the file cap exists separately.
         let junk = repo.path().join("build-output");
         std::fs::create_dir_all(&junk).expect("mkdir");
         for index in 0..(MAX_UNTRACKED_SNAPSHOT_FILES + 10) {
@@ -683,7 +630,6 @@ mod tests {
             MAX_UNTRACKED_SNAPSHOT_FILES + 10
         );
 
-        // The baseline is still usable for what it does cover.
         let paths = changed_paths_against_tree(repo.path(), &snapshot.tree_id, snapshot.untracked)
             .expect("changed_paths");
         assert!(
@@ -692,14 +638,12 @@ mod tests {
              in as spurious additions either - got {paths:?}"
         );
 
-        // Edits to tracked files are still caught, which is what makes the fallback worth having.
         fs::write(repo.path().join("file.txt"), "hello\nedited\n").expect("write");
         let paths = changed_paths_against_tree(repo.path(), &snapshot.tree_id, snapshot.untracked)
             .expect("changed_paths");
         assert_eq!(paths, vec![PathBuf::from("file.txt")]);
     }
 
-    /// The cap must not fire for an ordinary worktree, or every review silently degrades.
     #[test]
     fn an_ordinary_untracked_set_is_still_captured_in_full() {
         let repo = init_repo();
@@ -710,8 +654,6 @@ mod tests {
         assert_eq!(snapshot.untracked_files, 1);
     }
 
-    /// Gitignored content must not count toward the cap: `git add -A` would never stage it, so
-    /// counting it would push ordinary worktrees onto the fallback for nothing.
     #[test]
     fn gitignored_content_does_not_count_toward_the_untracked_cap() {
         let repo = init_repo();
@@ -736,8 +678,6 @@ mod tests {
         );
     }
 
-    /// An anchored baseline must survive an aggressive `git gc`, which is why [`anchor_tree`]
-    /// exists rather than trusting a bare tree id to stay reachable.
     #[test]
     fn an_anchored_baseline_survives_a_real_aggressive_gc() {
         let repo = init_repo();
@@ -754,7 +694,6 @@ mod tests {
             tree,
             "the anchored ref must still resolve to the same tree after a real gc"
         );
-        // The tree's content is still readable, not just the ref surviving.
         assert!(git_stdout(repo.path(), &["cat-file", "-p", &tree]).contains("only_here.txt"));
     }
 
@@ -795,8 +734,6 @@ mod tests {
             .expect("deleting an already-deleted baseline ref must not be an error");
     }
 
-    /// The guard that matters most: a corrupted or hand-edited persisted state file must never
-    /// be able to talk `delete_ref` into deleting a real branch.
     #[test]
     fn a_ref_outside_the_review_namespace_is_refused_and_the_branch_survives() {
         let repo = init_repo();
@@ -804,7 +741,6 @@ mod tests {
 
         assert!(delete_ref(repo.path(), "refs/heads/main").is_err());
         assert!(anchor_tree(repo.path(), "refs/heads/main", &"0".repeat(40)).is_err());
-        // Nor a path that merely *looks* like it starts inside the namespace.
         assert!(delete_ref(repo.path(), "refs/jerry/review/../../heads/main").is_err());
 
         assert_eq!(
@@ -814,9 +750,6 @@ mod tests {
         );
     }
 
-    /// Ref names must be injective in the key: two agents whose keys differ only in characters a
-    /// naive sanitizer would collapse (a space vs. an underscore, `/` vs. `-`) must never end up
-    /// sharing one baseline ref.
     #[test]
     fn distinct_keys_never_collide_onto_one_baseline_ref() {
         let a = baseline_ref_name("/repo/wt a|Claude|1");
@@ -834,16 +767,9 @@ mod tests {
         }
     }
 
-    /// **The regression test for the `NAME_MAX` bug.** A realistically deep worktree path used to
-    /// hex-encode into a ref filename longer than the 255-byte limit, so `git update-ref` failed
-    /// with "File name too long" and the review surface was silently, permanently disabled.
-    ///
-    /// Drives a real `anchor_tree` against a real repository with a long key, rather than only
-    /// asserting a length - the failure was in git, not in this crate's arithmetic.
     #[test]
     fn a_long_worktree_path_still_produces_a_usable_ref_name() {
         let repo = init_repo();
-        // A perfectly ordinary deep layout, well past the ~107-byte ceiling raw hex imposed.
         let long_key = format!(
             "/home/developer/Developer/some-organisation/{}/.worktrees/{}|Claude|1700000000",
             "a-reasonably-long-repository-name", "feature/a-descriptive-branch-name-here"
@@ -859,14 +785,12 @@ mod tests {
             REVIEW_REF_PREFIX.len() + 64,
             "a digest-based ref name is a fixed length regardless of key length"
         );
-        // The real limit is on the final path *component*, which is what git turns into a file.
         let component = ref_name.rsplit('/').next().expect("a final ref component");
         assert!(
             component.len() + ".lock".len() <= 255,
             "the ref's own filename, plus git's `.lock` suffix, must fit in NAME_MAX"
         );
 
-        // And it really works against real git, which is where the original bug actually showed.
         let tree = snapshot_tree(repo.path());
         anchor_tree(repo.path(), &ref_name, &tree).expect("a long key must still anchor");
         assert_eq!(
@@ -876,8 +800,6 @@ mod tests {
         delete_ref(repo.path(), &ref_name).expect("and must still be deletable");
     }
 
-    /// Key length must not affect ref length at all - the property that makes the `NAME_MAX`
-    /// failure structurally impossible rather than merely unlikely.
     #[test]
     fn ref_name_length_is_independent_of_key_length() {
         let short = baseline_ref_name("a");
@@ -886,8 +808,6 @@ mod tests {
         assert_ne!(short, long, "but distinct keys still produce distinct refs");
     }
 
-    /// A real `git check-ref-format` run over a key stuffed with every character class git's own
-    /// ref rules reject - the encoding must produce something git genuinely accepts.
     #[test]
     fn an_encoded_ref_name_is_accepted_by_real_git_check_ref_format() {
         let repo = init_repo();
@@ -905,7 +825,6 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
 
-        // And it really works as a ref, end to end.
         let tree = snapshot_tree(repo.path());
         anchor_tree(repo.path(), &ref_name, &tree).expect("anchor");
         assert_eq!(
@@ -934,8 +853,6 @@ mod tests {
         .is_err());
     }
 
-    /// A snapshot really is per-worktree: two worktrees of the same repository snapshot their own
-    /// content, and diffing one against the other's baseline reports the real difference.
     #[test]
     fn snapshots_are_scoped_to_the_worktree_they_were_taken_in() {
         let repo = init_repo();

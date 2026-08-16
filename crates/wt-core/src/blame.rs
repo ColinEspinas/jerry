@@ -6,8 +6,6 @@
 //!
 //! A line differing from `HEAD` is attributed to an all-zero sha with author
 //! `"Not Committed Yet"`; [`BlameLine::is_uncommitted`] marks exactly those.
-//!
-//! Performs blocking I/O; see the crate-level docs.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -15,14 +13,11 @@ use std::path::Path;
 use crate::error::Error;
 use crate::{open_repo, run_git};
 
-/// One line's blame attribution, in file order (index 0 is line 1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlameLine {
     /// The 40-character commit sha, or the all-zero sha when [`Self::is_uncommitted`].
     pub sha: String,
-    /// `"Not Committed Yet"` for an uncommitted line.
     pub author: String,
-    /// Seconds since the Unix epoch, UTC.
     pub author_time_unix: i64,
     /// The subject line only; see [`commit_message`] for the full message.
     pub summary: String,
@@ -31,7 +26,6 @@ pub struct BlameLine {
     pub is_uncommitted: bool,
 }
 
-/// A computed blame of one file, one entry per line in file order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileBlame {
     pub lines: Vec<BlameLine>,
@@ -39,22 +33,15 @@ pub struct FileBlame {
     pub head_commit: String,
 }
 
-/// The outcome of trying to compute a file's blame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlameOutcome {
     Blame(FileBlame),
-    /// `worktree_path` is not inside a git repository at all.
     NotARepo,
-    /// `relative_path` has no history in `HEAD` - untracked, or absent there.
     NotTracked,
 }
 
-/// Blames `relative_path`, resolved against `worktree_path`.
-///
 /// "Nothing to show" is [`BlameOutcome::NotARepo`]/[`BlameOutcome::NotTracked`] rather than an
 /// [`Error`]: both are expected, and a caller should render them as "no blame available".
-///
-/// Performs blocking I/O.
 pub fn blame_file(worktree_path: &Path, relative_path: &Path) -> Result<BlameOutcome, Error> {
     // Probing with `gix` first distinguishes "not a repo" without spawning `git`, and resolves
     // the `HEAD` this blame is cached against. An unborn `HEAD` has no history for any path.
@@ -90,13 +77,9 @@ pub fn blame_file(worktree_path: &Path, relative_path: &Path) -> Result<BlameOut
     }))
 }
 
-/// The full commit message body for `sha`, as `git log`'s `%B` produces it.
-///
 /// Meant to be called lazily per sha rather than eagerly for every blamed line. `Ok(None)` for
 /// the all-zero sha, for a non-hex `sha` (which is rejected before reaching `git` as an
 /// argument), and for one `git log` does not recognize.
-///
-/// Performs blocking I/O.
 pub fn commit_message(worktree_path: &Path, sha: &str) -> Result<Option<String>, Error> {
     if sha.is_empty()
         || !sha.bytes().all(|b| b.is_ascii_hexdigit())
@@ -126,8 +109,6 @@ pub fn commit_message(worktree_path: &Path, sha: &str) -> Result<Option<String>,
     }
 }
 
-/// Parses `git blame --line-porcelain` stdout into one [`BlameLine`] per content line.
-///
 /// A block runs from a `<sha> <orig-line> <final-line>` header through its `<key> <value>` fields
 /// to the `\t`-prefixed content line that ends it. One malformed block is skipped rather than
 /// aborting the file: losing a line's attribution beats losing the whole blame.
@@ -181,8 +162,6 @@ fn parse_line_porcelain(text: &str) -> Vec<BlameLine> {
     lines
 }
 
-/// Returns the sha if `raw_line` is a commit-header line rather than a `<key> <value>` field.
-///
 /// Told apart by requiring exactly 40 hex characters followed by two or three numeric tokens; no
 /// header key is hex-shaped and 40 characters long.
 fn parse_commit_header(raw_line: &str) -> Option<String> {

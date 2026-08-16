@@ -12,29 +12,19 @@ use std::path::Path;
 use crate::error::Error;
 use crate::{check_success, run_git};
 
-/// Applies `commit`'s changes as a new commit on top of the current branch.
-///
-/// Performs blocking I/O.
 pub fn cherry_pick(worktree_path: &Path, commit: &str) -> Result<(), Error> {
     let args: Vec<OsString> = vec!["cherry-pick".into(), "--no-edit".into(), commit.into()];
     let output = run_git(worktree_path, &args)?;
     check_success(&args, &output)
 }
 
-/// Commits the inverse of `commit`, leaving `commit` itself in history.
-///
-/// Performs blocking I/O.
 pub fn revert(worktree_path: &Path, commit: &str) -> Result<(), Error> {
     let args: Vec<OsString> = vec!["revert".into(), "--no-edit".into(), commit.into()];
     let output = run_git(worktree_path, &args)?;
     check_success(&args, &output)
 }
 
-/// Replays the current branch's commits - those not already reachable from `onto` - on top of it.
-///
 /// Plain and non-interactive; a conflict stops where the command line would.
-///
-/// Performs blocking I/O.
 pub fn rebase_onto(worktree_path: &Path, onto: &str) -> Result<(), Error> {
     let args: Vec<OsString> = vec!["rebase".into(), onto.into()];
     let output = run_git(worktree_path, &args)?;
@@ -93,7 +83,6 @@ mod tests {
     fn cherry_pick_really_applies_the_commits_change_on_top_of_head() {
         let repo = init_repo();
         commit(repo.path(), "a.txt", "base", "base");
-        // A second, unrelated branch line whose tip we'll cherry-pick back onto main.
         git(repo.path(), &["checkout", "-b", "feature"]);
         let feature_sha = commit(repo.path(), "b.txt", "feature content", "feature work");
         git(repo.path(), &["checkout", "main"]);

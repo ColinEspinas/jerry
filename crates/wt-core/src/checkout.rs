@@ -14,8 +14,6 @@ use crate::{check_success, run_git};
 ///
 /// No `--` terminator: `commit` is always an object id resolved from the caller's own graph,
 /// never user-typed. Use [`checkout_branch`] for anything that is.
-///
-/// Performs blocking I/O.
 pub fn checkout(worktree_path: &Path, commit: &str) -> Result<(), Error> {
     let args: Vec<OsString> = vec!["checkout".into(), commit.into()];
     let output = run_git(worktree_path, &args)?;
@@ -27,8 +25,6 @@ pub fn checkout(worktree_path: &Path, commit: &str) -> Result<(), Error> {
 /// `name` is user-typed but needs no `--`: it lands in `-b`'s option-value slot, which git never
 /// re-parses as a flag (`-b --evil` reports "not a valid branch name"). Collisions surface as
 /// git's own error rather than being pre-checked.
-///
-/// Performs blocking I/O.
 pub fn create_branch_at(worktree_path: &Path, name: &str, commit: &str) -> Result<(), Error> {
     let args: Vec<OsString> = vec!["checkout".into(), "-b".into(), name.into(), commit.into()];
     let output = run_git(worktree_path, &args)?;
@@ -41,8 +37,6 @@ pub fn create_branch_at(worktree_path: &Path, name: &str, commit: &str) -> Resul
 /// caller's graph: `git checkout --orphan` parses as the `--orphan` flag rather than as an
 /// unknown branch. `switch` has no pathspec overload, so `--` keeps its plain end-of-options
 /// meaning here - unlike `checkout -- <ref>`, which would look for a *file* by that name.
-///
-/// Performs blocking I/O.
 pub fn checkout_branch(worktree_path: &Path, branch: &str) -> Result<(), Error> {
     let args: Vec<OsString> = vec!["switch".into(), "--".into(), branch.into()];
     let output = run_git(worktree_path, &args)?;
@@ -56,8 +50,6 @@ pub fn checkout_branch(worktree_path: &Path, branch: &str) -> Result<(), Error> 
 /// refs by renaming the checked-out branch over `feature`. With `--` it is refused.
 ///
 /// Renaming the checked-out branch is not a special case; git moves `HEAD` onto the new name.
-///
-/// Performs blocking I/O.
 pub fn rename_branch(worktree_path: &Path, old_name: &str, new_name: &str) -> Result<(), Error> {
     let args: Vec<OsString> = vec![
         "branch".into(),
@@ -70,22 +62,17 @@ pub fn rename_branch(worktree_path: &Path, old_name: &str, new_name: &str) -> Re
     check_success(&args, &output)
 }
 
-/// Deletes a local branch, safely.
-///
 /// `-d`, never `-D`: git refuses an unmerged branch, and one checked out in any worktree. Neither
 /// refusal is pre-checked; both surface as git's own stderr.
 ///
 /// Carries the same mandatory `--` as [`rename_branch`], for the same positional-parsing reason,
 /// rather than depending on `name`'s provenance never changing.
-///
-/// Performs blocking I/O.
 pub fn delete_branch(worktree_path: &Path, name: &str) -> Result<(), Error> {
     let args: Vec<OsString> = vec!["branch".into(), "-d".into(), "--".into(), name.into()];
     let output = run_git(worktree_path, &args)?;
     check_success(&args, &output)
 }
 
-/// The `git reset` modes [`reset`] offers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResetMode {
     Soft,
@@ -103,16 +90,12 @@ impl ResetMode {
     }
 }
 
-/// Moves the current branch's tip to `commit`.
-///
 /// - [`ResetMode::Soft`] leaves index and working tree alone, so the difference ends up staged.
 /// - [`ResetMode::Mixed`] resets the index only, so it ends up unstaged.
 /// - [`ResetMode::Hard`] resets both, discarding uncommitted changes outright. Destructive;
 ///   confirming it is the caller's job.
 ///
 /// No `--` terminator, for the same reason as [`checkout`]: `commit` is never user-typed.
-///
-/// Performs blocking I/O.
 pub fn reset(worktree_path: &Path, mode: ResetMode, commit: &str) -> Result<(), Error> {
     let args: Vec<OsString> = vec!["reset".into(), mode.flag().into(), commit.into()];
     let output = run_git(worktree_path, &args)?;
@@ -203,7 +186,6 @@ mod tests {
         git(repo.path(), &["checkout", "-b", "other"]);
         commit(repo.path(), "a.txt", "other branch content", "other change");
         git(repo.path(), &["checkout", "main"]);
-        // An uncommitted change conflicting with what "other" holds; git refuses to clobber it.
         fs::write(repo.path().join("a.txt"), "uncommitted dirty content").expect("write");
 
         let result = checkout(repo.path(), "other");
@@ -317,9 +299,6 @@ mod tests {
         }
     }
 
-    /// A flag-shaped branch name must be refused as an invalid reference, not parsed as an option.
-    /// No branch named `--orphan` can exist, so reaching `fatal: invalid reference` proves the
-    /// safe refusal rather than [`checkout`]'s failure mode.
     #[test]
     fn checkout_branch_refuses_a_flag_shaped_name_instead_of_parsing_it_as_an_option() {
         let repo = init_repo();
@@ -420,9 +399,6 @@ mod tests {
         );
     }
 
-    /// The data-loss path the `--` terminator closes: without it, `git branch -m feature --force`
-    /// exits 0 having parsed `--force` as `-M`, destroying both refs while reporting success.
-    /// Reachable by typing it into the rename prompt.
     #[test]
     fn rename_branch_refuses_a_flag_shaped_name_instead_of_destroying_two_refs() {
         let repo = init_repo();
@@ -462,8 +438,6 @@ mod tests {
         );
     }
 
-    /// The same terminator, on the delete side - `name` comes from this app's own branch list
-    /// today, so this pins the guard rather than a live bug.
     #[test]
     fn delete_branch_treats_a_flag_shaped_name_as_a_branch_name_not_an_option() {
         let repo = init_repo();

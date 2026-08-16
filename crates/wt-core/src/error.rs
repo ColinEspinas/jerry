@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 use std::process::ExitStatus;
 
-/// How a spawned `git` process terminated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GitExit {
     Code(i32),
@@ -36,7 +35,6 @@ impl std::fmt::Display for GitExit {
     }
 }
 
-/// Errors produced by `wt-core`.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("failed to open git repository at {path}: {source}")]
@@ -46,7 +44,6 @@ pub enum Error {
         source: Box<gix::open::Error>,
     },
 
-    /// Reading worktree metadata, or communicating with a spawned `git` process.
     #[error("failed to read worktree information: {0}")]
     WorktreeIo(#[from] std::io::Error),
 
@@ -56,7 +53,6 @@ pub enum Error {
     #[error("failed to resolve HEAD to a commit: {0}")]
     PeelHead(#[source] Box<gix::head::peel::Error>),
 
-    /// Peeling an ordinary branch, never `HEAD` itself - unlike [`Self::PeelHead`].
     #[error("failed to resolve branch to a commit: {0}")]
     PeelReference(#[source] Box<gix::reference::peel::Error>),
 
@@ -84,7 +80,7 @@ pub enum Error {
     #[error("failed to iterate references: {0}")]
     ReferencesIter(#[source] Box<gix::reference::iter::init::Error>),
 
-    /// `gix` yields broken refs rather than skipping them; one fails the whole graph build
+    /// `gix` yields broken refs rather than skipping them, so one fails the whole graph build
     /// instead of silently dropping the commits it might point at.
     #[error("failed to read a reference: {0}")]
     ReferenceEntry(Box<dyn std::error::Error + Send + Sync + 'static>),
@@ -117,30 +113,25 @@ pub enum Error {
     #[error("worktree at {path} has no branch checked out (detached HEAD); nothing to merge")]
     MergeSourceDetached { path: PathBuf },
 
-    /// Merging into a detached `HEAD` would leave the merge commit on no branch at all.
     #[error("worktree at {path} has no branch checked out (detached HEAD); nothing to merge into")]
     MergeTargetDetached { path: PathBuf },
 
     #[error("branch {branch:?} is already the branch checked out here; nothing to merge")]
     MergeSourceIsCurrentBranch { branch: String },
 
-    /// git can only check a branch out in one worktree at a time, so merging into the base
-    /// branch requires a worktree that already has it checked out.
+    /// git can only check a branch out in one worktree at a time.
     #[error(
         "base branch {branch:?} is not checked out in any worktree; check it out somewhere \
          before merging into it"
     )]
     MergeBaseBranchNotCheckedOut { branch: String },
 
-    /// Shared by both merge directions; `path` names whichever worktree is dirty.
     #[error("worktree at {path} has uncommitted changes; commit or discard them before merging")]
     MergeTargetDirty { path: PathBuf },
 
     #[error("conflicted file {path} is not valid UTF-8; cannot parse its conflict markers")]
     MergeConflictFileNotUtf8 { path: PathBuf },
 
-    /// Reported rather than assumed well-formed: this is a parser of the file's bytes, and
-    /// guessing would corrupt content on write-back.
     #[error("conflicted file {path} has malformed/unterminated conflict markers")]
     MergeMalformedConflictMarkers { path: PathBuf },
 
@@ -149,11 +140,9 @@ pub enum Error {
     #[error("conflicted file {path} uses diff3-style conflict markers, which are not supported")]
     MergeUnsupportedConflictStyle { path: PathBuf },
 
-    /// The hunk does not exist, or an earlier call already resolved it.
     #[error("no unresolved conflict hunk at index {index} in {path}")]
     MergeNoSuchHunk { path: PathBuf, index: usize },
 
-    /// Writing now would leave literal conflict markers in the file.
     #[error("{path} still has unresolved conflict hunks; cannot write it back yet")]
     MergeFileNotFullyResolved { path: PathBuf },
 
@@ -161,7 +150,7 @@ pub enum Error {
     MergeNotInProgress { path: PathBuf },
 
     /// Defence in depth for conflicts a marker-based check cannot see, such as modify/delete
-    /// or binary conflicts (see [`crate::merge::ConflictedPath`]).
+    /// or binary conflicts.
     #[error(
         "cannot complete the merge: {} file(s) are still unmerged: {}",
         paths.len(),
@@ -172,8 +161,6 @@ pub enum Error {
     #[error("worktree at {path} has no uncommitted changes; nothing to commit")]
     NothingToCommit { path: PathBuf },
 
-    /// Identity guard: `HEAD` moved since the state this undo/redo was computed from, so
-    /// moving it now would discard whatever did that.
     #[error(
         "refusing to move HEAD in {path}: expected it to be {expected}, but it is now {actual} \
          (something else was committed there since)"
@@ -184,7 +171,6 @@ pub enum Error {
         actual: String,
     },
 
-    /// Identity guard: the rebase advanced past this stop, or something else moved `HEAD`.
     #[error(
         "refusing to amend HEAD in {path}: expected it to still be {expected}, but it is now \
          {actual} (the rebase already moved on, or something else changed HEAD)"
@@ -195,38 +181,29 @@ pub enum Error {
         actual: String,
     },
 
-    /// Refused rather than folding unrelated staged content into the amended commit.
     #[error(
         "refusing to amend HEAD in {path}: the index has real staged changes that were never \
          part of this amend"
     )]
     RebaseAmendIndexDirty { path: PathBuf },
 
-    /// Undoing a branch's first commit needs a branch ref for `git update-ref -d` to remove.
     #[error(
         "cannot undo the first commit on a detached-HEAD worktree at {path}: no branch ref to \
          unmake"
     )]
     CommitHasNoParentAndNoBranch { path: PathBuf },
 
-    /// `git stash` itself refuses to run without a `HEAD` commit to diff against.
     #[error("worktree at {path} has no commits yet; nothing real to discard")]
     DiscardSourceUnborn { path: PathBuf },
 
-    /// git always refuses to remove the main worktree, so stashing first would strand the
-    /// stash with nothing pointing back at it.
     #[error("{path} is the repository's main worktree; it cannot be discarded")]
     DiscardSourceIsMainWorktree { path: PathBuf },
 
-    /// `git stash push` produced no stash commit, or exited successfully without pushing
-    /// anything (a dirty submodule pointer does this). Refused rather than force-removing
-    /// content that was never captured.
+    /// `git stash push` can exit 0 without pushing anything - a dirty submodule pointer does
+    /// this - so a missing or unchanged `refs/stash` is refused rather than force-removed over.
     #[error("failed to snapshot uncommitted changes in {path} before discarding it")]
     DiscardSnapshotFailed { path: PathBuf },
 
-    /// The stash was taken but removal then failed. By this point `git worktree remove` has
-    /// usually already emptied and deregistered the directory, so the stash cannot be restored
-    /// in place - but it is still durable and recoverable by hand.
     #[error(
         "took a real snapshot of {path} (stash {stash}) but could not remove the worktree \
          itself: {source}. The stash is safe and recoverable (`git stash apply {stash}`), but \
@@ -239,12 +216,9 @@ pub enum Error {
         source: Box<Error>,
     },
 
-    /// Identity guard: something already occupies the worktree's original path.
     #[error("cannot undo: {path} is already occupied by another worktree or directory")]
     DiscardWorktreePathReoccupied { path: PathBuf },
 
-    /// Identity guard: recreating the worktree would clobber whatever now holds the branch, or
-    /// resurrect stale content over newer work.
     #[error(
         "cannot undo: branch {branch:?} no longer matches the state it was discarded in (moved, \
          deleted, or checked out elsewhere since)"

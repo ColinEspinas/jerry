@@ -40,31 +40,23 @@ use lsp_types::{
 use crate::proc;
 use crate::transport;
 
-/// Answers one `workspace/configuration` section, `None` meaning a scope-less whole-item request.
+/// Answers one `workspace/configuration` section; `None` means a scope-less whole-item request.
 ///
 /// A `fn` pointer rather than a closure: every value is known statically per language.
 pub type WorkspaceConfigFn = fn(section: Option<&str>) -> serde_json::Value;
 
-/// The shared default: an empty object for every section.
-///
-/// Spec-legal, and a different answer from `null`, which means "not found" and can leave a server
-/// assuming stale defaults.
+/// An empty object for every section - spec-legal, and a different answer from `null`, which
+/// means "not found" and can leave a server assuming stale defaults.
 pub fn default_workspace_configuration(_section: Option<&str>) -> serde_json::Value {
     serde_json::Value::Object(serde_json::Map::new())
 }
 
-/// Per-language-server spawn configuration. Only the shape lives here; callers own the values.
 #[derive(Debug, Clone)]
 pub struct ServerSpawnConfig {
-    /// Name used in every log and error message this crate produces.
     pub name: &'static str,
-    /// The binary [`Command::new`] spawns, looked up on `$PATH`.
     pub binary: &'static str,
-    /// Owned rather than `&'static`, so a config can carry a runtime-computed argument.
     pub args: Vec<String>,
-    /// `InitializeParams.initialization_options`, for a server that expects settings up front.
     pub initialization_options: Option<serde_json::Value>,
-    /// Answers this server's `workspace/configuration` requests.
     pub workspace_configuration: WorkspaceConfigFn,
     /// Notification methods the caller wants queued for
     /// [`LspClient::drain_custom_notifications`], beyond the `publishDiagnostics` handled here.
@@ -127,7 +119,6 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Everything that can go wrong spawning, driving, or tearing down an [`LspClient`].
 #[derive(Debug, thiserror::Error)]
 pub enum LspError {
     #[error("failed to spawn `{server}` (is it installed and on PATH?): {source}")]
@@ -183,7 +174,6 @@ type PendingResponse = Result<serde_json::Value, (i64, String)>;
 pub enum ClientUpdate {
     Updated,
     Timeout,
-    /// The connection is gone; no further update will ever arrive.
     Closed,
 }
 
@@ -395,12 +385,10 @@ impl LspClient {
         Ok(client)
     }
 
-    /// The server name this client was spawned with, so a caller can log without re-deriving it.
     pub fn name(&self) -> &'static str {
         self.name
     }
 
-    /// The handshake body; see the module docs for why the order is fixed.
     fn initialize(
         &self,
         repo_root: &Path,
@@ -471,8 +459,6 @@ impl LspClient {
         Ok(())
     }
 
-    /// The `completionProvider.triggerCharacters` this server advertised. Empty if it has no
-    /// `completionProvider`, or lists none.
     pub fn completion_trigger_characters(&self) -> Vec<String> {
         lock(&self.capabilities)
             .completion_provider
@@ -481,10 +467,8 @@ impl LspClient {
             .unwrap_or_default()
     }
 
-    /// Whether `completionItem/resolve` is permitted.
-    ///
-    /// Servers commonly return only `label`/`kind` inline, documentation being expensive per
-    /// candidate, and expect the client to resolve the one item the user is looking at.
+    /// Whether `completionItem/resolve` is permitted. Servers commonly return only `label`/`kind`
+    /// inline and expect the client to resolve the one item the user is looking at.
     pub fn supports_completion_resolve(&self) -> bool {
         lock(&self.capabilities)
             .completion_provider
@@ -505,11 +489,9 @@ impl LspClient {
         }
     }
 
-    /// Whether this server supports pull diagnostics.
-    ///
-    /// Not merely optional where advertised: rust-analyzer pushes `publishDiagnostics` exactly
-    /// once, after `didOpen`, and every recompute after a `didChange` must be pulled. A server
-    /// with no `diagnostic_provider` is assumed to keep pushing instead.
+    /// Whether pull diagnostics are supported - not merely optional where advertised:
+    /// rust-analyzer pushes `publishDiagnostics` once, after `didOpen`, and every recompute after
+    /// a `didChange` must be pulled. A server without it is assumed to keep pushing.
     pub fn supports_diagnostic_pull(&self) -> bool {
         lock(&self.capabilities).diagnostic_provider.is_some()
     }
@@ -652,12 +634,10 @@ impl LspClient {
         uri_to_path(uri)
     }
 
-    /// [`Self::diagnostics_for`] keyed by an already-computed [`Uri`].
     pub fn diagnostics_for_uri(&self, uri: &Uri) -> Option<Vec<lsp_types::Diagnostic>> {
         lock(&self.diagnostics).get(uri.as_str()).cloned()
     }
 
-    /// [`Self::has_diagnostics_result`] keyed by an already-computed [`Uri`].
     pub fn has_diagnostics_result_uri(&self, uri: &Uri) -> bool {
         lock(&self.diagnostics).contains_key(uri.as_str())
     }
@@ -726,7 +706,6 @@ impl LspClient {
         }
     }
 
-    /// Sends a request and blocks the calling thread for a response, up to `timeout`.
     pub fn request<R: LspRequest>(
         &self,
         params: R::Params,
@@ -993,8 +972,6 @@ fn retry_with_deadline<T>(
     Err(last_err.unwrap_or_else(timeout_err))
 }
 
-/// The diagnostic items out of a `textDocument/diagnostic` response.
-///
 /// `None` for an `Unchanged` report - a no-op, not an empty result - and for the `Partial` shape,
 /// which a compliant server has no reason to send since this crate never asks for one.
 /// Related-documents diagnostics are dropped: the model here is per-open-file, with nowhere to
@@ -1036,7 +1013,6 @@ fn canonicalize(path: &Path) -> std::io::Result<PathBuf> {
     dunce::canonicalize(path)
 }
 
-/// The inverse of [`path_to_uri`], parsed with `url` rather than hand-rolled percent-decoding.
 fn uri_to_path(uri: &Uri) -> Result<PathBuf, LspError> {
     let url = url::Url::parse(uri.as_str())
         .map_err(|_| LspError::InvalidUri(uri.as_str().to_string()))?;
@@ -1276,8 +1252,6 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
-    /// A round trip against a temp directory, proving [`canonicalize`] still resolves correctly.
-    /// The Windows-specific simplification cannot be exercised here.
     #[test]
     fn canonicalize_resolves_a_real_directory() {
         let dir = tempfile::TempDir::new().expect("tempdir");
@@ -1323,8 +1297,6 @@ mod tests {
         }
     }
 
-    // Coverage for `resolve_server_binary`; see its docs for the Windows `.cmd` root cause.
-
     #[test]
     fn resolve_server_binary_uses_whatever_the_injected_resolver_finds() {
         let expected = PathBuf::from("C:\\fake\\typescript-language-server.cmd");
@@ -1353,9 +1325,6 @@ mod tests {
         }
     }
 
-    /// The mechanism the fix relies on, against real `Command` behaviour rather than assumed: a
-    /// `.cmd` with no `.exe` sibling cannot be spawned from a bare name, but spawns fine from its
-    /// resolved absolute path.
     #[cfg(windows)]
     #[test]
     fn a_real_windows_batch_shim_is_unspawnable_by_bare_name_but_spawns_via_its_own_resolved_path()
@@ -1429,7 +1398,6 @@ mod tests {
             2,
             "one array entry per requested ConfigurationItem"
         );
-        // The default answers every section with an empty object, not `null`.
         assert!(array
             .iter()
             .all(|entry| entry.is_object() && !entry.is_null()));
@@ -1453,8 +1421,6 @@ mod tests {
         assert!(array.is_empty());
     }
 
-    /// A section-aware config fn must reach each array entry keyed by that item's own `section`,
-    /// not repeat one value for every item.
     #[test]
     fn workspace_configuration_uses_the_real_per_section_answer_from_the_server_fn() {
         fn fake_config(section: Option<&str>) -> serde_json::Value {
@@ -1549,9 +1515,6 @@ mod tests {
         }
     }
 
-    /// The real capability `crate::client`'s notification branch gained so a server's own custom
-    /// protocol extension stops being invisible: a subscribed method is queued verbatim, method
-    /// and raw params both intact, in real arrival order.
     #[test]
     fn a_subscribed_notification_is_queued_verbatim_for_draining() {
         let harness = IncomingHarness::new(&["tsserver/request", "server/other"]);
@@ -1585,8 +1548,6 @@ mod tests {
         );
     }
 
-    /// A client that subscribed to nothing queues nothing, however much traffic its server
-    /// produces - no added cost for servers that never needed this.
     #[test]
     fn a_client_that_subscribed_to_nothing_queues_nothing_at_all() {
         let harness = IncomingHarness::new(&[]);
@@ -1607,8 +1568,6 @@ mod tests {
         );
     }
 
-    /// Subscription is per-method, not all-or-nothing: an un-subscribed method is still ignored
-    /// even on a client that subscribed to something else.
     #[test]
     fn an_unsubscribed_method_is_ignored_even_when_other_methods_are_subscribed() {
         let harness = IncomingHarness::new(&["tsserver/request"]);
@@ -1620,11 +1579,8 @@ mod tests {
         assert!(harness.drain_custom().is_empty());
     }
 
-    /// `publishDiagnostics` must never *also* reach the custom path, which would give callers two
-    /// disagreeing sources for one fact.
     #[test]
     fn publish_diagnostics_never_appears_on_the_custom_notification_path() {
-        // Subscribed on purpose: even that must not divert it from the typed sink.
         let harness = IncomingHarness::new(&["textDocument/publishDiagnostics"]);
         harness.feed(serde_json::json!({
             "jsonrpc": "2.0",
@@ -1655,7 +1611,6 @@ mod tests {
         assert_eq!(recorded[0].message, "mismatched types");
     }
 
-    /// Both paths send the same wake, so one poll loop notices either.
     #[test]
     fn a_custom_notification_sends_the_same_real_wake_signal_diagnostics_do() {
         let harness = IncomingHarness::new(&["tsserver/request"]);
@@ -1675,9 +1630,6 @@ mod tests {
         );
     }
 
-    /// A server that sends a subscribed notification faster than anything drains it must not grow
-    /// this queue without limit - the *oldest* entry is dropped, so the newest, most relevant ones
-    /// are the ones that survive.
     #[test]
     fn the_custom_notification_queue_is_bounded_and_drops_the_oldest_first() {
         let harness = IncomingHarness::new(&["server/custom"]);
@@ -1707,8 +1659,6 @@ mod tests {
         );
     }
 
-    /// A server-initiated *request* takes the reply path and must not leak onto the notification
-    /// queue, which cannot answer one.
     #[test]
     fn a_server_initiated_request_is_not_treated_as_a_custom_notification() {
         let harness = IncomingHarness::new(&["client/registerCapability"]);
@@ -1724,7 +1674,6 @@ mod tests {
         );
     }
 
-    // Unix-only: exercises `crate::proc`'s descendant walk, which does not exist elsewhere.
     #[cfg(unix)]
     #[test]
     fn spawn_performs_a_real_handshake_and_shutdown_leaves_no_orphan() {
@@ -1757,7 +1706,6 @@ mod tests {
         );
     }
 
-    /// Unix-only: `pid_exists` has no Windows equivalent here.
     #[cfg(unix)]
     #[test]
     fn drop_without_shutdown_does_not_leave_an_orphaned_process() {
@@ -1808,13 +1756,6 @@ mod tests {
         );
     }
 
-    /// End-to-end against a real `rust-analyzer`: handshake, `didOpen`, and an asynchronously
-    /// pushed diagnostic naming the type error in the fixture. Slow, by real process startup and
-    /// indexing; nothing is faked if it times out.
-    ///
-    /// rust-analyzer publishes **twice** for a fresh file: an immediate empty set from its
-    /// syntax-only pass, then the real mismatch. That is ordinary eventual consistency, so this
-    /// waits for a non-empty result rather than stopping at the first arrival.
     #[test]
     fn rust_analyzer_reports_a_real_diagnostic_for_a_real_type_error() {
         let project = write_scratch_project(
@@ -1876,7 +1817,6 @@ mod tests {
             Some(lsp_types::DiagnosticSeverity::ERROR),
             "a genuine type mismatch should be reported at ERROR severity, got: {mismatch:#?}"
         );
-        // The range must land on the offending line, not merely be some diagnostic.
         assert_eq!(
             mismatch.range.start.line, 1,
             "expected the mismatch diagnostic's range to point at the real offending line, \
@@ -1886,12 +1826,6 @@ mod tests {
         client.shutdown().expect("shutdown should succeed");
     }
 
-    /// An *unsaved* edit - `did_change_full` alone, nothing written to disk - introduces a type
-    /// error, and a *pulled* request reports it.
-    ///
-    /// The regression this pins: rust-analyzer pushes `publishDiagnostics` only once, after
-    /// `didOpen`, and never again on its own after a `didChange`, despite advertising sync
-    /// support. Asserting on the push sink here instead simply hangs out the whole deadline.
     #[test]
     fn did_change_full_then_a_real_pull_reports_a_real_new_diagnostic() {
         let project = write_scratch_project(
@@ -1907,7 +1841,6 @@ mod tests {
             .did_open(&main_rs, source, 1, "rust")
             .expect("didOpen should send successfully");
 
-        // The file is clean, so the baseline is an empty set.
         let deadline = Instant::now() + Duration::from_secs(180);
         loop {
             if client.has_diagnostics_result(&main_rs) {
@@ -1937,7 +1870,6 @@ mod tests {
              current behavior"
         );
 
-        // A type mismatch sent via `did_change_full` alone: no re-open, nothing written to disk.
         let edited_content = "fn main() {\n    let x: i32 = 1;\n    println!(\"{}\", x);\n}\n\nfn bad() -> i32 {\n    \"not a number\"\n}\n".to_string();
         client
             .did_change_full(&main_rs, edited_content, 2)
@@ -1985,7 +1917,6 @@ mod tests {
             Some(lsp_types::DiagnosticSeverity::ERROR),
             "a genuine type mismatch should be reported at ERROR severity, got: {mismatch:#?}"
         );
-        // Line 6 is the offending `"not a number"` line, not merely some diagnostic.
         assert_eq!(
             mismatch.range.start.line, 6,
             "expected the mismatch diagnostic's range to point at the real offending line, \
@@ -1993,13 +1924,6 @@ mod tests {
         );
     }
 
-    /// A late pull result tagged with an older version must not clobber an already-landed newer
-    /// one - the race [`LspClient::diagnostics_version`] closes.
-    ///
-    /// Against a real server rather than simulated: a pull at version 10 records the error, then
-    /// a second pull against the same still-erroring content is deliberately mislabelled version
-    /// 3, standing in for a slow response to an older edit. It must return `Ok` - an answer was
-    /// obtained - while leaving the version-10 result in place.
     #[test]
     fn a_stale_lower_version_pull_never_clobbers_an_already_landed_newer_one() {
         let project = write_scratch_project(
@@ -2014,7 +1938,6 @@ mod tests {
             .did_open(&main_rs, source, 1, "rust")
             .expect("didOpen should send successfully");
 
-        // Wait for the clean baseline first.
         let deadline = Instant::now() + Duration::from_secs(180);
         loop {
             if client.has_diagnostics_result(&main_rs) {
@@ -2027,13 +1950,11 @@ mod tests {
             client.wait_for_update(Duration::from_secs(5));
         }
 
-        // A type error, sent as document version 10.
         let bad_content = "fn main() {\n    let x: i32 = 1;\n    println!(\"{}\", x);\n}\n\nfn bad() -> i32 {\n    \"not a number\"\n}\n".to_string();
         client
             .did_change_full(&main_rs, bad_content, 10)
             .expect("did_change_full should send successfully");
 
-        // Pull #1, tagged with the version it corresponds to, retrying until the mismatch lands.
         let pull_deadline = Instant::now() + Duration::from_secs(60);
         let baseline_diagnostics = loop {
             client
@@ -2095,10 +2016,6 @@ mod tests {
         client.shutdown().expect("shutdown should succeed");
     }
 
-    /// Killing the process out from under the client, with no `shutdown()`, must flip
-    /// [`LspClient::is_connection_alive`] - a tested signal, not just a log line.
-    ///
-    /// Unix-only: the kill step uses `crate::proc` directly.
     #[cfg(unix)]
     #[test]
     fn killing_the_real_process_flips_is_connection_alive_to_false() {
@@ -2110,7 +2027,6 @@ mod tests {
             "a freshly spawned, initialized client should report its connection as alive"
         );
 
-        // Killed out from under the client, standing in for an unprompted crash.
         let descendants = proc::collect_descendant_pids(client.pid);
         proc::signal_pid(client.pid, nix::sys::signal::Signal::SIGKILL);
         for pid in &descendants {
@@ -2128,16 +2044,6 @@ mod tests {
         }
     }
 
-    /// The other way a server stops working, and the one nothing used to detect: the process stays
-    /// **alive** but stops reading its stdin.
-    ///
-    /// Unbounded, a 256 KiB `didChange` fills the pipe and parks forever *holding* the mutex, so a
-    /// 3-second hover is unfinished 8 seconds later while the connection still reports itself
-    /// alive - the reader never sees EOF for a process that has not exited.
-    ///
-    /// `SIGSTOP` against a real server, not a stand-in, because this is the failure a stand-in
-    /// would most easily fake: a stopped process is genuinely alive, holds its pipe open, and
-    /// never drains it.
     #[cfg(unix)]
     #[test]
     fn a_real_but_frozen_server_fails_the_write_within_the_budget_instead_of_hanging_forever() {
@@ -2151,7 +2057,6 @@ mod tests {
             "sanity check: a freshly handshaked client is alive"
         );
 
-        // Frozen: it keeps its end of the pipe open and never reads another byte.
         nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(pid as i32),
             nix::sys::signal::Signal::SIGSTOP,
@@ -2189,11 +2094,6 @@ mod tests {
         );
     }
 
-    /// Once a connection is known dead, further writes must fail *immediately* rather than each
-    /// re-paying the full [`WRITE_TIMEOUT`] to rediscover it.
-    ///
-    /// Without the early-out, a 3-second hover was still unfinished 12 seconds after the first
-    /// write gave up, having refilled the same wedged pipe.
     #[cfg(unix)]
     #[test]
     fn a_connection_already_known_dead_fails_further_writes_immediately() {
@@ -2203,7 +2103,6 @@ mod tests {
             .expect("a real rust-analyzer should spawn and handshake");
         let pid = client.pid;
 
-        // An unprompted death: the reader observes EOF and flips the flag.
         nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(pid as i32),
             nix::sys::signal::Signal::SIGKILL,
@@ -2246,15 +2145,6 @@ mod tests {
         );
     }
 
-    /// The bounded write closes the unbounded hang but leaves a window for the corruption it
-    /// exists to prevent.
-    ///
-    /// Writers queue on the `stdin` mutex, so every concurrent caller has already passed the
-    /// liveness check and is parked while one writer is mid-frame. If that writer gives up
-    /// part-way and releases the guard *before* publishing the death, the next writer's
-    /// well-formed frame is eaten as the previous message's payload.
-    ///
-    /// Driven against a `SIGSTOP`ped server, with a second thread really contending for the mutex.
     #[cfg(unix)]
     #[test]
     fn a_writer_queued_behind_one_that_gives_up_is_refused_rather_than_corrupting_the_stream() {
@@ -2271,7 +2161,6 @@ mod tests {
         )
         .expect("a real SIGSTOP against the real rust-analyzer pid");
 
-        // Writer A: wedges on the frozen server for the full budget, holding the mutex.
         let wedged = {
             let client = Arc::clone(&client);
             let main_rs = main_rs.clone();
@@ -2359,9 +2248,6 @@ mod tests {
         dir
     }
 
-    /// The TypeScript counterpart of
-    /// [`rust_analyzer_reports_a_real_diagnostic_for_a_real_type_error`], through the same
-    /// [`LspClient::spawn`] every language shares.
     #[test]
     fn typescript_language_server_reports_a_real_diagnostic_for_a_real_type_error() {
         let project =
@@ -2414,8 +2300,6 @@ mod tests {
         client.shutdown().expect("shutdown should succeed");
     }
 
-    /// The TypeScript counterpart of
-    /// [`rust_analyzer_returns_a_real_hover_for_a_documented_function`].
     #[test]
     fn typescript_language_server_returns_a_real_hover_for_a_documented_function() {
         let project = write_scratch_ts_project(
@@ -2432,7 +2316,6 @@ mod tests {
             .expect("didOpen should send successfully");
 
         let uri = path_to_uri(&main_ts).expect("real file:// URI for the fixture file");
-        // `"const result = "` is 15 bytes, so character 17 lands inside the `addOne` identifier.
         let params = lsp_types::HoverParams {
             text_document_position_params: lsp_types::TextDocumentPositionParams {
                 text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
@@ -2529,8 +2412,6 @@ mod tests {
         dir
     }
 
-    /// The Python counterpart, spawned with the non-`null` `initializationOptions` and
-    /// `workspace/configuration` answers Pyright needs and the other two servers do not.
     #[test]
     fn pyright_reports_a_real_diagnostic_for_a_real_type_error() {
         let project = write_scratch_py_project(
@@ -2586,7 +2467,6 @@ mod tests {
         client.shutdown().expect("shutdown should succeed");
     }
 
-    /// The Python counterpart of the hover tests above.
     #[test]
     fn pyright_returns_a_real_hover_for_a_documented_function() {
         let project = write_scratch_py_project(
@@ -2603,7 +2483,6 @@ mod tests {
             .expect("didOpen should send successfully");
 
         let uri = path_to_uri(&main_py).expect("real file:// URI for the fixture file");
-        // `"result = "` is 9 bytes, so character 11 lands inside the `add_one` identifier.
         let params = lsp_types::HoverParams {
             text_document_position_params: lsp_types::TextDocumentPositionParams {
                 text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
@@ -2690,10 +2569,6 @@ mod tests {
         );
     }
 
-    /// A hover at a byte-accurate call-site position returns the function's signature and
-    /// doc-comment prose, not a placeholder. Same fixture technique as the diagnostics test:
-    /// a tiny dependency-free crate, a spawn and `didOpen`, and a bounded wait - rust-analyzer
-    /// needs to finish enough indexing to answer at all, so this polls rather than asking once.
     #[test]
     fn rust_analyzer_returns_a_real_hover_for_a_documented_function() {
         let project = write_scratch_project(
@@ -2726,7 +2601,6 @@ mod tests {
             work_done_progress_params: lsp_types::WorkDoneProgressParams::default(),
         };
 
-        // 180s, matching the diagnostics test: sysroot indexing time, not an arbitrary number.
         let deadline = Instant::now() + Duration::from_secs(180);
         let hover = loop {
             match client.request::<lsp_types::request::HoverRequest>(
@@ -2768,8 +2642,6 @@ mod tests {
         client.shutdown().expect("shutdown should succeed");
     }
 
-    /// A `textDocument/definition` request at the same call-site position the hover test uses
-    /// returns a location pointing back at the function's definition line in the same file.
     #[test]
     fn rust_analyzer_returns_a_real_definition_location_for_a_call_site() {
         let project = write_scratch_project(
@@ -2800,7 +2672,6 @@ mod tests {
             partial_result_params: lsp_types::PartialResultParams::default(),
         };
 
-        // 180s - see the hover test above's identical deadline for why.
         let deadline = Instant::now() + Duration::from_secs(180);
         let response = loop {
             match client.request::<lsp_types::request::GotoDefinition>(
@@ -2876,9 +2747,6 @@ mod retry_deadline_tests {
         }
     }
 
-    /// Giving each attempt the full, unshrinking `budget` lets an attempt that consumes 80% of
-    /// its timeout grow the total toward `budget * max_attempts`. Deriving each from the time
-    /// remaining until one shared deadline keeps the total near `budget` instead.
     #[test]
     fn total_real_elapsed_time_stays_within_the_caller_budget_not_multiplied_by_attempt_count() {
         let budget = Duration::from_millis(200);
@@ -2914,7 +2782,6 @@ mod retry_deadline_tests {
         );
     }
 
-    /// A first-attempt success must return immediately, so the common case stays cheap.
     #[test]
     fn a_successful_first_attempt_returns_immediately() {
         let start = Instant::now();
@@ -2934,7 +2801,6 @@ mod retry_deadline_tests {
         );
     }
 
-    /// `is_retryable` gates retrying, so a non-retryable error consumes no further attempts.
     #[test]
     fn a_non_retryable_error_is_returned_immediately_without_retrying() {
         let attempts = std::cell::Cell::new(0);

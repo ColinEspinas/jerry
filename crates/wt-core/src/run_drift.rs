@@ -5,25 +5,18 @@
 //! timestamp and no sha, and after a rebase `<sha>..HEAD` counts the whole branch. The trade-off is
 //! that counting by committer date makes a rebase's rewritten commits look like they landed after
 //! the run.
-//!
-//! Performs blocking I/O; see the crate-level docs.
 
 use std::ffi::OsString;
 use std::path::Path;
 
 use crate::{check_success, run_git, Error};
 
-/// For each entry of `since_unix`, how many commits reachable from `HEAD` were committed at or
-/// after that moment, in input order.
-///
 /// One `git` invocation for all of them, bounded by the oldest moment asked about, so a worktree
 /// with several runs does not cost one child process each. Timestamps are passed as git's
 /// `@<seconds>` fixed-date form, so no timezone interpretation happens anywhere.
 ///
 /// `Ok(None)`, never a vector of zeros, when `HEAD` is unborn. An empty `since_unix` spawns
 /// nothing.
-///
-/// Performs blocking I/O.
 pub fn commits_since_each(
     worktree_path: &Path,
     since_unix: &[i64],
@@ -146,7 +139,6 @@ mod tests {
         commit_at(path, "before-a", 1_700_000_000);
         commit_at(path, "before-b", 1_700_000_100);
 
-        // The run ended here; everything above predates it.
         let mark = 1_700_000_500;
         assert_eq!(
             commits_since(path, mark).expect("must run"),

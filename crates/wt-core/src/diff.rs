@@ -1,14 +1,9 @@
-//! Read-only diff of a worktree's `HEAD` (including uncommitted changes) against the
-//! merge-base with the repository's default branch.
+//! Read-only diff of a worktree's `HEAD`, uncommitted changes included, against the merge-base
+//! with the default branch.
 //!
 //! The default branch is detected in order: `refs/remotes/origin/HEAD`, a local `main`, a local
-//! `master`, then the main worktree's checked-out branch. If none resolve, or the worktree is
-//! already on it, or the histories share no ancestor, [`diff_against_base`] returns
-//! [`DiffBase::NoBase`] and still diffs uncommitted changes; [`DiffBase::NoBaseFound`] means
-//! `HEAD` is unborn.
-//!
-//! Detection uses `gix`; the diff text itself comes from `git` - see
-//! `docs/architecture/decisions.md` §5. Performs blocking I/O; see the crate-level docs.
+//! `master`, then the main worktree's checked-out branch. Detection uses `gix`; the diff text
+//! comes from `git` - see `docs/architecture/decisions.md` §5.
 
 use std::ffi::OsString;
 use std::io::Read as _;
@@ -21,13 +16,10 @@ use crate::{check_success, format_args, git_command, open_repo, run_git};
 /// Cap on how many bytes of `git diff` stdout are buffered; beyond it the diff is truncated.
 pub(crate) const MAX_DIFF_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 
-/// Cap on how many changed files are kept from a single diff.
 const MAX_FILES: usize = 300;
 
-/// Cap on how many hunk lines are kept per file.
 const MAX_HUNK_LINES_PER_FILE: usize = 2000;
 
-/// One line within a diff hunk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffLine {
     pub kind: DiffLineKind,
@@ -42,7 +34,6 @@ pub enum DiffLineKind {
     Removed,
 }
 
-/// One `@@ ... @@` hunk within a file's diff.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffHunk {
     /// The hunk header line as `git diff` printed it, e.g. `@@ -1,3 +1,4 @@ fn foo() {`.
@@ -50,7 +41,6 @@ pub struct DiffHunk {
     pub lines: Vec<DiffLine>,
 }
 
-/// How a single file differs from the base.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileChangeStatus {
     Added,
@@ -59,7 +49,6 @@ pub enum FileChangeStatus {
     Renamed,
 }
 
-/// One changed file within a [`WorktreeDiff`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffFile {
     /// The file's current path (or its last path before deletion).
@@ -74,22 +63,17 @@ pub struct DiffFile {
     pub truncated: bool,
 }
 
-/// A computed diff of a worktree against its base.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeDiff {
-    /// The short name of the detected default branch this was diffed against.
     pub base_branch: String,
-    /// The commit `git diff` was actually run against.
     pub base_commit: String,
     pub files: Vec<DiffFile>,
     /// `true` if output exceeded [`MAX_DIFF_OUTPUT_BYTES`] or [`MAX_FILES`], so content is missing.
     pub truncated: bool,
 }
 
-/// The outcome of trying to compute a worktree's diff against its base.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffBase {
-    /// A usable base branch was found; here is the diff against it.
     Diff(WorktreeDiff),
     /// No usable base *branch*, so `uncommitted` holds a `git diff HEAD` instead. `branch` names
     /// the detected default branch when the worktree is simply already on it.
@@ -117,10 +101,8 @@ impl DiffBase {
     }
 }
 
-/// The comparison points one worktree offers, resolved once through `gix`.
-///
-/// Resolved once and shared so every scope the Changes panel draws agrees about where `HEAD`
-/// and the base are, rather than each re-deriving them and disagreeing mid-refresh.
+/// Resolved once and shared, so every scope a caller draws agrees about where `HEAD` and the base
+/// are rather than each re-deriving them and disagreeing mid-refresh.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BaseResolution {
     /// The worktree's own checked-out branch, `None` when `HEAD` is detached.
@@ -143,8 +125,6 @@ impl BaseResolution {
 }
 
 /// Resolves `worktree_path`'s `HEAD` and its base. `Ok(None)` means `HEAD` is unborn.
-///
-/// Performs blocking I/O (`gix` reads only).
 pub(crate) fn resolve_base(worktree_path: &Path) -> Result<Option<BaseResolution>, Error> {
     let repo = open_repo(worktree_path)?;
 
@@ -170,7 +150,6 @@ pub(crate) fn resolve_base(worktree_path: &Path) -> Result<Option<BaseResolution
         }));
     };
 
-    // On the default branch itself: a base was detected, but nothing to diff against it.
     if worktree_branch.as_deref() == Some(base_branch.as_str()) {
         return Ok(Some(BaseResolution {
             worktree_branch,
@@ -182,7 +161,6 @@ pub(crate) fn resolve_base(worktree_path: &Path) -> Result<Option<BaseResolution
 
     let merge_base = match repo.merge_base(worktree_head_id.detach(), base_commit_id) {
         Ok(id) => Some(id.detach().to_string()),
-        // Unrelated histories: no common ancestor, so no point to diff from.
         Err(gix::repository::merge_base::Error::NotFound { .. }) => None,
         Err(source) => return Err(Error::MergeBase(Box::new(source))),
     };
@@ -195,7 +173,6 @@ pub(crate) fn resolve_base(worktree_path: &Path) -> Result<Option<BaseResolution
     }))
 }
 
-/// Diffs the worktree at `worktree_path` against its base. Performs blocking I/O.
 pub fn diff_against_base(worktree_path: &Path) -> Result<DiffBase, Error> {
     let Some(resolved) = resolve_base(worktree_path)? else {
         return Ok(DiffBase::NoBaseFound);
@@ -230,8 +207,6 @@ pub fn diff_against_base(worktree_path: &Path) -> Result<DiffBase, Error> {
 /// against `HEAD`, so work already committed on the branch does not appear.
 ///
 /// `Ok(None)` means `HEAD` is unborn; "nothing changed" is `Ok(Some(_))` with empty `files`.
-///
-/// Performs blocking I/O.
 pub fn diff_against_head(worktree_path: &Path) -> Result<Option<WorktreeDiff>, Error> {
     let Some(resolved) = resolve_base(worktree_path)? else {
         return Ok(None);
@@ -310,13 +285,10 @@ pub(crate) fn compute_diff(
     })
 }
 
-/// Cap on how many commits are loaded for a branch.
 const MAX_BRANCH_COMMITS: usize = 300;
 
-/// One commit on this branch since its base.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BranchCommit {
-    /// The full hex commit id.
     pub id: String,
     /// git's own `%h` abbreviation of [`Self::id`], never a hand-truncated prefix.
     pub short_id: String,
@@ -331,13 +303,11 @@ pub struct BranchCommit {
     pub removed: u32,
 }
 
-/// What is already committed on this branch, and the net diffstat of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BranchCommits {
     /// The base branch the range was taken against; `None` leaves [`Self::commits`] empty rather
     /// than falling back to the whole of history.
     pub base_branch: Option<String>,
-    /// The merge-base commit the range starts at, when there is one.
     pub base_commit: Option<String>,
     /// Newest first, exactly as `git log` lists them.
     pub commits: Vec<BranchCommit>,
@@ -345,14 +315,11 @@ pub struct BranchCommits {
     /// added then later removed counts in the sum but not here.
     pub added: u32,
     pub removed: u32,
-    /// `true` if the branch had more than [`MAX_BRANCH_COMMITS`] commits.
     pub truncated: bool,
 }
 
 /// Reads the commits on `worktree_path`'s branch since its merge-base, plus the range's net
 /// diffstat. With no usable base this returns an empty range rather than all of history.
-///
-/// Performs blocking I/O.
 pub fn commits_since_base(worktree_path: &Path) -> Result<BranchCommits, Error> {
     let empty = BranchCommits {
         base_branch: None,
@@ -416,7 +383,6 @@ pub fn commits_since_base(worktree_path: &Path) -> Result<BranchCommits, Error> 
     })
 }
 
-/// Parses `git log --numstat --format=%x1e%H%x1f%h%x1f%an%x1f%at%x1f%s` output.
 fn parse_branch_commits(text: &str) -> Vec<BranchCommit> {
     let mut commits = Vec::new();
     // Skipping empty records, rather than `skip(1)`, keeps a real record if git ever stops
@@ -440,7 +406,6 @@ fn parse_branch_commits(text: &str) -> Vec<BranchCommit> {
         ) else {
             continue;
         };
-        // Not a commit record: skipped rather than recorded with an id `git show` would reject.
         if id.is_empty() || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
             continue;
         }
@@ -499,8 +464,6 @@ pub struct WorktreeMergeStatus {
 
 /// Whether `worktree_path`'s `HEAD` is already merged into the detected default branch.
 /// `Ok(None)` if no base could be detected or `HEAD` is unborn.
-///
-/// Performs blocking I/O (`gix` reads only).
 pub fn merge_status_against_base(
     worktree_path: &Path,
 ) -> Result<Option<WorktreeMergeStatus>, Error> {
@@ -513,7 +476,6 @@ pub fn merge_status_against_base(
         .try_peel_to_id_in_place()
         .map_err(|source| Error::PeelHead(Box::new(source)))?;
     let Some(head_id) = head_id else {
-        // Unborn HEAD: nothing has been committed yet, so there is nothing to compare.
         return Ok(None);
     };
     let head_id = head_id.detach();
@@ -527,7 +489,6 @@ pub fn merge_status_against_base(
     } else {
         match repo.merge_base(head_id, base_commit_id) {
             Ok(merge_base_id) => merge_base_id.detach() == head_id,
-            // No common ancestor at all: definitely not merged.
             Err(gix::repository::merge_base::Error::NotFound { .. }) => false,
             Err(source) => return Err(Error::MergeBase(Box::new(source))),
         }
@@ -558,8 +519,6 @@ pub struct AheadBehind {
 /// Ahead/behind counts for `worktree_path` against its detected default base branch. `Ok(None)`
 /// if no base could be detected, `HEAD` is unborn, or the histories are unrelated; `{0, 0}` when
 /// the worktree is already on the base branch.
-///
-/// Performs blocking I/O.
 pub fn ahead_behind_against_base(worktree_path: &Path) -> Result<Option<AheadBehind>, Error> {
     let repo = open_repo(worktree_path)?;
 
@@ -571,7 +530,6 @@ pub fn ahead_behind_against_base(worktree_path: &Path) -> Result<Option<AheadBeh
         .try_peel_to_id_in_place()
         .map_err(|source| Error::PeelHead(Box::new(source)))?;
     let Some(worktree_head_id) = worktree_head_id else {
-        // Unborn HEAD: nothing has been committed yet, so there is nothing to compare.
         return Ok(None);
     };
 
@@ -1257,8 +1215,6 @@ mod tests {
         );
     }
 
-    /// A worktree on its own default branch must still report uncommitted edits, by falling
-    /// back to `git diff HEAD`.
     #[test]
     fn on_default_branch_with_real_uncommitted_changes_shows_them() {
         let repo = init_repo();
@@ -1266,7 +1222,6 @@ mod tests {
         fs::write(repo.path().join("new.txt"), "brand new\n").expect("write");
 
         let result = diff_against_base(repo.path()).expect("diff_against_base");
-        // `diff()` must surface this the same way it surfaces a `Diff`.
         let via_diff_accessor = result.diff().cloned();
 
         let DiffBase::NoBase {
@@ -1283,20 +1238,10 @@ mod tests {
         assert_eq!(via_diff_accessor, Some(uncommitted));
     }
 
-    /// The shadow index must not disable git's racy-index protection.
-    ///
-    /// Git compares a file against its index entry by whole-second mtime plus size, so a
-    /// same-length edit in the same second is indistinguishable from "unchanged" unless the
-    /// entry is racy against the index file's own mtime. A shadow copy carrying a fresh mtime
-    /// makes every entry look comfortably old, and the edit vanishes from the diff.
-    ///
-    /// The alignment is forced here rather than waited for: cached mtime, on-disk mtime and the
-    /// index's mtime all pinned to one second, with the rewrite keeping the byte length.
     #[test]
     fn a_same_length_edit_racy_against_the_index_timestamp_is_still_reported() {
         use std::time::{Duration, SystemTime};
 
-        // A whole second, safely in the past so nothing else can land on it by accident.
         let racy = SystemTime::UNIX_EPOCH
             + Duration::from_secs(
                 SystemTime::now()
@@ -1320,7 +1265,6 @@ mod tests {
         git(path, &["config", "user.email", "test@example.com"]);
         git(path, &["config", "user.name", "Test User"]);
         fs::write(path.join("a.rs"), "fn a() -> i32 {\n    1\n}\n").expect("write a.rs");
-        // Pinned *before* `git add`, so this is the mtime git records in the index entry.
         pin_mtime(&path.join("a.rs"));
         git(path, &["add", "."]);
         git(path, &["commit", "-m", "initial"]);
@@ -1330,7 +1274,6 @@ mod tests {
         // the same second the index entry already records.
         fs::write(path.join("a.rs"), "fn a() -> i32 {\n    2\n}\n").expect("rewrite a.rs");
         pin_mtime(&path.join("a.rs"));
-        // The index sits in the racy window too, which is what the shadow copy must preserve.
         let index = fs::OpenOptions::new()
             .write(true)
             .open(path.join(".git/index"))
@@ -1369,7 +1312,6 @@ mod tests {
         git(repo.path(), &["commit", "-m", "add keep.txt"]);
 
         git(repo.path(), &["checkout", "-b", "feature"]);
-        // Left uncommitted, to also prove uncommitted changes are included.
         fs::write(repo.path().join("file.txt"), "hello\nworld\n").expect("write");
         fs::write(repo.path().join("new.txt"), "new file\n").expect("write");
         git(repo.path(), &["add", "new.txt"]);
@@ -1452,7 +1394,6 @@ mod tests {
     #[test]
     fn rename_is_detected() {
         let repo = init_repo();
-        // `-M`'s similarity threshold needs enough content to see a rename, not a delete+add.
         let content = "line\n".repeat(50);
         fs::write(repo.path().join("file.txt"), &content).expect("write");
         git(repo.path(), &["commit", "-am", "pad file.txt"]);
@@ -1527,7 +1468,6 @@ mod tests {
         );
 
         git(repo.path(), &["checkout", "-b", "feature"]);
-        // Delete the comment line, keep everything else.
         fs::write(
             repo.path().join("file.txt"),
             "line one\nline three\nline four\n",
@@ -1551,7 +1491,6 @@ mod tests {
             "the comment line should be parsed as a real removed line, not dropped as a \
              fake file header: {lines:?}"
         );
-        // Content after the `--- `-looking line must survive: the hunk was not truncated there.
         assert!(
             !lines
                 .iter()
@@ -1581,7 +1520,6 @@ mod tests {
         let DiffBase::Diff(diff) = result else {
             panic!("expected DiffBase::Diff, got {result:?}");
         };
-        // Exactly one changed file, and not "evil.txt" or anything else derived from content.
         assert_eq!(
             diff.files.len(),
             1,
@@ -1628,7 +1566,6 @@ mod tests {
         );
         git(dir.path(), &["config", "user.email", "test@example.com"]);
         git(dir.path(), &["config", "user.name", "Test User"]);
-        // `git clone` sets `refs/remotes/origin/HEAD` up as a symbolic ref for us.
         git(dir.path(), &["checkout", "-b", "feature"]);
         fs::write(dir.path().join("file.txt"), "hello\nfrom feature\n").expect("write");
 
@@ -1656,7 +1593,6 @@ mod tests {
         let repo = init_repo();
         git(repo.path(), &["checkout", "-b", "feature"]);
         fs::write(repo.path().join("brand_new.txt"), "content nobody staged\n").expect("write");
-        // Deliberately NOT `git add`ed.
 
         let result = diff_against_base(repo.path()).expect("diff_against_base");
         let DiffBase::Diff(diff) = result else {
@@ -1674,7 +1610,6 @@ mod tests {
             .flat_map(|h| &h.lines)
             .any(|l| l.kind == DiffLineKind::Added && l.content == "content nobody staged"));
 
-        // The real index was never touched: `git status` still reports the file as untracked.
         let status = Command::new("git")
             .current_dir(repo.path())
             .args(["status", "--porcelain"])
@@ -1763,8 +1698,6 @@ mod tests {
         ));
     }
 
-    /// A transient failure clears within milliseconds, so a second attempt succeeds without the
-    /// caller ever seeing an error.
     #[test]
     fn a_transient_failure_that_clears_on_retry_never_surfaces_to_the_caller() {
         let mut calls = 0;
@@ -1783,8 +1716,6 @@ mod tests {
         assert_eq!(calls, 2, "must have retried exactly once before succeeding");
     }
 
-    /// A failure that never clears must still surface once the bound is reached: this is a
-    /// bounded retry, not one that could hang the whole diff.
     #[test]
     fn a_transient_failure_that_never_clears_gives_up_after_the_bound() {
         let mut calls = 0;
@@ -1802,7 +1733,6 @@ mod tests {
         );
     }
 
-    /// Any other `git add` failure must not be retried or delayed: it will not resolve itself.
     #[test]
     fn a_non_transient_failure_is_never_retried() {
         let mut calls = 0;
@@ -1817,10 +1747,6 @@ mod tests {
         );
     }
 
-    /// No open handle on the shadow index's path may survive [`prepare_shadow_index`], since
-    /// Windows can refuse to rename a lock file over a destination that has one.
-    ///
-    /// Checked through `/proc/self/fd`: the failure is Windows-only but the invariant is not.
     #[test]
     fn prepare_shadow_index_closes_its_own_file_handle_before_returning() {
         let repo = init_repo();
@@ -1832,7 +1758,6 @@ mod tests {
 
         let fd_dir = Path::new("/proc/self/fd");
         if !fd_dir.is_dir() {
-            // No procfs: this particular check has no portable equivalent.
             return;
         }
         for entry in fs::read_dir(fd_dir).expect("read /proc/self/fd") {
@@ -1879,7 +1804,6 @@ mod tests {
             "a shadow index left behind by a killed process must be recognisably ours"
         );
 
-        // Dropping it still deletes it, so a `.git` directory does not fill up with these.
         let path = shadow.to_path_buf();
         assert!(path.exists());
         drop(shadow);
@@ -1889,8 +1813,6 @@ mod tests {
         );
     }
 
-    /// A linked worktree's index lives in its own `<common-dir>/worktrees/<name>`, so its shadow
-    /// index must land there rather than in the main checkout's `.git`.
     #[test]
     fn a_linked_worktrees_shadow_index_lives_in_that_worktrees_own_git_directory() {
         let repo = init_repo();
@@ -1924,9 +1846,6 @@ mod tests {
         let _ = fs::remove_dir_all(&wt_path);
     }
 
-    /// An untracked embedded git repository makes `git add -A` print a multi-line "adding
-    /// embedded git repository" warning to stderr. That is noise on a *successful* command, so
-    /// nothing in the diff pipeline may treat it as a failure.
     #[test]
     fn an_embedded_git_repository_in_the_worktree_does_not_fail_the_diff() {
         let repo = init_repo();
@@ -1956,7 +1875,6 @@ mod tests {
             "the real untracked file must still be reported alongside the embedded repository"
         );
 
-        // The real index is still untouched: the embedded repo is still untracked.
         let status = Command::new("git")
             .current_dir(repo.path())
             .args(["status", "--porcelain"])
@@ -1980,13 +1898,10 @@ mod tests {
         git(repo.path(), &["commit", "-m", "add keep.txt"]);
         git(repo.path(), &["checkout", "-b", "feature"]);
 
-        // Committed since branch point.
         fs::write(repo.path().join("keep.txt"), "keep\ncommitted\n").expect("write");
         git(repo.path(), &["commit", "-am", "commit on feature"]);
-        // Uncommitted (staged) change.
         fs::write(repo.path().join("file.txt"), "hello\nstaged\n").expect("write");
         git(repo.path(), &["add", "file.txt"]);
-        // Untracked, never staged.
         fs::write(repo.path().join("new_untracked.txt"), "new\n").expect("write");
 
         let result = diff_against_base(repo.path()).expect("diff_against_base");
@@ -2293,7 +2208,6 @@ index 0000000..fedcba9
     fn merge_status_reports_merged_true_for_a_worktree_fully_contained_in_base() {
         let repo = init_repo();
         git(repo.path(), &["checkout", "-b", "feature"]);
-        // No new commits on `feature`: it's exactly `main`, so it's trivially "merged".
         git(repo.path(), &["checkout", "main"]);
 
         // Real linked worktree, not just a branch switch in place - this is what the rail
@@ -2354,7 +2268,6 @@ index 0000000..fedcba9
     fn merge_status_is_none_when_no_base_is_detectable() {
         let dir = TempDir::new().expect("tempdir");
         git(dir.path(), &["init", "-b", "main"]);
-        // Unborn HEAD: nothing committed yet.
         let status = merge_status_against_base(dir.path()).expect("merge_status_against_base");
         assert_eq!(status, None);
     }
@@ -2392,10 +2305,6 @@ index 0000000..fedcba9
         assert_eq!(result, None);
     }
 
-    /// Real, independently diverged histories on each side: two commits ahead on `feature`
-    /// after branching, then one commit added to `main` afterward - the exact shape the status
-    /// bar's `↑2 ↓0`-style indicator needs to be able to show a non-zero `behind` too, not just
-    /// `ahead`.
     #[test]
     fn ahead_behind_counts_real_diverged_commits_on_each_side() {
         let repo = init_repo();
@@ -2441,13 +2350,6 @@ index 0000000..fedcba9
         );
     }
 
-    /// The audit's exact reproduction of the wrong-ref bug: the detected base comes from
-    /// `refs/remotes/origin/HEAD` (short name `main`), but a *local* `main` branch of the same
-    /// short name also exists and has gone stale relative to `origin/main`. Before this fix,
-    /// `ahead_behind_against_base` handed git the bare short name `main`, which git's own
-    /// disambiguation rules resolve against the stale local branch (`refs/heads/main`) rather
-    /// than the fresh remote-tracking commit that was actually detected as the real base -
-    /// silently reporting `↓0` (up to date) when the real, correct answer is `↓2`.
     #[test]
     fn ahead_behind_is_computed_against_the_detected_base_commit_not_a_stale_local_branch_of_the_same_name(
     ) {
@@ -2476,7 +2378,6 @@ index 0000000..fedcba9
         );
         git(dir.path(), &["config", "user.email", "test@example.com"]);
         git(dir.path(), &["config", "user.name", "Test User"]);
-        // A real feature branch, checked out from `main` at the clone-time commit.
         git(dir.path(), &["checkout", "-b", "feature"]);
 
         // Advance origin's `main` two real commits further (from the seed clone - the origin
@@ -2508,11 +2409,6 @@ index 0000000..fedcba9
         assert_eq!(ahead_behind.ahead, 0);
     }
 
-    /// If `rev-list`'s output is ever not in the expected `<behind> <ahead>` shape, this must
-    /// report an honest "unknown" (`None`) rather than fabricating a confident-looking
-    /// `{ahead: 0, behind: 0}` via `.unwrap_or(0)`. Exercises the exact real parsing function
-    /// [`ahead_behind_against_base`] itself calls on `rev-list`'s real stdout, not a
-    /// reimplementation that could drift from it.
     #[test]
     fn unparsable_rev_list_output_parses_to_none_not_a_fabricated_zero() {
         assert_eq!(

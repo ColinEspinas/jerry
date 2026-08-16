@@ -35,11 +35,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-/// A single git worktree: either the main working tree of a repository, or one of the
-/// linked worktrees created by `git worktree add`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Worktree {
-    /// Absolute path to the worktree's working directory.
     pub path: PathBuf,
     /// The short name of the branch checked out in this worktree (e.g. `"main"`), or
     /// `None` if `HEAD` is detached.
@@ -47,7 +44,6 @@ pub struct Worktree {
     /// The full commit id `HEAD` currently resolves to, or `None` if the branch is
     /// "unborn" (a freshly initialized repository with no commits yet).
     pub head_commit: Option<String>,
-    /// Whether this is the main worktree, as opposed to one from `git worktree add`.
     pub is_main: bool,
     /// See `git worktree lock`. Always `false` for the main worktree: git has no lock concept
     /// for it, so this is not an unchecked case.
@@ -56,9 +52,7 @@ pub struct Worktree {
     pub lock_reason: Option<String>,
 }
 
-/// One worktree's metadata, or the error that made it unreadable.
-///
-/// Per-entry so that one corrupt worktree does not hide the others.
+/// Fallible per entry, so one corrupt worktree does not hide the others.
 pub type WorktreeResult = Result<Worktree, Error>;
 
 /// Lists every worktree belonging to the repository at `repo_path`, which may itself be any one
@@ -66,8 +60,6 @@ pub type WorktreeResult = Result<Worktree, Error>;
 ///
 /// Entries are independent: an unreadable worktree is an `Err` in its own entry. The outer
 /// `Result` covers only failures that make listing impossible at all.
-///
-/// Performs blocking I/O; see the crate-level docs.
 pub fn list_worktrees(repo_path: &Path) -> Result<Vec<WorktreeResult>, Error> {
     let repo = open_repo(repo_path)?;
     // Normalizing to the main repository is what makes `worktrees()` enumerate all of them
@@ -99,7 +91,6 @@ fn open_repo(repo_path: &Path) -> Result<gix::Repository, Error> {
     })
 }
 
-/// Reads a linked worktree's location and lock state, then opens it for the rest.
 fn describe_linked_worktree(proxy: gix::worktree::Proxy<'_>) -> Result<Worktree, Error> {
     let path = proxy.base()?;
     let is_locked = proxy.is_locked();
@@ -117,7 +108,6 @@ fn describe_linked_worktree(proxy: gix::worktree::Proxy<'_>) -> Result<Worktree,
     describe_worktree(&linked_repo, path, false, is_locked, lock_reason)
 }
 
-/// Assembles a [`Worktree`] from `repo`'s `HEAD` plus already-known metadata.
 fn describe_worktree(
     repo: &gix::Repository,
     path: PathBuf,
@@ -156,26 +146,17 @@ pub struct WorktreeStatus {
     /// Absolute path to the worktree's working directory (or where it used to be, if
     /// [`Self::is_prunable`]).
     pub path: PathBuf,
-    /// Whether this is the main worktree - true for the first entry `git worktree list`
-    /// reports, unless that entry is itself [`Self::is_bare`] (a bare repository has no main
-    /// *worktree* to report, mirroring [`list_worktrees`]'s own doc for the gix-backed path).
     pub is_main: bool,
-    /// Whether this entry is the bare repository itself (only ever the first entry, and only
-    /// for a bare repository) rather than a real checkout.
     pub is_bare: bool,
     /// The full commit id `HEAD` resolves to, or `None` for an unborn branch.
     pub head_commit: Option<String>,
     /// The short branch name if `HEAD` is a real branch ref, `None` if detached or bare.
     pub branch: Option<String>,
-    /// Whether `HEAD` is detached (a real commit checked out directly, not via a branch ref).
     pub is_detached: bool,
-    /// Whether the worktree is locked (`git worktree lock`).
     pub is_locked: bool,
-    /// The reason given when locked, if any and non-empty.
     pub lock_reason: Option<String>,
     /// Whether git considers this prunable: its metadata points at a working tree that is gone.
     pub is_prunable: bool,
-    /// The reason git gives, if any and non-empty; typically names the missing path.
     pub prunable_reason: Option<String>,
 }
 
@@ -184,8 +165,6 @@ pub struct WorktreeStatus {
 ///
 /// No per-entry fallibility, unlike [`list_worktrees`]: git has already resolved every entry by
 /// the time this output exists.
-///
-/// Performs blocking I/O; see the crate-level docs.
 pub fn list_worktrees_porcelain(repo_path: &Path) -> Result<Vec<WorktreeStatus>, Error> {
     let args: Vec<OsString> = vec!["worktree".into(), "list".into(), "--porcelain".into()];
     let output = run_git(repo_path, &args)?;
@@ -194,9 +173,7 @@ pub fn list_worktrees_porcelain(repo_path: &Path) -> Result<Vec<WorktreeStatus>,
     Ok(parse_worktree_list_porcelain(&stdout))
 }
 
-/// Parses `git worktree list --porcelain` into [`WorktreeStatus`] rows.
-///
-/// The porcelain form, not the default table, because the latter is ambiguous for a path
+/// Parses the porcelain form, not the default table, which is ambiguous for a path
 /// containing spaces. Each line is split on its *first* space only, so a space-containing value
 /// is never truncated. Unrecognized keys are ignored, per git's porcelain contract. CRLF is
 /// normalized first, so this parses identically on Windows.
@@ -278,8 +255,6 @@ pub fn parse_worktree_list_porcelain(text: &str) -> Vec<WorktreeStatus> {
 ///
 /// git prints a relative path when run from inside the repository, so the result is resolved
 /// against `repo_path`.
-///
-/// Performs blocking I/O; see the crate-level docs.
 pub fn git_common_dir(repo_path: &Path) -> Result<PathBuf, Error> {
     let args: Vec<OsString> = vec!["rev-parse".into(), "--git-common-dir".into()];
     let output = run_git(repo_path, &args)?;
@@ -304,8 +279,6 @@ fn absolutize(path: &Path, base: &Path) -> PathBuf {
 /// `branch` creates and checks out a new branch; otherwise `commit_ish` is checked out directly.
 /// Both `None` lets git pick its default. Positionals go after `--`, so a flag-shaped value can
 /// never be misparsed as one.
-///
-/// Performs blocking I/O; see the crate-level docs.
 pub fn add_worktree(
     repo_path: &Path,
     worktree_path: &Path,
@@ -334,8 +307,6 @@ pub fn add_worktree(
 ///
 /// `force` passes `--force` twice: once overrides a dirty worktree, but git wants it twice to
 /// override a *locked* one, so a single flag would still silently refuse those.
-///
-/// Performs blocking I/O; see the crate-level docs.
 pub fn remove_worktree(repo_path: &Path, worktree_path: &Path, force: bool) -> Result<(), Error> {
     let worktree_path = absolutize(worktree_path, repo_path);
 
@@ -363,8 +334,6 @@ pub fn remove_worktree(repo_path: &Path, worktree_path: &Path, force: bool) -> R
 /// Reads at most one byte of `git status --porcelain` - any output at all means dirty - so a huge
 /// untracked tree is never buffered. The child is killed rather than left to block on a full pipe,
 /// then reaped.
-///
-/// Performs blocking I/O; see the crate-level docs.
 pub fn is_dirty(worktree_dir: &Path) -> Result<bool, Error> {
     let args: Vec<OsString> = vec![
         "status".into(),
@@ -553,7 +522,6 @@ mod tests {
         let repo = init_repo();
         let linked_dir = TempDir::new().expect("tempdir");
         let linked_path = linked_dir.path().join("linked-wt");
-        // Remove the dir itself; `git worktree add` creates it.
         drop(linked_dir);
 
         git(
@@ -820,7 +788,6 @@ mod tests {
 
         add_worktree(repo.path(), &linked_path, Some("dirty-branch"), None).expect("add_worktree");
 
-        // Dirty a tracked file without committing.
         fs::write(linked_path.join("file.txt"), "changed\n").expect("write");
 
         let err = remove_worktree(repo.path(), &linked_path, false)
@@ -839,7 +806,6 @@ mod tests {
             "worktree directory must still exist after a refused removal"
         );
 
-        // Now force it.
         remove_worktree(repo.path(), &linked_path, true).expect("forced remove should succeed");
         assert!(!linked_path.exists());
     }
@@ -854,7 +820,6 @@ mod tests {
         add_worktree(repo.path(), &linked_path, Some("untracked-branch"), None)
             .expect("add_worktree");
 
-        // An untracked file must also count as dirty.
         fs::write(linked_path.join("new_untracked.txt"), "surprise\n").expect("write");
 
         let err = remove_worktree(repo.path(), &linked_path, false)
@@ -1094,11 +1059,6 @@ mod tests {
         assert_eq!(linked.lock_reason.as_deref(), Some("on a USB drive"));
     }
 
-    /// The real, honest reproduction of the issue's "prunable / missing worktree" case: the
-    /// worktree's own directory is deleted by hand (not via `git worktree remove`), leaving
-    /// git's own administrative metadata pointing at nothing. `git worktree list --porcelain`
-    /// is expected to flag this itself - this test asserts that real git behavior, not an
-    /// assumption about it.
     #[test]
     fn list_worktrees_porcelain_flags_a_manually_deleted_worktree_as_prunable() {
         let repo = init_repo();

@@ -855,17 +855,6 @@ mod tests {
         );
     }
 
-    /// A long stream must arrive complete and in order however it gets split into chunks - the
-    /// property [`READ_BUF_SIZE`] and [`OUTPUT_CHANNEL_CAPACITY`] could otherwise silently trade
-    /// away. Every line carries its index, so a dropped or truncated chunk fails at the exact
-    /// line rather than on a vague length mismatch.
-    ///
-    /// The consumer drains *slowly* on purpose: a tight `recv` loop keeps the channel near-empty,
-    /// so the reader never blocks in `send` and the backpressure path - the one a real consumer
-    /// on a timer exercises constantly, and where a mistake would lose bytes - goes untested.
-    ///
-    /// `seq` writes into a pty, so the line discipline turns each `\n` into `\r\n`; the
-    /// comparison below normalizes that rather than pretending it doesn't happen.
     #[test]
     fn long_output_arrives_complete_and_in_order_across_chunk_boundaries() {
         const LINES: usize = 200_000;
@@ -873,7 +862,6 @@ mod tests {
         let session = spawn(SpawnOptions::new("seq").arg("1").arg(LINES.to_string()))
             .expect("spawning `seq` should succeed");
 
-        // Drain to EOF, not to a needle: stopping early would hide loss.
         let mut collected = Vec::new();
         let mut received = 0usize;
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -886,7 +874,6 @@ mod tests {
                 Ok(chunk) => {
                     collected.extend_from_slice(&chunk);
                     received += 1;
-                    // This pause is what fills the channel and blocks the reader.
                     if received.is_multiple_of(OUTPUT_CHANNEL_CAPACITY) {
                         std::thread::sleep(Duration::from_millis(5));
                     }
@@ -918,7 +905,6 @@ mod tests {
         }
     }
 
-    // unix-only: uses the `#[cfg(unix)]` `pid_exists`/`is_executable` helpers directly.
     #[cfg(unix)]
     #[test]
     fn drop_kills_child_and_it_does_not_become_an_orphan() {
@@ -947,7 +933,6 @@ mod tests {
         }
     }
 
-    // unix-only: uses the `#[cfg(unix)]` `pid_exists`/`is_executable` helpers directly.
     #[cfg(unix)]
     #[test]
     fn drop_terminates_entire_process_tree_including_escaped_grandchild() {
@@ -991,7 +976,6 @@ mod tests {
         }
     }
 
-    // unix-only: uses the `#[cfg(unix)]` `pid_exists`/`is_executable` helpers directly.
     #[cfg(unix)]
     #[test]
     fn shutdown_reaps_child_deterministically_without_lingering_zombie() {
@@ -1010,9 +994,6 @@ mod tests {
         );
     }
 
-    /// Observes `/proc/<pid>/status`'s `State:` line, so this proves the process actually stops
-    /// and restarts rather than that the calls returned `Ok`. The kernel reports `T` only for a
-    /// process `SIGSTOP` really landed on.
     #[cfg(target_os = "linux")]
     #[test]
     fn pause_really_stops_the_process_and_resume_really_restarts_it() {
@@ -1031,7 +1012,6 @@ mod tests {
             .process_id()
             .expect("a spawned unix child should report a pid");
 
-        // Let the freshly spawned process settle into a steady state first.
         let deadline = Instant::now() + Duration::from_secs(5);
         while !proc_state(pid).starts_with('S') && !proc_state(pid).starts_with('R') {
             assert!(
@@ -1072,9 +1052,6 @@ mod tests {
         }
     }
 
-    /// Pausing must reach a grandchild that escaped the process group via its own `setsid()`, not
-    /// just the direct child. A bare `kill` would leave it running and writing files as if
-    /// nothing had paused.
     #[cfg(target_os = "linux")]
     #[test]
     fn pause_and_resume_really_reach_an_escaped_grandchild_process_too() {
@@ -1197,7 +1174,6 @@ mod tests {
                 .expect("VmRSS should be present and parseable in /proc/self/status")
         }
 
-        // Kept alive for the measurement window; its `Drop` is what tears `yes` down.
         let _session = spawn(SpawnOptions::new("yes")).expect("spawning `yes` should succeed");
 
         let rss_before = read_self_rss_kb();
@@ -1216,8 +1192,6 @@ mod tests {
         );
     }
 
-    /// A live session must report a working writer and keep accepting writes. The check gates
-    /// `write_input`, so one that fired by accident would break every paste and sent prompt.
     #[test]
     fn a_live_session_reports_a_healthy_writer_and_keeps_accepting_writes() {
         let session = spawn(SpawnOptions::new("cat")).expect("spawning `cat` should succeed");
@@ -1232,8 +1206,6 @@ mod tests {
         assert!(String::from_utf8_lossy(&output).contains("still-writing"));
     }
 
-    /// And the closed half: once the session has been shut down there is no writer at all, so a
-    /// write must be a typed error rather than a silent success into nothing.
     #[test]
     fn a_shut_down_session_refuses_writes() {
         let mut session = spawn(SpawnOptions::new("cat")).expect("spawning `cat` should succeed");
@@ -1301,10 +1273,6 @@ mod tests {
         }
     }
 
-    /// End-to-end proof that [`resolve_on_path`] returns a path that exists, is a file and is
-    /// executable - not just that it found something. This suite assumes a unix shell
-    /// environment throughout, matching CI, which only builds on non-Linux.
-    // unix-only: uses the `#[cfg(unix)]` `pid_exists`/`is_executable` helpers directly.
     #[cfg(unix)]
     #[test]
     fn resolve_on_path_finds_a_real_binary_and_the_path_is_itself_real() {
@@ -1320,10 +1288,6 @@ mod tests {
         assert!(resolved.is_absolute(), "resolved path should be absolute");
     }
 
-    /// The exact real, non-panicking "not found" case the app's Settings › Agents page
-    /// depends on for a genuinely-absent binary (e.g. `codex` on a dev machine that never
-    /// installed it) to show a real "not found" status rather than silently panicking or
-    /// fabricating a `ready` state.
     #[test]
     fn resolve_on_path_returns_none_for_a_binary_that_does_not_exist() {
         assert_eq!(
@@ -1332,17 +1296,6 @@ mod tests {
         );
     }
 
-    /// A directory that happens to share the binary's name must not be mistaken for it -
-    /// this is exactly the `candidate.is_dir()` guard `portable-pty`'s own `search_path`
-    /// has (see [`resolve_on_path`]'s docs); the equivalent guard here is `is_file()`,
-    /// checked directly against a real temporary directory of that name to prove it isn't
-    /// just an untested claim in a comment.
-    ///
-    /// Builds a real, isolated `PATH` value and passes it directly to
-    /// [`resolve_in_path_var`] rather than mutating the real process-global `PATH` via
-    /// `std::env::set_var` - that would need `unsafe` and would be genuinely racy against
-    /// `cargo test`'s default concurrent test execution (see [`resolve_in_path_var`]'s
-    /// docs), for zero benefit: the search loop under test never reads `std::env` itself.
     #[test]
     fn resolve_on_path_skips_a_same_named_directory() {
         let tmp = tempfile::TempDir::new().expect("tempdir");

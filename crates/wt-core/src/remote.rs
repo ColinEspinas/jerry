@@ -13,8 +13,6 @@ use crate::error::Error;
 use crate::{check_success, run_git};
 
 /// `git fetch` for whatever remote a bare fetch resolves to. Updates remote-tracking refs only.
-///
-/// Performs blocking I/O.
 pub fn fetch(worktree_path: &Path) -> Result<(), Error> {
     let args: Vec<OsString> = vec!["fetch".into()];
     let output = run_git(worktree_path, &args)?;
@@ -23,15 +21,12 @@ pub fn fetch(worktree_path: &Path) -> Result<(), Error> {
 
 /// `git pull` into the current branch. Conflicts, a detached `HEAD`, and changes that would be
 /// overwritten all surface as git's own stderr.
-///
-/// Performs blocking I/O.
 pub fn pull(worktree_path: &Path) -> Result<(), Error> {
     let args: Vec<OsString> = vec!["pull".into()];
     let output = run_git(worktree_path, &args)?;
     check_success(&args, &output)
 }
 
-/// How hard [`push`] should push.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PushForce {
     /// Refuses outright on any non-fast-forward.
@@ -43,12 +38,8 @@ pub enum PushForce {
     Force,
 }
 
-/// Pushes `worktree_path`'s current branch.
-///
 /// A branch with no upstream gets `--set-upstream origin <branch>` folded into the same push,
 /// rather than failing and needing a second recovery step.
-///
-/// Performs blocking I/O.
 pub fn push(worktree_path: &Path, force: PushForce) -> Result<(), Error> {
     let branch = current_branch_name(worktree_path)?;
     let has_upstream = has_configured_upstream(worktree_path, None)?;
@@ -72,8 +63,6 @@ pub fn push(worktree_path: &Path, force: PushForce) -> Result<(), Error> {
 ///
 /// The `--` terminator is mandatory: `git push origin --evil` is otherwise read as an option
 /// (`error: unknown option 'evil'`) rather than refused as a refspec.
-///
-/// Performs blocking I/O.
 pub fn push_branch(worktree_path: &Path, branch: &str, force: PushForce) -> Result<(), Error> {
     let has_upstream = has_configured_upstream(worktree_path, Some(branch))?;
 
@@ -88,8 +77,6 @@ pub fn push_branch(worktree_path: &Path, branch: &str, force: PushForce) -> Resu
     check_success(&args, &output)
 }
 
-/// The argument prefix both [`push`] and [`push_branch`] start from, shared so the two cannot
-/// disagree about what a [`PushForce`] means.
 fn push_args(force: PushForce) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec!["push".into()];
     match force {
@@ -100,7 +87,6 @@ fn push_args(force: PushForce) -> Vec<OsString> {
     args
 }
 
-/// The current branch's short name, for [`push`]'s `--set-upstream` fallback.
 fn current_branch_name(worktree_path: &Path) -> Result<String, Error> {
     let args: Vec<OsString> = vec!["rev-parse".into(), "--abbrev-ref".into(), "HEAD".into()];
     let output = run_git(worktree_path, &args)?;
@@ -194,7 +180,6 @@ mod tests {
         git(seed.path(), &["push", "origin", "main"]);
 
         let local = clone_of(remote.path());
-        // Advance the remote after the clone, so `fetch` has something to do.
         commit(seed.path(), "b.txt", "1", "second");
         git(seed.path(), &["push", "origin", "main"]);
 
@@ -253,7 +238,6 @@ mod tests {
         git(seed.path(), &["push", "origin", "main"]);
 
         let local = clone_of(remote.path());
-        // Diverge both sides on the same line, so the merge conflicts.
         commit(seed.path(), "a.txt", "remote change", "remote diverges");
         git(seed.path(), &["push", "origin", "main"]);
         commit(local.path(), "a.txt", "local change", "local diverges");
@@ -372,7 +356,6 @@ mod tests {
         git(seed.path(), &["push", "origin", "main"]);
 
         let local = clone_of(remote.path());
-        // Someone else pushes after the clone's last knowledge of the remote.
         commit(seed.path(), "c.txt", "1", "someone else's push");
         git(seed.path(), &["push", "origin", "main"]);
         commit(local.path(), "b.txt", "1", "local work");
@@ -473,7 +456,6 @@ mod tests {
         git(seed.path(), &["push", "origin", "main"]);
 
         let local = clone_of(remote.path());
-        // `main` stays checked out, so a push that used `HEAD` instead would be visible here.
         git(local.path(), &["checkout", "-b", "side-branch"]);
         commit(local.path(), "b.txt", "1", "side work");
         git(local.path(), &["checkout", "main"]);
@@ -563,7 +545,6 @@ mod tests {
         git(seed.path(), &["push", "origin", "main"]);
 
         let local = clone_of(remote.path());
-        // Both sides move: a divergence a plain push must refuse.
         commit(seed.path(), "c.txt", "1", "diverged upstream work");
         git(seed.path(), &["push", "origin", "main"]);
         commit(local.path(), "b.txt", "1", "local work");
