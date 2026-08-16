@@ -7,12 +7,14 @@ use super::lsp_ui::{
 };
 use super::zoom::zoom_scoped;
 use super::*;
-use crate::lsp::client::{lsp_file_status, LspFileStatus};
 #[cfg(test)]
-use crate::root::focus::palette_focus_tests;
+use crate::code_surface::fixtures::temp_repo;
+use crate::lsp::client::{lsp_file_status, LspFileStatus};
 use crate::root::plural;
 use crate::root::scrollbar;
 use crate::root::widgets::render_sidebar_message;
+#[cfg(test)]
+use crate::test_support::open_test_app;
 use std::collections::HashSet;
 
 impl AdeApp {
@@ -1863,13 +1865,13 @@ mod lsp_failed_status_chip_tests {
     async fn clicking_the_failed_status_chip_really_restarts_the_language_servers(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let root = repo.path().to_path_buf();
         std::fs::create_dir_all(root.join("src")).expect("mkdir src");
         let main_rs = root.join("src").join("main.rs");
         std::fs::write(&main_rs, "fn main() {}\n").expect("write main.rs");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, root.clone());
+        let (app, cx) = open_test_app(cx, root.clone());
         let key = (root.clone(), "rust-analyzer");
         app.update_in(cx, |app, window, cx| {
             // A real, already-recorded failure - exactly the state `reap_dead_lsp_clients` puts a
