@@ -215,20 +215,22 @@ impl AdeApp {
         )
     }
 
-    /// The environment chip and the palette/agent keycap hints - all that is left on the right
-    /// after §4b's subtractive pass (the file/editor cluster and the LSP counts were the rest of
-    /// it, and both are gone).
+    /// The environment chip and the palette keycap hint - all that is left on the right after
+    /// §4b's subtractive pass (the file/editor cluster and the LSP counts were the rest of it,
+    /// and both are gone).
+    ///
+    /// This used to also carry a second hint, a `secondary-1`..`secondary-8` agent-jump keycap
+    /// row (`Self::render_status_agent_hint`, mirroring the tab strip's own right-aligned copy -
+    /// `work_surface::render::AdeApp::render_tab_strip`). GitHub issue #397, a direct
+    /// product-owner report: at zero real agent sessions in the current worktree the keycap row
+    /// rendered empty and left the bare word "agent" floating with nothing in front of it, which
+    /// read as clutter rather than a useful hint. The underlying `secondary-1`..`secondary-8`
+    /// jump keybindings (`root::AdeApp::jump_to_agent_at`) are unaffected - only the advertising
+    /// hint is gone.
     fn render_status_bar_right(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let hints = div()
-            .flex()
-            .items_center()
-            .gap(px(16.0))
-            .child(self.render_status_palette_hint(cx))
-            .child(self.render_status_agent_hint());
-
         render_status_segment_row(vec![
             render_env_chip().into_any_element(),
-            hints.into_any_element(),
+            self.render_status_palette_hint(cx).into_any_element(),
         ])
         .into_any_element()
     }
@@ -567,26 +569,6 @@ impl AdeApp {
             .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
                 this.open_palette(window, cx);
             }))
-    }
-
-    /// The real agent-jump keycap hint (`secondary-1`..`secondary-8`) - reuses
-    /// [`Self::agent_jump_keys`], the exact same computation `Self::render_tab_strip`'s own
-    /// right-aligned cluster uses, not a second copy that could drift from what's really bound.
-    fn render_status_agent_hint(&self) -> impl IntoElement {
-        let jump_keys = self.agent_jump_keys();
-        div()
-            .flex()
-            .items_center()
-            .gap(px(6.0))
-            .child(render_keycap_row(&jump_keys, KeycapSize::Standard))
-            .child(
-                div()
-                    .font(font(theme::font::SANS))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_size(self.ui_text_size(10.5))
-                    .text_color(theme::text::FAINT)
-                    .child("agent"),
-            )
     }
 
     /// One status-bar readout, rendered in its assigned [`StatusTier`] - the one place a bar

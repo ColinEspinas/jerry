@@ -890,10 +890,10 @@ impl AdeApp {
 
     /// [`Self::current_worktree_agents`] narrowed to **real agent sessions**
     /// (`ProcessKind::is_agent_session`) - the list every surface that says the word *agent* to
-    /// the user counts and indexes by: [`Self::agent_jump_keys`]/[`Self::jump_to_agent_at`] (the
-    /// `secondary-1`..`secondary-8` keycaps and the status bar's copy of them),
-    /// [`Self::select_relative_agent`] (the title bar's `Next Agent`/`Previous Agent`), and that
-    /// pair's own menu-enablement predicate.
+    /// the user counts and indexes by: [`Self::jump_to_agent_at`] (the `secondary-1`..
+    /// `secondary-8` bindings - no longer advertised by an on-screen keycap hint, removed per a
+    /// direct product-owner request), [`Self::select_relative_agent`] (the title bar's `Next
+    /// Agent`/`Previous Agent`), and that pair's own menu-enablement predicate.
     ///
     /// Same order as the strip, just with the shells dropped, so `secondary-2` still means "the
     /// second agent you can see, reading left to right" - it simply stops counting the terminal
@@ -968,7 +968,15 @@ impl AdeApp {
     /// [`Self::render_agent_tab`] for a `TabRef::Agent`, [`Self::render_file_tab`] for a
     /// `TabRef::File` - so an agent tab and a file tab can sit side by side in either order
     /// (GitHub issue #16), rather than always "every agent, then every file" - followed by the
-    /// `+` menu button ([`Self::render_tab_strip_plus`]) and right-aligned agent-jump keycaps.
+    /// `+` menu button ([`Self::render_tab_strip_plus`]).
+    ///
+    /// This used to end in a right-aligned `secondary-1`..`secondary-8` agent-jump keycap hint
+    /// (mirrored by the status bar's own copy, `status_bar::render::AdeApp::
+    /// render_status_agent_hint`). GitHub issue #397, a direct product-owner report: at zero
+    /// real agent sessions in the current worktree the keycap row rendered empty and left the
+    /// bare word "agent" floating with nothing in front of it, which read as clutter rather than
+    /// a useful hint. The underlying `secondary-1`..`secondary-8` jump keybindings
+    /// ([`Self::jump_to_agent_at`]) are unaffected - only the advertising hint is gone.
     ///
     /// Each agent tab's label is read per tab, inside the loop below
     /// (`Self::agent_tab_label`): a label is now purely a fact about that one pane's own live
@@ -999,9 +1007,16 @@ impl AdeApp {
     /// The `+` button rides inside the same scrollable region, immediately after the last tab
     /// (exactly where it already sits when nothing overflows), so reaching it when tabs overflow
     /// is the same one scroll gesture that reaches the last tab - not a second, independently
-    /// reachable control. The trailing spacer and the right-aligned agent-jump keycap cluster stay
-    /// **outside** the scrollable region, as `#tab-strip`'s own direct children: they are chrome
-    /// that should always stay visible/pinned, not part of what can be scrolled through.
+    /// reachable control.
+    ///
+    /// A trailing chrome spacer stays **outside** the scrollable region, as `#tab-strip`'s own
+    /// direct child alongside the scroller: always visible/pinned, not part of what can be
+    /// scrolled through. It used to carry a real right-aligned agent-jump keycap hint, removed
+    /// per a direct product-owner request (see [`Self::render_tab_strip`]'s own top docs) - a
+    /// bare 12px bordered spacer is kept in its place, both to give the strip's trailing edge the
+    /// same breathing room every other 12px chrome margin in this bar gets (rather than leaving
+    /// the `+` button flush against the window's edge), and to keep carrying its own slice of
+    /// §4v's bottom rule (`.border_b_1()`) exactly as it did with the hint still in it.
     pub(in crate::work_surface) fn render_tab_strip(
         &self,
         cx: &mut Context<Self>,
@@ -1084,40 +1099,13 @@ impl AdeApp {
 
         scroller = scroller.child(self.render_tab_strip_plus(cx));
 
-        let jump_keys = self.agent_jump_keys();
-
         bar.child(scroller).child(
             div()
                 .flex_none()
-                .flex()
-                .items_center()
-                .gap(px(6.0))
-                .px(px(12.0))
+                .w(px(12.0))
                 .border_b_1()
-                .border_color(theme::border::RAIL_INNER)
-                .child(render_keycap_row(&jump_keys, KeycapSize::Standard))
-                .child(
-                    div()
-                        .font(font(theme::font::SANS))
-                        .text_size(px(10.0))
-                        .text_color(theme::text::PATH)
-                        .child("agent"),
-                ),
+                .border_color(theme::border::RAIL_INNER),
         )
-    }
-
-    /// The real `secondary-1`..`secondary-8` agent-jump keycap labels: one per **real agent
-    /// session** open in the *currently selected* worktree
-    /// ([`Self::current_worktree_agent_sessions`] - a plain shell is not an agent and gets no
-    /// number, see that method's docs), capped at 8 since those are the only ones actually bound
-    /// (`crate::default_key_bindings`) - never a keycap advertising a shortcut that silently does
-    /// nothing, and (GitHub issue #381) never one more keycap than there are agents for them to
-    /// land on. Shared by [`Self::render_tab_strip`]'s own right-aligned cluster and the status
-    /// bar's agent hint (`status_bar::render::render_status_agent_hint`), so the two can never
-    /// independently drift on what's really bound.
-    pub(crate) fn agent_jump_keys(&self) -> Vec<String> {
-        let agent_count = self.current_worktree_agent_sessions().count().min(8);
-        (1..=agent_count).map(|n| n.to_string()).collect()
     }
 
     /// Every tab kind's own `×` close hit box - identical id-suffixing, size, hover, and styling
@@ -1762,10 +1750,10 @@ impl AdeApp {
 
     /// The `+` menu's "Next changed file" action (`]`) - opens the next changed file after the
     /// active file tab as a tab, wrapping around to the first once the last is passed (so a
-    /// repeated `]` press cycles indefinitely, matching how the agent-jump keycaps and palette
-    /// arrow keys already treat "next"/"previous"). If the active file isn't itself a changed
-    /// file, or nothing is active, this opens the first changed file. No-op if there's no loaded
-    /// diff, or it has no changed files.
+    /// repeated `]` press cycles indefinitely, matching how `secondary-1`..`secondary-8` and
+    /// palette arrow keys already treat "next"/"previous"). If the active file isn't itself a
+    /// changed file, or nothing is active, this opens the first changed file. No-op if there's no
+    /// loaded diff, or it has no changed files.
     pub(crate) fn next_changed_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let next_path = {
             let Some(diff) = self.current_diff() else {
@@ -1787,10 +1775,13 @@ impl AdeApp {
         self.open_change_diff(next_path, window, cx);
     }
 
-    /// The tab strip's agent-jump keycaps (`secondary-1`..`secondary-8`) - jumps to the **real
-    /// agent session** at 1-indexed `position` in the same order [`Self::render_tab_strip`]
-    /// iterates ([`Self::current_worktree_agent_sessions`]), via [`Self::select_agent`]. No-op if
-    /// fewer than `position` agent sessions are currently open in the selected worktree.
+    /// The real handler behind the `secondary-1`..`secondary-8` keybindings - jumps to the
+    /// **real agent session** at 1-indexed `position` in the same order
+    /// [`Self::render_tab_strip`] iterates ([`Self::current_worktree_agent_sessions`]), via
+    /// [`Self::select_agent`]. No-op if fewer than `position` agent sessions are currently open
+    /// in the selected worktree. No longer advertised by any on-screen keycap hint (removed per
+    /// a direct product-owner request), but the bindings themselves are still real and
+    /// unaffected.
     ///
     /// GitHub issue #381: a plain [`ProcessKind::Shell`] does not take a number. It used to, and
     /// the position it consumed was the user's own live report - the *worktree's startup shell*
