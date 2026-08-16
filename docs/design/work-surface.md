@@ -1,7 +1,9 @@
 # Zone 2 — the work surface
 
-**Code:** `crates/app/src/work_surface/`, and the surfaces it hosts — `terminal/`, `code_surface/`, `lsp/`, `merge/`, `graph_view/`, `review/`, `review_notes/`, `run_history/`, `provenance/`, `budget/`
-**Tokens:** `theme::{term, editor, diff, syntax, band, button, completions_popup}`
+- **Code:** `crates/app/src/work_surface/`, and the surfaces it hosts — `terminal/`,
+  `code_surface/`, `lsp/`, `merge/`, `graph_view/`, `review/`, `review_notes/`, `run_history/`,
+  `provenance/`, `budget/`
+- **Tokens:** `theme::{term, editor, diff, syntax, band, button, completions_popup}`
 
 ## What it's for
 
@@ -65,18 +67,18 @@ moment the centre zone narrows. ([`principles.md`](./principles.md) rule 6.)
 agent's question is *its own* numbered prompt, never a card Jerry designed for it.
 
 That is a product position, not an implementation shortcut, and it is why the pane's header shows
-the real invocation, the real pid and the real pty state (`attached · waiting on stdin`,
-`exited 101`, `detached · resumable`) rather than an abstraction over them.
+the real invocation, the real pid and the real pty state (`attached · waiting on stdin`, `exited
+101`, `detached · resumable`) rather than an abstraction over them.
 
 Its footer band is a **readout, not an action bar** — the strip below an agent pane reports; it does
-not offer git operations the CLI could have done itself. `work_surface::state::ActionKind` is down to
-two variants (`Respawn`, `DiscardWorktree`) and the five it lost were deleted rather than hidden.
+not offer git operations the CLI could have done itself. `work_surface::state::ActionKind` is down
+to two variants (`Respawn`, `DiscardWorktree`) and the five it lost were deleted rather than hidden.
 Anything still listed renders honestly disabled when it has no backing logic
 (`FooterAction::implemented`).
 
-The pane also carries the **per-provider rate-limit budget** readout (`budget/`) — the
-`claude 5h ▓░░░░░ 19%` bar and the popover behind it, read from each provider's own usage endpoint
-with real credentials found on disk.
+The pane also carries the **per-provider rate-limit budget** readout (`budget/`) — the `claude 5h
+▓░░░░░ 19%` bar and the popover behind it, read from each provider's own usage endpoint with real
+credentials found on disk.
 
 ### Surface B — the shell
 
@@ -94,8 +96,8 @@ tab, two views, toggled in the surface's own toolbar.
 
 **Diff view** — unified, full width. Two line-number gutters, a sign column, then the code.
 Backgrounds and text per line kind come from `theme::diff`. **Folds** are what stop a twelve-file
-change from being a wall: only changed hunks plus context, everything else collapsed behind a
-`⋯ N unchanged lines` marker.
+change from being a wall: only changed hunks plus context, everything else collapsed behind a `⋯ N
+unchanged lines` marker.
 
 **File view** — a real editable buffer (`edit_buffer`, driven from real keystrokes through
 `editing`'s `EntityInputHandler` wiring), with a breadcrumb, tree-sitter syntax spans from
@@ -119,9 +121,9 @@ and diagnostics *over* the surface; `lsp::completion_popup` is the completions p
 
 Three decorations, at most one at a time: **completions** (a two-column popover — candidates with
 kind chips on the left, signature and doc on the right — carrying the one shadow in the product,
-`theme::shadow::POPOVER`), **diagnostics** (an underline on the offending span, a dim inline message,
-a tinted row, and a card below with the server's own code and any quick fix), and **hover** (an
-underline on the symbol and a card with signature, doc and module path).
+`theme::shadow::POPOVER`), **diagnostics** (an underline on the offending span, a dim inline
+message, a tinted row, and a card below with the server's own code and any quick fix), and **hover**
+(an underline on the symbol and a card with signature, doc and module path).
 
 The mappings are pure functions over `lsp_types` responses, so their rules are tested against
 fixture responses rather than against a live server.
@@ -133,13 +135,13 @@ real `wt_core::merge` calls and the surface's own state machine (`flow`), a whol
 buffer for conflicts the side-picker can't resolve (`editing`), and the view (`render`).
 
 **Each side is headed by its agent, not by "ours" and "theirs".** That is the single most important
-thing about this surface: in Jerry the two sides of a conflict are two agents you know by name and by
-tint, and each column tints its own lines with that agent's colour. "Ours/theirs" is git's framing
-and it is the wrong one here.
+thing about this surface: in Jerry the two sides of a conflict are two agents you know by name and
+by tint, and each column tints its own lines with that agent's colour. "Ours/theirs" is git's
+framing and it is the wrong one here.
 
-Jerry proposes the answer rather than only presenting the choice — a pre-flight strip states how many
-files it can auto-resolve because their edits don't overlap, and `Take both` is the primary action
-where both edits can be kept.
+Jerry proposes the answer rather than only presenting the choice — a pre-flight strip states how
+many files it can auto-resolve because their edits don't overlap, and `Take both` is the primary
+action where both edits can be kept.
 
 ### Other centre surfaces
 
@@ -149,10 +151,10 @@ where both edits can be kept.
   in that module's docs: a **git diff** answers *how does this worktree differ from the merge-base*
   (a property of the branch), while an **agent diff** answers *what did this agent change* (a
   property of a run). They are separated by base point and lifetime, not by filtering one list.
-- **Review notes** (`review_notes/`) — line-anchored comments on a diff, **batched** into one prompt,
-  delivered to a **named** agent's pty, and **kept pinned** afterwards so the revision can be checked
-  against them. All three properties are the point; sending comments one at a time makes an agent
-  swing back and forth.
+- **Review notes** (`review_notes/`) — line-anchored comments on a diff, **batched** into one
+  prompt, delivered to a **named** agent's pty, and **kept pinned** afterwards so the revision can
+  be checked against them. All three properties are the point; sending comments one at a time makes
+  an agent swing back and forth.
 - **Run transcript** (`run_history/`) — one finished run's own recording. The governing sentence is
   *"the sidebar indexes; the centre shows one run"*: history is a list you navigate from Zone 3, and
   opening an entry opens its transcript here, exactly the Explorer → editor pattern.
@@ -166,8 +168,8 @@ where both edits can be kept.
 - **One region, one surface.** Tabs replace each other. There is no split, and adding one is a
   [`decisions.md`](./decisions.md) entry.
 - **A pane has exactly one bottom bar**, chosen by its kind. Never both stacked.
-- **The agent pane renders the agent, not a rendering of the agent.** No chat bubbles, no synthesised
-  cards around its questions, no reformatting of its output.
+- **The agent pane renders the agent, not a rendering of the agent.** No chat bubbles, no
+  synthesised cards around its questions, no reformatting of its output.
 - **A tab's chip identifies it.** Agent tint for agents, language chip for files — derived, never
   hand-assigned.
 - **Controls dim, they don't vanish.** `Accept file` is the canonical case.

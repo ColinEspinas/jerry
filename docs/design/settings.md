@@ -1,7 +1,7 @@
 # Settings
 
-**Code:** `crates/app/src/settings/`
-**Tokens:** `theme::{settings, toggle, button, zone::SETTINGS_*}`
+- **Code:** `crates/app/src/settings/`
+- **Tokens:** `theme::{settings, toggle, button, zone::SETTINGS_*}`
 
 ## What it's for
 
@@ -37,15 +37,15 @@ than derived from the variant name, so renaming a variant cannot silently re-key
 ### Content column
 
 Capped at `theme::zone::SETTINGS_CONTENT_MAX_WIDTH` — header block and scrollable body share the cap
-— and left-aligned inside the surface padding. Long lines of prose in a settings page are the fastest
-way to make it unreadable.
+— and left-aligned inside the surface padding. Long lines of prose in a settings page are the
+fastest way to make it unreadable.
 
 Every page is: header block (title, one-line rationale) · **config banner** · sections · **snippet
 block**.
 
-**Config banner** — the file path, the page's own key list, a `TOML | JSON` switch, and an
-`Open file` button. `store::config_keys_line` is the key list, and it is deliberately narrower than
-the mockup's fixture: it names only the `Settings` fields this app really persists, rather than
+**Config banner** — the file path, the page's own key list, a `TOML | JSON` switch, and an `Open
+file` button. `store::config_keys_line` is the key list, and it is deliberately narrower than the
+mockup's fixture: it names only the `Settings` fields this app really persists, rather than
 inheriting a list that included settings that were never implemented.
 
 **Snippet block** — `In settings.toml`, then the page's real keys with their real current values,

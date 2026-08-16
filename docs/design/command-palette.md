@@ -1,7 +1,7 @@
 # Command palette
 
-**Code:** `crates/app/src/palette/`
-**Tokens:** `theme::palette`, `theme::{band::PALETTE_*, zone::PALETTE_WIDTH, shadow::PALETTE}`
+- **Code:** `crates/app/src/palette/`
+- **Tokens:** `theme::palette`, `theme::{band::PALETTE_*, zone::PALETTE_WIDTH, shadow::PALETTE}`
 
 ## What it's for
 
@@ -9,9 +9,10 @@ One overlay that is both the command list **and** the way you get to a pane or a
 touching the mouse. It is the keyboard route to everything, which is why an agent, a shell, a file
 and a command are all rows in the same list rather than four separate finders.
 
-An **overlay, not a page**: a flat scrim over everything below the title bar (a plain alpha fill, not
-a blur — see [`principles.md`](./principles.md) rule 3), and a panel pinned near the top. Clicking
-the scrim or pressing `esc` dismisses it. There is nothing here you can leave the app parked in.
+An **overlay, not a page**: a flat scrim over everything below the title bar (a plain alpha fill,
+not a blur — see [`principles.md`](./principles.md) rule 3), and a panel pinned near the top.
+Clicking the scrim or pressing `esc` dismisses it. There is nothing here you can leave the app
+parked in.
 
 ## Structure
 
@@ -48,11 +49,11 @@ Built by `build_groups`, in order:
 | Recent Files / Files | `All`, `Files` | Label depends on the query — see below |
 
 The Agents/Terminals split is a good example of the honesty rule applied to a label. A shell is not
-an agent: the rail gives it no agent row, and the pane chrome draws it a different bottom bar. Filing
-it under a heading reading `Agents` would tell the user the opposite of what the rest of the app
-tells them. Filtering shells out entirely would have been the other easy answer, and it was rejected
-— the palette is the keyboard route to a pane, so that would make terminal tabs mouse-reachable only.
-Splitting is the fix; renaming is the whole fix.
+an agent: the rail gives it no agent row, and the pane chrome draws it a different bottom bar.
+Filing it under a heading reading `Agents` would tell the user the opposite of what the rest of the
+app tells them. Filtering shells out entirely would have been the other easy answer, and it was
+rejected — the palette is the keyboard route to a pane, so that would make terminal tabs
+mouse-reachable only. Splitting is the fix; renaming is the whole fix.
 
 **"Recent Files" means "currently has uncommitted changes."** Jerry has no file-access or mtime
 history to rank true recency by, so an empty query narrows to changed files under that label rather
@@ -61,9 +62,10 @@ than inventing an ordering. A non-empty query searches the whole tree under a pl
 ### Rows
 
 A 15px kind chip — the `›` command chip, the file's language chip, or the agent's tint badge, so the
-palette inherits the rail's colour coding — then the label with the **matched substring highlighted**
-(three spans: pre, match, post), a dim secondary line (branch for an agent, `dir · +n −n` for a file,
-a one-line description for a command), an optional status dot, and a keycap for the bound shortcut.
+palette inherits the rail's colour coding — then the label with the **matched substring
+highlighted** (three spans: pre, match, post), a dim secondary line (branch for an agent, `dir · +n
+−n` for a file, a one-line description for a command), an optional status dot, and a keycap for the
+bound shortcut.
 
 Selected rows carry the same left-edge treatment used elsewhere for selection.
 
@@ -73,8 +75,8 @@ Selected rows carry the same left-edge treatment used elsewhere for selection.
   that opens a "coming soon". `PaletteCommand::ALL` is the closed list.
 - **A label must be true.** If a group's name would misdescribe half its rows, split the group; do
   not filter the rows away to make the name fit.
-- **Scope ≠ step.** A new filter over the same candidates is a scope. A new list reached by running a
-  command is a step. Getting this wrong makes `esc` mean two things.
+- **Scope ≠ step.** A new filter over the same candidates is a scope. A new list reached by running
+  a command is a step. Getting this wrong makes `esc` mean two things.
 - **The palette inherits existing chips**; it does not define its own row iconography.
 - **No blur.** The scrim is a flat alpha fill.
 

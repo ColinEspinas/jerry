@@ -62,9 +62,9 @@ category does some version of this.
 a card Jerry designed. The pane header shows the real invocation, the real pid and the real pty
 state.
 
-**Consequences:** Jerry works with any agent CLI on day one, including ones that don't exist yet, and
-never lies about what the agent said. Structural information about agent state has to come from real
-side channels — the terminal title (`rail::title_signal`), OSC sequences (`terminal::osc`), and
+**Consequences:** Jerry works with any agent CLI on day one, including ones that don't exist yet,
+and never lies about what the agent said. Structural information about agent state has to come from
+real side channels — the terminal title (`rail::title_signal`), OSC sequences (`terminal::osc`), and
 Claude Code's own hook system (`hooks/`) — rather than from parsing rendered output. Anything Jerry
 adds around the agent goes in the chrome above and below the pane, never inside it. It also means
 Jerry cannot offer features that require understanding the conversation, and that is accepted.
@@ -73,9 +73,9 @@ Jerry cannot offer features that require understanding the conversation, and tha
 
 **Status:** **Superseded by entry 8.**
 
-**Context:** The original design had no image assets at all. Every icon was absolutely-positioned 1px
-`div`s and Unicode glyphs, so nothing needed an SVG pipeline and the whole UI ported cheaply to any
-toolkit.
+**Context:** The original design had no image assets at all. Every icon was absolutely-positioned
+1px `div`s and Unicode glyphs, so nothing needed an SVG pipeline and the whole UI ported cheaply to
+any toolkit.
 
 **Decision:** No icon assets. Compose from rects and glyphs.
 
@@ -92,8 +92,8 @@ toolkit.
 
 **Consequences:** Layout under the cursor never moves. Hiding it reflows the toggle sitting beside
 it — under the pointer that was about to click the toggle. Generalised into
-[`principles.md`](./principles.md) rule 6: controls dim, they do not vanish. `FooterAction::implemented`
-applies the same treatment to the agent pane's actions.
+[`principles.md`](./principles.md) rule 6: controls dim, they do not vanish.
+`FooterAction::implemented` applies the same treatment to the agent pane's actions.
 
 ## 6. Merge-conflict columns are headed by their agent
 
@@ -109,8 +109,8 @@ badge, agent name, branch, commit count, and its own lines tinted with that agen
 **Consequences:** In Jerry the two sides of a conflict are two agents you know by name and by tint,
 and the surface reads as *these two agents disagree here* rather than as a git operation. The same
 reasoning makes Jerry propose the resolution where it can — a pre-flight strip states how many files
-auto-resolve because their edits don't overlap, and `Take both` is the primary action when both edits
-can be kept.
+auto-resolve because their edits don't overlap, and `Take both` is the primary action when both
+edits can be kept.
 
 ## 7. The rail has one structure: repo → worktree → agent
 
@@ -121,16 +121,16 @@ can be kept.
 was the only mode that could show worktrees with no agent in them at all.
 
 **Decision:** One structure, always: **repo group → worktree → agents.** The mode toggle, the sort
-control and their state were deleted, not hidden. Urgency became *ranking within* the fixed structure
-— worktrees ordered by their most urgent agent, repos by their most urgent worktree.
+control and their state were deleted, not hidden. Urgency became *ranking within* the fixed
+structure — worktrees ordered by their most urgent agent, repos by their most urgent worktree.
 
 **Consequences:** Entry 1's property is preserved (the most urgent things still float to the top and
 wear a colour) while the rail keeps one shape a user can build spatial memory of. Worktrees with no
 agent are always visible, which was the only real argument for the second mode. Repo headers carry
 **two** urgency counts, red and amber, rather than one merged amber count: merging them said "three
 worktrees want you" when one of the three had actually died. That generalises to a rule stated in
-[`layout.md`](./layout.md#rules-that-matter) — two states distinguished anywhere in the app are never
-summed anywhere in it.
+[`layout.md`](./layout.md#rules-that-matter) — two states distinguished anywhere in the app are
+never summed anywhere in it.
 
 ## 8. Shipped icons are Phosphor SVGs; Jerry's own vocabulary stays hand-drawn
 
@@ -138,8 +138,8 @@ summed anywhere in it.
 
 **Context:** Entry 4's rule held through the first build and produced, in the words of the review
 that ended it: "mismatched optical sizes in a row, two glyphs from one family a divider apart, marks
-that read as nothing at 17px". Hand-composed icons have no shared canvas, so two of them side by side
-have no reason to look like siblings.
+that read as nothing at 17px". Hand-composed icons have no shared canvas, so two of them side by
+side have no reason to look like siblings.
 
 **Decision:** Vendor real [Phosphor](https://phosphoricons.com) SVGs (MIT) under `assets/icons/` for
 **actions and views only** — panel tabs, sidebar-strip cells, the overflow menu, the terminal tab,
@@ -155,26 +155,26 @@ as paths.
 **Consequences:** Two mechanical rules came with it, both enforced by tests rather than convention:
 icons draw only through an `IconRow` so a row shares one optical box, and files are vendored at
 `bold` weight because `regular`'s stroke reads thin below 20px. Every vendored file is on the same
-`0 0 256 256` canvas, asserted by a test, which is what makes equal boxes give equal optical weight —
-the property entry 4 could not hold. Moving something off the hand-drawn list needs its own entry
+`0 0 256 256` canvas, asserted by a test, which is what makes equal boxes give equal optical weight
+— the property entry 4 could not hold. Moving something off the hand-drawn list needs its own entry
 here.
 
 ## 9. Agent tints may not reuse a reserved hue
 
 **Status:** Accepted.
 
-**Context:** Agent tints are the one saturated, non-status use of colour in the product (entry 2). The
-original allocation collided with it: one agent wore the additions green, another wore an amber one
-step from the needs-input amber it sits *beside* in a rail row, and a third wore the exact branch-scope
-violet.
+**Context:** Agent tints are the one saturated, non-status use of colour in the product (entry 2).
+The original allocation collided with it: one agent wore the additions green, another wore an amber
+one step from the needs-input amber it sits *beside* in a rail row, and a third wore the exact
+branch-scope violet.
 
 **Decision:** No agent tint may sit in a hue already spent on status or on diffs. The pool is
 enumerable (`theme::agent::TINT_POOL`) and the rule is enforced by a real test
 (`theme::agent_tint_allocation_tests`), not by review.
 
-**Consequences:** The pool was reallocated to copper / teal / periwinkle / steel blue. Adding an agent
-means adding a tint that passes the test, which in practice means the pool is finite and a fifth or
-sixth agent will need a deliberate hue decision rather than the next colour to hand.
+**Consequences:** The pool was reallocated to copper / teal / periwinkle / steel blue. Adding an
+agent means adding a tint that passes the test, which in practice means the pool is finite and a
+fifth or sixth agent will need a deliberate hue decision rather than the next colour to hand.
 
 ## 10. `Status::Review` renders as `Finished`
 
@@ -195,21 +195,21 @@ The urgency ordering is unchanged.
 
 **Status:** Accepted. (GitHub issue #293.)
 
-**Context:** An audit of the status bar counted thirteen readouts and found eight of them lifted from
-VS Code — cursor position, indent width, line ending, encoding, editor zoom, UI scale among them.
-"VS Code's footer answers *what am I typing into*; Jerry's job is watching agents. Wrong app's
+**Context:** An audit of the status bar counted thirteen readouts and found eight of them lifted
+from VS Code — cursor position, indent width, line ending, encoding, editor zoom, UI scale among
+them. "VS Code's footer answers *what am I typing into*; Jerry's job is watching agents. Wrong app's
 chrome."
 
 **Decision:** Delete all eight, code paths included. What is left is three groups on three type
-tiers: a transient notice slot, the branch cluster, running agents, and machine load on the left; the
-environment chip and the palette hint on the right.
+tiers: a transient notice slot, the branch cluster, running agents, and machine load on the left;
+the environment chip and the palette hint on the right.
 
 **Consequences:** Editor zoom survives as `mod+plus`/`mod+minus` — the state and handlers were kept,
 only the readouts went. The urgency dot cluster moved into the title bar. `N worktrees · Y GB` was
 dropped because the rail footer carries it 30px away: the rail owns worktree inventory and its prune
-action, the bar owns activity and cost. This is also where the general rule comes from that replacing
-a control means deleting its old keys in the same edit — a key defined twice is two specifications of
-one thing and the reader cannot tell which is real.
+action, the bar owns activity and cost. This is also where the general rule comes from that
+replacing a control means deleting its old keys in the same edit — a key defined twice is two
+specifications of one thing and the reader cannot tell which is real.
 
 ## 12. The agent pane's bottom strip is a readout, not an action bar
 
@@ -230,9 +230,9 @@ itself. Anything still rendered without backing logic is dimmed and non-interact
 
 **Status:** Accepted.
 
-**Context:** `mod+K` was the original binding. The file editor's real `ctrl-k ctrl-d` chord registers
-`ctrl-k` as a chord *prefix* in that context, so a lone press waited out GPUI's ~1s prefix timeout
-before replaying and reaching the palette.
+**Context:** `mod+K` was the original binding. The file editor's real `ctrl-k ctrl-d` chord
+registers `ctrl-k` as a chord *prefix* in that context, so a lone press waited out GPUI's ~1s prefix
+timeout before replaying and reaching the palette.
 
 **Decision:** Bind `mod+P`, unscoped, as a real replacement — not an alias alongside `mod+K`.
 
@@ -244,26 +244,26 @@ binding rather than reaching the shell. A terminal's Up-arrow history navigation
 
 **Status:** Accepted. (GitHub issue #414.)
 
-**Context:** `design_handoff_jerry_ade/` was a one-shot handoff bundle — an interactive HTML mockup, a
-transcribed `tokens.rs`, and a README written as a build brief. It was the de-facto design authority:
-364 doc comments across 81 files in `crates/` cited it, and so did `CONTRIBUTING.md`,
-`docs/development-workflow.md`, two skills and an issue template. `CONTRIBUTING.md` also described it
-honestly as "a one-time handoff artifact, not a living spec".
+**Context:** `design_handoff_jerry_ade/` was a one-shot handoff bundle — an interactive HTML mockup,
+a transcribed `tokens.rs`, and a README written as a build brief. It was the de-facto design
+authority: 364 doc comments across 81 files in `crates/` cited it, and so did `CONTRIBUTING.md`,
+`docs/development-workflow.md`, two skills and an issue template. `CONTRIBUTING.md` also described
+it honestly as "a one-time handoff artifact, not a living spec".
 
 Three things had gone wrong. Roughly a third of those citations pointed at `revision N/` directories
 that were never committed, so a contributor reading `theme.rs` hit an unresolvable path every other
-screen. The citations were exactly what `CLAUDE.md`'s comment rule forbids — design history, revision
-IDs, issue archaeology — and were the single largest class of violation in the codebase. And a frozen
-mockup cannot absorb a design change: entry 8 silently superseded entry 4 with nothing in the
-repository to record it.
+screen. The citations were exactly what `CLAUDE.md`'s comment rule forbids — design history,
+revision IDs, issue archaeology — and were the single largest class of violation in the codebase.
+And a frozen mockup cannot absorb a design change: entry 8 silently superseded entry 4 with nothing
+in the repository to record it.
 
 **Decision:** Delete the bundle and replace it with this documentation set. `theme.rs` stays the
-source of truth for **values**; these docs cover **intent, structure, vocabulary and invariants**, and
-name the token rather than reprinting a hex. The bundle is preserved by git history alone — no tag,
-no release asset.
+source of truth for **values**; these docs cover **intent, structure, vocabulary and invariants**,
+and name the token rather than reprinting a hex. The bundle is preserved by git history alone — no
+tag, no release asset.
 
-**Consequences:** The docs cannot drift from the code on values, because they never duplicate them. A
-UI change updates the relevant page in the same PR, and a call worth recording gets an entry here
+**Consequences:** The docs cannot drift from the code on values, because they never duplicate them.
+A UI change updates the relevant page in the same PR, and a call worth recording gets an entry here
 instead of an uncommitted `revision N/` folder. Where the old mockup and the shipped app disagree,
 **the app wins**, and the delta becomes an entry here or a `Not built yet` line on a surface page —
 entries 7 and 10 through 13 are that reconciliation, written down for the first time.

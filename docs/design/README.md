@@ -43,7 +43,8 @@ Every surface doc uses one skeleton, so the set reads as a single document:
 ```markdown
 # Session rail
 
-**Code:** `crates/app/src/rail/`  ·  **Tokens:** `theme::{status, rail}`
+- **Code:** `crates/app/src/rail/`
+- **Tokens:** `theme::{status, rail}`
 
 ## What it's for       — one paragraph, the job this surface does
 ## Structure           — the parts, and what each is
@@ -60,8 +61,8 @@ code, applied to the docs.
 A UI change **updates the relevant page in the same PR** — that is the entire difference between
 this and what it replaced. Concretely:
 
-- Changed how a surface behaves or what it's composed of → edit that surface's `Structure` or
-  `Rules that matter`.
+- Changed how a surface behaves or what it's composed of → edit that surface's `Structure` or `Rules
+  that matter`.
 - Built something the page lists under `Not built yet` → delete the line.
 - Made a call that a future contributor would otherwise re-litigate, or reversed one already
   recorded → add a **new numbered entry** to [`decisions.md`](./decisions.md). Never edit an old
@@ -73,10 +74,10 @@ this and what it replaced. Concretely:
 
 Until #414, the design authority was `design_handoff_jerry_ade/` — a one-shot handoff bundle
 containing a 4,266-line interactive HTML mockup, a transcribed `tokens.rs`, and a README written as
-a build brief. It did its job: essentially all of Jerry's chrome was built from it. But it was frozen
-by construction, so every design change after it was recorded as another `revision N/` folder that
-was never committed, and roughly a third of the 364 source comments citing it pointed at paths that
-did not exist in the repository.
+a build brief. It did its job: essentially all of Jerry's chrome was built from it. But it was
+frozen by construction, so every design change after it was recorded as another `revision N/` folder
+that was never committed, and roughly a third of the 364 source comments citing it pointed at paths
+that did not exist in the repository.
 
 The bundle is preserved by git history alone — no tag, no release asset. To recover it:
 
@@ -86,5 +87,5 @@ git show <that-sha>^:design_handoff_jerry_ade/README.md                 # any fi
 ```
 
 Read it as the historical artefact it is. Where it and the shipped app disagree, **the app wins**,
-and the delta is either an entry in [`decisions.md`](./decisions.md) or a line under a
-`Not built yet` heading here.
+and the delta is either an entry in [`decisions.md`](./decisions.md) or a line under a `Not built
+yet` heading here.

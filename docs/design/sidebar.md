@@ -1,7 +1,7 @@
 # Zone 3 — files, search and changes
 
-**Code:** `crates/app/src/sidebar/`, `crates/app/src/search/`
-**Tokens:** `theme::{tree, changes, lang, band, zone}`
+- **Code:** `crates/app/src/sidebar/`, `crates/app/src/search/`
+- **Tokens:** `theme::{tree, changes, lang, band, zone}`
 
 ## What it's for
 
@@ -16,18 +16,17 @@ preview would be.
 ## Structure
 
 Header (`theme::band::CHROME_HEADER`, sharing its y with the other two column headers — see
-[`layout.md`](./layout.md#one-header-rule-across-three-columns)) carrying a segmented
-**Files · Search · Changes**. Files is first and the default; the review flow opens straight into
-Changes. Each tab's icon is drawn in one shared optical box (`icons::IconSize::PanelTab`) — a first
-cut that sized each to suit itself put three different weights on one row.
+[`layout.md`](./layout.md#one-header-rule-across-three-columns)) carrying a segmented **Files ·
+Search · Changes**. Files is first and the default; the review flow opens straight into Changes.
+Each tab's icon is drawn in one shared optical box (`icons::IconSize::PanelTab`) — a first cut that
+sized each to suit itself put three different weights on one row.
 
 ### Files
 
 A flattened, indented row list from a real `std::fs::read_dir` walk (`sidebar::file_tree`), rendered
-virtualised. Rows carry the file's language chip (see
-[`vocabulary.md`](./vocabulary.md#chips)) and a mark for changed files. Folder expansion is real,
-per-worktree state persisted to disk (`sidebar::fold_state`), so reopening a worktree restores the
-shape of the tree you left.
+virtualised. Rows carry the file's language chip (see [`vocabulary.md`](./vocabulary.md#chips)) and
+a mark for changed files. Folder expansion is real, per-worktree state persisted to disk
+(`sidebar::fold_state`), so reopening a worktree restores the shape of the tree you left.
 
 Live refresh is a `notify`-backed OS watcher that sets a flag, polled by a GPUI background loop
 (`sidebar::file_tree_watch`) — the same split `rail::worktree_watch` uses, and the reason neither
@@ -52,10 +51,10 @@ count row with the modifier buttons, then a **two-level result tree** — file r
 match rows showing the line with its hit highlighted.
 
 The pure halves are worth knowing about because they carry the semantics: `search::glob` is the
-pattern language, `search::exclude` is the always-on `target`/`node_modules`/`.git` exclusion applied
-*before* `.gitignore` is consulted at all, and `search::engine` is the compiled matcher, the bounded
-walk, and the real on-disk replace. `search::in_file` is the `mod+F` find bar over the open buffer,
-reusing the same three-state count.
+pattern language, `search::exclude` is the always-on `target`/`node_modules`/`.git` exclusion
+applied *before* `.gitignore` is consulted at all, and `search::engine` is the compiled matcher, the
+bounded walk, and the real on-disk replace. `search::in_file` is the `mod+F` find bar over the open
+buffer, reusing the same three-state count.
 
 ### Changes
 

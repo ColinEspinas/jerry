@@ -1,7 +1,7 @@
 # Window layout
 
-**Code:** `crates/app/src/root/`, `crates/app/src/title_bar/`, `crates/app/src/status_bar/`
-**Tokens:** `theme::{band, zone, surface, border}`
+- **Code:** `crates/app/src/root/`, `crates/app/src/title_bar/`, `crates/app/src/status_bar/`
+- **Tokens:** `theme::{band, zone, surface, border}`
 
 ## What it's for
 
@@ -72,8 +72,8 @@ and not two.
   their cluster width and draws the trailing divider clear of them.
 - **Windows / Linux** — a menu row (`File Edit View Agent Help`, whose dropdowns live in
   `title_bar::menu`) and three caption buttons pinned to the right edge, outside the band's own
-  padding. The close glyph is two rotated rects; `title_bar::render`'s
-  `CLOSE_GLYPH_HALF_DIAGONAL` is the geometry.
+  padding. The close glyph is two rotated rects; `title_bar::render`'s `CLOSE_GLYPH_HALF_DIAGONAL`
+  is the geometry.
 
 Everything between the two ends — project chip, the compact urgency dot chips, panel toggles — is
 shared.
@@ -95,15 +95,15 @@ What is left is three groups, one per type tier, separated by a deliberately hea
 (`theme::status_bar::DIVIDER`; at the old weight the groups they separated ran together):
 
 - **Left** — a transient notice slot (an available update from `updater`, or one-off
-  keep-all/discard feedback from `worktree_history::flow`), the branch cluster with ahead/behind,
-  `N agents running`, and the machine's real CPU/memory load.
+  keep-all/discard feedback from `worktree_history::flow`), the branch cluster with ahead/behind, `N
+  agents running`, and the machine's real CPU/memory load.
 - **Right** — the environment chip and the palette keycap hint. That is all of it.
 
 Resource figures are real measurements sampled off the OS (`status_bar::process_stats`,
 `status_bar::resources`), not decoration.
 
-Two removals are worth knowing about because they look like omissions and are not: the **urgency
-dot cluster** moved into the title bar's compact dot chips, and **`N worktrees · Y GB`** was dropped
+Two removals are worth knowing about because they look like omissions and are not: the **urgency dot
+cluster** moved into the title bar's compact dot chips, and **`N worktrees · Y GB`** was dropped
 because the rail footer already carries it 30px away — the rail owns worktree inventory, the bar
 owns activity. Editor zoom survives as `mod+plus`/`mod+minus`; only its readout is gone.
 

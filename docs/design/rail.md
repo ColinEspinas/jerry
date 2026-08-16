@@ -1,7 +1,7 @@
 # Zone 1 — the agent rail
 
-**Code:** `crates/app/src/rail/`
-**Tokens:** `theme::{status, rail, band, zone}`
+- **Code:** `crates/app/src/rail/`
+- **Tokens:** `theme::{status, rail, band, zone}`
 
 ## What it's for
 
@@ -17,10 +17,10 @@ it reads a single word. See [`principles.md`](./principles.md) rule 1.
 
 ### Two levels, always
 
-**Repo group → worktree → agents.** There is no grouping-mode toggle. An earlier design had a
-`by urgency / by project` switch in the rail header; the revision that redesigned the rail around
-repo grouping removed it outright, along with its sort control, rather than leaving a second
-structure behind. `rail::state`'s own module docs record this.
+**Repo group → worktree → agents.** There is no grouping-mode toggle. An earlier design had a `by
+urgency / by project` switch in the rail header; the revision that redesigned the rail around repo
+grouping removed it outright, along with its sort control, rather than leaving a second structure
+behind. `rail::state`'s own module docs record this.
 
 Urgency did not disappear — it became **ranking within the fixed structure** rather than an
 alternative to it:
@@ -53,10 +53,10 @@ status, and its diff totals against base.
 **Agent row** — one per open agent under an expanded worktree, in the same order the tab strip uses.
 Carries the agent's tint badge, its title, its status, and its own `+n −n`.
 
-**Earlier-runs link** — `↺ N earlier runs`, under a worktree that has **no live agent**. Deliberately
-under the row rather than among its children, so a folded worktree still offers it; and deliberately
-not under every worktree, because a first pass that did produced eight identical rows carrying no
-information. Clicking it goes to the History view.
+**Earlier-runs link** — `↺ N earlier runs`, under a worktree that has **no live agent**.
+Deliberately under the row rather than among its children, so a folded worktree still offers it; and
+deliberately not under every worktree, because a first pass that did produced eight identical rows
+carrying no information. Clicking it goes to the History view.
 
 `rail::state::RailListItem` is the flattened list of all of the above — index-only into the frame's
 own `&[RepoGroup]`, rebuilt each render rather than cached.

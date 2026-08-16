@@ -43,10 +43,9 @@ ships.
 
 This is [`CLAUDE.md`](../../CLAUDE.md)'s rule applied to pixels, and it has real teeth in the
 codebase: `work_surface::state::FooterAction::implemented` renders an unwired action *dimmed and
-non-interactive* rather than hiding it or letting it no-op, and
-`work_surface::state::ActionKind`'s own docs record five variants being **deleted** rather than left
-as decoration. Where a surface genuinely isn't built, it says so — in the UI, and in the
-`Not built yet` section of its page here.
+non-interactive* rather than hiding it or letting it no-op, and `work_surface::state::ActionKind`'s
+own docs record five variants being **deleted** rather than left as decoration. Where a surface
+genuinely isn't built, it says so — in the UI, and in the `Not built yet` section of its page here.
 
 ## 5. One object, one specification
 
@@ -82,11 +81,11 @@ Not principles so much as the palette these principles are executed in. All of i
 - **Two font families, nothing else** — IBM Plex Sans for UI, IBM Plex Mono for branches, paths,
   diffs, terminal and code (`theme::font`, bundled by `crate::fonts`). Both are OFL.
 - **Radii** are a scale in `theme::radius`, from the window corner down to a small mark. The step
-  matters: at 5px across, the difference between `MARK` and `MARK_SM` is the difference
-  between reading as a square and reading as a dot, and this app already uses a real circle for
-  "an agent's status".
-- **Band heights** are named in `theme::band`, **zone widths** in `theme::zone`. A new surface reuses
-  an existing band height wherever it plausibly can, per rule 5.
+  matters: at 5px across, the difference between `MARK` and `MARK_SM` is the difference between
+  reading as a square and reading as a dot, and this app already uses a real circle for "an agent's
+  status".
+- **Band heights** are named in `theme::band`, **zone widths** in `theme::zone`. A new surface
+  reuses an existing band height wherever it plausibly can, per rule 5.
 - **Interface scale** applies to text size only (`theme::ui_scale`), deliberately not to padding,
   icons or fixed chrome. That module's docs enumerate exactly which surfaces honour it and why each
   exclusion exists.
