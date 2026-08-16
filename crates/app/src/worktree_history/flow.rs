@@ -268,46 +268,17 @@ impl AdeApp {
 mod worktree_history_regression_tests {
     use super::*;
     use crate::root::focus::palette_focus_tests;
+    use crate::test_support::{temp_repo, TempRepo};
     use gpui::{Entity, TestAppContext};
     use std::fs;
-    use std::process::Command;
     use tempfile::TempDir;
+    use test_support::{git, git_output};
 
-    fn git(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn git_output(dir: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(output.status.success(), "git {args:?} failed in {dir:?}");
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
-    }
-
-    fn init_repo() -> TempDir {
-        let dir = TempDir::new().expect("tempdir");
-        git(dir.path(), &["init", "-b", "main"]);
-        git(dir.path(), &["config", "user.email", "test@example.com"]);
-        git(dir.path(), &["config", "user.name", "Test User"]);
-        fs::write(dir.path().join("base.txt"), "base\n").expect("write");
-        git(dir.path(), &["add", "base.txt"]);
-        git(dir.path(), &["commit", "-m", "initial"]);
-        dir
+    fn init_repo() -> TempRepo {
+        temp_repo_with(|root| {
+            test_support::seed_empty_repo_at(root);
+            test_support::commit(root, "base.txt", "base\n", "initial");
+        })
     }
 
     /// Same linked-worktree idiom `merge::flow`/`rail::render`'s own test modules use.

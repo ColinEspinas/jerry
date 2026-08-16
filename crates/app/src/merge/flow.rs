@@ -1100,63 +1100,37 @@ fn fold_merge_result(
 #[cfg(test)]
 mod merge_regression_tests {
     use super::*;
+    use crate::test_support::{temp_repo, TempRepo};
     use gpui::{EntityInputHandler, TestAppContext};
     use std::fs;
     use std::process::Command;
     use tempfile::TempDir;
+    use test_support::{git, git_output};
 
-    fn git(dir: &std::path::Path, args: &[&str]) {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+    fn init_repo() -> TempRepo {
+        temp_repo_with(|root| {
+            test_support::seed_empty_repo_at(root);
+            test_support::commit(root, "base.txt", "base\n", "initial");
+        })
     }
 
-    fn init_repo() -> TempDir {
-        let dir = TempDir::new().expect("tempdir");
-        git(dir.path(), &["init", "-b", "main"]);
-        git(dir.path(), &["config", "user.email", "test@example.com"]);
-        git(dir.path(), &["config", "user.name", "Test User"]);
-        fs::write(dir.path().join("base.txt"), "base\n").expect("write");
-        git(dir.path(), &["add", "base.txt"]);
-        git(dir.path(), &["commit", "-m", "initial"]);
-        dir
-    }
-
-    /// Same real-linked-worktree idiom as `wt_core::merge`'s own test module.
+    /// Same real-linked-worktree idiom as `wt_core::merge`'s own test module. The path is
+    /// canonicalized for the same reason [`temp_repo`] canonicalizes a repo root: the app keys
+    /// worktrees by exact `PathBuf`, and on macOS the temp directory is behind a symlink.
     fn add_worktree(repo_path: &std::path::Path, branch: &str, name: &str) -> PathBuf {
         let container = TempDir::new().expect("tempdir");
-        let path = container.path().join(name);
+        let root = container
+            .path()
+            .canonicalize()
+            .expect("canonicalize tempdir");
+        let path = root.join(name);
         drop(container);
-        git(
-            repo_path,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                branch,
-                path.to_str().expect("utf8 path"),
-            ],
-        );
+        test_support::add_worktree(repo_path, branch, &path);
         path
     }
 
     fn status(dir: &std::path::Path) -> String {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(["status", "--porcelain"])
-            .output()
-            .expect("git status");
-        String::from_utf8_lossy(&output.stdout).into_owned()
+        git_output(dir, &["status", "--porcelain"])
     }
 
     /// Real parent-commit count for `rev` - the same real check `wt_core::merge`'s own test

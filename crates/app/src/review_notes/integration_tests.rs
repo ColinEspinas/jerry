@@ -9,13 +9,12 @@
 use super::render::notes_bar_label;
 use super::{FileNoteState, NoteAnchor};
 use crate::provenance::{store::ProvenanceStore, AgentKey};
-use crate::root::focus::palette_focus_tests::open_test_app;
 use crate::root::AdeApp;
 use crate::sidebar::render::RightSidebarView;
+use crate::test_support::{open_test_app, temp_repo, TempRepo};
 use crate::work_surface::agents::{AgentId, AgentKind, ProcessKind};
 use gpui::TestAppContext;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -39,31 +38,14 @@ impl UserApi {
 }
 ";
 
-fn git(dir: &Path, args: &[&str]) {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .expect("failed to spawn git");
-    assert!(
-        output.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
 /// A real repo with a real one-line change in `src/api/users.rs`, plus provenance recording that
 /// one real agent wrote it.
-fn repo_with_an_agent_authored_change(spawned_at: i64) -> (TempDir, ProvenanceStore) {
-    let dir = TempDir::new().expect("tempdir");
+fn repo_with_an_agent_authored_change(spawned_at: i64) -> (TempRepo, ProvenanceStore) {
+    let dir = temp_repo_with(|root| {
+        test_support::seed_empty_repo_at(root);
+        test_support::commit(root, PATH, BASE, "initial");
+    });
     let repo = dir.path();
-    git(repo, &["init", "-b", "main"]);
-    git(repo, &["config", "user.email", "test@example.com"]);
-    git(repo, &["config", "user.name", "Test User"]);
-    std::fs::create_dir_all(repo.join("src/api")).expect("mkdir");
-    std::fs::write(repo.join(PATH), BASE).expect("seed");
-    git(repo, &["add", "-A"]);
-    git(repo, &["commit", "-m", "initial"]);
 
     let file = repo.join(PATH);
     let mut store = ProvenanceStore::default();
@@ -116,7 +98,7 @@ fn agent_stand_in(dir: &Path) -> String {
 /// process weight of one"). The *process* is real either way, which is the half this test needs.
 fn open_review<'a>(
     cx: &'a mut TestAppContext,
-    repo: &TempDir,
+    repo: &TempRepo,
     shim_dir: &TempDir,
     store: ProvenanceStore,
     spawned_at: i64,
@@ -935,13 +917,10 @@ fn plain_letters_bound_over_the_diff_are_typed_into_a_note_not_swallowed(cx: &mu
 /// So: open a note near the top of a long diff, scroll it far out of view, and keep typing.
 #[gpui::test]
 fn typing_into_a_note_keeps_working_after_the_card_scrolls_out_of_view(cx: &mut TestAppContext) {
-    let repo = TempDir::new().expect("tempdir");
-    git(repo.path(), &["init", "-b", "main"]);
-    git(repo.path(), &["config", "user.email", "test@example.com"]);
-    git(repo.path(), &["config", "user.name", "Test User"]);
-    std::fs::write(repo.path().join("big.rs"), "fn noop() {}\n").expect("seed");
-    git(repo.path(), &["add", "-A"]);
-    git(repo.path(), &["commit", "-m", "initial"]);
+    let repo = temp_repo_with(|root| {
+        test_support::seed_empty_repo_at(root);
+        test_support::commit(root, "big.rs", "fn noop() {}\n", "initial");
+    });
     // Far more lines than any viewport, so the note's own row genuinely leaves the built range.
     let mut content = String::from("fn noop() {}\n");
     for index in 0..300 {

@@ -677,58 +677,27 @@ mod review_flow_tests {
     use super::*;
     use crate::review::state::BaselineReason;
     use crate::root::focus::palette_focus_tests;
+    use crate::test_support::{temp_repo, TempRepo};
     use crate::work_surface::agents::{AgentKind, ProcessKind};
     use gpui::TestAppContext;
-
-    fn git(dir: &Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn git_stdout(dir: &Path, args: &[&str]) -> String {
-        let output = std::process::Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        String::from_utf8_lossy(&output.stdout).into_owned()
-    }
+    use test_support::{git, git_output, git_try};
 
     /// A real repo whose branch has **already diverged from `main`**, with a real committed
     /// change on it. That divergence is the whole point: it gives the worktree a real, non-empty
     /// *git* diff that has nothing to do with any agent, which is exactly the state that used to
     /// make an agent falsely report "review ready".
-    fn diverged_repo() -> tempfile::TempDir {
-        let repo = tempfile::tempdir().expect("tempdir");
-        git(repo.path(), &["init", "-b", "main"]);
-        git(repo.path(), &["config", "user.email", "test@example.com"]);
-        git(repo.path(), &["config", "user.name", "Test User"]);
-        std::fs::write(repo.path().join("base.txt"), "base\n").expect("write");
-        git(repo.path(), &["add", "."]);
-        git(repo.path(), &["commit", "-m", "initial"]);
-        git(repo.path(), &["checkout", "-b", "feature"]);
-        std::fs::write(
-            repo.path().join("already_here.txt"),
-            "committed on feature\n",
-        )
-        .expect("write");
-        git(repo.path(), &["add", "."]);
-        git(
-            repo.path(),
-            &["commit", "-m", "work that predates any agent"],
-        );
-        repo
+    fn diverged_repo() -> TempRepo {
+        temp_repo_with(|root| {
+            test_support::seed_empty_repo_at(root);
+            test_support::commit(root, "base.txt", "base\n", "initial");
+            git(root, &["checkout", "-b", "feature"]);
+            test_support::commit(
+                root,
+                "already_here.txt",
+                "committed on feature\n",
+                "work that predates any agent",
+            );
+        })
     }
 
     /// Every window starts with exactly one agent - a plain shell `AdeApp::new` spawns into the
@@ -810,22 +779,20 @@ mod review_flow_tests {
         git(repo.path(), &["add", "staged.txt"]);
         std::fs::write(repo.path().join("base.txt"), "base\nedited\n").expect("write");
         std::fs::write(repo.path().join("untracked.txt"), "untracked\n").expect("write");
-        let status_before = git_stdout(repo.path(), &["status", "--porcelain"]);
-        let head_before = git_stdout(repo.path(), &["rev-parse", "HEAD"]);
+        let status_before = git_output(repo.path(), &["status", "--porcelain"]);
+        let head_before = git_output(repo.path(), &["rev-parse", "HEAD"]);
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
         let id = sole_agent(&app, cx);
 
         assert_eq!(
-            git_stdout(repo.path(), &["status", "--porcelain"]),
+            git_output(repo.path(), &["status", "--porcelain"]),
             status_before,
             "capturing a baseline must not change one byte of the worktree's real git state"
         );
-        assert_eq!(git_stdout(repo.path(), &["rev-parse", "HEAD"]), head_before);
-        assert!(git_stdout(repo.path(), &["stash", "list"])
-            .trim()
-            .is_empty());
+        assert_eq!(git_output(repo.path(), &["rev-parse", "HEAD"]), head_before);
+        assert!(git_output(repo.path(), &["stash", "list"]).is_empty());
 
         let (tree_id, ref_name, reason) = app.read_with(cx, |app, _| {
             let review = app
@@ -845,12 +812,12 @@ mod review_flow_tests {
             "a baseline must be anchored inside this app's own ref namespace - got {ref_name}"
         );
         assert_eq!(
-            git_stdout(repo.path(), &["rev-parse", &ref_name]).trim(),
+            git_output(repo.path(), &["rev-parse", &ref_name]),
             tree_id,
             "the anchored ref must really resolve to the captured tree in the real repository"
         );
         assert_eq!(
-            git_stdout(repo.path(), &["cat-file", "-t", &tree_id]).trim(),
+            git_output(repo.path(), &["cat-file", "-t", &tree_id]),
             "tree",
             "and that object must really be a tree"
         );
@@ -982,7 +949,7 @@ mod review_flow_tests {
             assert!(!app.agent_has_unreviewed_changes(id));
             assert!(review.open_file.is_none());
             assert_eq!(
-                git_stdout(repo.path(), &["rev-parse", &ref_name]).trim(),
+                git_output(repo.path(), &["rev-parse", &ref_name]),
                 review.baseline.tree_id,
                 "the real ref must really point at the new snapshot"
             );
@@ -1232,7 +1199,7 @@ mod review_flow_tests {
                 "and a real snapshot behind it, not an empty placeholder"
             );
             assert_eq!(
-                git_stdout(repo.path(), &["rev-parse", &review.baseline.ref_name]).trim(),
+                git_output(repo.path(), &["rev-parse", &review.baseline.ref_name]),
                 review.baseline.tree_id,
                 "the real ref must point at that snapshot"
             );
@@ -1254,7 +1221,7 @@ mod review_flow_tests {
                  released, so without one it has nothing at all to review against",
             );
             assert_eq!(
-                git_stdout(repo.path(), &["rev-parse", &review.baseline.ref_name]).trim(),
+                git_output(repo.path(), &["rev-parse", &review.baseline.ref_name]),
                 review.baseline.tree_id
             );
         });
@@ -1277,16 +1244,14 @@ mod review_flow_tests {
                 .ref_name
                 .clone()
         });
-        assert!(!git_stdout(repo.path(), &["rev-parse", &ref_name])
-            .trim()
-            .is_empty());
+        assert!(!git_output(repo.path(), &["rev-parse", &ref_name]).is_empty());
 
         app.update_in(cx, |app, window, cx| app.close_agent(id, window, cx));
         cx.run_until_parked();
 
         assert!(
-            git_stdout(repo.path(), &["rev-parse", "--verify", &ref_name])
-                .trim()
+            git_try(repo.path(), &["rev-parse", "--verify", &ref_name])
+                .stdout
                 .is_empty(),
             "a closed agent's baseline ref must really be deleted"
         );
@@ -1666,7 +1631,7 @@ mod review_flow_tests {
         });
         for (cwd, ref_name) in &refs {
             assert!(
-                !git_stdout(cwd, &["rev-parse", ref_name]).trim().is_empty(),
+                !git_output(cwd, &["rev-parse", ref_name]).is_empty(),
                 "{ref_name} must really exist in {}",
                 cwd.display()
             );
@@ -1691,16 +1656,14 @@ mod review_flow_tests {
             name != &refs[0].1
         }) {
             assert!(
-                git_stdout(cwd, &["rev-parse", "--verify", ref_name])
-                    .trim()
+                git_try(cwd, &["rev-parse", "--verify", ref_name])
+                    .stdout
                     .is_empty(),
                 "{ref_name} must really have been deleted"
             );
         }
         assert!(
-            !git_stdout(&refs[0].0, &["rev-parse", "--verify", &refs[0].1])
-                .trim()
-                .is_empty(),
+            !git_output(&refs[0].0, &["rev-parse", "--verify", &refs[0].1]).is_empty(),
             "the still-open sole agent's own baseline ref must be untouched"
         );
         app.read_with(cx, |app, _| {

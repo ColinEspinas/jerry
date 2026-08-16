@@ -75,15 +75,8 @@ const REAL_PAYLOAD: &str = r#"{"session_id":"5a4bef04-9e59-4d75-874d-928b1f8c395
 
 /// Blocks until `check` passes or the deadline expires - the forwarder is a real subprocess and
 /// the listener a real thread, so the handoff is genuinely asynchronous.
-fn wait_for(mut check: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        if check() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    check()
+fn wait_for(check: impl FnMut() -> bool) -> bool {
+    test_support::wait_until(Duration::from_secs(10), check)
 }
 
 #[test]
@@ -188,7 +181,11 @@ fn a_forwarder_run_outside_jerry_reaches_no_listener_at_all() {
     }
     assert!(child.wait().expect("wait").success());
 
-    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        test_support::stays_false(Duration::from_millis(300), || (0..64)
+            .any(|id| listener.signal_for(id).fact.is_some())),
+        "an unconfigured forwarder must not report anything for any agent id"
+    );
     for id in 0..64 {
         assert_eq!(
             listener.signal_for(id).fact,
@@ -267,6 +264,7 @@ fn run_real_claude(
     }
 }
 
+#[ignore = "external: claude; see docs/testing.md"]
 #[test]
 fn a_real_claude_session_reports_its_hooks_to_a_real_jerry_listener() {
     let Some(binary) = real_claude() else {
@@ -313,6 +311,7 @@ fn a_real_claude_session_reports_its_hooks_to_a_real_jerry_listener() {
     );
 }
 
+#[ignore = "external: claude; see docs/testing.md"]
 #[test]
 fn jerry_s_settings_file_does_not_disable_the_user_s_own_hooks() {
     // The regression this whole feature must not cause. `--settings` merging (rather than
@@ -414,6 +413,7 @@ fn jerry_s_settings_file_does_not_disable_the_user_s_own_hooks() {
 /// `pty_core`'s `CommandBuilder` - is skipped by all of them. This one skips none of it, which is
 /// the whole reason it exists: a regression anywhere along that chain would leave every other
 /// test in this file green.
+#[ignore = "external: claude; see docs/testing.md"]
 #[gpui::test]
 fn a_claude_agent_spawned_through_the_real_app_path_really_reports_its_hooks(
     cx: &mut gpui::TestAppContext,

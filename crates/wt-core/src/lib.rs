@@ -574,42 +574,7 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
-
-    /// Run `git` with `args` in `dir` and panic with full output on failure. Test-only
-    /// helper, not part of the library's public error handling.
-    fn git(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    /// Turn a freshly-created directory into a repository with one commit on branch
-    /// `main`.
-    fn init_repo_at(dir: &Path) {
-        git(dir, &["init", "-b", "main"]);
-        git(dir, &["config", "user.email", "test@example.com"]);
-        git(dir, &["config", "user.name", "Test User"]);
-        fs::write(dir.join("file.txt"), "hello\n").expect("write file");
-        git(dir, &["add", "file.txt"]);
-        git(dir, &["commit", "-m", "initial commit"]);
-    }
-
-    /// Initialize a fresh repository in a tempdir with one commit on branch `main`.
-    fn init_repo() -> TempDir {
-        let dir = TempDir::new().expect("tempdir");
-        init_repo_at(dir.path());
-        dir
-    }
+    use test_support::{git, seed_repo, seed_repo_at};
 
     /// `list_worktrees`, asserting the outer call succeeds and every per-worktree entry
     /// succeeds too, for tests where every entry is expected to be readable.
@@ -623,7 +588,7 @@ mod tests {
 
     #[test]
     fn lists_main_worktree_only() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let worktrees = list_ok(repo.path());
         assert_eq!(worktrees.len(), 1);
         let main = &worktrees[0];
@@ -640,7 +605,7 @@ mod tests {
 
     #[test]
     fn lists_main_and_linked_worktrees() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let linked_dir = TempDir::new().expect("tempdir");
         let linked_path = linked_dir.path().join("linked-wt");
         // Remove the dir itself; `git worktree add` creates it.
@@ -680,7 +645,7 @@ mod tests {
 
     #[test]
     fn add_worktree_creates_branch_and_checkout() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let linked_dir = TempDir::new().expect("tempdir");
         let linked_path = linked_dir.path().join("new-wt");
         drop(linked_dir);
@@ -700,7 +665,7 @@ mod tests {
 
     #[test]
     fn add_worktree_checks_out_existing_branch_via_commit_ish() {
-        let repo = init_repo();
+        let repo = seed_repo();
         git(repo.path(), &["branch", "existing-branch"]);
 
         let linked_dir = TempDir::new().expect("tempdir");
@@ -720,7 +685,7 @@ mod tests {
 
     #[test]
     fn add_worktree_rejects_flag_like_commit_ish_as_positional() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let linked_dir = TempDir::new().expect("tempdir");
         let linked_path = linked_dir.path().join("dashy-wt");
         drop(linked_dir);
@@ -745,7 +710,7 @@ mod tests {
 
     #[test]
     fn detached_head_worktree_has_no_branch() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let linked_dir = TempDir::new().expect("tempdir");
         let linked_path = linked_dir.path().join("detached-wt");
         drop(linked_dir);
@@ -773,7 +738,7 @@ mod tests {
 
     #[test]
     fn list_reports_lock_state_with_reason() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let linked_dir = TempDir::new().expect("tempdir");
         let linked_path = linked_dir.path().join("locked-wt");
         drop(linked_dir);
@@ -800,7 +765,7 @@ mod tests {
 
     #[test]
     fn list_reports_lock_without_reason_as_none() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let linked_dir = TempDir::new().expect("tempdir");
         let linked_path = linked_dir.path().join("locked-no-reason-wt");
         drop(linked_dir);
@@ -830,7 +795,7 @@ mod tests {
 
     #[test]
     fn remove_force_removes_locked_worktree() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let linked_dir = TempDir::new().expect("tempdir");
         let linked_path = linked_dir.path().join("locked-remove-wt");
         drop(linked_dir);
@@ -860,7 +825,7 @@ mod tests {
 
     #[test]
     fn list_worktrees_on_bare_repo_skips_main_entry() {
-        let source = init_repo();
+        let source = seed_repo();
         let bare_dir = TempDir::new().expect("tempdir");
         git(
             bare_dir.path(),
@@ -890,7 +855,7 @@ mod tests {
 
     #[test]
     fn remove_clean_worktree_without_force_succeeds() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let linked_dir = TempDir::new().expect("tempdir");
         let linked_path = linked_dir.path().join("clean-wt");
         drop(linked_dir);
@@ -904,7 +869,7 @@ mod tests {
 
     #[test]
     fn remove_refuses_dirty_tracked_file_without_force() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let linked_dir = TempDir::new().expect("tempdir");
         let linked_path = linked_dir.path().join("dirty-wt");
         drop(linked_dir);
@@ -937,7 +902,7 @@ mod tests {
 
     #[test]
     fn remove_refuses_untracked_file_without_force() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let linked_dir = TempDir::new().expect("tempdir");
         let linked_path = linked_dir.path().join("untracked-wt");
         drop(linked_dir);
@@ -967,7 +932,7 @@ mod tests {
         let container = TempDir::new().expect("tempdir");
         let repo_path = container.path().join("repo");
         fs::create_dir(&repo_path).expect("mkdir repo");
-        init_repo_at(&repo_path);
+        seed_repo_at(&repo_path);
 
         let linked_path = container.path().join("linked");
         add_worktree(&repo_path, &linked_path, Some("relative-branch"), None)
@@ -1103,7 +1068,7 @@ mod tests {
 
     #[test]
     fn list_worktrees_porcelain_reports_main_and_linked() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let linked_dir = TempDir::new().expect("tempdir");
         let linked_path = linked_dir.path().join("porcelain-linked-wt");
         drop(linked_dir);
@@ -1131,7 +1096,7 @@ mod tests {
 
     #[test]
     fn list_worktrees_porcelain_reports_detached_head() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let linked_dir = TempDir::new().expect("tempdir");
         let linked_path = linked_dir.path().join("porcelain-detached-wt");
         drop(linked_dir);
@@ -1159,7 +1124,7 @@ mod tests {
 
     #[test]
     fn list_worktrees_porcelain_reports_lock_reason() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let linked_dir = TempDir::new().expect("tempdir");
         let linked_path = linked_dir.path().join("porcelain-locked-wt");
         drop(linked_dir);
@@ -1192,7 +1157,7 @@ mod tests {
     /// assumption about it.
     #[test]
     fn list_worktrees_porcelain_flags_a_manually_deleted_worktree_as_prunable() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let linked_dir = TempDir::new().expect("tempdir");
         let linked_path = linked_dir.path().join("porcelain-prunable-wt");
         drop(linked_dir);
@@ -1222,7 +1187,7 @@ mod tests {
 
     #[test]
     fn git_common_dir_resolves_to_the_dot_git_directory() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let common_dir = git_common_dir(repo.path()).expect("git_common_dir");
         assert_eq!(
             fs::canonicalize(&common_dir).expect("canonicalize"),
@@ -1232,7 +1197,7 @@ mod tests {
 
     #[test]
     fn git_common_dir_from_a_linked_worktree_resolves_to_the_same_shared_directory() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let linked_dir = TempDir::new().expect("tempdir");
         let linked_path = linked_dir.path().join("common-dir-linked-wt");
         drop(linked_dir);

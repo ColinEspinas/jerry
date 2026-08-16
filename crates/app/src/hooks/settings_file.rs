@@ -1692,23 +1692,26 @@ mod tests {
         // exec specifically on that signature - rather than looping on some fd of our own - is
         // the correct fix, not a band-aid: it is bounded, narrowly targeted at the one known
         // transient cause, and does not mask any other failure mode.
-        let mut attempt = 0;
-        let output = loop {
-            attempt += 1;
-            let output = std::process::Command::new("/bin/sh")
+        let run = || {
+            std::process::Command::new("/bin/sh")
                 .arg("-c")
                 .arg(command)
                 .env("PATH", &bin)
                 .stdin(std::process::Stdio::null())
                 .output()
-                .expect("the generated command must be runnable by a real POSIX shell");
-            let is_etxtbsy = !output.status.success()
-                && String::from_utf8_lossy(&output.stderr).contains("Text file busy");
-            if !is_etxtbsy || attempt >= 20 {
-                break output;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
+                .expect("the generated command must be runnable by a real POSIX shell")
         };
+        let mut output = run();
+        // Retrying *is* the wait here: the condition is "the exec stopped hitting the transient
+        // ETXTBSY", so each poll re-runs the command rather than sleeping beside it.
+        test_support::wait_until(std::time::Duration::from_millis(100), || {
+            let settled = output.status.success()
+                || !String::from_utf8_lossy(&output.stderr).contains("Text file busy");
+            if !settled {
+                output = run();
+            }
+            settled
+        });
         assert!(
             output.status.success(),
             "the generated command must parse: {}",
@@ -2066,19 +2069,18 @@ mod tests {
 
             // While it is running, and again once it has finished: neither moment may show a file.
             let mut seen: Vec<String> = Vec::new();
-            for _ in 0..20 {
-                seen.extend(
-                    std::fs::read_dir(&directory)
-                        .expect("read launch dir")
-                        .flatten()
-                        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                        .filter(|name| name != SETTINGS_NAME && name != WINDOWS_FORWARDER_NAME),
-                );
-                if !seen.is_empty() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
+            let extra_entries = || {
+                std::fs::read_dir(&directory)
+                    .expect("read launch dir")
+                    .flatten()
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .filter(|name| name != SETTINGS_NAME && name != WINDOWS_FORWARDER_NAME)
+                    .collect::<Vec<_>>()
+            };
+            test_support::wait_until(std::time::Duration::from_secs(1), || {
+                seen = extra_entries();
+                !seen.is_empty()
+            });
             let output = child.wait_with_output().expect("wait");
             seen.extend(
                 std::fs::read_dir(&directory)
