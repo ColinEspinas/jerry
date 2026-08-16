@@ -11,6 +11,20 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  # Fails fast if the pushed tag doesn't match the workspace version (issue #317). Skipped on
+  # workflow_dispatch, which has no real tag and only ever publishes a draft.
+  version-check:
+    name: Tag matches crate version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+      - name: Check tag against workspace version
+        if: github.event_name == 'push'
+        run: .claude/hooks/check-release-version.sh "${GITHUB_REF_NAME}"
+
   # Build-only signal per platform before packaging, deliberately matching ci.yml's own
   # "build, test, clippy, fmt" -> build-only narrowing on this exact workspace: a real
   # `v0.0.1-test` tag run of a fuller `cargo test --workspace` step here hit the same
@@ -26,6 +40,7 @@ jobs:
   # fuller CI as follow-up rather than something to take on inside this release
   # workflow.
   build:
+    needs: version-check
     strategy:
       fail-fast: false
       matrix:
