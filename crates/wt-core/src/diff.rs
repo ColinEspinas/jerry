@@ -2540,6 +2540,9 @@ mod tests {
         assert_eq!(uncommitted.files[0].path, Path::new("other.txt"));
     }
 
+    /// `#[cfg(unix)]`: the child is `sh -c` over `head`, `/dev/zero` and `tr`. The draining
+    /// behaviour it proves is platform-free, but reproducing the full-pipe deadlock needs them.
+    #[cfg(unix)]
     #[test]
     fn stdout_and_stderr_are_drained_concurrently_without_deadlocking() {
         // A child that writes well past a typical OS pipe buffer (64KB on Linux) to stderr

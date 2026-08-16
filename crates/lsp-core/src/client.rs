@@ -2001,6 +2001,7 @@ mod tests {
     /// constructor of its own and the notification branches under test never write to it), plus
     /// the same real `Arc<Mutex<..>>` sinks [`LspClient::spawn`] wires up. Returns the child too,
     /// so the caller keeps it alive - and kills it - for the duration of the test.
+    #[cfg(unix)]
     struct IncomingHarness {
         /// Kept alive for the test's duration, and killed on drop by the guard itself.
         _child: ChildGuard,
@@ -2008,6 +2009,7 @@ mod tests {
         wake_rx: Receiver<()>,
     }
 
+    #[cfg(unix)]
     impl IncomingHarness {
         /// `subscribed` is the real [`ServerSpawnConfig::custom_notification_methods`] list this
         /// harness's `handle_incoming` calls are driven with.
@@ -2049,6 +2051,7 @@ mod tests {
     /// The real capability `crate::client`'s notification branch gained so a server's own custom
     /// protocol extension stops being invisible: a subscribed method is queued verbatim, method
     /// and raw params both intact, in real arrival order.
+    #[cfg(unix)]
     #[test]
     fn a_subscribed_notification_is_queued_verbatim_for_draining() {
         let harness = IncomingHarness::new(&["tsserver/request", "server/other"]);
@@ -2087,6 +2090,7 @@ mod tests {
     /// this app's pre-existing servers) queues nothing at all, no matter how much unrelated
     /// notification traffic its server produces. Behaviorally identical to before this capability
     /// existed.
+    #[cfg(unix)]
     #[test]
     fn a_client_that_subscribed_to_nothing_queues_nothing_at_all() {
         let harness = IncomingHarness::new(&[]);
@@ -2109,6 +2113,7 @@ mod tests {
 
     /// Subscription is per-method, not all-or-nothing: an un-subscribed method is still ignored
     /// even on a client that subscribed to something else.
+    #[cfg(unix)]
     #[test]
     fn an_unsubscribed_method_is_ignored_even_when_other_methods_are_subscribed() {
         let harness = IncomingHarness::new(&["tsserver/request"]);
@@ -2123,6 +2128,7 @@ mod tests {
     /// The other half of the partition: `publishDiagnostics` keeps going only to its own real,
     /// typed sink and must never *also* appear on the custom-notification path, which would give
     /// callers two disagreeing sources for the same real data.
+    #[cfg(unix)]
     #[test]
     fn publish_diagnostics_never_appears_on_the_custom_notification_path() {
         // Subscribed on purpose: even an explicit subscription must not divert it from its own
@@ -2159,6 +2165,7 @@ mod tests {
 
     /// Both paths send the same real wake signal, so the `app` crate's single existing poll loop
     /// notices either without new polling machinery.
+    #[cfg(unix)]
     #[test]
     fn a_custom_notification_sends_the_same_real_wake_signal_diagnostics_do() {
         let harness = IncomingHarness::new(&["tsserver/request"]);
@@ -2181,6 +2188,7 @@ mod tests {
     /// A server that sends a subscribed notification faster than anything drains it must not grow
     /// this queue without limit - the *oldest* entry is dropped, so the newest, most relevant ones
     /// are the ones that survive.
+    #[cfg(unix)]
     #[test]
     fn the_custom_notification_queue_is_bounded_and_drops_the_oldest_first() {
         let harness = IncomingHarness::new(&["server/custom"]);
@@ -2212,6 +2220,7 @@ mod tests {
 
     /// A server-initiated *request* (an `id` alongside the `method`) still takes the real
     /// reply path and must not leak onto the notification queue, which has no way to answer one.
+    #[cfg(unix)]
     #[test]
     fn a_server_initiated_request_is_not_treated_as_a_custom_notification() {
         let harness = IncomingHarness::new(&["client/registerCapability"]);

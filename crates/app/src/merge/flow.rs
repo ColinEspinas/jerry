@@ -1123,8 +1123,14 @@ mod merge_regression_tests {
             .path()
             .canonicalize()
             .expect("canonicalize tempdir");
+        // `keep()`, not `drop()`: dropping the container deleted the directory and freed its
+        // random name for reuse, so under the parallel suite another fixture could be handed the
+        // same name and create `<name>` inside it first - `git worktree add` then failed with
+        // "already exists". Reproduced directly: 1 run in ~7 of the merge module under load.
+        // Keeping the (empty) directory costs nothing the old code did not already leak, since
+        // git recreated the path afterwards and nothing ever removed it.
+        let _ = container.keep();
         let path = root.join(name);
-        drop(container);
         test_support::add_worktree(repo_path, branch, &path);
         path
     }

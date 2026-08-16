@@ -284,8 +284,14 @@ mod worktree_history_regression_tests {
     /// Same linked-worktree idiom `merge::flow`/`rail::render`'s own test modules use.
     fn add_worktree(repo_path: &Path, branch: &str, name: &str) -> PathBuf {
         let container = TempDir::new().expect("tempdir");
-        let path = container.path().join(name);
-        drop(container);
+        // `keep()`, not `drop()`: dropping the container deleted the directory and freed its
+        // random name for reuse, so under the parallel suite another fixture could be handed the
+        // same name and create `<name>` inside it first - `git worktree add` then failed with
+        // "already exists". Reproduced directly: 1 run in ~7 of the merge module under load.
+        // Keeping the (empty) directory costs nothing the old code did not already leak, since
+        // git recreated the path afterwards and nothing ever removed it.
+        let root = container.keep();
+        let path = root.join(name);
         git(
             repo_path,
             &[
