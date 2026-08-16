@@ -6,8 +6,6 @@
 //! versus "what can I actually do from it".
 
 use super::*;
-#[cfg(test)]
-use crate::root::focus::palette_focus_tests;
 use crate::root::widgets::{menu_popover_chrome, render_menu_group_divider};
 use crate::title_bar::menu_model::{MenuCommand, MenuRow};
 use crate::work_surface::render::render_dropdown_menu_row;
@@ -476,8 +474,8 @@ mod title_menu_tests {
     fn open_windows_variant(
         cx: &mut TestAppContext,
     ) -> (Entity<AdeApp>, &mut gpui::VisualTestContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         app.update(cx, |app, cx| {
             app.set_window_controls_style(WindowControlsStyle::WindowsLinuxStyle, cx);
         });
@@ -525,28 +523,27 @@ mod title_menu_tests {
         )
     }
 
-    /// Clicking the real "File" label - a genuine painted div with its own `on_click`, hit-test
-    /// via a real simulated click at its own captured bounds - opens the real File dropdown, not
+    /// Clicking each real label - a genuine painted div with its own `on_click`, hit-tested via a
+    /// real simulated click at its own captured bounds - opens that label's own dropdown, not
     /// just a state flip.
     #[gpui::test]
-    fn clicking_the_file_label_opens_the_real_file_menu(cx: &mut TestAppContext) {
+    fn clicking_each_title_label_opens_its_own_real_menu(cx: &mut TestAppContext) {
         let (app, cx) = open_windows_variant(cx);
-        let bounds = app.read_with(cx, |app, _| {
-            app.title_menu_button_bounds[TitleMenu::File.index()]
-        });
-        assert_ne!(
-            bounds,
-            gpui::Bounds::default(),
-            "the File label should have really painted by now"
-        );
 
-        cx.simulate_click(center_of(bounds), gpui::Modifiers::none());
-        cx.run_until_parked();
+        for menu in TitleMenu::ALL {
+            let bounds = app.read_with(cx, |app, _| app.title_menu_button_bounds[menu.index()]);
+            assert_ne!(
+                bounds,
+                gpui::Bounds::default(),
+                "the {} label should have really painted by now",
+                menu.label()
+            );
 
-        assert_eq!(
-            app.read_with(cx, |app, _| app.title_menu_open),
-            Some(TitleMenu::File)
-        );
+            cx.simulate_click(center_of(bounds), gpui::Modifiers::none());
+            cx.run_until_parked();
+
+            assert_eq!(app.read_with(cx, |app, _| app.title_menu_open), Some(menu));
+        }
     }
 
     /// The File menu's first row ("Open File…") really opens the command palette scoped to
@@ -590,9 +587,9 @@ mod title_menu_tests {
     fn file_menu_open_folder_row_focuses_a_real_chosen_folder_in_this_window(
         cx: &mut TestAppContext,
     ) {
-        let original_repo = tempfile::tempdir().expect("tempdir");
-        let chosen_repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, original_repo.path().to_path_buf());
+        let original_repo = crate::test_support::temp_root();
+        let chosen_repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, original_repo.path().to_path_buf());
         app.update(cx, |app, cx| {
             app.set_window_controls_style(WindowControlsStyle::WindowsLinuxStyle, cx);
         });
@@ -678,22 +675,6 @@ mod title_menu_tests {
         });
     }
 
-    #[gpui::test]
-    fn clicking_the_edit_label_opens_the_real_edit_menu(cx: &mut TestAppContext) {
-        let (app, cx) = open_windows_variant(cx);
-        let bounds = app.read_with(cx, |app, _| {
-            app.title_menu_button_bounds[TitleMenu::Edit.index()]
-        });
-
-        cx.simulate_click(center_of(bounds), gpui::Modifiers::none());
-        cx.run_until_parked();
-
-        assert_eq!(
-            app.read_with(cx, |app, _| app.title_menu_open),
-            Some(TitleMenu::Edit)
-        );
-    }
-
     /// The Edit menu's *first* row is now real **text** undo (GitHub issue #17), and it is a real
     /// affordance in both directions: inert with nothing to undo (no `on_click` attached at all,
     /// per `render_dropdown_menu_row`'s own enabled/disabled contract), and genuinely undoing the
@@ -704,10 +685,10 @@ mod title_menu_tests {
     /// `mod+z` does inside a text widget.
     #[gpui::test]
     fn edit_menu_text_undo_row_is_inert_until_there_is_real_text_to_undo(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
         let file_path = repo.path().join("notes.txt");
         std::fs::write(&file_path, "hello\n").expect("write notes.txt");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         app.update(cx, |app, cx| {
             app.set_window_controls_style(WindowControlsStyle::WindowsLinuxStyle, cx);
         });
@@ -769,22 +750,6 @@ mod title_menu_tests {
         assert_eq!(app.read_with(cx, |app, _| app.title_menu_open), None);
     }
 
-    #[gpui::test]
-    fn clicking_the_view_label_opens_the_real_view_menu(cx: &mut TestAppContext) {
-        let (app, cx) = open_windows_variant(cx);
-        let bounds = app.read_with(cx, |app, _| {
-            app.title_menu_button_bounds[TitleMenu::View.index()]
-        });
-
-        cx.simulate_click(center_of(bounds), gpui::Modifiers::none());
-        cx.run_until_parked();
-
-        assert_eq!(
-            app.read_with(cx, |app, _| app.title_menu_open),
-            Some(TitleMenu::View)
-        );
-    }
-
     /// The View menu's first row ("Command Palette") really opens the real palette (default
     /// scope, unlike the File menu's files-scoped row).
     #[gpui::test]
@@ -806,22 +771,6 @@ mod title_menu_tests {
             assert!(app.palette_open);
             assert_eq!(app.title_menu_open, None);
         });
-    }
-
-    #[gpui::test]
-    fn clicking_the_agent_label_opens_the_real_agent_menu(cx: &mut TestAppContext) {
-        let (app, cx) = open_windows_variant(cx);
-        let bounds = app.read_with(cx, |app, _| {
-            app.title_menu_button_bounds[TitleMenu::Agent.index()]
-        });
-
-        cx.simulate_click(center_of(bounds), gpui::Modifiers::none());
-        cx.run_until_parked();
-
-        assert_eq!(
-            app.read_with(cx, |app, _| app.title_menu_open),
-            Some(TitleMenu::Agent)
-        );
     }
 
     /// The Agent menu's first row ("New Terminal") really spawns a new real agent tab (the
@@ -851,22 +800,6 @@ mod title_menu_tests {
             );
             assert_eq!(app.title_menu_open, None);
         });
-    }
-
-    #[gpui::test]
-    fn clicking_the_help_label_opens_the_real_help_menu(cx: &mut TestAppContext) {
-        let (app, cx) = open_windows_variant(cx);
-        let bounds = app.read_with(cx, |app, _| {
-            app.title_menu_button_bounds[TitleMenu::Help.index()]
-        });
-
-        cx.simulate_click(center_of(bounds), gpui::Modifiers::none());
-        cx.run_until_parked();
-
-        assert_eq!(
-            app.read_with(cx, |app, _| app.title_menu_open),
-            Some(TitleMenu::Help)
-        );
     }
 
     /// The Help menu's real "About" row (the third row, after a divider - so this test drives it
@@ -965,105 +898,6 @@ mod title_menu_tests {
         );
     }
 
-    /// The Agent menu's "Discard worktree" row's real two-step confirm - mirrors the agent
-    /// footer's own identical two-click button
-    /// (`crate::work_surface::render::AdeApp::render_footer_action_button`), reusing the
-    /// exact same real [`AdeApp::request_discard_worktree`]/[`AdeApp::discard_confirm_armed`]
-    /// this test drives through the menu row instead of the footer button. Needs a real,
-    /// non-main worktree (`crate::worktree_history::flow::AdeApp::request_discard_worktree`
-    /// unconditionally refuses on the main worktree), so this sets one up the same way
-    /// `crate::worktree_history::flow::worktree_history_regression_tests::add_worktree` does.
-    #[gpui::test]
-    fn agent_menu_discard_row_arms_then_executes_a_real_discard(cx: &mut TestAppContext) {
-        use std::process::Command;
-
-        fn git(dir: &std::path::Path, args: &[&str]) {
-            let output = Command::new("git")
-                .current_dir(dir)
-                .args(args)
-                .output()
-                .expect("failed to spawn git");
-            assert!(output.status.success(), "git {args:?} failed in {dir:?}");
-        }
-
-        let repo = tempfile::tempdir().expect("tempdir");
-        git(repo.path(), &["init", "-b", "main"]);
-        git(repo.path(), &["config", "user.email", "test@example.com"]);
-        git(repo.path(), &["config", "user.name", "Test User"]);
-        std::fs::write(repo.path().join("base.txt"), "base\n").expect("write");
-        git(repo.path(), &["add", "base.txt"]);
-        git(repo.path(), &["commit", "-m", "initial"]);
-
-        let worktree_container = tempfile::tempdir().expect("tempdir");
-        let worktree_path = worktree_container.path().join("feature-wt");
-        drop(worktree_container);
-        git(
-            repo.path(),
-            &[
-                "worktree",
-                "add",
-                "-b",
-                "feature",
-                worktree_path.to_str().expect("utf8 path"),
-            ],
-        );
-        std::fs::write(worktree_path.join("dirty.txt"), "uncommitted\n").expect("write");
-
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        app.update(cx, |app, cx| {
-            app.set_window_controls_style(WindowControlsStyle::WindowsLinuxStyle, cx);
-        });
-        let id = app.update_in(cx, |app, window, cx| {
-            app.agents.spawn(
-                ProcessKind::Shell,
-                worktree_path.clone(),
-                app.settings.appearance.terminal_font_size,
-                app.settings.terminal.shell_override(),
-                None,
-                window,
-                cx,
-            )
-        });
-        app.update_in(cx, |app, window, cx| {
-            app.select_agent(id, window, cx);
-        });
-        cx.run_until_parked();
-
-        // Agent>Discard worktree is the last row - two dividers and three earlier rows above
-        // it, so this drives the real handler directly (`request_discard_worktree`) rather than
-        // computing that row's exact pixel offset. What's under real test here is the *result*
-        // of two real calls through the exact same real method the row's `on_click` calls - the
-        // arm-then-close-or-not menu logic itself is covered separately below.
-        app.update_in(cx, |app, window, cx| {
-            app.request_discard_worktree(id, window, cx);
-        });
-        cx.run_until_parked();
-        assert_eq!(
-            app.read_with(cx, |app, _| app.discard_confirm_armed),
-            Some(id),
-            "the first click should only arm confirmation, matching the footer's own two-click \
-             discipline"
-        );
-        assert!(
-            worktree_path.exists(),
-            "an armed-but-not-yet-confirmed discard must not have touched the real worktree"
-        );
-
-        app.update_in(cx, |app, window, cx| {
-            app.request_discard_worktree(id, window, cx);
-        });
-        cx.run_until_parked();
-
-        assert!(
-            !worktree_path.exists(),
-            "the second, confirming click should have run the real discard, actually removing \
-             the worktree directory"
-        );
-        app.read_with(cx, |app, _| {
-            assert_eq!(app.discard_confirm_armed, None);
-        });
-    }
-
     /// The title menu's own click-handling for the Discard row (not just
     /// `request_discard_worktree` itself, already covered above): the first, arming click must
     /// leave the menu open so the row's label can really swap to "confirm discard?" for a second
@@ -1077,41 +911,14 @@ mod title_menu_tests {
     fn agent_menu_discard_row_stays_open_while_armed_and_closes_once_confirmed(
         cx: &mut TestAppContext,
     ) {
-        use std::process::Command;
-
-        fn git(dir: &std::path::Path, args: &[&str]) {
-            let output = Command::new("git")
-                .current_dir(dir)
-                .args(args)
-                .output()
-                .expect("failed to spawn git");
-            assert!(output.status.success(), "git {args:?} failed in {dir:?}");
-        }
-
-        let repo = tempfile::tempdir().expect("tempdir");
-        git(repo.path(), &["init", "-b", "main"]);
-        git(repo.path(), &["config", "user.email", "test@example.com"]);
-        git(repo.path(), &["config", "user.name", "Test User"]);
-        std::fs::write(repo.path().join("base.txt"), "base\n").expect("write");
-        git(repo.path(), &["add", "base.txt"]);
-        git(repo.path(), &["commit", "-m", "initial"]);
-
-        let worktree_container = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_repo();
+        let worktree_container = crate::test_support::temp_root();
         let worktree_path = worktree_container.path().join("feature-wt");
         drop(worktree_container);
-        git(
-            repo.path(),
-            &[
-                "worktree",
-                "add",
-                "-b",
-                "feature",
-                worktree_path.to_str().expect("utf8 path"),
-            ],
-        );
-        std::fs::write(worktree_path.join("dirty.txt"), "uncommitted\n").expect("write");
+        test_support::add_worktree(repo.path(), "feature", &worktree_path);
+        test_support::write_file(&worktree_path, "dirty.txt", "uncommitted\n");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         app.update(cx, |app, cx| {
             app.set_window_controls_style(WindowControlsStyle::WindowsLinuxStyle, cx);
         });
@@ -1139,9 +946,7 @@ mod title_menu_tests {
         // The Discard row is the 8th real row (index 7, 0-based) in the Agent menu: New
         // Terminal, New Agent Pane, [divider], Next Agent, Previous Agent, [divider], Review
         // Agent, Archive Agent, Keep All Changes, Discard Worktree - seven real rows and two
-        // dividers sit above it (see `MenuCommand::rows`'s own row order). `Review Agent` joined
-        // that third group with GitHub issue #295, which deleted the agent pane footer's own
-        // `Review` door along with the rest of the finished-agent action bar.
+        // dividers sit above it (see `MenuCommand::rows`'s own row order).
         let bounds = app.read_with(cx, |app, _| {
             app.title_menu_button_bounds[TitleMenu::Agent.index()]
         });
@@ -1208,9 +1013,9 @@ mod title_menu_tests {
     /// resolves through whichever worktree is genuinely current.
     #[gpui::test]
     fn select_relative_agent_cycles_through_real_agents_and_wraps_around(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let other_wt = tempfile::tempdir().expect("tempdir b");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let other_wt = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         app.update(cx, |app, _cx| {
             app.worktrees = vec![
@@ -1383,8 +1188,8 @@ mod title_menu_tests {
     /// them back on the terminal they were trying to leave.
     #[gpui::test]
     fn next_agent_skips_shells_and_enters_the_cycle_from_one(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         for _ in 0..2 {

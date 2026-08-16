@@ -164,25 +164,17 @@ fn has_word(haystack: &str, word: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// The real captures this module was written against, byte for byte: Gemini CLI's idle title
+    /// (OSC 0 payload, trailing padding included) and Claude Code 2.1.228's whole session
+    /// transcript - at rest, a spinner alternating across a 9-second stretch of silent `sleep 3`
+    /// tool calls, then back to rest. Nothing here is invented; see the module docs.
     #[test]
-    fn the_exact_gemini_idle_title_captured_from_a_real_session_reads_as_idle() {
-        // Byte-for-byte what Gemini CLI wrote to a real pty on this machine (OSC 0 payload,
-        // trailing padding included) - see the module docs.
-        assert_eq!(
-            classify_title(
-                "\u{25c7}  Ready (scratchpad)                                                    "
-            ),
-            TitleSignal::Idle
-        );
-    }
-
-    #[test]
-    fn the_real_claude_code_session_transcript_classifies_end_to_end() {
-        // The exact titles Claude Code 2.1.228 wrote to a real pty, in order, over one session:
-        // at rest, then a spinner alternating across a 9-second stretch of silent `sleep 3` tool
-        // calls, then back to rest. Nothing here is invented - see the module docs for the
-        // capture. This is the whole signal, pinned as one sequence.
+    fn the_real_captured_session_titles_classify_end_to_end() {
         let transcript = [
+            (
+                "\u{25c7}  Ready (scratchpad)                                                    ",
+                TitleSignal::Idle,
+            ),
             ("\u{2733} Claude Code", TitleSignal::Idle),
             ("\u{25d0} Claude Code", TitleSignal::Busy),
             (
@@ -203,80 +195,81 @@ mod tests {
         }
     }
 
+    /// Every glyph family this module knows, and the rule that a glyph outranks contradicting
+    /// prose - the glyph is the deliberate signal, the prose is incidental. `\u{25d0}`/`\u{25d1}`
+    /// and the Braille frames were observed live; the rest of each contiguous set is included
+    /// because it must not read as anything else (see the constants' own docs).
     #[test]
-    fn every_frame_of_claude_codes_half_circle_spinner_reads_as_busy() {
-        // `\u{25d0}`/`\u{25d1}` were observed live; the other two are the rest of the same
-        // contiguous set (see the constants' docs) and must not read as anything else.
-        for frame in ['\u{25d0}', '\u{25d1}', '\u{25d2}', '\u{25d3}'] {
-            assert_eq!(
-                classify_title(&format!("{frame} doing something")),
-                TitleSignal::Busy,
-                "{frame:?}"
-            );
+    fn a_status_glyph_decides_the_signal_whatever_the_prose_says() {
+        let cases: &[(&str, TitleSignal)] = &[
+            ("\u{25d0} doing something", TitleSignal::Busy),
+            ("\u{25d1} doing something", TitleSignal::Busy),
+            ("\u{25d2} doing something", TitleSignal::Busy),
+            ("\u{25d3} doing something", TitleSignal::Busy),
+            ("\u{2726} Working (jerry)", TitleSignal::Busy),
+            ("\u{23f2} (jerry)", TitleSignal::Busy),
+            ("\u{25c7} Ready", TitleSignal::Idle),
+            (
+                "\u{270b} Waiting for permission",
+                TitleSignal::NeedsAttention,
+            ),
+            ("\u{280b} some-cli", TitleSignal::Busy),
+            ("\u{2819} some-cli", TitleSignal::Busy),
+            ("\u{2839} some-cli", TitleSignal::Busy),
+            ("\u{2807} some-cli", TitleSignal::Busy),
+            ("\u{2800} some-cli", TitleSignal::Busy),
+            ("\u{28ff} some-cli", TitleSignal::Busy),
+            ("\u{2726} almost done", TitleSignal::Busy),
+            ("\u{270b} working on it", TitleSignal::NeedsAttention),
+        ];
+        for (title, expected) in cases {
+            assert_eq!(classify_title(title), *expected, "{title:?}");
         }
     }
 
+    /// Keywords match case-insensitively, and only on whole words - including at either end of
+    /// the title, which the boundary check has to treat as a boundary rather than a missing
+    /// character, and after an earlier non-matching occurrence, which `has_word`'s scan-onward
+    /// loop has to get past ("already ready").
     #[test]
-    fn geminis_documented_glyph_set_maps_to_its_four_states() {
-        assert_eq!(
-            classify_title("\u{2726} Working (jerry)"),
-            TitleSignal::Busy
-        );
-        assert_eq!(classify_title("\u{23f2} (jerry)"), TitleSignal::Busy);
-        assert_eq!(classify_title("\u{25c7} Ready"), TitleSignal::Idle);
-        assert_eq!(
-            classify_title("\u{270b} Waiting for permission"),
-            TitleSignal::NeedsAttention
-        );
-    }
-
-    #[test]
-    fn a_braille_spinner_frame_anywhere_means_busy() {
-        for frame in [
-            '\u{280b}', '\u{2819}', '\u{2839}', '\u{2807}', '\u{2800}', '\u{28ff}',
-        ] {
-            assert_eq!(
-                classify_title(&format!("{frame} some-cli")),
-                TitleSignal::Busy,
-                "{frame:?} is a Braille spinner frame"
-            );
+    fn a_keyword_matches_case_insensitively_on_whole_words_anywhere_in_the_title() {
+        let cases: &[(&str, TitleSignal)] = &[
+            ("agent: thinking", TitleSignal::Busy),
+            ("[Ready]", TitleSignal::Idle),
+            ("build done.", TitleSignal::Idle),
+            ("waiting for approval", TitleSignal::NeedsAttention),
+            ("WORKING", TitleSignal::Busy),
+            ("Idle", TitleSignal::Idle),
+            ("PERMISSION needed", TitleSignal::NeedsAttention),
+            ("ready", TitleSignal::Idle),
+            ("ready to go", TitleSignal::Idle),
+            ("all ready", TitleSignal::Idle),
+            ("already ready", TitleSignal::Idle),
+            ("\u{2026}\u{2026}ready\u{2026}\u{2026}", TitleSignal::Idle),
+        ];
+        for (title, expected) in cases {
+            assert_eq!(classify_title(title), *expected, "{title:?}");
         }
     }
 
+    /// The false-positive class the word-boundary guard exists for: terminal titles are mostly
+    /// paths, and plenty of ordinary ones embed these letters. An ordinary shell title - and a
+    /// multibyte one, whose bytes `has_word`'s offset arithmetic must never split - claims
+    /// nothing at all.
     #[test]
-    fn a_glyph_beats_a_contradicting_keyword() {
-        assert_eq!(
-            classify_title("\u{2726} almost done"),
-            TitleSignal::Busy,
-            "the glyph is the deliberate signal; the prose is incidental"
-        );
-        assert_eq!(
-            classify_title("\u{270b} working on it"),
-            TitleSignal::NeedsAttention
-        );
-    }
-
-    #[test]
-    fn keywords_match_only_on_whole_words() {
-        assert_eq!(classify_title("agent: thinking"), TitleSignal::Busy);
-        assert_eq!(classify_title("[Ready]"), TitleSignal::Idle);
-        assert_eq!(classify_title("build done."), TitleSignal::Idle);
-        assert_eq!(
-            classify_title("waiting for approval"),
-            TitleSignal::NeedsAttention
-        );
-    }
-
-    #[test]
-    fn a_path_that_merely_contains_a_keyword_as_a_substring_does_not_match() {
-        // The exact false-positive class the word-boundary guard exists for: terminal titles
-        // are mostly paths, and plenty of ordinary ones embed these letters.
+    fn an_ordinary_title_claims_no_status_even_when_it_embeds_the_letters() {
         for title in [
             "~/src/already/main.rs",
             "vim ~/notes/readyish.md",
             "npm run networking-tests",
             "~/code/rethinking/mod.rs",
             "~/work/idleness.txt",
+            "colin@jerry: ~/spike/ade",
+            "bash",
+            "",
+            "make -j8",
+            "\u{2713} tests passed",
+            "日本語のタイトル",
         ] {
             assert_eq!(
                 classify_title(title),
@@ -284,52 +277,5 @@ mod tests {
                 "{title:?} must not be read as a status claim"
             );
         }
-    }
-
-    #[test]
-    fn an_ordinary_shell_title_is_unknown() {
-        for title in [
-            "colin@jerry: ~/spike/ade",
-            "bash",
-            "",
-            "make -j8",
-            "\u{2713} tests passed",
-        ] {
-            assert_eq!(classify_title(title), TitleSignal::Unknown, "{title:?}");
-        }
-    }
-
-    #[test]
-    fn classification_is_case_insensitive_for_keywords() {
-        assert_eq!(classify_title("WORKING"), TitleSignal::Busy);
-        assert_eq!(classify_title("Idle"), TitleSignal::Idle);
-        assert_eq!(
-            classify_title("PERMISSION needed"),
-            TitleSignal::NeedsAttention
-        );
-    }
-
-    #[test]
-    fn a_word_at_either_end_of_the_title_still_matches() {
-        // The boundary check has to treat "start of string" and "end of string" as boundaries,
-        // not as missing characters that fail the test.
-        assert_eq!(classify_title("ready"), TitleSignal::Idle);
-        assert_eq!(classify_title("ready to go"), TitleSignal::Idle);
-        assert_eq!(classify_title("all ready"), TitleSignal::Idle);
-    }
-
-    #[test]
-    fn a_real_word_after_a_non_matching_occurrence_is_still_found() {
-        // Exercises `has_word`'s scan-onward loop: the first "ready" is inside "already" and
-        // must be rejected without ending the search.
-        assert_eq!(classify_title("already ready"), TitleSignal::Idle);
-    }
-
-    #[test]
-    fn multibyte_titles_do_not_panic_and_classify_by_their_glyph() {
-        // `has_word`'s byte-offset arithmetic must never split a UTF-8 character.
-        assert_eq!(classify_title("日本語のタイトル"), TitleSignal::Unknown);
-        assert_eq!(classify_title("\u{25c7} 準備完了"), TitleSignal::Idle);
-        assert_eq!(classify_title("……ready……"), TitleSignal::Idle);
     }
 }

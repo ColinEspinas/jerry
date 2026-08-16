@@ -4,8 +4,6 @@
 //! [`super::menu`].
 
 use super::*;
-#[cfg(test)]
-use crate::root::focus::palette_focus_tests;
 use crate::root::plural;
 
 /// Half-diagonal of an 11×1px rect rotated ±45° about its own center - `5.5 * cos(45°)`. Used to
@@ -630,8 +628,8 @@ mod caption_button_tests {
     /// calls the real `Window::remove_window` and closes the real window - not a mock.
     #[gpui::test]
     fn clicking_the_close_caption_button_closes_the_real_window(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         // Pin the Windows/Linux caption-button variant regardless of the real host OS this test
         // happens to run on, so the test is deterministic everywhere.
@@ -673,8 +671,8 @@ mod caption_button_tests {
     fn a_single_click_on_empty_title_bar_space_never_reaches_the_maximize_call(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
         let _ = app;
 
@@ -721,8 +719,8 @@ mod macos_dot_cluster_tests {
     /// regression by failing its second assertion.
     #[gpui::test]
     fn clicking_the_macos_maximize_dot_toggles_fullscreen_both_ways(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         // Pin the macOS dot-cluster variant regardless of the real host OS this test happens to
         // run on, so the test is deterministic everywhere (the same reasoning
@@ -795,8 +793,12 @@ mod agent_state_chip_text_tests {
         }
     }
 
+    /// The formatter's silence rules: a zero count never renders a chip for any status, and
+    /// `Review`/`Idle` never render one at all however non-zero they are. The design's own
+    /// title-bar example names exactly three states (§4) - finished and idle counts already have
+    /// a real home in the rail's agent rows and the status bar's five-way dot row.
     #[test]
-    fn a_zero_count_is_hidden_for_every_status() {
+    fn chip_text_is_silent_for_a_zero_count_and_for_review_or_idle() {
         for status in Status::ORDER {
             assert_eq!(
                 title_bar_agent_state_chip_text(status, 0),
@@ -804,15 +806,30 @@ mod agent_state_chip_text_tests {
                 "a zero count must never render a chip, for {status:?}"
             );
         }
-    }
-
-    #[test]
-    fn review_and_idle_never_get_a_title_bar_chip_even_with_a_real_nonzero_count() {
-        // The design's own title-bar example names exactly three states (§4) - finished and
-        // idle counts already have a real home in the rail's own agent rows and the status
-        // bar's five-way dot row, so they must stay silent here even when genuinely non-zero.
         assert_eq!(title_bar_agent_state_chip_text(Status::Review, 3), None);
         assert_eq!(title_bar_agent_state_chip_text(Status::Idle, 5), None);
+    }
+
+    /// Each shown state's own wording, conjugated against its own count. `Run`'s two-and
+    /// four-agent forms are `design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §4's
+    /// literal example text, reproduced verbatim.
+    #[test]
+    fn each_shown_state_conjugates_its_own_noun_and_verb() {
+        let cases: &[(Status, usize, &str)] = &[
+            (Status::Ask, 1, "1 agent needs input"),
+            (Status::Ask, 2, "2 agents need input"),
+            (Status::Ask, 7, "7 agents need input"),
+            (Status::Fail, 1, "1 agent failed"),
+            (Status::Fail, 2, "2 agents failed"),
+            (Status::Run, 1, "1 agent running"),
+            (Status::Run, 4, "4 agents running"),
+        ];
+        for (status, count, expected) in cases {
+            assert_eq!(
+                title_bar_agent_state_chip_text(*status, *count).as_deref(),
+                Some(*expected)
+            );
+        }
     }
 
     /// The title bar's half of revision 6's `Review ready` → `Finished` rename (GitHub issue
@@ -834,48 +851,6 @@ mod agent_state_chip_text_tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn ask_conjugates_its_verb_at_exactly_one_vs_two_or_more() {
-        assert_eq!(
-            title_bar_agent_state_chip_text(Status::Ask, 1).as_deref(),
-            Some("1 agent needs input")
-        );
-        assert_eq!(
-            title_bar_agent_state_chip_text(Status::Ask, 2).as_deref(),
-            Some("2 agents need input")
-        );
-        assert_eq!(
-            title_bar_agent_state_chip_text(Status::Ask, 7).as_deref(),
-            Some("7 agents need input")
-        );
-    }
-
-    #[test]
-    fn fail_pluralizes_the_noun_only_the_verb_does_not_conjugate() {
-        assert_eq!(
-            title_bar_agent_state_chip_text(Status::Fail, 1).as_deref(),
-            Some("1 agent failed")
-        );
-        assert_eq!(
-            title_bar_agent_state_chip_text(Status::Fail, 2).as_deref(),
-            Some("2 agents failed")
-        );
-    }
-
-    #[test]
-    fn run_matches_the_design_doc_s_own_worked_example_exactly() {
-        assert_eq!(
-            title_bar_agent_state_chip_text(Status::Run, 1).as_deref(),
-            Some("1 agent running")
-        );
-        // `design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §4's own literal
-        // example text - "4 agents running" - reproduced verbatim.
-        assert_eq!(
-            title_bar_agent_state_chip_text(Status::Run, 4).as_deref(),
-            Some("4 agents running")
-        );
     }
 
     /// Rev 6 §7 rule 4, quoted verbatim: "Two states distinguished anywhere in the app are never
@@ -905,6 +880,18 @@ mod agent_state_chip_text_tests {
                  that summed two states would report more"
             );
         }
+        // The degenerate case the same bug would show up in first: one agent can only ever be
+        // in one state, so it can only ever produce one chip.
+        for status in [Status::Ask, Status::Fail, Status::Run] {
+            let single = title_bar_agent_state_chips(&[row(1, status)]);
+            assert_eq!(
+                single.len(),
+                1,
+                "one agent in {status:?} must produce exactly one chip"
+            );
+            assert_eq!(single[0].1, 1);
+        }
+
         let charged: usize = chips.iter().map(|(_, count, _)| count).sum();
         let chip_eligible = rows
             .iter()
@@ -917,22 +904,6 @@ mod agent_state_chip_text_tests {
              across {} chips for {chip_eligible} eligible agents",
             chips.len()
         );
-    }
-
-    /// A single agent can only ever be in one state, so exactly one chip can ever exist for a
-    /// one-agent window - the degenerate case of the rule above, and the one a "count it in both"
-    /// bug would show up in first.
-    #[test]
-    fn one_agent_produces_exactly_one_chip_whatever_its_state() {
-        for status in [Status::Ask, Status::Fail, Status::Run] {
-            let chips = title_bar_agent_state_chips(&[row(1, status)]);
-            assert_eq!(
-                chips.len(),
-                1,
-                "one agent in {status:?} must produce exactly one chip"
-            );
-            assert_eq!(chips[0].1, 1);
-        }
     }
 
     /// §4b's compaction: the chip shows a bare count, and the fully conjugated sentence is what
@@ -959,11 +930,6 @@ mod agent_state_chip_text_tests {
     }
 
     #[test]
-    fn zero_agents_anywhere_produces_an_entirely_empty_chip_list() {
-        assert_eq!(title_bar_agent_state_chips(&[]), Vec::new());
-    }
-
-    #[test]
     fn only_non_empty_states_produce_a_chip_and_review_idle_are_excluded() {
         let rows = vec![
             row(1, Status::Ask),
@@ -975,6 +941,11 @@ mod agent_state_chip_text_tests {
             vec![(Status::Ask, 1, "1 agent needs input".to_string())],
             "only the one non-empty Ask/Fail/Run state should produce a chip - Review and Idle \
              must stay silent even though they are the majority of the rows"
+        );
+        assert_eq!(
+            title_bar_agent_state_chips(&[]),
+            Vec::new(),
+            "and with no agents anywhere the list is entirely empty"
         );
     }
 
@@ -1040,7 +1011,6 @@ mod agent_state_chip_text_tests {
 #[cfg(test)]
 mod agent_state_chip_live_tests {
     use super::*;
-    use crate::root::focus::palette_focus_tests;
     use gpui::TestAppContext;
 
     fn worktree_item(path: PathBuf, label: &str) -> WorktreeItem {
@@ -1078,8 +1048,8 @@ mod agent_state_chip_live_tests {
     /// real spawned process, only the bookkeeping `kind` the rail/chip logic reads.
     #[gpui::test]
     fn closing_the_only_real_agent_makes_the_chip_row_disappear(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         let startup_agent_id = app
@@ -1139,9 +1109,9 @@ mod agent_state_chip_live_tests {
     fn a_second_real_spawned_agent_flips_the_live_chip_from_singular_to_plural(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let wt_b = tempfile::tempdir().expect("tempdir wt-b");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let wt_b = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         let startup_agent_id = app
@@ -1226,22 +1196,19 @@ mod agent_state_chip_live_tests {
         // "^L" - so what's checked here is the actual thing this test cares about,
         // `idle_duration` itself, not a literal byte sequence that this particular shell state
         // was never going to produce.
-        let refresh_deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
-        let mut first_agent_refreshed = false;
-        loop {
-            cx.background_executor
-                .advance_clock(std::time::Duration::from_millis(8));
-            cx.run_until_parked();
-            let idle = first_pane.read_with(cx, |pane, _| pane.idle_duration());
-            if idle.is_some_and(|idle| idle < std::time::Duration::from_secs(1)) {
-                first_agent_refreshed = true;
-                break;
-            }
-            if std::time::Instant::now() >= refresh_deadline {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        // Both clocks advance together, one poll at a time: the pane only notices new output on
+        // a simulated-clock poll tick, while the real pty reader is an ordinary OS thread that
+        // only makes progress in real time. `test_support::wait_until` is the workspace's one
+        // sanctioned wall-clock wait (`docs/testing.md`).
+        let first_agent_refreshed =
+            test_support::wait_until(std::time::Duration::from_secs(30), || {
+                cx.background_executor
+                    .advance_clock(std::time::Duration::from_millis(8));
+                cx.run_until_parked();
+                first_pane
+                    .read_with(cx, |pane, _| pane.idle_duration())
+                    .is_some_and(|idle| idle < std::time::Duration::from_secs(1))
+            });
         assert!(
             first_agent_refreshed,
             "expected the first agent's real pty activity to refresh after this real Ctrl-L \

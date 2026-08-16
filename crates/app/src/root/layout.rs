@@ -53,43 +53,64 @@ pub fn panel_width_for_cursor(body_right: f32, cursor_x: f32) -> f32 {
 mod tests {
     use super::*;
 
+    /// The rail's width is how far right of the body's *own* left edge the cursor is, clamped to
+    /// its documented range. The body deliberately does not start at window x=0 in the middle
+    /// case, so a dropped `body_left` term cannot pass.
     #[test]
-    fn rail_width_is_the_cursors_distance_from_the_bodys_left_edge() {
-        assert_eq!(rail_width_for_cursor(0.0, 300.0), 300.0);
+    fn rail_width_measures_from_the_bodys_left_edge_and_clamps_to_its_range() {
+        for (body_left, cursor_x, expected, why) in [
+            (
+                0.0,
+                300.0,
+                300.0,
+                "the plain distance from the body's left edge",
+            ),
+            (
+                50.0,
+                350.0,
+                300.0,
+                "measured from the body, not the window origin",
+            ),
+            (
+                0.0,
+                10_000.0,
+                RAIL_MAX,
+                "never wider than its documented maximum",
+            ),
+            (
+                0.0,
+                -10_000.0,
+                RAIL_MIN,
+                "never narrower than its documented minimum",
+            ),
+        ] {
+            assert_eq!(
+                rail_width_for_cursor(body_left, cursor_x),
+                expected,
+                "{why}"
+            );
+        }
     }
 
+    /// The panel's handle sits on its *left* edge and the panel is flush against the body's right
+    /// edge, so it grows as the cursor moves left - the mirror image of the rail's measurement,
+    /// clamped to its own documented range.
     #[test]
-    fn rail_never_exceeds_its_documented_maximum() {
-        assert_eq!(rail_width_for_cursor(0.0, 10_000.0), RAIL_MAX);
-    }
-
-    #[test]
-    fn rail_never_drops_below_its_documented_minimum() {
-        assert_eq!(rail_width_for_cursor(0.0, -10_000.0), RAIL_MIN);
-    }
-
-    #[test]
-    fn rail_width_still_measures_from_a_body_thats_not_flush_with_the_window_origin() {
-        // The body (the div `rail_width_for_cursor` is really measuring against) doesn't
-        // itself start at window x=0 - confirm the offset is subtracted, not assumed away.
-        assert_eq!(rail_width_for_cursor(50.0, 350.0), 300.0);
-    }
-
-    #[test]
-    fn panel_width_is_the_cursors_distance_from_the_bodys_right_edge() {
-        // The panel's handle sits on its *left* edge, and the panel itself is flush against
-        // the body's right edge, so the panel grows as the cursor moves left (away from that
-        // right edge) - the mirror image of the rail's left-edge measurement.
-        assert_eq!(panel_width_for_cursor(1200.0, 900.0), 300.0);
-    }
-
-    #[test]
-    fn panel_never_exceeds_its_maximum() {
-        assert_eq!(panel_width_for_cursor(1200.0, -10_000.0), PANEL_MAX);
-    }
-
-    #[test]
-    fn panel_never_drops_below_its_documented_floor() {
-        assert_eq!(panel_width_for_cursor(1200.0, 10_000.0), PANEL_MIN);
+    fn panel_width_measures_back_from_the_bodys_right_edge_and_clamps_to_its_range() {
+        for (cursor_x, expected, why) in [
+            (
+                900.0,
+                300.0,
+                "the plain distance back from the body's right edge",
+            ),
+            (-10_000.0, PANEL_MAX, "never wider than its maximum"),
+            (
+                10_000.0,
+                PANEL_MIN,
+                "never narrower than its documented floor",
+            ),
+        ] {
+            assert_eq!(panel_width_for_cursor(1200.0, cursor_x), expected, "{why}");
+        }
     }
 }

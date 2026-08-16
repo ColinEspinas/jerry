@@ -8,7 +8,59 @@
 use crate::root::AdeApp;
 use crate::settings::store as settings_store;
 use gpui::{Entity, TestAppContext, VisualTestContext};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// A temporary directory whose [`Self::path`] is already the root `AdeApp` will resolve it to.
+///
+/// `AdeApp` canonicalizes every repo root it is handed ([`crate::rail::repo::canonical_repo_path`])
+/// and then keys repos, worktrees, agents and open files by exact-path equality or `strip_prefix`
+/// against it. On macOS `std::env::temp_dir()` is behind a `/var` -> `/private/var` symlink, so a
+/// fixture that hands the app a bare `tempfile::TempDir::path()` and then builds its expected
+/// values from that same uncanonicalized path compares two different strings for the same
+/// directory, and every worktree-scoped lookup in the test silently misses.
+pub(crate) struct TempRoot {
+    /// Held for its `Drop`; the directory is removed when this value is.
+    _dir: tempfile::TempDir,
+    root: PathBuf,
+}
+
+impl TempRoot {
+    pub(crate) fn path(&self) -> &Path {
+        &self.root
+    }
+
+    pub(crate) fn to_path_buf(&self) -> PathBuf {
+        self.root.clone()
+    }
+
+    /// Writes `contents` to a `self`-relative `name`, creating parent directories, and returns the
+    /// absolute path.
+    pub(crate) fn write(&self, name: &str, contents: &str) -> PathBuf {
+        let path = self.root.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent directories");
+        }
+        std::fs::write(&path, contents).expect("write fixture file");
+        path
+    }
+}
+
+/// An empty [`TempRoot`] — for the tests whose subject is a directory, not a repository.
+pub(crate) fn temp_root() -> TempRoot {
+    let dir = tempfile::tempdir().expect("tempdir");
+    canonicalized(dir)
+}
+
+/// A [`TempRoot`] holding `test_support::seed_repo`'s repository: branch `main`, one commit
+/// (`file.txt`), clean tree.
+pub(crate) fn temp_repo() -> TempRoot {
+    canonicalized(test_support::seed_repo())
+}
+
+fn canonicalized(dir: tempfile::TempDir) -> TempRoot {
+    let root = dir.path().canonicalize().expect("canonicalize tempdir");
+    TempRoot { _dir: dir, root }
+}
 
 /// Opens an `AdeApp` in a test GPUI window against `repo_path`.
 ///
