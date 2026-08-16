@@ -265,6 +265,12 @@ impl AdeApp {
         let settings_keymap_filter_focus_handle = cx.focus_handle();
         let theme_seed_focus_handle = cx.focus_handle();
         let shell_focus_handle = cx.focus_handle();
+        // GitHub issue #401: a real hand-rolled `text_history::TextField` input built alongside
+        // the others in this pre-`this` cluster - see `Self::wire_caret_blink`'s own docs for why
+        // these are all built here rather than inline in the literal below, and GitHub issue #45
+        // for why joining this call (rather than being left out, the recurring live bug this app
+        // keeps re-finding) is not optional.
+        let search_exclude_input_focus_handle = cx.focus_handle();
         let (caret_blink_subscriptions, caret_blink_handles) = AdeApp::wire_caret_blink(
             &[
                 &code_focus_handle,
@@ -275,6 +281,7 @@ impl AdeApp {
                 &settings_keymap_filter_focus_handle,
                 &theme_seed_focus_handle,
                 &shell_focus_handle,
+                &search_exclude_input_focus_handle,
             ],
             window,
             cx,
@@ -670,6 +677,8 @@ impl AdeApp {
             _lsp_rows_task: None,
             settings_keymap_filter: text_history::TextField::new(),
             settings_keymap_filter_focus_handle,
+            search_exclude_input: text_history::TextField::new(),
+            search_exclude_input_focus_handle,
             theme_seed_input: text_history::TextField::new(),
             theme_seed_focus_handle,
             shell_input,

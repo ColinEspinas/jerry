@@ -89,12 +89,18 @@
 //! `search.useIgnoreFiles` split, collapsed into Jerry's one combined always-on list since there
 //! is no separate file-explorer walk to share the distinction with): [`collect_candidate_files`]
 //! below now runs [`crate::search::exclude::collect_files_excluding`] - a real, rayon-parallelized
-//! filesystem walk pruned by [`crate::search::exclude::DEFAULT_EXCLUDES`] - as the one, always-on,
+//! filesystem walk pruned by [`SearchRequest::search_excludes`] - as the one, always-on,
 //! git-independent primary discovery mechanism, and layers `list_worktree_files` on top of it as
 //! an *additive*, independently toggleable filter
 //! ([`crate::settings::store::EditorSettings::respect_gitignore`], default `true`) rather than the
 //! sole file source. Measured directly against this repository, in both toggle states: see
 //! [`collect_candidate_files`]'s own docs.
+//!
+//! GitHub issue #401 made that pruning list itself real, persisted, user-editable settings state
+//! ([`crate::settings::store::EditorSettings::search_excludes`]) rather than the compiled-in
+//! [`crate::search::exclude::DEFAULT_EXCLUDES`] constant alone - see [`SearchRequest::
+//! search_excludes`]'s own docs for exactly what's threaded through, and `crate::search::exclude`'s
+//! own "GitHub issue #401" docs for the full replace-vs-additive design decision.
 
 use std::collections::HashSet;
 use std::fs;
@@ -361,6 +367,15 @@ pub struct SearchRequest {
     pub root: PathBuf,
     pub matcher: Matcher,
     pub filter: PathFilter,
+    /// Layer one's own real, persisted pattern list - `crate::settings::store::EditorSettings::
+    /// search_excludes` (GitHub issue #401), compiled by [`collect_candidate_files`] via
+    /// [`crate::search::exclude::exclude_list_from`] into the [`crate::search::glob::GlobList`]
+    /// [`crate::search::exclude::collect_files_excluding`] prunes the walk against, before layer
+    /// two (below) is ever consulted. `crate::search::render::AdeApp::start_search` is the one
+    /// real call site that populates this, straight from the live setting, so an edit in Settings
+    /// takes effect on the very next query with no restart needed - the same guarantee
+    /// `respect_gitignore` already makes.
+    pub search_excludes: Vec<String>,
     /// The gitignore layer's own toggle - `crate::settings::store::EditorSettings::
     /// respect_gitignore`, `true` by default. See [`collect_candidate_files`]'s own docs for
     /// exactly how this composes with the always-on explicit exclude list underneath it.
@@ -393,8 +408,12 @@ pub fn search_worktree_cancellable(
     is_stale: &dyn Fn() -> bool,
 ) -> SearchOutcome {
     let mut outcome = SearchOutcome::default();
-    let mut candidates =
-        collect_candidate_files(&request.root, request.respect_gitignore, &mut outcome);
+    let mut candidates = collect_candidate_files(
+        &request.root,
+        &request.search_excludes,
+        request.respect_gitignore,
+        &mut outcome,
+    );
     // A stable, predictable order: the tree is read top to bottom and a search re-run after a
     // keystroke must not shuffle rows the user was reading. Neither `git ls-files`' own order nor
     // `read_dir`'s is defined to be that.
@@ -490,11 +509,14 @@ fn scan_file(path: &Path, matcher: &Matcher) -> Option<Vec<LineMatch>> {
 /// fix into.
 ///
 /// **Layer one, always on:** [`crate::search::exclude::collect_files_excluding`] - a real,
-/// `rayon`-parallelized filesystem walk pruned by [`crate::search::exclude::DEFAULT_EXCLUDES`]
-/// (`target`, `node_modules`, `.git`, and a handful of other common build/dependency directory
-/// names) *before* a directory is ever opened. This is the primary discovery mechanism now, not a
-/// fallback: it runs identically whether or not `root` is a real git worktree, which is the literal
-/// answer to the live pushback this issue exists for - "this should have nothing to do with git".
+/// `rayon`-parallelized filesystem walk pruned by `search_excludes`, compiled via
+/// [`crate::search::exclude::exclude_list_from`] (GitHub issue #401's real, persisted
+/// `crate::settings::store::EditorSettings::search_excludes` - `target`, `node_modules`, `.git`,
+/// and a handful of other common build/dependency directory names *by default*, and genuinely
+/// user-editable from there) *before* a directory is ever opened. This is the primary discovery
+/// mechanism now, not a fallback: it runs identically whether or not `root` is a real git
+/// worktree, which is the literal answer to the live pushback this issue exists for - "this should
+/// have nothing to do with git".
 ///
 /// **Layer two, toggleable:** when `request.respect_gitignore` is `true` (the default -
 /// `crate::settings::store::EditorSettings::respect_gitignore`), [`list_worktree_files`] (`git
@@ -512,11 +534,13 @@ fn scan_file(path: &Path, matcher: &Matcher) -> Option<Vec<LineMatch>> {
 /// numbers, not asserted here as a flaky wall-clock unit test.
 fn collect_candidate_files(
     root: &Path,
+    search_excludes: &[String],
     respect_gitignore: bool,
     outcome: &mut SearchOutcome,
 ) -> Vec<(PathBuf, String)> {
+    let excludes = exclude::exclude_list_from(search_excludes);
     let (mut candidates, walk_truncated) =
-        exclude::collect_files_excluding(root, &exclude::default_exclude_list(), MAX_SCANNED_FILES);
+        exclude::collect_files_excluding(root, &excludes, MAX_SCANNED_FILES);
     if walk_truncated {
         outcome.truncated = true;
     }
@@ -1003,6 +1027,7 @@ mod perf_tests {
             .expect("compiles")
             .expect("a query"),
             filter: PathFilter::new("", ""),
+            search_excludes: exclude::default_search_excludes(),
             respect_gitignore: true,
         }
     }
@@ -1137,6 +1162,7 @@ mod worktree_tests {
             root: root.to_path_buf(),
             matcher,
             filter: PathFilter::new(include, exclude),
+            search_excludes: exclude::default_search_excludes(),
             respect_gitignore: true,
         })
     }
@@ -1571,6 +1597,7 @@ mod layered_exclude_tests {
             root: root.to_path_buf(),
             matcher,
             filter: PathFilter::new("", ""),
+            search_excludes: exclude::default_search_excludes(),
             respect_gitignore,
         })
     }
@@ -1723,5 +1750,105 @@ mod layered_exclude_tests {
             .iter()
             .map(|file| file.relative.as_str())
             .collect()
+    }
+}
+
+/// Real, end-to-end coverage for GitHub issue #401: `SearchRequest::search_excludes` is a real,
+/// user-editable list (`crate::settings::store::EditorSettings::search_excludes`), not just the
+/// compiled-in `crate::search::exclude::DEFAULT_EXCLUDES` constant. `crate::search::exclude`'s own
+/// unit tests already prove `exclude_list_from`'s compilation in isolation; this module proves the
+/// *whole* `search_worktree` path - request in, real result out - actually threads a caller's list
+/// through rather than silently falling back to the built-in one somewhere along the way.
+#[cfg(test)]
+mod configurable_exclude_tests {
+    use super::*;
+
+    fn write(root: &Path, relative: &str, content: &str) {
+        let path = root.join(relative);
+        fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
+        fs::write(&path, content).expect("write");
+    }
+
+    fn run(root: &Path, search_excludes: Vec<String>) -> SearchOutcome {
+        let matcher = Matcher::compile("needle", SearchOptions::default())
+            .expect("compiles")
+            .expect("a non-empty query");
+        search_worktree(&SearchRequest {
+            root: root.to_path_buf(),
+            matcher,
+            filter: PathFilter::new("", ""),
+            search_excludes,
+            // No real git worktree in this fixture - irrelevant to what's under test here, same
+            // as every plain-tempdir fixture above `layered_exclude_tests`.
+            respect_gitignore: true,
+        })
+    }
+
+    fn relatives(outcome: &SearchOutcome) -> Vec<&str> {
+        outcome
+            .files
+            .iter()
+            .map(|file| file.relative.as_str())
+            .collect()
+    }
+
+    /// A pattern the user typed into the Settings > Editor > Search "add a pattern" row - not on
+    /// `DEFAULT_EXCLUDES` at all - really prunes the walk, proving the request's own list, not the
+    /// compiled-in constant, is what layer one actually excludes against.
+    #[test]
+    fn a_real_custom_pattern_from_settings_excludes_matching_files() {
+        let dir = tempfile::tempdir().expect("a temp worktree");
+        let root = dir.path();
+        write(root, "src/lib.rs", "needle\n");
+        write(root, "vendor/thirdparty/lib.rs", "needle\n");
+
+        let mut patterns = exclude::default_search_excludes();
+        patterns.push("vendor".to_string());
+        let outcome = run(root, patterns);
+
+        assert_eq!(
+            relatives(&outcome),
+            vec!["src/lib.rs"],
+            "the user's own added `vendor` pattern must exclude it just like a built-in entry"
+        );
+    }
+
+    /// The user removed `node_modules` from their own copy of the list in Settings (the row's
+    /// remove affordance, `crate::settings::render::AdeApp::remove_search_exclude_pattern`) -
+    /// a real search must now find matches inside it again, proving the removal really reaches
+    /// the walk rather than only updating what Settings displays.
+    #[test]
+    fn removing_a_default_pattern_in_settings_re_includes_it_in_a_real_search() {
+        let dir = tempfile::tempdir().expect("a temp worktree");
+        let root = dir.path();
+        write(root, "src/lib.rs", "needle\n");
+        write(root, "node_modules/pkg/index.js", "needle\n");
+
+        let mut patterns = exclude::default_search_excludes();
+        patterns.retain(|pattern| pattern != "node_modules");
+        let outcome = run(root, patterns);
+
+        assert_eq!(
+            relatives(&outcome),
+            vec!["node_modules/pkg/index.js", "src/lib.rs"],
+            "removing node_modules from the user's own list must really re-include it: {:?}",
+            relatives(&outcome)
+        );
+    }
+
+    /// The default request (what every fresh install effectively sends, before any Settings edit)
+    /// still excludes `target/` - the same core #387 guarantee, now proven through the
+    /// user-editable field's own real default rather than only through the old hardcoded-constant
+    /// call path.
+    #[test]
+    fn the_real_default_search_excludes_still_excludes_target() {
+        let dir = tempfile::tempdir().expect("a temp worktree");
+        let root = dir.path();
+        write(root, "src/lib.rs", "needle\n");
+        write(root, "target/debug/deps/needle.d", "needle\n");
+
+        let outcome = run(root, exclude::default_search_excludes());
+
+        assert_eq!(relatives(&outcome), vec!["src/lib.rs"]);
     }
 }

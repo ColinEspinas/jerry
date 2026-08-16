@@ -757,16 +757,17 @@ mod tests {
         let sites = key_context_call_sites();
         let call_sites: usize = sites.iter().map(|(_, count)| count).sum();
         assert_eq!(
-            call_sites, 20,
-            "real_context_stacks() is hand-derived from exactly twenty .key_context(..) call \
-             sites (thirteen of which emit the same bare \"text-input\": the palette, the rail \
+            call_sites, 21,
+            "real_context_stacks() is hand-derived from exactly twenty-one .key_context(..) call \
+             sites (fourteen of which emit the same bare \"text-input\": the palette, the rail \
              filter, the new-file prompt, the Branches filter, the Keybindings filter, the \
              Themes page's \"Generate from colour\" seed input, the General page's \"Shell\" \
              field (GitHub issue #213), GitHub issue #241's git graph row menu's \"Create \
              branch here\" prompt, GitHub issue #242 phase B's interactive-rebase plan row's own \
              reword message field, GitHub issue #285's Changes panel commit message field, and - \
-             GitHub issue #288's pinned review-note card, and - newest - GitHub issue #162's \
-             Search panel row and its in-file find bar - plus GitHub issue #304's own \
+             GitHub issue #288's pinned review-note card, and - GitHub issue #162's \
+             Search panel row and its in-file find bar, and - newest - GitHub issue #401's \
+             Editor > Search page's \"add a pattern\" row - plus GitHub issue #304's own \
              \"rebase-plan\" and issue #288's own \"diff-view\") - a new one means \
              that list, and every disjointness answer built on \
              it, needs updating. Real sites found: {sites:?}"

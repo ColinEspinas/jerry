@@ -1148,6 +1148,9 @@ impl AdeApp {
             root: self.file_tree_root.clone(),
             matcher,
             filter: PathFilter::new(self.search.include.as_str(), self.search.exclude.as_str()),
+            // GitHub issue #401: the real, persisted, user-editable list - see
+            // `crate::settings::store::EditorSettings::search_excludes`'s own docs.
+            search_excludes: self.settings.editor.search_excludes.clone(),
             respect_gitignore: self.settings.editor.respect_gitignore,
         };
         // Captured now rather than re-read after the awaits below: a search that resolves against
