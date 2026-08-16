@@ -74,8 +74,25 @@ impl AdeApp {
             // GitHub issue #90: a genuinely empty window has no real repo root to spawn an agent
             // into - see `crate::work_surface::render::AdeApp::new_agent`'s own docs.
             MenuCommand::NewTerminal | MenuCommand::NewAgentPane => self.focused_repo().is_some(),
+            // Exactly what `select_relative_agent` can actually do, so the row is never enabled
+            // over a no-op: with the active tab already *being* the worktree's only agent
+            // session there is nowhere to cycle to, but from a shell tab (or any other non-agent
+            // pane) a single agent session is a real destination - see that method's own docs
+            // for the entry-from-outside-the-cycle case, and GitHub issue #381 for why a shell
+            // stopped counting as a stop on it.
             MenuCommand::NextAgent | MenuCommand::PreviousAgent => {
-                self.current_worktree_agents().count() > 1
+                let ids: Vec<_> = self
+                    .current_worktree_agent_sessions()
+                    .map(|agent| agent.id)
+                    .collect();
+                match self.agents.active_id() {
+                    None => false,
+                    // Already sitting on the cycle: it has to have somewhere else to go.
+                    Some(active) if ids.contains(&active) => ids.len() > 1,
+                    // Entering it from outside (a shell tab is the common one): any single
+                    // agent session is a real destination.
+                    Some(_) => !ids.is_empty(),
+                }
             }
             MenuCommand::ArchiveAgent => self.agents.active_id().is_some(),
             // GitHub issue #295 moved the agent review door here from the pane footer, which §4r

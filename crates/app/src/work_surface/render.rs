@@ -864,9 +864,12 @@ impl AdeApp {
     /// the same order [`Self::combined_tab_order`] renders them - never Agents' own raw
     /// creation order once a real drag has interleaved them differently, and never every agent
     /// across every worktree, per this revision's whole point (see `crate::root::mod`'s "One
-    /// rail row per worktree" docs). The real per-worktree tab-strip order both
-    /// [`Self::render_tab_strip`] and [`Self::agent_jump_keys`]/[`Self::jump_to_agent_at`]
-    /// share, so the tabs shown and the tabs a jump keycap can reach can never disagree.
+    /// rail row per worktree" docs). The real per-worktree tab-strip order
+    /// [`Self::render_tab_strip`] draws from, so the tabs shown and this list can never disagree.
+    ///
+    /// **Every** pane tab, shells included - this is "what does the strip show", and a
+    /// [`ProcessKind::Shell`] genuinely gets a tab. Anything that means "a real agent session"
+    /// rather than "a pane" wants [`Self::current_worktree_agent_sessions`] instead.
     pub(crate) fn current_worktree_agents(&self) -> impl Iterator<Item = &Agent> {
         let order = self.combined_tab_order();
         order.into_iter().filter_map(move |tab_ref| match tab_ref {
@@ -876,6 +879,30 @@ impl AdeApp {
             | work_surface::TabRef::Review(_)
             | work_surface::TabRef::Run => None,
         })
+    }
+
+    /// [`Self::current_worktree_agents`] narrowed to **real agent sessions**
+    /// (`ProcessKind::is_agent_session`) - the list every surface that says the word *agent* to
+    /// the user counts and indexes by: [`Self::agent_jump_keys`]/[`Self::jump_to_agent_at`] (the
+    /// `secondary-1`..`secondary-8` keycaps and the status bar's copy of them),
+    /// [`Self::select_relative_agent`] (the title bar's `Next Agent`/`Previous Agent`), and that
+    /// pair's own menu-enablement predicate.
+    ///
+    /// Same order as the strip, just with the shells dropped, so `secondary-2` still means "the
+    /// second agent you can see, reading left to right" - it simply stops counting the terminal
+    /// sitting between them. GitHub issue #381: `Jerry.dc.html` has never treated a terminal as
+    /// an agent (`isAgent = t => activeWt.agents.indexOf(t) >= 0`, with `'terminal'` a separate
+    /// tab id its `isFileTab` test excludes by name), and the design's own keybinding table calls
+    /// this `Jump to session by position`. Counting shells made the keycap row advertise more
+    /// positions than there were agents and pushed every real agent off its own number.
+    ///
+    /// A shell is not made unreachable by this: it still has a real tab to click, and - since
+    /// this same issue stopped the palette filing shells under a heading that reads `Agents` - it
+    /// now has its own `Terminals` group there, which is a full keyboard path to it
+    /// (`crate::palette::state::build_groups`).
+    pub(crate) fn current_worktree_agent_sessions(&self) -> impl Iterator<Item = &Agent> {
+        self.current_worktree_agents()
+            .filter(|agent| agent.kind.is_agent_session())
     }
 
     /// Whether the *currently selected* worktree has zero real agents - at most a default
@@ -1034,15 +1061,17 @@ impl AdeApp {
         )
     }
 
-    /// The real `secondary-1`..`secondary-8` agent-jump keycap labels: one per agent open in
-    /// the *currently selected* worktree (`Self::current_worktree_agents`), capped at 8 since
-    /// those are the only ones actually bound (`crate::default_key_bindings`) - never a keycap
-    /// advertising a shortcut that silently does nothing. Shared by [`Self::render_tab_strip`]'s
-    /// own right-aligned cluster and the status bar's agent hint (`status_bar::render::
-    /// render_status_agent_hint`), so the two can never independently drift on what's really
-    /// bound.
+    /// The real `secondary-1`..`secondary-8` agent-jump keycap labels: one per **real agent
+    /// session** open in the *currently selected* worktree
+    /// ([`Self::current_worktree_agent_sessions`] - a plain shell is not an agent and gets no
+    /// number, see that method's docs), capped at 8 since those are the only ones actually bound
+    /// (`crate::default_key_bindings`) - never a keycap advertising a shortcut that silently does
+    /// nothing, and (GitHub issue #381) never one more keycap than there are agents for them to
+    /// land on. Shared by [`Self::render_tab_strip`]'s own right-aligned cluster and the status
+    /// bar's agent hint (`status_bar::render::render_status_agent_hint`), so the two can never
+    /// independently drift on what's really bound.
     pub(crate) fn agent_jump_keys(&self) -> Vec<String> {
-        let agent_count = self.current_worktree_agents().count().min(8);
+        let agent_count = self.current_worktree_agent_sessions().count().min(8);
         (1..=agent_count).map(|n| n.to_string()).collect()
     }
 
@@ -1706,10 +1735,16 @@ impl AdeApp {
         self.open_change_diff(next_path, window, cx);
     }
 
-    /// The tab strip's agent-jump keycaps (`secondary-1`..`secondary-8`) - jumps to the
-    /// agent at 1-indexed `position` in the same order [`Self::render_tab_strip`] iterates
-    /// (`Self::current_worktree_agents`), via [`Self::select_agent`]. No-op if fewer than
-    /// `position` agents are currently open in the selected worktree.
+    /// The tab strip's agent-jump keycaps (`secondary-1`..`secondary-8`) - jumps to the **real
+    /// agent session** at 1-indexed `position` in the same order [`Self::render_tab_strip`]
+    /// iterates ([`Self::current_worktree_agent_sessions`]), via [`Self::select_agent`]. No-op if
+    /// fewer than `position` agent sessions are currently open in the selected worktree.
+    ///
+    /// GitHub issue #381: a plain [`ProcessKind::Shell`] does not take a number. It used to, and
+    /// the position it consumed was the user's own live report - the *worktree's startup shell*
+    /// occupies position 1 in essentially every worktree, so `secondary-1` selected a terminal
+    /// and every real agent sat one place further along than the keycap beside it claimed. See
+    /// [`Self::current_worktree_agent_sessions`] for why the design agrees.
     pub(crate) fn jump_to_agent_at(
         &mut self,
         position: usize,
@@ -1718,7 +1753,7 @@ impl AdeApp {
     ) {
         let Some(id) = position
             .checked_sub(1)
-            .and_then(|index| self.current_worktree_agents().nth(index))
+            .and_then(|index| self.current_worktree_agent_sessions().nth(index))
             .map(|agent| agent.id)
         else {
             return;
@@ -1728,7 +1763,7 @@ impl AdeApp {
 
     /// The Windows/Linux title bar's Agent menu "Next agent"/"Previous agent" rows
     /// (`crate::title_bar::menu::AdeApp::render_title_menu`) - `delta` is `1`/`-1`. Cycles
-    /// through [`Self::current_worktree_agents`] in the same order
+    /// through [`Self::current_worktree_agent_sessions`] in the same order
     /// [`Self::jump_to_agent_at`] indexes - **never** every agent across every worktree
     /// (a real, live-reproduced bug found in this revision's own self-audit: an earlier version
     /// cycled `self.agents` directly, so "Next Agent" could jump to a *different* worktree's
@@ -1740,27 +1775,52 @@ impl AdeApp {
     /// [`Self::next_changed_file`]'s own cyclic-index convention for "next" over an existing
     /// ordered list), via the same real [`Self::select_agent`] every tab-strip click and jump
     /// keycap already goes through - no separate "next agent" subsystem, just a cyclic index
-    /// over the existing per-worktree list. No-op with fewer than two agents in the selected
-    /// worktree (nothing to cycle to) or no active agent at all (both real, reachable states -
-    /// the latter only while every agent has been closed).
+    /// over the existing per-worktree list. No-op with no agent session in the selected worktree
+    /// at all, or with no active agent at all (both real, reachable states - the latter only
+    /// while every agent has been closed).
+    ///
+    /// GitHub issue #381: a plain [`ProcessKind::Shell`] is not a stop on this cycle. A row that
+    /// says `Next Agent` and lands on a terminal is the same conflation the jump keycaps had, and
+    /// this one bit harder in practice - the startup shell sits in every worktree, so a two-tab
+    /// worktree of `[shell, claude]` made `Next Agent` a toggle that spent half its presses
+    /// leaving the only agent there was.
+    ///
+    /// **The active tab not being an agent session is a first-class case, not a no-op.** It is
+    /// the *normal* state (a focused terminal), and `Next Agent` from it must mean something:
+    /// there is no "current" position on the cycle to step from, so `delta > 0` enters at the
+    /// first agent session and `delta < 0` at the last. Falling out through the old
+    /// `position()?` here would have made the row silently dead in exactly the situation a user
+    /// reaches for it.
     pub(crate) fn select_relative_agent(
         &mut self,
         delta: isize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let ids: Vec<AgentId> = self.current_worktree_agents().map(|s| s.id).collect();
-        if ids.len() < 2 {
+        let ids: Vec<AgentId> = self
+            .current_worktree_agent_sessions()
+            .map(|s| s.id)
+            .collect();
+        if ids.is_empty() {
             return;
         }
         let Some(active_id) = self.agents.active_id() else {
             return;
         };
-        let Some(current_index) = ids.iter().position(|id| *id == active_id) else {
-            return;
+        let next_index = match ids.iter().position(|id| *id == active_id) {
+            Some(current_index) => {
+                if ids.len() < 2 {
+                    // The one agent session here is already active - cycling has nowhere to go.
+                    return;
+                }
+                let len = ids.len() as isize;
+                (current_index as isize + delta).rem_euclid(len) as usize
+            }
+            // Active on a shell (or on some other pane that isn't an agent session at all):
+            // enter the cycle from whichever end `delta` is heading towards.
+            None if delta >= 0 => 0,
+            None => ids.len() - 1,
         };
-        let len = ids.len() as isize;
-        let next_index = (current_index as isize + delta).rem_euclid(len) as usize;
         self.select_agent(ids[next_index], window, cx);
     }
 

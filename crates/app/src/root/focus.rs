@@ -828,9 +828,17 @@ mod tab_strip_keybinding_tests {
         );
     }
 
-    /// Spawns four extra real shell agents (five total, including the one `AdeApp::new` starts)
-    /// and confirms `secondary-3` really jumps to the third one in real agent order - not just
-    /// that `AdeApp::jump_to_agent_at(3, ..)` does when called directly.
+    /// Spawns a genuinely **mixed** strip - shells and real agent sessions interleaved - and
+    /// confirms `secondary-3` really jumps to the third *agent session*, not to the third tab.
+    /// Real keystroke coverage, not just that `AdeApp::jump_to_agent_at(3, ..)` does the right
+    /// thing when called directly.
+    ///
+    /// GitHub issue #381, the user's own report: shells used to take numbers. The startup shell
+    /// `AdeApp::new` opens sits at tab position 1 in every worktree, so with the old behaviour
+    /// every real agent was one position further along than the keycap beside it said, and
+    /// `secondary-1` selected a terminal. The fixture below is built so tab order and agent order
+    /// genuinely disagree: `[shell, claude, shell, codex, claude]`, where the third *agent* is
+    /// tab 5.
     #[gpui::test]
     fn secondary_3_jumps_to_the_third_real_agent_through_the_real_key_bindings(
         cx: &mut TestAppContext,
@@ -839,24 +847,42 @@ mod tab_strip_keybinding_tests {
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         bind_real_keys(cx);
 
+        // Tab 1 is `open_test_app`'s own startup shell. Four more, then retagged so the strip
+        // reads `[shell, claude, shell, codex, claude]` - every process is a real spawned shell,
+        // `set_kind_for_test` only changes what this app *calls* each one, which is exactly the
+        // discriminator under test.
         for _ in 0..4 {
             app.update_in(cx, |app, window, cx| {
                 app.new_agent(ProcessKind::Shell, window, cx);
             });
         }
-        let third_id = app.read_with(cx, |app, _| {
-            app.agents
-                .iter()
-                .nth(2)
-                .map(|agent| agent.id)
-                .expect("five real agents should exist by now")
+        let tab_ids: Vec<crate::work_surface::agents::AgentId> = app.read_with(cx, |app, _| {
+            app.agents.iter().map(|agent| agent.id).collect()
         });
-        assert_ne!(
-            app.read_with(cx, |app, _| app.agents.active_id()),
-            Some(third_id),
-            "sanity check: the most recently spawned agent (the fifth), not the third, should \
-             be active before the jump"
+        assert_eq!(tab_ids.len(), 5, "five real tabs should exist by now");
+        app.update(cx, |app, _cx| {
+            app.agents
+                .set_kind_for_test(tab_ids[1], ProcessKind::claude());
+            app.agents
+                .set_kind_for_test(tab_ids[3], ProcessKind::codex());
+            app.agents
+                .set_kind_for_test(tab_ids[4], ProcessKind::claude());
+        });
+        // The third real agent session: tab 5, two shells having been skipped on the way.
+        let third_agent_id = tab_ids[4];
+        let third_tab_id = tab_ids[2];
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.agent_jump_keys()),
+            vec!["1".to_string(), "2".to_string(), "3".to_string()],
+            "the keycap row must advertise one number per real agent session (three), not one \
+             per tab (five)"
         );
+
+        // Start from a tab that is neither answer, so the assertion below can't pass by accident.
+        app.update_in(cx, |app, window, cx| {
+            app.select_agent(tab_ids[0], window, cx);
+        });
 
         let secondary_3 = if cfg!(target_os = "macos") {
             "cmd-3"
@@ -867,15 +893,25 @@ mod tab_strip_keybinding_tests {
 
         assert_eq!(
             app.read_with(cx, |app, _| app.agents.active_id()),
-            Some(third_id),
-            "a real, simulated {secondary_3} keystroke must activate the agent at position 3 \
+            Some(third_agent_id),
+            "a real, simulated {secondary_3} keystroke must activate the *third agent session* \
              through crate::default_key_bindings' real secondary-3 -> JumpToAgent3 binding"
+        );
+        assert_ne!(
+            app.read_with(cx, |app, _| app.agents.active_id()),
+            Some(third_tab_id),
+            "it must not activate the third *tab*, which is a plain shell - a terminal is not an \
+             agent and takes no jump number (GitHub issue #381)"
         );
     }
 
     /// [`AdeApp::jump_to_agent_at`]'s own direct-call coverage (as opposed to the keystroke
     /// simulation above) for every position 1..=8, plus the real "fewer agents than the
     /// position" no-op.
+    ///
+    /// Every tab here is retagged to a real agent session, so positions 1..=4 are genuinely
+    /// occupied - GitHub issue #381 stopped shells taking a number, and the interleaved-fixture
+    /// case is covered by the keystroke test above.
     #[gpui::test]
     fn jump_to_agent_at_activates_the_right_agent_by_position(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -899,6 +935,11 @@ mod tab_strip_keybinding_tests {
             ids.push(id);
         }
         // Four real agents now exist, in spawn order `ids[0..4]`.
+        app.update(cx, |app, _cx| {
+            for id in &ids {
+                app.agents.set_kind_for_test(*id, ProcessKind::claude());
+            }
+        });
 
         for (position, expected_id) in ids.iter().enumerate() {
             let position = position + 1;
