@@ -65,11 +65,16 @@ There is exactly one version number for the whole workspace: `version` in the ro
 `[workspace.package]`. Every crate inherits it (`version = { workspace = true }`); nothing pins its
 own. To cut a release:
 
-1. Bump that one `version` field and commit.
-2. Tag the commit `v<same number>` (e.g. version `0.1.1` → tag `v0.1.1`) and push the tag.
+1. Bump that one `version` field on a branch, commit, and open a PR — never commit the bump
+   directly to `master`.
+2. Once the PR is merged, tag the resulting `master` commit `v<same number>` (e.g. version
+   `0.1.1` → tag `v0.1.1`) and push the tag.
 3. `.github/workflows/release.yml` takes it from there — its `version-check` job runs
    `.claude/hooks/check-release-version.sh` against the pushed tag and refuses the release outright
    if the tag doesn't match the workspace version, before any of the per-OS builds run.
+
+The same rule applies to the changelog: `CHANGELOG.md` updates and any other release-adjacent
+commit go through a branch and a PR too, same as any other change to the repo.
 
 This tag/version equality is what the in-app updater (`crates/app/src/updater/`) actually depends
 on — it compares `env!("CARGO_PKG_VERSION")` against the latest release tag, so any drift between
