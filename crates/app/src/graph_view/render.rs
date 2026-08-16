@@ -2120,7 +2120,7 @@ impl AdeApp {
                 lane_count,
                 scale_factor,
             ))
-            .child(render_graph_ref_chips(row))
+            .child(render_graph_ref_chips(row, cx))
             .child(
                 div()
                     .flex_1()
@@ -4158,7 +4158,22 @@ fn render_graph_lane_canvas(
 
 /// Ref chips for one row (design spec §2): local branches on their lane-colour dim pair, `HEAD`,
 /// outlined remotes, and tags.
-fn render_graph_ref_chips(row: &GraphRow) -> impl IntoElement {
+///
+/// GitHub issue #277: a local-branch chip is a right-click target in its own right, distinct
+/// from the row it sits on. Right-clicking directly on one opens the *branch*-scoped menu
+/// ([`AdeApp::render_graph_branch_menu`], via [`AdeApp::open_graph_branch_menu_at`]) with its
+/// real "Checkout Branch" action (`AdeApp::request_graph_branch_checkout` -
+/// `git switch -- <branch>`), rather than falling through to the row's own commit-scoped `⋯`
+/// menu (`AdeApp::request_graph_checkout`, a detached-HEAD checkout of the row's SHA). This
+/// mirrors `render_graph_branch_row`'s own right-click handler in the Branches panel byte for
+/// byte - same target function, same `cx.stop_propagation()` so the click never also reaches
+/// the row's handler underneath - the chip is just a second, row-embedded entry point onto the
+/// exact same branch menu. Scoped to `LocalBranch` only, same as the Branches panel itself
+/// (`Self::render_graph_branches_panel` filters on `RefKind::LocalBranch`): a remote branch or a
+/// tag has no "Checkout Branch" operation of its own - checking either out is inherently a
+/// detached-HEAD move, so those chips are left non-interactive and a right-click on them falls
+/// through to the row's own (correct, commit-scoped) menu, same as clicking bare row space.
+fn render_graph_ref_chips(row: &GraphRow, cx: &mut Context<AdeApp>) -> impl IntoElement {
     let mut chips = div()
         .flex_none()
         .flex()
@@ -4167,17 +4182,42 @@ fn render_graph_ref_chips(row: &GraphRow) -> impl IntoElement {
         .px(px(6.0));
     for chip in &row.commit.refs {
         let element = match chip.kind {
-            RefKind::LocalBranch => div()
-                .px(px(6.0))
-                .h(px(15.0))
-                .flex()
-                .items_center()
-                .rounded(theme::radius::MARK)
-                .bg(local_branch_dim_bg(lane_for_ref(row, chip)))
-                .font(font(theme::font::MONO))
-                .text_size(px(9.0))
-                .text_color(lane_color(lane_for_ref(row, chip)))
-                .child(chip.name.clone()),
+            RefKind::LocalBranch => {
+                let name = chip.name.clone();
+                div()
+                    .id(format!("graph-ref-chip-{name}"))
+                    .debug_selector({
+                        let name = name.clone();
+                        move || format!("graph-ref-chip-{name}")
+                    })
+                    .px(px(6.0))
+                    .h(px(15.0))
+                    .flex()
+                    .items_center()
+                    .rounded(theme::radius::MARK)
+                    .bg(local_branch_dim_bg(lane_for_ref(row, chip)))
+                    .font(font(theme::font::MONO))
+                    .text_size(px(9.0))
+                    .text_color(lane_color(lane_for_ref(row, chip)))
+                    .on_mouse_down(
+                        gpui::MouseButton::Right,
+                        cx.listener({
+                            let name = name.clone();
+                            move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                this.open_graph_branch_menu_at(
+                                    name.clone(),
+                                    event.position.x,
+                                    event.position.y,
+                                    window,
+                                    cx,
+                                );
+                            }
+                        }),
+                    )
+                    .child(chip.name.clone())
+                    .into_any_element()
+            }
             RefKind::RemoteBranch => div()
                 .px(px(6.0))
                 .h(px(15.0))
@@ -4189,7 +4229,8 @@ fn render_graph_ref_chips(row: &GraphRow) -> impl IntoElement {
                 .font(font(theme::font::MONO))
                 .text_size(px(9.0))
                 .text_color(theme::text::DIM)
-                .child(chip.name.clone()),
+                .child(chip.name.clone())
+                .into_any_element(),
             RefKind::Tag => div()
                 .px(px(6.0))
                 .h(px(15.0))
@@ -4200,7 +4241,8 @@ fn render_graph_ref_chips(row: &GraphRow) -> impl IntoElement {
                 .font(font(theme::font::MONO))
                 .text_size(px(9.0))
                 .text_color(theme::graph::TAG_CHIP_FG)
-                .child(chip.name.clone()),
+                .child(chip.name.clone())
+                .into_any_element(),
         };
         chips = chips.child(element);
         if chip.is_head {
@@ -4338,6 +4380,134 @@ mod graph_row_menu_tests {
                 "the popover must paint at exactly the position captured when it opened"
             );
         });
+    }
+
+    /// GitHub issue #277: right-clicking a branch chip *directly* - `main`'s own ref chip,
+    /// painted on row 0 by `render_graph_ref_chips` since `seed_three_commits` leaves `main`
+    /// checked out on the newest commit - must open the branch-scoped menu
+    /// (`AdeApp::render_graph_branch_menu`) naming that branch, with a real "Checkout Branch"
+    /// action behind it (`AdeApp::request_graph_branch_checkout`, `git switch -- <branch>`), not
+    /// the row's own commit-scoped menu (`AdeApp::request_graph_checkout`, a detached-HEAD
+    /// checkout of the row's SHA). Before the fix, the chip was a purely decorative div with no
+    /// handler of its own, so this click fell through to the row's handler and opened
+    /// `row_menu_open` instead.
+    #[gpui::test]
+    fn right_clicking_a_branch_chip_opens_the_branch_menu_not_the_row_menu(
+        cx: &mut TestAppContext,
+    ) {
+        let (_repo, app, cx) = open_seeded_graph(cx);
+
+        let chip = cx
+            .debug_bounds("graph-ref-chip-main")
+            .expect("main's own ref chip must really be painted on the newest commit's row");
+        right_click(cx, chip.center());
+
+        app.read_with(cx, |app, _| {
+            let menu = app.graph_state.branch_menu_open.clone().expect(
+                "a right-click on the branch chip itself must open the branch menu, not \
+                     leave it closed",
+            );
+            assert_eq!(
+                menu.branch, "main",
+                "the branch menu must name the chip's own branch"
+            );
+            assert!(
+                app.graph_state.row_menu_open.is_none(),
+                "the click must not *also* open the row's commit-scoped menu underneath - \
+                 exactly one menu should come out of one right-click"
+            );
+        });
+        let painted = cx
+            .debug_bounds("graph-branch-menu-popover")
+            .expect("and the branch menu popover must genuinely paint");
+        app.read_with(cx, |app, _| {
+            let menu = app.graph_state.branch_menu_open.clone().expect("menu");
+            assert_eq!(
+                (painted.origin.x, painted.origin.y),
+                (menu.origin_x, menu.origin_y),
+                "anchored at the real click position on the chip, not some row-derived origin"
+            );
+        });
+    }
+
+    /// The other half of GitHub issue #277's fix: right-clicking the *same* row that carries a
+    /// real branch chip, but away from the chip itself (over the commit subject, same spot
+    /// `right_clicking_a_row_opens_its_menu_at_the_real_click_position` above already uses),
+    /// must still open the row's own commit-scoped menu targeting that commit - a right-click
+    /// that isn't on the branch chip has no branch to scope to, so it stays a plain (correct)
+    /// detached-HEAD-style commit checkout, exactly as before this fix.
+    #[gpui::test]
+    fn right_clicking_the_bare_row_still_targets_the_commit_not_the_branch(
+        cx: &mut TestAppContext,
+    ) {
+        let (_repo, app, cx) = open_seeded_graph(cx);
+
+        let expected_sha = app.read_with(cx, |app, _| {
+            app.current_graph_row(0)
+                .expect("row 0 must be loaded")
+                .commit
+                .id
+                .clone()
+        });
+
+        let row = cx
+            .debug_bounds("graph-row-0")
+            .expect("the first commit row must be painted");
+        right_click(cx, row.center());
+
+        app.read_with(cx, |app, _| {
+            let menu = app.graph_state.row_menu_open.expect(
+                "a right-click on the row away from its branch chip must open the row's own \
+                 commit-scoped menu",
+            );
+            assert_eq!(
+                menu.row_index, 0,
+                "targeting the row under the cursor, i.e. the commit at index 0"
+            );
+            assert!(
+                app.graph_state.branch_menu_open.is_none(),
+                "a click that never touched the branch chip must not open the branch menu"
+            );
+        });
+
+        // The row menu's own "Check out" action really does target that commit's SHA
+        // (`AdeApp::request_graph_checkout`), not the branch, confirming the two menus stay on
+        // their own separate operations end to end.
+        app.update(cx, |app, cx| {
+            app.request_graph_checkout(expected_sha.clone(), cx);
+        });
+        cx.run_until_parked();
+        let head_sha = String::from_utf8(
+            std::process::Command::new("git")
+                .current_dir(_repo.path())
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .expect("git rev-parse")
+                .stdout,
+        )
+        .expect("utf8")
+        .trim()
+        .to_string();
+        assert_eq!(
+            head_sha, expected_sha,
+            "commit checkout must land HEAD on that exact commit's SHA"
+        );
+        let branch = String::from_utf8(
+            std::process::Command::new("git")
+                .current_dir(_repo.path())
+                .args(["branch", "--show-current"])
+                .output()
+                .expect("git branch --show-current")
+                .stdout,
+        )
+        .expect("utf8")
+        .trim()
+        .to_string();
+        assert!(
+            branch.is_empty(),
+            "a commit checkout must leave the worktree in detached HEAD, not on a named branch, \
+             got branch {branch:?}"
+        );
     }
 
     /// `theme::graph::ROW_MENU_HEIGHT` is a hand-measured constant (this menu's content is fixed,
