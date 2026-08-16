@@ -24,7 +24,31 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 ///     "the watcher must observe a real file write within the tier's budget"
 /// );
 /// ```
-pub fn wait_until(deadline: Duration, mut condition: impl FnMut() -> bool) -> bool {
+pub fn wait_until(deadline: Duration, condition: impl FnMut() -> bool) -> bool {
+    wait_until_every(POLL_INTERVAL, deadline, condition)
+}
+
+/// [`wait_until`] with an explicit poll interval, for a condition whose *check* perturbs the very
+/// thing it measures — a probe that takes a connection slot in the server it is asking about, a
+/// check that contends for the lock the subject needs. At [`POLL_INTERVAL`] such a probe measures
+/// its own polling rate rather than the subject; pick an interval coarse enough that it doesn't.
+///
+/// Prefer plain [`wait_until`] everywhere else: a coarse interval buys nothing when the check is
+/// free, and costs up to `interval` of dead time on a condition that has already been satisfied.
+///
+/// ```no_run
+/// # use std::time::Duration;
+/// # let served = || true;
+/// assert!(
+///     test_support::wait_until_every(Duration::from_millis(250), Duration::from_secs(20), served),
+///     "the server must recover once it gives up on the clients holding every slot"
+/// );
+/// ```
+pub fn wait_until_every(
+    interval: Duration,
+    deadline: Duration,
+    mut condition: impl FnMut() -> bool,
+) -> bool {
     let expiry = Instant::now() + deadline;
     loop {
         if condition() {
@@ -34,7 +58,7 @@ pub fn wait_until(deadline: Duration, mut condition: impl FnMut() -> bool) -> bo
         if remaining.is_zero() {
             return false;
         }
-        thread::sleep(POLL_INTERVAL.min(remaining));
+        thread::sleep(interval.min(remaining));
     }
 }
 
@@ -48,7 +72,7 @@ pub fn stays_false(window: Duration, condition: impl FnMut() -> bool) -> bool {
 
 #[cfg(test)]
 mod bounded_wait_tests {
-    use crate::{stays_false, wait_until};
+    use crate::{stays_false, wait_until, wait_until_every};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
@@ -96,6 +120,46 @@ mod bounded_wait_tests {
         assert!(
             started.elapsed() < Duration::from_millis(10),
             "an already-satisfied condition must cost no wall-clock time at all"
+        );
+    }
+
+    #[test]
+    fn wait_until_every_polls_at_the_interval_it_was_given_rather_than_the_default() {
+        let polls = AtomicUsize::new(0);
+        let started = Instant::now();
+
+        let satisfied =
+            wait_until_every(Duration::from_millis(100), Duration::from_secs(30), || {
+                polls.fetch_add(1, Ordering::SeqCst) >= 3
+            });
+
+        assert!(
+            satisfied,
+            "the condition became true well inside the deadline"
+        );
+        // Four checks at 100ms is at least 300ms of sleeping; at `wait_until`'s own 10ms it would
+        // be ~30ms, which is what this distinguishes.
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "a coarse interval must really be waited out between checks - it took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn wait_until_every_never_sleeps_past_the_deadline() {
+        let started = Instant::now();
+
+        assert!(!wait_until_every(
+            Duration::from_secs(30),
+            Duration::from_millis(50),
+            || false
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the interval must be clamped to what is left of the deadline, not slept in full - it \
+             took {:?}",
+            started.elapsed()
         );
     }
 

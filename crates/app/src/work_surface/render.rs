@@ -5856,6 +5856,8 @@ mod agent_pane_readout_tests {
     /// Driven through the genuinely painted button (`debug_bounds` + `simulate_click`), not
     /// through `request_discard_worktree` directly - the point is that this strip still offers
     /// those two, and that `Open terminal` (which used to sit between them) does not paint.
+    /// `#[cfg(unix)]`: the failed run below is a real `/bin/false` child, which needs a `/bin`.
+    #[cfg(unix)]
     #[gpui::test]
     fn a_failed_run_keeps_retry_and_a_two_click_discard_and_nothing_else(cx: &mut TestAppContext) {
         let repo = crate::test_support::temp_repo();
