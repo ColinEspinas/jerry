@@ -634,6 +634,23 @@ pub struct EditorSettings {
     /// `crate::language::auto_import_suppression_options`, which currently means
     /// `typescript-language-server` and no one else.
     pub suggest_auto_imports: bool,
+    /// Whether the search panel's real, always-on explicit exclude list
+    /// (`crate::search::exclude::DEFAULT_EXCLUDES` - `target`, `node_modules`, `.git`, and a
+    /// handful of other common build/dependency directories) is ALSO layered with the worktree's
+    /// real `.gitignore` (GitHub issue #394, which reworked #387/#388's own gitignore-only fix
+    /// into this layered model after a direct "this should have nothing to do with git?"
+    /// pushback - see `crate::search::exclude`'s own module docs for the full story).
+    ///
+    /// Matches VS Code's own `search.useIgnoreFiles`, including its default of `true`: on top of
+    /// the explicit list (which always applies and this toggle cannot turn off), this
+    /// additionally hides gitignored files. Off, only the explicit list applies - a search
+    /// deliberately scoped independently of git, which is what the pushback this setting exists
+    /// to satisfy actually asked for. Read by `crate::search::engine::search_worktree_cancellable`
+    /// via `crate::search::engine::SearchRequest::respect_gitignore`
+    /// (`crate::search::render::AdeApp::start_search` is the one real call site that populates it
+    /// from this field), and toggled by the Editor settings page's own row
+    /// (`crate::settings::render::AdeApp::toggle_respect_gitignore`).
+    pub respect_gitignore: bool,
 }
 
 impl Default for EditorSettings {
@@ -645,6 +662,7 @@ impl Default for EditorSettings {
             tab_width: EDITOR_TAB_WIDTH_DEFAULT,
             auto_import: true,
             suggest_auto_imports: true,
+            respect_gitignore: true,
         }
     }
 }
@@ -826,7 +844,10 @@ pub fn config_keys_line(page: ConfigPage) -> &'static str {
         ConfigPage::Theme => {
             "theme.name \u{b7} theme.follow_system \u{b7} theme.high_contrast_diff"
         }
-        ConfigPage::Editor => "editor.minimap_enabled \u{b7} editor.minimap_scale_percent",
+        ConfigPage::Editor => {
+            "editor.minimap_enabled \u{b7} editor.minimap_scale_percent \u{b7} \
+             editor.respect_gitignore"
+        }
         ConfigPage::Notifications => {
             "sound.enabled \u{b7} sound.app_start.sound \u{b7} sound.agent_finished.sound \u{b7} \
              sound.agent_needs_input.sound"
@@ -993,6 +1014,55 @@ mod tests {
         );
         assert!(settings.editor.insert_spaces);
         assert_eq!(settings.editor.tab_width, EDITOR_TAB_WIDTH_DEFAULT);
+        assert!(
+            settings.editor.respect_gitignore,
+            "matches VS Code's own search.useIgnoreFiles default of true"
+        );
+    }
+
+    /// The real toggle a user flips from the Editor settings page - see
+    /// `crate::settings::render::AdeApp::toggle_respect_gitignore`. Proven here at the file-format
+    /// level (round-trips through a real save + load, and an explicit `false` in a hand-edited
+    /// file is honoured rather than silently reset to the default) rather than only asserted
+    /// in-memory, since a toggle nobody can actually flip-and-keep-flipped is not a real setting.
+    #[test]
+    fn respect_gitignore_persists_through_a_real_save_and_load_in_both_states() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+
+        let mut settings = Settings::default();
+        assert!(settings.editor.respect_gitignore, "the real default");
+        settings.editor.respect_gitignore = false;
+        settings.save_at(&path).expect("save");
+
+        let reloaded = Settings::load_or_init_at(&path);
+        assert!(
+            !reloaded.editor.respect_gitignore,
+            "a real save must round-trip an explicit `false`, not silently revert to the default"
+        );
+
+        let mut settings = reloaded;
+        settings.editor.respect_gitignore = true;
+        settings.save_at(&path).expect("save");
+        assert!(Settings::load_or_init_at(&path).editor.respect_gitignore);
+    }
+
+    /// A `settings.toml` written before this setting existed has no `respect_gitignore` key at
+    /// all under `[editor]` - `#[serde(default)]` must fall back to the real default (`true`)
+    /// rather than failing the whole parse, the same fallback already proven for the minimap and
+    /// keymap sections.
+    #[test]
+    fn a_settings_file_missing_respect_gitignore_entirely_still_loads_the_real_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, "[editor]\ntab_width = 2\n").expect("write old file");
+
+        let loaded = Settings::load_or_init_at(&path);
+        assert_eq!(loaded.editor.tab_width, 2);
+        assert!(
+            loaded.editor.respect_gitignore,
+            "a missing key must fall back to the real default, not an implicit false"
+        );
     }
 
     #[test]

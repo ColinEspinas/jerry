@@ -1148,6 +1148,7 @@ impl AdeApp {
             root: self.file_tree_root.clone(),
             matcher,
             filter: PathFilter::new(self.search.include.as_str(), self.search.exclude.as_str()),
+            respect_gitignore: self.settings.editor.respect_gitignore,
         };
         // Captured now rather than re-read after the awaits below: a search that resolves against
         // whatever the user has since typed would report a count for one query beside a tree for

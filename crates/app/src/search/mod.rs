@@ -9,6 +9,9 @@
 //! the `gpui::Div`-building code that draws it:
 //!
 //! - [`glob`] - the pure `include`/`exclude` pattern language (`**`, `*`, `?`, comma-separated).
+//! - [`exclude`] - the always-on, explicit `target`/`node_modules`/`.git`-style exclude list the
+//!   worktree walk applies before it ever asks `.gitignore` anything (GitHub issue #394) - see
+//!   that module's own docs for how it composes with the separate, toggleable gitignore layer.
 //! - [`engine`] - the compiled matcher the three modifier buttons produce, the bounded worktree
 //!   walk, the two-level result tree, and the real on-disk replace.
 //! - [`in_file`] - the `mod+F` find bar's own pure model: hits in the open buffer, the current
@@ -22,6 +25,7 @@
 //! `crate::sidebar` established for its own submodules.
 
 pub mod engine;
+pub mod exclude;
 pub mod glob;
 pub mod in_file;
 pub mod state;
