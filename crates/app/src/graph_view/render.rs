@@ -4316,40 +4316,9 @@ fn lane_for_ref(row: &GraphRow, _chip: &wt_core::graph::RefChip) -> usize {
 #[cfg(test)]
 mod graph_row_menu_tests {
     use super::*;
-    use crate::root::focus::palette_focus_tests;
+    use crate::test_support::open_test_app;
     use gpui::{Bounds, Entity, Pixels, Point, Size, TestAppContext};
-
-    fn git(dir: &std::path::Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    /// Three real commits, clean working tree at the end - `build_graph` yields exactly three
-    /// real commit rows (indices 0..=2, newest first), with no "Working tree" row to
-    /// throw off the indices these tests target.
-    fn seed_three_commits(dir: &std::path::Path) {
-        git(dir, &["init", "-b", "main"]);
-        git(dir, &["config", "user.email", "test@example.com"]);
-        git(dir, &["config", "user.name", "Test User"]);
-        std::fs::write(dir.join("a.txt"), "1\n").expect("write a.txt");
-        git(dir, &["add", "."]);
-        git(dir, &["commit", "-m", "first"]);
-        std::fs::write(dir.join("a.txt"), "2\n").expect("write a.txt");
-        git(dir, &["commit", "-am", "second"]);
-        std::fs::write(dir.join("a.txt"), "3\n").expect("write a.txt");
-        git(dir, &["commit", "-am", "third"]);
-    }
+    use test_support::seed_three_commits;
 
     fn open_seeded_graph(
         cx: &mut TestAppContext,
@@ -4360,7 +4329,7 @@ mod graph_row_menu_tests {
     ) {
         let repo = tempfile::tempdir().expect("tempdir");
         seed_three_commits(repo.path());
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_git_graph(window, cx);
         });
@@ -4707,7 +4676,7 @@ mod graph_row_menu_tests {
     fn the_dots_button_anchors_off_its_own_real_captured_bounds(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
         seed_three_commits(repo.path());
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         let scrolled_bounds = Bounds {
@@ -4864,7 +4833,7 @@ mod graph_row_menu_tests {
     ) {
         let repo = tempfile::tempdir().expect("tempdir");
         seed_three_commits(repo.path());
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         app.update_in(cx, |app, window, cx| {

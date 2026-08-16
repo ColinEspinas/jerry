@@ -55,6 +55,11 @@ pub mod sidebar;
 pub mod sound;
 pub mod status_bar;
 pub mod terminal;
+// The GPUI half of this workspace's shared fixtures; the gpui-free half is `crates/test-support`
+// (see that crate's docs and `docs/testing.md`). `cfg(test)`, so none of it is compiled into the
+// shipped binary.
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod text_history;
 pub mod theme;
 // `pub(crate)`, unlike every other feature folder above: this one exposes no public item at

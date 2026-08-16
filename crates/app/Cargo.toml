@@ -379,6 +379,9 @@ windows-sys = { version = "0.61.2", features = [
 
 [dev-dependencies]
 tempfile = "3"
+# Shared, gpui-free fixtures (real seeded repositories, argv-only `git`, bounded waits,
+# `ChildGuard`) - see `docs/testing.md`.
+test-support = { path = "../test-support" }
 # `test-support` unlocks GPUI's real interactive test harness (`#[gpui::test]`,
 # `TestAppContext`/`VisualTestContext` - a real window, real focus tracking, real action
 # dispatch/keystroke simulation, not a mock). Kept as a permanent dependency, not a temporary

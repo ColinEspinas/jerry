@@ -238,28 +238,12 @@ impl AdeApp {
 #[cfg(test)]
 pub(crate) mod palette_focus_tests {
     use super::*;
-    use gpui::{Entity, TestAppContext};
+    use gpui::TestAppContext;
 
-    /// Opens an `AdeApp` in a test GPUI window against a throwaway temp directory (not a real
-    /// git repo, so `worktrees`/`diff_state` end up empty/errored - irrelevant to what these
-    /// tests check). `pub(crate)` since `settings_focus_tests` and others reuse this
-    /// same setup. Uses `AdeApp::new_with_settings` (in-memory `Settings::default()`, `None`
-    /// path), not `AdeApp::new`, so tests never read or write a real `settings.toml`.
-    pub(crate) fn open_test_app(
-        cx: &mut TestAppContext,
-        repo_path: PathBuf,
-    ) -> (Entity<AdeApp>, &mut gpui::VisualTestContext) {
-        cx.add_window_view(|window, cx| {
-            AdeApp::new_with_settings(
-                Some(repo_path),
-                true,
-                settings_store::Settings::default(),
-                None,
-                window,
-                cx,
-            )
-        })
-    }
+    /// The window fixture now lives in [`crate::test_support`]; re-exported here so the call
+    /// sites that still say `palette_focus_tests::open_test_app` keep resolving while they are
+    /// migrated (GitHub issue #425).
+    pub(crate) use crate::test_support::open_test_app;
 
     /// Without a focus restore in `close_palette`, `Window::focus` stayed on the untracked
     /// `palette_focus_handle` and every action dispatch after that - including the next ⌘P -

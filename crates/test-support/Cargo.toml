@@ -1,0 +1,16 @@
+[package]
+name = "test-support"
+version = { workspace = true }
+edition = { workspace = true }
+publish = { workspace = true }
+license = { workspace = true }
+description = "Shared, gpui-free test fixtures for this workspace: real git repositories, bounded waits, process teardown"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The one dependency this crate is allowed: `seed_repo`/`seed_bare_remote` hand back a live
+# temp directory, so `TempDir` is part of the public signature rather than an implementation
+# detail. Same major version every consuming crate already dev-depends on.
+tempfile = "3"

@@ -227,49 +227,12 @@ fn path_from_bytes(bytes: &[u8]) -> PathBuf {
 mod tests {
     use super::*;
     use std::fs;
-    use std::process::Command;
     use tempfile::TempDir;
-
-    fn git(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn git_output(dir: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(output.status.success(), "git {args:?} failed in {dir:?}");
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
-    }
-
-    fn init_repo() -> TempDir {
-        let dir = TempDir::new().expect("tempdir");
-        git(dir.path(), &["init", "-b", "main"]);
-        git(dir.path(), &["config", "user.email", "test@example.com"]);
-        git(dir.path(), &["config", "user.name", "Test User"]);
-        fs::write(dir.path().join("file.txt"), "hello\n").expect("write file");
-        git(dir.path(), &["add", "file.txt"]);
-        git(dir.path(), &["commit", "-m", "initial commit"]);
-        dir
-    }
+    use test_support::{git, git_output, seed_repo};
 
     #[test]
     fn stage_path_really_adds_a_modified_file_to_the_real_index() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("file.txt"), "changed\n").expect("modify");
 
         stage_path(repo.path(), Path::new("file.txt")).expect("stage_path");
@@ -283,7 +246,7 @@ mod tests {
 
     #[test]
     fn stage_path_really_adds_a_new_untracked_file() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("new.txt"), "new\n").expect("write new file");
 
         stage_path(repo.path(), Path::new("new.txt")).expect("stage_path");
@@ -297,7 +260,7 @@ mod tests {
 
     #[test]
     fn unstage_path_really_removes_a_path_from_the_real_index_without_touching_the_working_tree() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("file.txt"), "changed\n").expect("modify");
         git(repo.path(), &["add", "file.txt"]);
         let staged_before = git_output(repo.path(), &["status", "--porcelain", "file.txt"]);
@@ -323,7 +286,7 @@ mod tests {
 
     #[test]
     fn unstage_path_is_a_harmless_no_op_when_already_unstaged() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("file.txt"), "changed\n").expect("modify");
 
         unstage_path(repo.path(), Path::new("file.txt")).expect("unstage_path on a clean index");
@@ -334,7 +297,7 @@ mod tests {
 
     #[test]
     fn staged_paths_reflects_the_real_git_index_including_files_staged_by_something_else() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("file.txt"), "changed\n").expect("modify");
         fs::write(repo.path().join("also.txt"), "also\n").expect("write");
         // Staged directly via a real `git add`, standing in for something other than
@@ -354,13 +317,13 @@ mod tests {
 
     #[test]
     fn staged_paths_is_empty_on_a_clean_index() {
-        let repo = init_repo();
+        let repo = seed_repo();
         assert!(staged_paths(repo.path()).expect("staged_paths").is_empty());
     }
 
     #[test]
     fn staged_paths_never_includes_an_unstaged_modification() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("file.txt"), "changed but not staged\n").expect("modify");
 
         let staged = staged_paths(repo.path()).expect("staged_paths");
@@ -375,7 +338,7 @@ mod tests {
     /// GitHub issue #220 is about. `committed.txt` is genuinely part of a commit and clean on
     /// disk; the caller then dirties whatever else it wants to contrast against it.
     fn repo_with_a_committed_clean_file() -> TempDir {
-        let dir = init_repo();
+        let dir = seed_repo();
         git(dir.path(), &["checkout", "-b", "feature"]);
         fs::write(dir.path().join("committed.txt"), "committed\n").expect("write");
         git(dir.path(), &["add", "committed.txt"]);
@@ -417,7 +380,7 @@ mod tests {
 
     #[test]
     fn dirty_paths_includes_a_staged_file() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("file.txt"), "changed\n").expect("modify");
         git(repo.path(), &["add", "file.txt"]);
 
@@ -432,7 +395,7 @@ mod tests {
 
     #[test]
     fn dirty_paths_includes_an_unstaged_file() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("file.txt"), "changed\n").expect("modify");
 
         assert!(
@@ -445,7 +408,7 @@ mod tests {
 
     #[test]
     fn dirty_paths_includes_an_untracked_file() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("brand-new.txt"), "new\n").expect("write");
 
         assert!(
@@ -459,7 +422,7 @@ mod tests {
 
     #[test]
     fn dirty_paths_includes_a_deleted_tracked_file() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::remove_file(repo.path().join("file.txt")).expect("remove");
 
         assert!(
@@ -472,7 +435,7 @@ mod tests {
 
     #[test]
     fn dirty_paths_includes_both_halves_of_a_live_rename() {
-        let repo = init_repo();
+        let repo = seed_repo();
         git(repo.path(), &["mv", "file.txt", "renamed.txt"]);
 
         let dirty = dirty_paths(repo.path()).expect("dirty_paths");
@@ -493,7 +456,7 @@ mod tests {
 
     #[test]
     fn dirty_paths_reports_a_nested_path_relative_to_the_worktree_root() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::create_dir_all(repo.path().join("src/db")).expect("mkdir");
         fs::write(repo.path().join("src/db/query.rs"), "fn q() {}\n").expect("write");
 
@@ -511,7 +474,7 @@ mod tests {
     /// non-`-z` porcelain output (`"my file.txt"`, with real quotes). `-z` emits it raw.
     #[test]
     fn dirty_paths_handles_a_path_with_a_space_without_quoting_it() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("my file.txt"), "spaces\n").expect("write");
 
         assert!(
@@ -548,7 +511,7 @@ mod tests {
 
     #[test]
     fn stage_then_unstage_round_trips_back_to_a_clean_staged_set() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("file.txt"), "changed\n").expect("modify");
 
         stage_path(repo.path(), Path::new("file.txt")).expect("stage_path");
@@ -563,7 +526,7 @@ mod tests {
 
     #[test]
     fn discard_path_really_restores_a_modified_file_from_head() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("file.txt"), "the agent wrote this\n").expect("modify");
 
         discard_path(repo.path(), Path::new("file.txt")).expect("discard_path");
@@ -585,7 +548,7 @@ mod tests {
     /// -- <path>` is what really discards both halves.
     #[test]
     fn discard_path_also_drops_a_change_that_was_already_staged() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("file.txt"), "the agent wrote this\n").expect("modify");
         git(repo.path(), &["add", "file.txt"]);
         assert_eq!(
@@ -607,7 +570,7 @@ mod tests {
 
     #[test]
     fn discard_path_restores_a_file_the_agent_deleted() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::remove_file(repo.path().join("file.txt")).expect("delete");
 
         discard_path(repo.path(), Path::new("file.txt")).expect("discard_path");
@@ -621,7 +584,7 @@ mod tests {
 
     #[test]
     fn discard_path_removes_an_untracked_file_outright() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("new.txt"), "brand new\n").expect("write");
 
         discard_path(repo.path(), Path::new("new.txt")).expect("discard_path");
@@ -638,7 +601,7 @@ mod tests {
     /// branch, and both halves have to really happen.
     #[test]
     fn discard_path_removes_a_staged_addition_from_both_the_index_and_the_disk() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("new.txt"), "brand new\n").expect("write");
         git(repo.path(), &["add", "new.txt"]);
         assert_eq!(
@@ -657,7 +620,7 @@ mod tests {
 
     #[test]
     fn discarding_one_path_leaves_every_other_dirty_path_alone() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("file.txt"), "edited\n").expect("modify");
         fs::write(repo.path().join("other.txt"), "also new\n").expect("write");
 

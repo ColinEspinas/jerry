@@ -312,6 +312,7 @@ dependencies = [
  "sha2",
  "streaming-iterator",
  "tempfile",
+ "test-support",
  "toml 0.8.23",
  "tree-sitter",
  "tree-sitter-c",
@@ -7929,6 +7930,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "test-support"
+version = "0.1.1"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9890,6 +9898,7 @@ dependencies = [
  "gix",
  "sha2",
  "tempfile",
+ "test-support",
  "thiserror 1.0.69",
 ]
 
