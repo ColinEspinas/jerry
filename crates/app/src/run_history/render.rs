@@ -1016,6 +1016,136 @@ mod history_surface_tests {
         assert!(cx.debug_bounds("sidebar-history").is_some());
     }
 
+    /// Screenshot-reported: "the earlier run row spacing in the worktree pane is wrong, it should
+    /// be correctly centered - like [the `main checkout \u{b7} clean` row]". Real root cause,
+    /// found with `debug_bounds` against this exact row before the fix: `render_earlier_runs_link`
+    /// used to add `trailing_pb`'s `.pb(px(7.0))` straight onto the same `div` that carries a
+    /// fixed `.h(px(19.0))`. `taffy`'s default `BoxSizing::BorderBox` (the same rule
+    /// `Self::render_worktree_row`'s own `header` note documents) means that padding ate into the
+    /// row's own 19px content area rather than adding space below it - real measured bounds on the
+    /// unfixed code showed both the `\u{21ba}` glyph and the `N earlier runs` label centered
+    /// 3.5px *above* the row's own vertical center, spilling 1.5px above the row's own top edge.
+    ///
+    /// The fix moved the 7px into a real sibling spacer box (the same idiom
+    /// `Self::render_worktree_row`/`Self::render_repo_group_header` already use), leaving `row`'s
+    /// own 19px content area untouched. This test proves the real, painted result: the icon and
+    /// label glyphs' own vertical centers land on the row's own vertical center - and, so this is
+    /// not just an accident of this one row's numbers, that the exact sibling row the user's own
+    /// screenshot called out as already correct - the worktree row's own `\u{b7} <note>` text,
+    /// e.g. `main checkout \u{b7} clean` (`Self::render_worktree_row`) - centers its own text the
+    /// same way: on its own row's real geometric center, not the note text's own.
+    #[gpui::test]
+    fn earlier_runs_link_icon_and_label_are_centered_like_the_worktree_rows_own_note(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = init_repo();
+        let wt = TempDir::new().expect("tempdir wt with history, no agent");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            cx.notify();
+            app.worktrees = vec![crate::rail::worktrees::WorktreeItem {
+                path: wt.path().to_path_buf(),
+                label: "feature-a".to_string(),
+                branch: Some("feature-a".to_string()),
+                is_main: false,
+                is_bare: false,
+                is_detached: false,
+                short_sha: None,
+                is_locked: false,
+                lock_reason: None,
+                is_broken: false,
+                broken_reason: None,
+                error: None,
+            }];
+        });
+        // A real finished run, so this worktree really carries a nonzero `history.len()` and its
+        // `EarlierRunsLink` row genuinely renders right below its own `WorktreeRow` header - the
+        // same seeding the sibling test above this one uses. No live agent, so the header's own
+        // `\u{b7} <note>` sibling text renders too (`when(!has_agents, ..)`).
+        record_finished_run(&app, cx, wt.path(), 1_700_000_000, "an earlier run");
+        cx.run_until_parked();
+
+        let center = |b: gpui::Bounds<gpui::Pixels>| -> f32 {
+            f32::from(b.origin.y) + f32::from(b.size.height) / 2.0
+        };
+
+        // The earlier-runs-link row: its own row bounds, and its icon glyph's and label's bounds
+        // (selectors added alongside the fix so a real test can reach past the row and measure
+        // its own children, the same `debug_selector` idiom every other rail row test in this
+        // crate already relies on).
+        let link_row_sel: &'static str =
+            Box::leak(format!("earlier-runs-{}", wt.path().display()).into_boxed_str());
+        let link_icon_sel: &'static str =
+            Box::leak(format!("earlier-runs-icon-{}", wt.path().display()).into_boxed_str());
+        let link_label_sel: &'static str =
+            Box::leak(format!("earlier-runs-label-{}", wt.path().display()).into_boxed_str());
+        let link_row = cx
+            .debug_bounds(link_row_sel)
+            .expect("the earlier-runs-link row must paint");
+        let link_icon = cx
+            .debug_bounds(link_icon_sel)
+            .expect("its icon glyph must paint");
+        let link_label = cx
+            .debug_bounds(link_label_sel)
+            .expect("its label must paint");
+
+        let link_row_center = center(link_row);
+        let icon_offset = center(link_icon) - link_row_center;
+        let label_offset = center(link_label) - link_row_center;
+
+        // The real regression: both the icon and the label must be centered on the row's own
+        // real vertical center, not 3.5px above it, and neither may spill above the row's own
+        // top edge the way the unfixed code did.
+        assert!(
+            icon_offset.abs() < 0.5,
+            "the \u{21ba} glyph must be vertically centered in its 19px row; \
+             real offset from the row's own center was {icon_offset}px \
+             (row={link_row:?}, icon={link_icon:?})"
+        );
+        assert!(
+            label_offset.abs() < 0.5,
+            "the 'N earlier runs' label must be vertically centered in its 19px row; \
+             real offset from the row's own center was {label_offset}px \
+             (row={link_row:?}, label={link_label:?})"
+        );
+        assert!(
+            link_icon.origin.y >= link_row.origin.y,
+            "the icon must not spill above the row's own top edge - it did before the fix \
+             (icon top {:?} vs. row top {:?})",
+            link_icon.origin.y,
+            link_row.origin.y
+        );
+
+        // The real sibling comparison: worktree row 0's own header is the exact row the user's
+        // screenshot showed as already correct (`main checkout \u{b7} clean`) - its `\u{b7} <note>`
+        // text must center on *its* row's real vertical center exactly the same way, so the
+        // earlier-runs-link row's centering isn't a coincidence of its own numbers, it matches
+        // this app's one real convention for a single-line, fixed-height rail row.
+        let worktree_row_sel: &'static str =
+            Box::leak(format!("worktree-row-0-{}", wt.path().display()).into_boxed_str());
+        let worktree_row = cx
+            .debug_bounds(worktree_row_sel)
+            .expect("the real worktree row must paint");
+        let worktree_note = cx
+            .debug_bounds("worktree-row-note-0")
+            .expect("its own \u{b7} note text must paint (no live agent)");
+        let note_offset = center(worktree_note) - center(worktree_row);
+
+        assert!(
+            (icon_offset - note_offset).abs() < 0.5,
+            "the earlier-runs-link icon and the worktree row's own note text must share the same \
+             real vertical-center offset within their own row - earlier-runs offset {icon_offset}px, \
+             worktree-row-note offset {note_offset}px"
+        );
+        assert!(
+            (label_offset - note_offset).abs() < 0.5,
+            "the earlier-runs-link label and the worktree row's own note text must share the same \
+             real vertical-center offset within their own row - earlier-runs offset {label_offset}px, \
+             worktree-row-note offset {note_offset}px"
+        );
+    }
+
     /// The two empty states are two different facts, and the view says which one it is - the same
     /// pair the Problems view one module over keeps, for the same reason.
     #[gpui::test]
