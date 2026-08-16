@@ -96,6 +96,10 @@ jobs:
       - name: Convention ratchet
         run: .claude/hooks/check-conventions.sh
 
+      # Catches a crate manifest that regresses to a hardcoded version (issue #317).
+      - name: Crate version inheritance
+        run: .claude/hooks/check-release-version.sh
+
       - name: cargo fmt --all -- --check
         run: cargo fmt --all -- --check
 
