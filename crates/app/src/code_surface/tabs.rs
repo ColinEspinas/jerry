@@ -43,6 +43,18 @@ impl AdeApp {
         self._load_diff_task = Some(self.spawn_diff_reload(root, cx));
     }
 
+    /// Re-runs the same reload [`Self::refresh_diff`] does, but only when no reload is already in
+    /// flight - GitHub issue #415. The watcher/poll loop driving this fires far faster than the
+    /// five git queries take on a large worktree, so an ungated call would cancel its own
+    /// still-running predecessor on every tick (assigning [`Self::_load_diff_task`] drops the
+    /// previous task) and the pane could starve indefinitely while an agent keeps writing.
+    pub(crate) fn refresh_diff_if_idle(&mut self, cx: &mut Context<Self>) {
+        if self.diff_reload_in_flight {
+            return;
+        }
+        self.refresh_diff(cx);
+    }
+
     /// The real background git reload both [`Self::load_diff`] and [`Self::refresh_diff`] run -
     /// the five real `wt_core` queries (`diff_against_base`, `staged_paths`, `dirty_paths`,
     /// `diff_against_head`, `commits_since_base`), off the foreground thread, folded into exactly
@@ -50,6 +62,10 @@ impl AdeApp {
     /// they do *before* this runs (see [`Self::refresh_diff`]'s own docs), never in what happens
     /// once the real answer comes back.
     fn spawn_diff_reload(&mut self, root: PathBuf, cx: &mut Context<Self>) -> gpui::Task<()> {
+        // Set here rather than in the two callers so every spawn is covered by construction,
+        // including the one that cancels a still-running predecessor: the replacement task owns
+        // the flag from this point, and its own completion below is what clears it.
+        self.diff_reload_in_flight = true;
         cx.spawn(async move |this, cx| {
             let (diff_result, staged_result, dirty_result, uncommitted_result, commits_result) = cx
                 .background_executor()
@@ -87,6 +103,7 @@ impl AdeApp {
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
+                this.diff_reload_in_flight = false;
                 match diff_result {
                     Ok((base, totals)) => {
                         this.diff_state = DiffLoadState::Loaded(base);
@@ -2139,5 +2156,221 @@ mod terminal_link_click_tests {
                 "a link to a nonexistent path must not add a real tab either"
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod diff_self_refresh_tests {
+    use crate::root::focus::palette_focus_tests;
+    use crate::root::{AdeApp, FILE_TREE_WATCH_SETTLE, FILE_TREE_WATCH_TICK};
+    use crate::settings::store as settings_store;
+    use gpui::{Entity, TestAppContext, VisualTestContext};
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    fn git_repo(dir: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("failed to spawn git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed in {:?}:\nstderr: {}",
+            args,
+            dir,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A repo on a feature branch with one committed file, so `diff_against_head` has a real base
+    /// to answer against.
+    fn repo_on_a_feature_branch() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().expect("tempdir");
+        git_repo(repo.path(), &["init", "-b", "main"]);
+        git_repo(repo.path(), &["config", "user.email", "test@example.com"]);
+        git_repo(repo.path(), &["config", "user.name", "Test User"]);
+        std::fs::write(repo.path().join("a.txt"), "1\n").expect("write a.txt");
+        git_repo(repo.path(), &["add", "."]);
+        git_repo(repo.path(), &["commit", "-m", "initial"]);
+        git_repo(repo.path(), &["checkout", "-b", "feature"]);
+        repo
+    }
+
+    /// Unlike `palette_focus_tests::open_test_app`, this passes a real settings path: without one
+    /// `AdeApp::start_file_tree_watch` returns before arming anything, so the watch loop these
+    /// tests exercise would never run at all.
+    fn open_watched_app(
+        cx: &mut TestAppContext,
+        repo_path: PathBuf,
+        settings_path: PathBuf,
+    ) -> (Entity<AdeApp>, &mut VisualTestContext) {
+        cx.add_window_view(|window, cx| {
+            AdeApp::new_with_settings(
+                Some(repo_path),
+                true,
+                settings_store::Settings::default(),
+                Some(settings_path),
+                window,
+                cx,
+            )
+        })
+    }
+
+    fn uncommitted_paths(app: &AdeApp) -> Vec<PathBuf> {
+        app.uncommitted_diff
+            .loaded()
+            .map(|diff| diff.files.iter().map(|file| file.path.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// The watcher's callback is delivered by the OS on its own thread, so this cannot be a purely
+    /// simulated clock - the same real-time bounded wait `crate::sidebar::file_tree_watch`'s own
+    /// tests use, with the executor's timers advanced on each pass so the loop's tick/settle
+    /// waits actually elapse.
+    fn wait_until(
+        app: &Entity<AdeApp>,
+        cx: &mut VisualTestContext,
+        mut done: impl FnMut(&AdeApp) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            cx.executor()
+                .advance_clock(FILE_TREE_WATCH_TICK + FILE_TREE_WATCH_SETTLE);
+            cx.run_until_parked();
+            if app.read_with(cx, |app, _| done(app)) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        false
+    }
+
+    /// GitHub issue #415's headline symptom: an agent writes a file and the Changes pane never
+    /// hears about it, because the only steady-state reload was the user navigating *to* the
+    /// Changes tab. Nothing here touches `set_right_sidebar_view`.
+    #[gpui::test]
+    fn a_write_after_load_reaches_the_changes_pane_without_visiting_the_tab(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = repo_on_a_feature_branch();
+        let settings = tempfile::tempdir().expect("settings tempdir");
+        let (app, cx) = open_watched_app(
+            cx,
+            repo.path().to_path_buf(),
+            settings.path().join("settings.toml"),
+        );
+        cx.run_until_parked();
+
+        assert!(
+            app.read_with(cx, |app, _| uncommitted_paths(app))
+                .is_empty(),
+            "sanity: a freshly opened clean worktree has no uncommitted files"
+        );
+
+        // What an agent does: write a file nothing in the app initiated.
+        std::fs::write(repo.path().join("agent-wrote-this.txt"), "hello\n").expect("write");
+
+        let target = PathBuf::from("agent-wrote-this.txt");
+        assert!(
+            wait_until(&app, cx, |app| uncommitted_paths(app).contains(&target)),
+            "a file written behind the app's back must appear in the Changes pane on its own, \
+             without the user switching to the Changes tab first"
+        );
+    }
+
+    /// The other half of #415: the `+n`/`-n` totals live in the sidebar header band, which is
+    /// rendered above all three views, so they have to self-update wherever the user is standing.
+    #[gpui::test]
+    fn the_header_totals_self_update_after_a_write(cx: &mut TestAppContext) {
+        let repo = repo_on_a_feature_branch();
+        let settings = tempfile::tempdir().expect("settings tempdir");
+        let (app, cx) = open_watched_app(
+            cx,
+            repo.path().to_path_buf(),
+            settings.path().join("settings.toml"),
+        );
+        cx.run_until_parked();
+
+        std::fs::write(repo.path().join("a.txt"), "1\n2\n3\n").expect("rewrite a.txt");
+
+        assert!(
+            wait_until(&app, cx, |app| app
+                .diff_totals
+                .is_some_and(|(add, _)| add >= 2)),
+            "the header's +n/-n totals must reflect a write the app did not initiate"
+        );
+    }
+
+    /// The in-flight guard: the watch loop ticks far faster than five git queries take on a real
+    /// worktree, and assigning `_load_diff_task` drops whatever was still running - so an ungated
+    /// refresh would cancel its own predecessor every tick and could never finish.
+    #[gpui::test]
+    fn a_refresh_is_skipped_while_a_reload_is_still_in_flight(cx: &mut TestAppContext) {
+        let repo = repo_on_a_feature_branch();
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        assert!(
+            !app.read_with(cx, |app, _| app.diff_reload_in_flight),
+            "a settled app has no reload running"
+        );
+
+        std::fs::write(repo.path().join("b.txt"), "b\n").expect("write b.txt");
+
+        // Stand in for a reload that has been spawned but has not landed yet, then ask for the
+        // refresh the watch loop would ask for on its next tick.
+        app.update(cx, |app, cx| {
+            app.diff_reload_in_flight = true;
+            app.refresh_diff_if_idle(cx);
+        });
+        cx.run_until_parked();
+
+        let target = PathBuf::from("b.txt");
+        assert!(
+            !app.read_with(cx, |app, _| uncommitted_paths(app))
+                .contains(&target),
+            "the guard must have skipped the refresh, so the new file is not picked up yet"
+        );
+
+        // Once the in-flight reload lands, the very next tick does the work.
+        app.update(cx, |app, cx| {
+            app.diff_reload_in_flight = false;
+            app.refresh_diff_if_idle(cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            app.read_with(cx, |app, _| uncommitted_paths(app))
+                .contains(&target),
+            "with no reload in flight the same call must genuinely refresh"
+        );
+    }
+
+    /// `spawn_diff_reload` owns the flag for every spawn, including the manual button's, so a
+    /// cancelled-and-replaced reload can never strand it `true` and wedge the watcher refresh off
+    /// for the rest of the session.
+    #[gpui::test]
+    fn a_replaced_reload_still_clears_the_in_flight_flag(cx: &mut TestAppContext) {
+        let repo = repo_on_a_feature_branch();
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        // Two reloads back to back: the second drops the first's still-running task.
+        app.update(cx, |app, cx| {
+            app.refresh_diff(cx);
+            app.refresh_diff(cx);
+        });
+        assert!(
+            app.read_with(cx, |app, _| app.diff_reload_in_flight),
+            "a spawned reload must mark itself in flight"
+        );
+        cx.run_until_parked();
+
+        assert!(
+            !app.read_with(cx, |app, _| app.diff_reload_in_flight),
+            "the surviving reload's completion must clear the flag, or every later watcher-driven \
+             refresh is silently skipped forever"
+        );
     }
 }
