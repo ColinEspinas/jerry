@@ -1733,6 +1733,36 @@ impl AdeApp {
                                     },
                                 )),
                         )
+                    })
+                    // GitHub issue #415's explicit ask ("even better have a refresh button or
+                    // something on the changes pane"). The watcher now keeps the pane current on
+                    // its own, so this is the escape hatch for the cases a filesystem watcher
+                    // structurally cannot cover - a dropped OS event, or a `notify` backend that
+                    // silently stopped delivering - rather than the primary refresh path.
+                    // Deliberately `refresh_diff`, not `load_diff`: the pane keeps showing its
+                    // last real answer for the duration instead of blanking to "Loading".
+                    .when(self.right_sidebar_view == RightSidebarView::Changes, |el| {
+                        el.child(
+                            div()
+                                .id("changes-refresh")
+                                .debug_selector(|| "changes-refresh".to_string())
+                                .flex_none()
+                                .cursor_pointer()
+                                .px(px(5.0))
+                                .rounded(theme::radius::CHIP)
+                                .font(font(theme::font::MONO))
+                                .text_size(self.ui_text_size(12.0))
+                                .text_color(theme::text::GHOST)
+                                .hover(|el| {
+                                    el.bg(theme::surface::ROW_HOVER_ALT)
+                                        .text_color(theme::text::PRIMARY)
+                                })
+                                .tooltip(text_tooltip("Refresh the changes list"))
+                                .child("\u{21bb}")
+                                .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                                    this.refresh_diff(cx);
+                                })),
+                        )
                     }),
             )
     }

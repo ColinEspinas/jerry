@@ -342,6 +342,7 @@ impl AdeApp {
             find_bar_focus_handle: cx.focus_handle(),
             diff_state: DiffLoadState::Loading,
             diff_totals: None,
+            diff_reload_in_flight: false,
             agent_reviews: HashMap::new(),
             review_baseline_state,
             review_baseline_path,
@@ -1455,6 +1456,15 @@ impl AdeApp {
                         return false;
                     }
                     this.load_file_tree(root.clone(), cx);
+                    // GitHub issue #415: the Changes pane and the sidebar's `+n`/`-n` totals used
+                    // to have no time- or watcher-driven trigger at all - the only steady-state
+                    // reload was the user navigating *to* the Changes tab, so an agent's writes
+                    // stayed invisible until then. Riding this loop rather than adding a second
+                    // watcher covers both halves: the watcher arm catches working-tree writes
+                    // within one tick, and the poll arm catches the `.git/`-only changes
+                    // (`git add`, `git commit`) that `spawn_file_tree_watcher` deliberately
+                    // filters out and would otherwise never report.
+                    this.refresh_diff_if_idle(cx);
                     true
                 });
                 match updated {

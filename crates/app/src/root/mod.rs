@@ -459,6 +459,10 @@ pub struct AdeApp {
     /// [`Self::current_diff`]'s docs for exactly which [`DiffLoadState`]/[`DiffBase`]
     /// combinations count).
     pub(crate) diff_totals: Option<(u32, u32)>,
+    /// Whether a `Self::spawn_diff_reload` task is running right now, so the watcher-driven
+    /// refresh behind GitHub issue #415 can skip a tick instead of cancelling a reload that is
+    /// still working - see [`Self::refresh_diff_if_idle`].
+    pub(crate) diff_reload_in_flight: bool,
     /// Every open agent's own **review** state (GitHub issue #225) - its captured baseline, the
     /// diff loaded against that baseline, and which file it has open. Keyed by
     /// [`crate::work_surface::agents::AgentId`].
