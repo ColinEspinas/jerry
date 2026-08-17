@@ -1521,10 +1521,10 @@ pub mod agent {
         token("agent.haiku.fg", 0x9d8fd4),
         token("agent.haiku.bg", 0x241f33),
     );
-    /// Steel blue - the pool's fourth hue, unchanged by §4a: already outside all five families.
-    /// Claimed by the Cursor agent CLI in GitHub issue #463; the `local` key name is the mock's
-    /// original `qwen-local` slot and is kept as-is, because it is the public override key every
-    /// built-in and user theme already writes (`assets/themes/*.toml`'s `[agent] local.fg`).
+    /// Steel blue - the Cursor agent CLI. Unchanged by §4a: already outside all five families.
+    /// Claimed by Cursor in GitHub issue #463; the `local` key name is the mock's original
+    /// `qwen-local` slot, kept as-is because it is the public override key every built-in and
+    /// user theme already writes (`assets/themes/*.toml`'s `[agent] local.fg`).
     pub const LOCAL: (ColorToken, ColorToken) = (
         token("agent.local.fg", 0x7f9ad4),
         token("agent.local.bg", 0x1f2941),

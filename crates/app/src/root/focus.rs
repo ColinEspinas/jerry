@@ -1807,6 +1807,13 @@ mod palette_result_focus_tests {
 
         app.update_in(cx, |app, window, cx| app.open_palette(window, cx));
         cx.run_until_parked();
+        // Typed, not taken from the unfiltered list: with an empty query every command scores
+        // equally and `MAX_ENTRIES_PER_GROUP` keeps only the first eight, so which commands appear
+        // by default shifts whenever one is added (GitHub issue #463 added a third agent-spawn
+        // command and pushed this one out). The subject here is focus restoration, not default
+        // list membership, so this asks for the command by name the way a user would.
+        cx.simulate_input("window controls: system");
+        cx.run_until_parked();
         let ran = app.update(cx, |app, cx| {
             let groups = app.build_palette_groups(cx);
             let index = palette::flatten(&groups).iter().position(|entry| {
