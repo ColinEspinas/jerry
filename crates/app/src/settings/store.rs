@@ -41,8 +41,8 @@ pub struct Settings {
 #[serde(default)]
 pub struct TerminalSettings {
     /// The program a plain Shell tab (`crate::work_surface::agents::ProcessKind::Shell`) spawns,
-    /// or `None` for "whatever the OS says" - `$SHELL` on unix, `%COMSPEC%` on Windows, exactly
-    /// the behaviour every install had before this setting existed (see
+    /// or `None` for this platform's own default - `$SHELL` on unix,
+    /// `crate::terminal::pane::WINDOWS_DEFAULT_SHELL` on Windows (see
     /// `crate::terminal::pane::TerminalSpec::shell`). `None` is the zero-config default, so a
     /// user who never touches this keeps their real login shell.
     pub shell: Option<String>,

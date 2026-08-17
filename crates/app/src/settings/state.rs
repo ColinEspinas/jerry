@@ -650,7 +650,8 @@ pub fn filter_keybinding_rows<'a>(
 /// (GitHub issue #213) - see [`detect_shell_status`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShellStatus {
-    /// Nothing configured: a shell tab launches the real OS default (`$SHELL`/`%COMSPEC%`).
+    /// Nothing configured: a shell tab launches the real OS default (`$SHELL` on Unix,
+    /// `crate::terminal::pane::WINDOWS_DEFAULT_SHELL` on Windows).
     SystemDefault,
     /// A real program was found - the resolved absolute path, exactly as it would be run.
     Resolved(PathBuf),
@@ -744,8 +745,13 @@ pub const ETC_SHELLS: &str = "/etc/shells";
 const UNIX_SUPPLEMENTARY_SHELLS: [&str; 5] = ["fish", "nu", "pwsh", "elvish", "xonsh"];
 
 /// Shell programs a Windows install may genuinely have on `%PATH%`, probed one by one - see
-/// [`windows_shell_suggestions`], which only offers the ones a real search actually finds.
-const WINDOWS_PROBED_SHELLS: [&str; 3] = ["powershell.exe", "pwsh.exe", "bash.exe"];
+/// [`windows_shell_suggestions`], which only offers the ones a real search actually finds. The
+/// program an empty field already runs leads, so the first suggestion is the current default.
+const WINDOWS_PROBED_SHELLS: [&str; 3] = [
+    crate::terminal::pane::WINDOWS_DEFAULT_SHELL,
+    "pwsh.exe",
+    "bash.exe",
+];
 
 /// Every shell this machine genuinely has, for the field's suggestion list - the production
 /// entry point, wired to the real `/etc/shells`, the real `%COMSPEC%`, and the real
@@ -797,10 +803,10 @@ pub fn unix_shell_suggestions(
 }
 
 /// The Windows half of [`detect_installed_shells`]. Windows has no `/etc/shells`, so there are
-/// exactly two real sources and this uses both: `%COMSPEC%` - already this app's own default-shell
-/// mechanism (`crate::terminal::pane::TerminalSpec::default_shell_program`), so the first
-/// suggestion is literally the program an empty field already runs - and a real `PATH` search for
-/// each of [`WINDOWS_PROBED_SHELLS`].
+/// exactly two real sources and this uses both: a real `PATH` search for each of
+/// [`WINDOWS_PROBED_SHELLS`], which leads because its first entry is the program an empty field
+/// already runs, and `%COMSPEC%` last - still a genuinely installed shell worth offering, just no
+/// longer this app's default (GitHub issue #452).
 pub fn windows_shell_suggestions(
     comspec: Option<std::ffi::OsString>,
     resolve: impl Fn(&str) -> Option<PathBuf>,
@@ -808,15 +814,15 @@ pub fn windows_shell_suggestions(
     let mut found = Vec::new();
     let mut seen = Vec::new();
 
-    if let Some(comspec) = comspec {
-        let path = PathBuf::from(comspec);
-        if path.is_file() {
+    for name in WINDOWS_PROBED_SHELLS {
+        if let Some(path) = resolve(name) {
             push_unique_shell(&mut found, &mut seen, path);
         }
     }
 
-    for name in WINDOWS_PROBED_SHELLS {
-        if let Some(path) = resolve(name) {
+    if let Some(comspec) = comspec {
+        let path = PathBuf::from(comspec);
+        if path.is_file() {
             push_unique_shell(&mut found, &mut seen, path);
         }
     }
@@ -1023,7 +1029,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_offers_comspec_and_real_path_hits_and_nothing_else() {
+    fn windows_offers_real_path_hits_then_comspec_and_nothing_else() {
         let dir = tempfile::tempdir().expect("tempdir");
         let real_cmd = dir.path().join("cmd.exe");
         std::fs::write(&real_cmd, "").expect("write");
@@ -1037,16 +1043,16 @@ mod tests {
             found,
             vec![
                 ShellSuggestion {
-                    name: "cmd.exe".to_string(),
-                    path: real_cmd
-                },
-                ShellSuggestion {
                     name: "pwsh.exe".to_string(),
                     path: real_pwsh
                 },
+                ShellSuggestion {
+                    name: "cmd.exe".to_string(),
+                    path: real_cmd
+                },
             ],
-            "%COMSPEC% first (it is what an empty field already runs), then only the probed names \
-             a real PATH search actually found - never powershell.exe or bash.exe on faith"
+            "the probed names a real PATH search actually found lead - never powershell.exe or \
+             bash.exe on faith - and %COMSPEC% follows as a real but no-longer-default shell"
         );
 
         assert!(

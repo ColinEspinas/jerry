@@ -652,7 +652,11 @@ mod tests {
             vec![("JERRY_HOOK_TOKEN".to_owned(), "secret".to_owned())],
         ));
         let shell = ProcessKind::Shell.spec(PathBuf::from("/tmp"), None, extras);
-        assert!(shell.args.is_empty(), "a shell must get no injected args");
+        assert_eq!(
+            shell,
+            ProcessKind::Shell.spec(PathBuf::from("/tmp"), None, None),
+            "offering an injection must not change a shell's spec by so much as one argument"
+        );
         assert!(
             shell.env.is_empty(),
             "a shell must never see the hook token"

@@ -162,12 +162,21 @@ impl TerminalSpec {
     /// same Unix path unconditionally, which is a real path (`/bin/bash`) that doesn't exist on
     /// Windows at all - every default-shell spawn there was trying, and failing, to launch it.
     pub fn shell(cwd: PathBuf, configured: Option<&str>) -> Self {
-        Self {
-            program: configured_shell_program(configured)
-                .unwrap_or_else(Self::default_shell_program),
-            args: Vec::new(),
-            cwd,
-            env: Vec::new(),
+        match configured_shell_program(configured) {
+            // The user typed this program, so it runs verbatim; only the OS default this app
+            // picked for them carries arguments (`Self::default_shell_args`).
+            Some(program) => Self {
+                program,
+                args: Vec::new(),
+                cwd,
+                env: Vec::new(),
+            },
+            None => Self {
+                program: Self::default_shell_program(),
+                args: Self::default_shell_args(),
+                cwd,
+                env: Vec::new(),
+            },
         }
     }
 
@@ -177,24 +186,31 @@ impl TerminalSpec {
         shell_program_from_env(std::env::var_os("SHELL"), "/bin/bash")
     }
 
-    /// Windows: `%COMSPEC%` - the real, documented Windows environment variable naming the
-    /// user's configured command interpreter (almost always `C:\Windows\System32\cmd.exe`),
-    /// the same real role `$SHELL` plays on Unix. Falls back to the bare name `cmd.exe` if
-    /// unset (`cmd.exe` ships with every real Windows install and is always on `%PATH%`) rather
-    /// than a hardcoded absolute path, mirroring the Unix fallback's own "a real, always-present
-    /// binary" choice. A bare name, not an absolute path: `pty_core::spawn`'s own
-    /// `CommandBuilder` already resolves a bare program name via `PATH` (see
-    /// [`TerminalSpec::command`]'s own docs for the identical, already-relied-on mechanism), so
-    /// this needs no separate resolution step of its own.
+    /// Windows: [`WINDOWS_DEFAULT_SHELL`], from no environment variable at all - see that
+    /// constant for why `%COMSPEC%`, which this used to read, is the wrong source.
     #[cfg(windows)]
     fn default_shell_program() -> PathBuf {
-        shell_program_from_env(std::env::var_os("COMSPEC"), "cmd.exe")
+        PathBuf::from(WINDOWS_DEFAULT_SHELL)
+    }
+
+    /// Unix: a login terminal starts `$SHELL` with no arguments, and so does this.
+    #[cfg(unix)]
+    fn default_shell_args() -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Windows: `-NoLogo`, because PowerShell otherwise opens on a copyright banner that costs
+    /// several of the first visible lines in a pane this size. Only the default gets this - a
+    /// shell the user named in Settings is launched exactly as typed.
+    #[cfg(windows)]
+    fn default_shell_args() -> Vec<String> {
+        vec!["-NoLogo".to_string()]
     }
 
     /// The real program a shell tab launches when the user has configured nothing (GitHub issue
-    /// #213) - `$SHELL`'s value on this machine right now, `%COMSPEC%`'s on Windows, resolved by
-    /// exactly the same code [`Self::shell`] falls back to. Exposed so the Settings row's
-    /// placeholder can name the *actual* program an empty field means, rather than a generic
+    /// #213) - `$SHELL`'s value on this machine right now, [`WINDOWS_DEFAULT_SHELL`] on Windows,
+    /// resolved by exactly the same code [`Self::shell`] falls back to. Exposed so the Settings
+    /// row's placeholder can name the *actual* program an empty field means, rather than a generic
     /// `"$SHELL"` string that would be a second, drift-prone description of this decision.
     pub fn default_shell_program_display() -> String {
         Self::default_shell_program().display().to_string()
@@ -229,10 +245,21 @@ impl TerminalSpec {
     }
 }
 
-/// The pure "real env var, or a real fallback" decision behind both
-/// [`TerminalSpec::default_shell_program`] variants - not itself `#[cfg]`-gated, so it's directly
-/// testable on any host regardless of which platform-specific env var name/fallback the caller
-/// passes in.
+/// The program a Windows Shell tab launches with nothing configured (GitHub issue #452): Windows
+/// PowerShell, in `System32` on every supported Windows and always on `%PATH%`, which has `ls`,
+/// `cd`, `clear`, `cat`, `pwd`, `rm`, `cp` and `mv`. Not `%COMSPEC%` - that names the *batch*
+/// interpreter, and Windows always sets it to a `cmd.exe` that has none of those.
+///
+/// A bare name, not a path: `pty_core::spawn`'s `CommandBuilder` resolves one via `%PATH%` (see
+/// [`TerminalSpec::command`]), which also keeps
+/// [`TerminalSpec::default_shell_program_display`] off the filesystem - the Settings placeholder
+/// calling it is recomputed every frame.
+pub(crate) const WINDOWS_DEFAULT_SHELL: &str = "powershell.exe";
+
+/// The pure "real env var, or a real fallback" decision behind
+/// [`TerminalSpec::default_shell_program`]'s Unix variant. Takes the value rather than reading
+/// the environment so both branches are testable without touching the process environment.
+#[cfg(unix)]
 fn shell_program_from_env(env_value: Option<std::ffi::OsString>, fallback: &str) -> PathBuf {
     env_value
         .map(PathBuf::from)
@@ -249,23 +276,17 @@ fn configured_shell_program(configured: Option<&str>) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// GitHub issue #50's real regression guard: the Windows fallback must be a real Windows path
-/// (`cmd.exe`), never the Unix `/bin/bash` [`TerminalSpec::shell`] used to fall back to
-/// unconditionally - `$SHELL` is a Unix-only convention Windows never sets, so every Windows
-/// session with no real override was actually trying to launch a Unix path that doesn't exist
-/// there at all. `shell_program_from_env` itself isn't `#[cfg]`-gated, so both real platform
-/// variants' own decisions are directly testable here regardless of which OS runs this test.
+/// Which program a Shell tab actually launches: the user's configured one, or each platform's own
+/// default. [`WINDOWS_DEFAULT_SHELL`] isn't `#[cfg]`-gated, so issue #452's guard (never `cmd.exe`)
+/// and issue #50's (never a Unix path) both run on every host.
 #[cfg(test)]
 mod shell_program_tests {
     use super::*;
 
-    /// Both platform variants' own decisions, side by side. The Windows row is GitHub issue
-    /// #50's actual regression: the fallback must be a real Windows path (`cmd.exe`), never the
-    /// Unix `/bin/bash` this crate used to fall back to unconditionally - `$SHELL` is a Unix-only
-    /// convention Windows never sets, so every Windows session with no override was trying to
-    /// launch a Unix path that does not exist there at all.
+    /// The Unix default's own decision: `$SHELL` verbatim, `/bin/bash` when it's unset.
+    #[cfg(unix)]
     #[test]
-    fn an_env_value_is_used_verbatim_and_an_absent_one_falls_back_per_platform() {
+    fn an_env_value_is_used_verbatim_and_an_absent_one_falls_back() {
         assert_eq!(
             shell_program_from_env(Some(std::ffi::OsString::from("/usr/bin/zsh")), "/bin/bash"),
             PathBuf::from("/usr/bin/zsh")
@@ -273,15 +294,6 @@ mod shell_program_tests {
         assert_eq!(
             shell_program_from_env(None, "/bin/bash"),
             PathBuf::from("/bin/bash")
-        );
-
-        let windows_fallback = shell_program_from_env(None, "cmd.exe");
-        assert_eq!(windows_fallback, PathBuf::from("cmd.exe"));
-        assert_ne!(
-            windows_fallback,
-            PathBuf::from("/bin/bash"),
-            "the Windows default shell must never be the Unix path - that real path does not \
-             exist on Windows, which is the whole bug GitHub issue #50 reports"
         );
     }
 
@@ -330,6 +342,65 @@ mod shell_program_tests {
             configured_shell_program(Some("  zsh  ")),
             Some(PathBuf::from("zsh"))
         );
+    }
+
+    /// Issue #452: `%COMSPEC%`, what this used to read, is always `cmd.exe`, and `cmd.exe` has no
+    /// `ls`, `clear`, `cat`, `pwd`, `rm`, `cp` or `mv` - the entire bug.
+    #[test]
+    fn the_windows_default_shell_is_powershell_never_cmd_and_never_a_unix_path() {
+        assert_eq!(WINDOWS_DEFAULT_SHELL, "powershell.exe");
+        assert_ne!(
+            WINDOWS_DEFAULT_SHELL, "cmd.exe",
+            "cmd.exe is what %COMSPEC% always names, and it is missing every command GitHub \
+             issue #452 reports failing"
+        );
+        assert_ne!(
+            WINDOWS_DEFAULT_SHELL, "/bin/bash",
+            "GitHub issue #50's own guard: the Windows default must never be a Unix path"
+        );
+    }
+
+    /// The Windows half of issue #452, end to end through the real constructor.
+    #[cfg(windows)]
+    #[test]
+    fn an_unconfigured_windows_shell_is_powershell_started_without_its_banner() {
+        let spec = TerminalSpec::shell(std::env::temp_dir(), None);
+
+        assert_eq!(spec.program, PathBuf::from("powershell.exe"));
+        assert_eq!(
+            spec.args,
+            vec!["-NoLogo".to_string()],
+            "PowerShell otherwise opens on a copyright banner, several of the first visible \
+             lines in a pane this size"
+        );
+    }
+
+    /// The Unix default is still launched exactly as a login terminal launches it.
+    #[cfg(unix)]
+    #[test]
+    fn an_unconfigured_unix_shell_takes_no_arguments() {
+        assert!(TerminalSpec::shell(std::env::temp_dir(), None)
+            .args
+            .is_empty());
+    }
+
+    /// The Windows counterpart of [`a_configured_shell_really_spawns_and_a_typo_really_fails`]:
+    /// the default this app picks has to be a program a real Windows host can actually start.
+    #[cfg(windows)]
+    #[test]
+    fn the_default_windows_shell_really_spawns() {
+        let spec = TerminalSpec::shell(std::env::temp_dir(), None);
+        let mut session = pty_core::spawn(
+            pty_core::SpawnOptions::new(spec.program.clone())
+                .args(spec.args.clone())
+                .cwd(spec.cwd.clone()),
+        )
+        .expect("the Windows default shell must spawn on a real Windows host");
+        assert!(
+            session.process_id().is_some(),
+            "the default shell must be a real, running child with a real pid"
+        );
+        session.shutdown().expect("reap the child");
     }
 
     #[cfg(unix)]
