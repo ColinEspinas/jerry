@@ -858,8 +858,10 @@ impl AdeApp {
 
         // Headers and rows are children of the scroller itself rather than of a per-group wrapper,
         // so `palette_results_scroll_handle`'s child bounds line up with
-        // `palette::row_child_index` and a row can actually be scrolled to. The old wrapper was a
-        // bare `flex_col` with no styling of its own, so this lays out identically.
+        // `palette::row_child_index` and a row can actually be scrolled to. Both carry `flex_none`
+        // for that to be safe: as direct children of a column flex container they would otherwise
+        // shrink below their themed heights the moment the list overflows, compacting the list
+        // rather than scrolling it (the per-group wrapper used to absorb that shrink).
         let mut flat_index = 0usize;
         for group in groups {
             container = container.child(self.render_palette_group_header(group));
@@ -897,6 +899,9 @@ impl AdeApp {
     ) -> impl IntoElement {
         div()
             .id(format!("palette-group-{}", group.label))
+            // Same reason as [`Self::render_palette_row`]'s own: a direct child of the scrolling
+            // column must not shrink when the list overflows.
+            .flex_none()
             .flex()
             .items_center()
             .gap(px(7.0))
@@ -970,6 +975,9 @@ impl AdeApp {
             // results viewport, rather than trusting that scrolling "probably" happened.
             .debug_selector(move || format!("palette-row-{index}"))
             .cursor_pointer()
+            // A row is a direct child of the scrolling column, so it has to opt out of flex
+            // shrinking or an overflowing list compacts its rows instead of scrolling them.
+            .flex_none()
             .flex()
             .items_center()
             .gap(px(9.0))
@@ -1709,6 +1717,30 @@ mod palette_scroll_tests {
             "after {step} the highlighted row {index} must sit entirely inside the results \
              viewport - got row {row:?} against viewport {viewport:?}"
         );
+    }
+
+    /// A scrolling list must scroll, not squash. Rows and headers are flex children of a column
+    /// container, so without `flex_none` they shrink below their themed height as soon as the
+    /// content overflows - the list quietly compacts instead of overflowing, which is both wrong
+    /// on its own and hides the very overflow the scrolling exists to handle.
+    #[gpui::test]
+    fn an_overflowing_list_keeps_every_row_at_its_full_themed_height(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = open_overflowing_palette(cx, repo.path());
+
+        let total = row_count(&app, cx);
+        for index in 0..total {
+            let row = cx
+                .debug_bounds(row_selector(index))
+                .unwrap_or_else(|| panic!("row {index} should have really painted"));
+            assert_eq!(
+                row.size.height,
+                crate::theme::band::PALETTE_ROW,
+                "row {index} of {total} must paint at its full themed height even though the list \
+                 overflows - a shorter row means flex shrank it, compacting the list instead of \
+                 scrolling it"
+            );
+        }
     }
 
     #[gpui::test]
