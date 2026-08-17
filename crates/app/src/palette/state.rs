@@ -391,6 +391,25 @@ pub fn flatten(groups: &[PaletteGroup]) -> Vec<&PaletteEntry> {
         .collect()
 }
 
+/// Maps a [`flatten`] row index onto that row's position among the *children* of the scrolling
+/// results list, which `crate::palette::render::AdeApp::render_palette_groups` lays out flat as
+/// `[header, rows.., header, rows..]`. `gpui::ScrollHandle::scroll_to_item` addresses those
+/// children, so every group header above a row shifts it down by one. `None` for a row index past
+/// the end.
+pub fn row_child_index(groups: &[PaletteGroup], row: usize) -> Option<usize> {
+    let mut child = 0usize;
+    let mut rows_before = 0usize;
+    for group in groups {
+        child += 1; // the group's own header
+        if row < rows_before + group.entries.len() {
+            return Some(child + (row - rows_before));
+        }
+        child += group.entries.len();
+        rows_before += group.entries.len();
+    }
+    None
+}
+
 /// A position-preserving ASCII-fold of `text` (only ASCII letters are case-folded; every other
 /// `char` passes through unchanged), so a matched span's `(char_index, char_len)` always indexes
 /// back correctly into the *original* string. A full Unicode fold (`str::to_lowercase`) can
@@ -1112,6 +1131,75 @@ mod tests {
         assert_eq!(
             flat[1].target,
             EntryTarget::Command(PaletteCommand::NewShell)
+        );
+    }
+
+    /// `n` groups of `size` rows each, which is all [`row_child_index`] looks at.
+    fn sized_groups(sizes: &[usize]) -> Vec<PaletteGroup> {
+        sizes
+            .iter()
+            .map(|size| PaletteGroup {
+                label: "Commands",
+                entries: (0..*size)
+                    .map(|_| PaletteEntry {
+                        label: MatchedText::plain("row"),
+                        secondary: String::new(),
+                        shortcut: None,
+                        status: None,
+                        file_change: None,
+                        process_kind: None,
+                        target: EntryTarget::Command(PaletteCommand::NewShell),
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn row_child_index_skips_one_child_per_group_header() {
+        let groups = sized_groups(&[2, 3]);
+
+        // Children lay out as: header, r0, r1, header, r2, r3, r4.
+        assert_eq!(row_child_index(&groups, 0), Some(1));
+        assert_eq!(row_child_index(&groups, 1), Some(2));
+        assert_eq!(
+            row_child_index(&groups, 2),
+            Some(4),
+            "the first row of the second group sits after that group's own header, so it skips \
+             two children rather than one"
+        );
+        assert_eq!(row_child_index(&groups, 3), Some(5));
+        assert_eq!(row_child_index(&groups, 4), Some(6));
+    }
+
+    #[test]
+    fn row_child_index_agrees_with_flatten_on_every_row() {
+        let groups = sized_groups(&[1, 4, 2]);
+        let total = flatten(&groups).len();
+
+        let mapped: Vec<usize> = (0..total)
+            .map(|row| row_child_index(&groups, row).expect("every flattened row must map"))
+            .collect();
+        assert!(
+            mapped.windows(2).all(|pair| pair[1] > pair[0]),
+            "the mapping must be strictly increasing - two rows sharing a child index would \
+             scroll to the wrong one, got {mapped:?}"
+        );
+        assert_eq!(
+            mapped.last().copied(),
+            Some(total + groups.len() - 1),
+            "the last row's child index must account for every header above it"
+        );
+    }
+
+    #[test]
+    fn row_child_index_is_none_past_the_last_row() {
+        let groups = sized_groups(&[2, 1]);
+        assert_eq!(row_child_index(&groups, 3), None);
+        assert_eq!(
+            row_child_index(&[], 0),
+            None,
+            "an empty palette has no row to scroll to"
         );
     }
 

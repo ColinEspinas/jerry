@@ -1220,7 +1220,10 @@ pub struct AdeApp {
     pub(crate) palette_open: bool,
     /// The palette's own real overlay scrollbar handle (GitHub issue #30) - a plain
     /// `gpui::ScrollHandle`: `crate::palette::render::AdeApp::render_palette_groups` renders
-    /// every result row eagerly, not through a `uniform_list`.
+    /// every result row eagerly, not through a `uniform_list`. It also carries the keyboard
+    /// selection (GitHub issue #413), which is why that function lays headers and rows out as one
+    /// flat run of children: `ScrollHandle::scroll_to_item` addresses direct children, and
+    /// `crate::palette::state::row_child_index` is the mapping from a row index to one.
     pub(crate) palette_results_scroll_handle: gpui::ScrollHandle,
     /// The palette's active scope (`All`/`Commands`/`Files`).
     pub(crate) palette_scope: palette::PaletteScope,
