@@ -4671,6 +4671,10 @@ mod repo_list_tests {
     /// killed" guarantee the `open_repo_in_current_window` mirror test proves via the identical
     /// technique (asserting against the live agent list and each one's own `TerminalPane::
     /// is_running`).
+    // Asserts `TerminalPane::is_running` on a spawned `claude` CLI, so it needs that binary to
+    // exist: without it the PTY child exits at once and the persistence being proven here cannot
+    // be observed at all. The `external` tier.
+    #[ignore = "external: claude; see docs/testing.md"]
     #[gpui::test]
     fn checkout_repo_from_rail_leaves_the_previous_repos_agents_running(cx: &mut TestAppContext) {
         let repo_a = crate::test_support::temp_root();

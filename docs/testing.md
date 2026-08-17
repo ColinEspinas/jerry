@@ -139,8 +139,14 @@ a signal the subject already emits: perturbing nothing beats polling coarsely.
 ## Running tests
 
 `cargo nextest run --workspace` is part of the pre-commit gate (`CLAUDE.md`, `/check`) and runs on
-every PR in CI, on Linux, macOS and Windows. It covers the `unit` and `ui` tiers: the `external`
-tier is `#[ignore]`d, and nextest skips ignored tests unless asked for them.
+every PR in CI, on Linux and macOS. It covers the `unit` and `ui` tiers: the `external` tier is
+`#[ignore]`d, and nextest skips ignored tests unless asked for them.
+
+**Windows is not a test platform yet.** Its CI job builds the workspace and runs only
+`status_bar::process_stats`, the FFI backend that exists nowhere else. The full suite does not pass
+there — a single trial run scored 134 failures and 26 timeouts, mostly paths formatted into strings
+and forward slashes baked into expected values — and GitHub issue #440 tracks fixing it. Until then
+nothing asks a contributor to run the suite on Windows, and a Windows result is not a gate.
 
 While iterating, scope it to what you touched:
 

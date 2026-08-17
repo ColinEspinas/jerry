@@ -7975,6 +7975,10 @@ mod changes_sections_tests {
         );
     }
 
+    // Asserts both run rows report `live` and read `running`, which requires the spawned `claude`
+    // CLI to be a real live process - without that binary the child exits immediately and the row
+    // honestly reports an ended run. The `external` tier.
+    #[ignore = "external: claude; see docs/testing.md"]
     #[gpui::test]
     fn a_live_runs_row_states_that_it_is_running_and_switching_focus_changes_no_count(
         cx: &mut TestAppContext,

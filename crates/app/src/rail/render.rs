@@ -3382,6 +3382,10 @@ mod repo_checkout_tests {
     /// promise: repo A's own tab strip (`crate::work_surface::render::AdeApp::
     /// combined_tab_order`) must *not* show repo B's agent while B isn't the active worktree -
     /// cross-repo visibility lives in the rail alone, never a new tab-strip affordance.
+    // Asserts the folded-in row carries `Status::Run`, which requires the spawned `claude` CLI to
+    // still be a live process. On a machine without that binary the PTY child exits immediately
+    // and the status is `Fail`, so this needs the real agent CLI - the `external` tier.
+    #[ignore = "external: claude; see docs/testing.md"]
     #[gpui::test]
     fn build_repo_groups_folds_a_non_focused_repos_real_agent_into_its_own_row(
         cx: &mut TestAppContext,

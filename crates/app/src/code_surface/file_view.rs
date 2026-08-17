@@ -1861,6 +1861,10 @@ mod lsp_failed_status_chip_tests {
 
     const CHIP_SELECTOR: &str = "file-view-lsp-status";
 
+    // The assertion below is that the click's own `ensure_lsp_client` reached `Spawning`/`Ready`,
+    // which only happens when a real `rust-analyzer` is on PATH; without one the restart lands
+    // straight back in `Failed` and the test fails. That is the `external` tier by definition.
+    #[ignore = "external: rust-analyzer; see docs/testing.md"]
     #[gpui::test]
     async fn clicking_the_failed_status_chip_really_restarts_the_language_servers(
         cx: &mut TestAppContext,

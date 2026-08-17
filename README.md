@@ -112,8 +112,9 @@ cargo nextest run --workspace
 
 must all pass — see [`CLAUDE.md`](CLAUDE.md) for the full standards, [`CONTRIBUTING.md`](CONTRIBUTING.md)
 for the process, and [`docs/development-workflow.md`](docs/development-workflow.md) for how a
-change moves from issue to merged PR. `.github/workflows/ci.yml` runs the same checks on every
-push, on Linux, macOS and Windows. Tests run under [`cargo-nextest`](https://nexte.st) rather than
+change moves from issue to merged PR. `.github/workflows/ci.yml` runs the same checks on Linux and
+macOS; Windows builds and runs only its platform-specific sampling tests, because the full suite
+does not pass there yet (issue #440). Tests run under [`cargo-nextest`](https://nexte.st) rather than
 `cargo test`, for the per-test process isolation and timeout configured in `.config/nextest.toml`:
 
 ```sh
