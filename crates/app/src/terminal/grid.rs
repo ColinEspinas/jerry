@@ -1,5 +1,6 @@
 //! ANSI/VT100 terminal grid emulation via `alacritty_terminal::Term`.
 
+use crate::terminal::mouse::{MouseEncoding, MouseProtocol, MouseTracking};
 use crate::terminal::osc::{OscWatcher, Progress};
 use alacritty_terminal::event::{Event as AlacEvent, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll as AlacScroll};
@@ -695,6 +696,33 @@ impl TerminalGrid {
     /// since a program can enable and disable it at any point in its own lifetime.
     pub fn bracketed_paste_enabled(&self) -> bool {
         self.term.mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
+    /// Which mouse-reporting protocol the running program has turned on right now (GitHub issue
+    /// #437): `DECSET 1000`/`1002`/`1003` for what to report, `1006`/`1005` for how to frame it.
+    /// "Off" is a [`MouseTracking`] variant rather than an `Option` because a caller has to handle
+    /// that state either way. Read live, never latched, for the same reason
+    /// [`Self::bracketed_paste_enabled`] is.
+    pub fn mouse_protocol(&self) -> MouseProtocol {
+        let mode = self.term.mode();
+        // Most permissive first, so the result stays sane even if two bits are ever set at once.
+        let tracking = if mode.contains(TermMode::MOUSE_MOTION) {
+            MouseTracking::ClicksAndMotion
+        } else if mode.contains(TermMode::MOUSE_DRAG) {
+            MouseTracking::ClicksAndDrag
+        } else if mode.contains(TermMode::MOUSE_REPORT_CLICK) {
+            MouseTracking::Clicks
+        } else {
+            MouseTracking::Off
+        };
+        let encoding = if mode.contains(TermMode::SGR_MOUSE) {
+            MouseEncoding::Sgr
+        } else if mode.contains(TermMode::UTF8_MOUSE) {
+            MouseEncoding::Utf8
+        } else {
+            MouseEncoding::Normal
+        };
+        MouseProtocol { tracking, encoding }
     }
 
     /// Whether a mouse-wheel scroll reaching this pane right now should be translated into key
@@ -1682,5 +1710,98 @@ mod selection_tests {
 
         grid.append_bytes(b"\x1b[?2004l");
         assert!(!grid.bracketed_paste_enabled());
+    }
+}
+
+#[cfg(test)]
+mod mouse_protocol_tests {
+    use crate::terminal::grid::TerminalGrid;
+    use crate::terminal::mouse::{MouseEncoding, MouseTracking};
+
+    fn grid_after(bytes: &[u8]) -> TerminalGrid {
+        let mut grid = TerminalGrid::new(5, 20);
+        grid.append_bytes(bytes);
+        grid
+    }
+
+    #[test]
+    fn mouse_reporting_is_off_until_a_program_asks_for_it() {
+        let protocol = TerminalGrid::new(5, 20).mouse_protocol();
+        assert_eq!(protocol.tracking, MouseTracking::Off);
+        assert_eq!(
+            protocol.encoding,
+            MouseEncoding::Normal,
+            "the original framing is the one a program gets without asking"
+        );
+    }
+
+    #[test]
+    fn decset_1000_turns_on_click_tracking() {
+        assert_eq!(
+            grid_after(b"\x1b[?1000h").mouse_protocol().tracking,
+            MouseTracking::Clicks
+        );
+    }
+
+    #[test]
+    fn decset_1002_reports_drag_and_replaces_click_tracking() {
+        assert_eq!(
+            grid_after(b"\x1b[?1000h\x1b[?1002h")
+                .mouse_protocol()
+                .tracking,
+            MouseTracking::ClicksAndDrag,
+            "the three tracking levels are mutually exclusive, not additive"
+        );
+    }
+
+    #[test]
+    fn decset_1003_reports_all_motion() {
+        assert_eq!(
+            grid_after(b"\x1b[?1003h").mouse_protocol().tracking,
+            MouseTracking::ClicksAndMotion
+        );
+    }
+
+    #[test]
+    fn decset_1006_switches_the_encoding_without_changing_what_is_tracked() {
+        let protocol = grid_after(b"\x1b[?1002h\x1b[?1006h").mouse_protocol();
+        assert_eq!(protocol.tracking, MouseTracking::ClicksAndDrag);
+        assert_eq!(protocol.encoding, MouseEncoding::Sgr);
+    }
+
+    #[test]
+    fn decset_1005_is_reported_as_the_utf8_encoding_until_1006_supersedes_it() {
+        assert_eq!(
+            grid_after(b"\x1b[?1005h").mouse_protocol().encoding,
+            MouseEncoding::Utf8
+        );
+        assert_eq!(
+            grid_after(b"\x1b[?1005h\x1b[?1006h")
+                .mouse_protocol()
+                .encoding,
+            MouseEncoding::Sgr,
+            "the two encodings are mutually exclusive too"
+        );
+    }
+
+    #[test]
+    fn decrst_1000_turns_reporting_back_off() {
+        assert_eq!(
+            grid_after(b"\x1b[?1000h\x1b[?1000l")
+                .mouse_protocol()
+                .tracking,
+            MouseTracking::Off
+        );
+    }
+
+    #[test]
+    fn turning_off_a_tracking_level_that_was_never_on_leaves_the_live_one_alone() {
+        assert_eq!(
+            grid_after(b"\x1b[?1002h\x1b[?1000l")
+                .mouse_protocol()
+                .tracking,
+            MouseTracking::ClicksAndDrag,
+            "DECRST clears only its own bit - a program disabling 1000 it never set keeps 1002"
+        );
     }
 }
