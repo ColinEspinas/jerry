@@ -13,7 +13,7 @@ members = [
 [workspace.package]
 # Single source of truth for the release version - crates inherit via `version = { workspace =
 # true }` rather than pinning their own.
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 publish = false
 license = "MIT OR Apache-2.0"

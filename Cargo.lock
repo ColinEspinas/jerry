@@ -288,7 +288,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "app"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -4776,7 +4776,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "lsp-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dunce",
  "libc",
@@ -6149,7 +6149,7 @@ dependencies = [
 
 [[package]]
 name = "pty-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "filedescriptor",
@@ -7937,7 +7937,7 @@ dependencies = [
 
 [[package]]
 name = "test-support"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "tempfile",
 ]
@@ -9908,7 +9908,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "wt-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "gix",
  "sha2",
