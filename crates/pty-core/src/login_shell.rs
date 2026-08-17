@@ -352,8 +352,52 @@ mod resolve_login_shell_path_tests {
 #[cfg(test)]
 mod run_login_shell_probe_tests {
     use super::run_login_shell_probe;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
+    use tempfile::TempDir;
+    use test_support::stays_false;
+
+    /// The probe's timeout is a parameter precisely so no test pays the production one.
+    const PROBE_TIMEOUT: Duration = Duration::from_millis(50);
+
+    /// A command that outlives the probe's budget several times over, then records that it ran
+    /// to completion. `"$0"` is the operand passed after the script, so the marker path reaches
+    /// the shell as argv rather than as text interpolated into the script.
+    const HANGS_THEN_MARKS_COMPLETION: &str = "sleep 0.15; : > \"$0\"";
+
+    /// Long enough for a shell that outlived its timeout to reach the marker, so the kill is
+    /// observed rather than assumed. Overrunning it under load costs a missed regression, never
+    /// a false failure: correct behaviour leaves no shell alive to write the marker at all.
+    const KILL_OBSERVATION_WINDOW: Duration = Duration::from_millis(300);
+
+    /// The hanging command, backgrounded so the shell itself exits at once and leaves the job
+    /// holding the inherited stdout pipe - the case that outlives killing the shell, and so the
+    /// one whose marker must stay absent at the moment the probe returns rather than over a
+    /// window. Its sleep beats that moment by an order of magnitude while keeping the one
+    /// process no teardown here can reach - a grandchild this test never spawned - short-lived.
+    const BACKGROUNDS_A_GRANDCHILD_THEN_MARKS_COMPLETION: &str =
+        "sleep 2 && : > \"$0\" & echo /usr/bin:/bin";
+
+    /// A tempdir, and the path inside it a probed command touches to prove it ran to completion.
+    fn completion_marker() -> (TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("a temporary directory for the completion marker");
+        let marker = dir.path().join("ran-to-completion");
+        (dir, marker)
+    }
+
+    fn marker_arg(marker: &Path) -> &str {
+        marker
+            .to_str()
+            .expect("a tempdir path this test made is valid UTF-8")
+    }
+
+    /// Whether the probe really waited out its own budget. A *lower* bound on elapsed time: no
+    /// amount of CI slowness can break it, and it is what stops the marker assertions from
+    /// passing vacuously when the probe returned early for some unrelated reason - a shell that
+    /// never spawned would leave the marker absent too.
+    fn elapsed_covers_the_timeout(started: Instant) -> bool {
+        started.elapsed() >= PROBE_TIMEOUT
+    }
 
     #[test]
     fn captures_stdout_of_a_quick_real_command() {
@@ -373,43 +417,54 @@ mod run_login_shell_probe_tests {
 
     #[test]
     fn a_command_that_hangs_is_killed_at_the_timeout_instead_of_blocking_forever() {
-        // The bound is deliberately far above the timeout rather than a hair over it: what this
-        // asserts is that the probe gives up on its own budget instead of running the command
-        // out, and a bound tight enough to also measure *which* internal wait ended it would be
-        // measuring the CI runner's scheduling latency.
-        let timeout = Duration::from_millis(200);
+        let (_dir, marker) = completion_marker();
         let started = Instant::now();
 
-        let _ = run_login_shell_probe(Path::new("/bin/sh"), &["-c", "sleep 30"], timeout);
+        let _ = run_login_shell_probe(
+            Path::new("/bin/sh"),
+            &["-c", HANGS_THEN_MARKS_COMPLETION, marker_arg(&marker)],
+            PROBE_TIMEOUT,
+        );
 
-        let elapsed = started.elapsed();
         assert!(
-            elapsed < Duration::from_secs(2),
-            "probe of a hanging command took {elapsed:?}, expected it to be killed at \
-             roughly the {timeout:?} timeout instead of running to completion"
+            elapsed_covers_the_timeout(started),
+            "the probe returned before its own {PROBE_TIMEOUT:?} budget was up, so this asserted \
+             nothing - the shell most likely never spawned at all"
+        );
+        assert!(
+            stays_false(KILL_OBSERVATION_WINDOW, || marker.exists()),
+            "the hanging command ran to completion, so the probe either waited it out or left \
+             the shell alive past its timeout instead of killing it"
         );
     }
 
     #[test]
     fn a_backgrounded_grandchild_holding_the_pipe_open_does_not_hang_startup() {
-        // The shell exits immediately but leaves a `sleep` holding the inherited stdout write
-        // end, so `read_to_end` never sees EOF. Without a bounded wait on the reader channel
-        // this returns only when the grandchild dies - 30s here, unbounded in the real rc-file
-        // case this guards.
-        let timeout = Duration::from_millis(200);
+        // `read_to_end` never sees EOF here, so without a bounded wait on the reader channel
+        // the probe returns only once the grandchild dies - unbounded in the real rc-file case
+        // this guards.
+        let (_dir, marker) = completion_marker();
         let started = Instant::now();
 
         let _ = run_login_shell_probe(
             Path::new("/bin/sh"),
-            &["-c", "sleep 30 & echo /usr/bin:/bin"],
-            timeout,
+            &[
+                "-c",
+                BACKGROUNDS_A_GRANDCHILD_THEN_MARKS_COMPLETION,
+                marker_arg(&marker),
+            ],
+            PROBE_TIMEOUT,
         );
 
-        let elapsed = started.elapsed();
         assert!(
-            elapsed < Duration::from_secs(5),
-            "probe took {elapsed:?} with a grandchild holding the stdout pipe open, expected \
-             it to give up near the {timeout:?} timeout rather than wait out the grandchild"
+            elapsed_covers_the_timeout(started),
+            "the probe returned before its own {PROBE_TIMEOUT:?} budget was up, so this asserted \
+             nothing - the shell most likely never spawned at all"
+        );
+        assert!(
+            !marker.exists(),
+            "the grandchild holding the stdout pipe open was waited out to its very end, which \
+             is the startup hang this bounds"
         );
     }
 
