@@ -8039,6 +8039,25 @@ mod graph_virtualization_tests {
             app.open_git_graph(window, cx);
         });
         cx.run_until_parked();
+        // The walk behind this is real `gix`/`git` I/O against a real fixture - the one step in
+        // this helper that can fail for a reason the test itself does not control. Every caller
+        // then opens with `debug_bounds("graph-row-0")`, which answers `None` for a failed walk
+        // and a broken renderer alike, so a walk failure used to surface as "the first commit row
+        // must really paint" and blame the wrong thing entirely. Naming the real load state here
+        // is what makes that distinguishable on a CI runner nobody can attach a debugger to.
+        app.read_with(cx, |app, _| match &app.graph_state.load {
+            GraphLoadState::Loaded(graph) => assert!(
+                !graph.rows.is_empty(),
+                "the graph walk succeeded but produced no rows for this fixture"
+            ),
+            GraphLoadState::Error(err) => panic!("the real graph walk failed: {err}"),
+            GraphLoadState::Loading => {
+                panic!("the graph walk was still in flight after run_until_parked")
+            }
+            GraphLoadState::NotLoaded => {
+                panic!("opening the graph tab never started a walk at all")
+            }
+        });
         (app, cx)
     }
 
