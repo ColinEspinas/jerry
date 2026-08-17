@@ -5391,6 +5391,9 @@ mod agent_pane_readout_tests {
     /// at a time: the pane only notices an exit on a simulated-clock poll tick, while the child
     /// itself only exits in real time. `test_support::wait_until` is the workspace's one
     /// sanctioned wall-clock wait (`docs/testing.md`).
+    ///
+    /// `#[cfg(unix)]` to match its only caller, which spawns a real `/bin/false`.
+    #[cfg(unix)]
     fn wait_for_exit(app: &gpui::Entity<AdeApp>, cx: &mut gpui::VisualTestContext, id: AgentId) {
         let exited = test_support::wait_until(std::time::Duration::from_secs(30), || {
             app.update(cx, |_app, cx| cx.notify());
