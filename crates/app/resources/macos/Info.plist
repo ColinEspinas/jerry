@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>Jerry</string>
+	<key>CFBundleDisplayName</key>
+	<string>Jerry</string>
+	<key>CFBundleExecutable</key>
+	<string>jerry</string>
+	<key>CFBundleIconFile</key>
+	<string>Jerry</string>
+	<key>CFBundleIdentifier</key>
+	<string>dev.jerry.Jerry</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<!-- Overwritten from the workspace version by script/bundle-mac.sh at bundle time via
+	     `plutil -replace`; Cargo.toml's [workspace.package] version stays the single source
+	     of truth. -->
+	<key>CFBundleShortVersionString</key>
+	<string>0.0.0</string>
+	<key>CFBundleVersion</key>
+	<string>0.0.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSSupportsAutomaticGraphicsSwitching</key>
+	<true/>
+	<!-- Matches Zed's own MACOSX_DEPLOYMENT_TARGET (crates/zed/build.rs). -->
+	<key>LSMinimumSystemVersion</key>
+	<string>10.15.7</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.developer-tools</string>
+</dict>
+</plist>

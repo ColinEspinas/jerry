@@ -698,6 +698,32 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
 /// (`vendor/zed/crates/gpui/src/geometry.rs:740`), which both real call sites have (the launch
 /// callback's own `&mut App`, and a menu row's `Context<AdeApp>`, which derefs to `App` -
 /// `vendor/zed/crates/gpui/src/app/context.rs:25-37`).
+/// The window/taskbar icon on X11 (`WindowOptions::icon`, documented X11-only at
+/// `vendor/zed/crates/gpui/src/platform.rs:1809` - Wayland instead takes its icon from
+/// `crates/app/resources/linux/jerry.desktop.in`). Decoded once, not per window: `default_window_options`
+/// runs on every "New Window" (GitHub issue #90), and there is no reason to re-decode the same
+/// bundled PNG on each call. `include_bytes!` of the already-generated
+/// `resources/linux/app-icon-256.png` directly, rather than a `build.rs` resize step into
+/// `OUT_DIR` the way `vendor/zed/crates/zed/build.rs:240-258` does - simpler, and this crate
+/// already embeds every other bundled asset the same plain way (`crate::icons`, `crate::fonts`,
+/// `crate::sound::library`).
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+static APP_ICON: std::sync::LazyLock<Option<std::sync::Arc<image::RgbaImage>>> =
+    std::sync::LazyLock::new(|| {
+        const BYTES: &[u8] = include_bytes!("../resources/linux/app-icon-256.png");
+        match image::load_from_memory(BYTES) {
+            Ok(image) => Some(std::sync::Arc::new(image.to_rgba8())),
+            Err(err) => {
+                // A decode failure here means the checked-in PNG itself is corrupt, not a
+                // runtime/user condition - falling back to no icon (rather than panicking) still
+                // leaves a launchable window, matching this field's own `Option` shape for "no
+                // icon available".
+                log::error!("failed to decode the bundled X11 window icon: {err}");
+                None
+            }
+        }
+    });
+
 pub(crate) fn default_window_options(cx: &App) -> WindowOptions {
     let bounds = Bounds::centered(None, size(px(1440.0), px(928.0)), cx);
     WindowOptions {
@@ -727,6 +753,8 @@ pub(crate) fn default_window_options(cx: &App) -> WindowOptions {
             width: px(720.0),
             height: px(480.0),
         }),
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        icon: APP_ICON.clone(),
         ..Default::default()
     }
 }
@@ -1052,6 +1080,38 @@ mod open_ade_window_tests {
                  fresh first launch would - not crash, not silently open nothing"
             );
         });
+    }
+}
+
+/// GitHub issue #447: [`default_window_options`]'s X11-only window icon (see [`APP_ICON`]'s own
+/// docs for why it's X11-only and why it's a `LazyLock`).
+#[cfg(test)]
+mod default_window_options_icon_tests {
+    use super::default_window_options;
+
+    #[gpui::test]
+    fn the_icon_field_is_set_only_on_x11_platforms(cx: &mut gpui::TestAppContext) {
+        let icon = cx.update(|cx| default_window_options(cx).icon);
+
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        {
+            let icon = icon.expect(
+                "Linux/FreeBSD must set a real bundled icon, not silently fall back to gpui's \
+                 own `None` default",
+            );
+            assert_eq!(
+                (icon.width(), icon.height()),
+                (256, 256),
+                "must be the real decoded resources/linux/app-icon-256.png, not a placeholder"
+            );
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+        assert!(
+            icon.is_none(),
+            "the icon field is documented X11-only (vendor/zed/crates/gpui/src/platform.rs:1809) \
+             - every other platform must leave gpui's own `None` default alone"
+        );
     }
 }
 

@@ -196,12 +196,34 @@ Grab a build from the [latest release](../../releases/latest):
 
 | Platform | File |
 | --- | --- |
-| macOS (Apple Silicon) | `jerry-macos.tar.gz` |
+| macOS (Apple Silicon) | `Jerry-macos.dmg` |
 | Linux (x86_64) | `jerry-linux.tar.gz` |
-| Windows (x86_64) | `jerry-windows.zip` |
+| Windows (x86_64) | `Jerry-windows.zip` |
 
 Every release ships all three, but they're not equally proven: macOS is the one run day to day, Linux
 builds and runs against both Wayland and X11, and Windows is verified by CI.
+
+### First launch
+
+None of these builds are signed with a paid certificate — that's a deliberate, tracked decision
+(see [#449](../../issues/449) for the cost breakdown and what buying one would take) rather than an
+oversight. Each OS's "unknown developer" warning is expected; here's how to get past it.
+
+**macOS** — drag `Jerry.app` out of the DMG into `/Applications`, then clear the quarantine
+attribute Gatekeeper set on download:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/Jerry.app
+```
+
+Prefer not to run a terminal command? Right-click `Jerry.app` in Finder and choose **Open** — this
+shows the same warning but with an **Open** button Gatekeeper otherwise hides.
+
+**Windows** — SmartScreen shows "Windows protected your PC". Click **More info**, then **Run
+anyway**.
+
+**Linux** — extract the tarball and run `install.sh`. It copies Jerry into `~/.local` and
+registers a launcher entry; no warning appears on Linux at all, so there's nothing to bypass.
 
 ### From source
 

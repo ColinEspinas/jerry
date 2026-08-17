@@ -313,6 +313,20 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "7b030b50
     "wayland",
     "x11",
 ] }
+# GitHub issue #447: decodes the embedded window icon for `WindowOptions::icon`
+# (`crate::default_window_options`), documented X11-only at `vendor/zed/crates/gpui/src/platform.rs:1809`
+# ("Icon image (X11 only)") - Wayland instead takes its icon from the `.desktop` entry
+# (`crates/app/resources/linux/jerry.desktop.in`), which is why this dependency is scoped to this
+# same `cfg(any(target_os = "linux", target_os = "freebsd"))` table gpui_platform already lives in,
+# not a plain top-level dependency. `image` itself is already resolved in this workspace's lock
+# file at `0.25.10`, transitively via `gpui`'s own workspace-level `image` dependency (which pulls
+# in the full `zed-industries/zed` `default-formats` codec list) - `version = "0.25"` here just
+# promotes that already-locked crate to a direct dependency, the same call this crate's
+# `unicode-segmentation`/`rayon` entries above already made, rather than adding new version
+# surface. `default-features = false, features = ["png"]` documents the real, narrow need (decode
+# one bundled PNG into an `RgbaImage`) even though feature unification with gpui's own broader
+# request means the compiled artifact ends up with the same codec set either way.
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 # macOS: `gpui_macos` is pulled in by `gpui_platform` itself purely from `target_os`, but text
 # rendering is NOT automatic - `gpui_macos`'s own `font-kit` feature (which pulls in its real
@@ -376,6 +390,30 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }
+
+# GitHub issue #447: `crates/app/build.rs` embeds `resources/windows/app-icon.ico` plus a version
+# resource (`ProductName`/`FileDescription` = "Jerry", `FileVersion` from the workspace version)
+# into the built `.exe`. Target-gated the same way the `windows-sys` table above is, so this is
+# never even fetched, let alone compiled, on macOS/Linux.
+#
+# `winresource`, not upstream zed's own mechanism: `crates/zed/build.rs` calls its own
+# `windows_resources::compile()` (`crates/windows_resources/src/windows_resources.rs` in the
+# pinned checkout), which `format!`s an ICON+VERSIONINFO `.rc` block at build time into `OUT_DIR`
+# and hands it to `embed_resource::compile()` - read directly from that crate's real source rather
+# than assumed. `embed-resource` is in fact already resolved in this workspace's lock file (a
+# transitive, always-on optional dependency of `gpui`'s own `windows-manifest` feature, which
+# embeds gpui's own *manifest* resource - a different resource type from the icon/version-info
+# pair this crate needs) - but matching zed's approach exactly would mean copying that hand-rolled
+# `.rc`-templating function into this crate's own `build.rs`, for code nobody on this (non-Windows)
+# machine can compile-test. `winresource` trades a small (~80KB, MIT) additional crate for a typed
+# builder (`WindowsResource::new().set_icon(..).set(..)`) that generates the equivalent `.rc`
+# internally, which is the safer choice here. `default-features = false`: the only non-default
+# feature is `toml`, for parsing a `[package.metadata.winresource]` table this crate doesn't use
+# (every field is set programmatically in `build.rs` instead) - without it, `version_check`
+# (already in this workspace's lock file transitively) is the only real additional build-time
+# dependency this pulls in.
+[target.'cfg(windows)'.build-dependencies]
+winresource = { version = "0.1", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
