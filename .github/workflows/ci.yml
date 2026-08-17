@@ -4,9 +4,13 @@ on:
   # Scoped to the default branch on purpose. An unscoped `push:` alongside `pull_request:` fires
   # two complete, identical runs of this workflow for every push to a PR branch - verified on
   # GitHub issue #426's own branch, where runs 31974623400 (push) and 31974624833 (pull_request)
-  # are the same commit. At GitHub's billing multipliers (Linux 1x, Windows 2x, macOS 10x) one run
-  # of this workflow is roughly 200 billed minutes, so the duplicate bought no extra signal at
-  # about 200 minutes a push. PR branches are covered by `pull_request` alone.
+  # are the same commit. PR branches are covered by `pull_request` alone.
+  #
+  # This is not about money: the repository is public, so GitHub-hosted standard runners are free
+  # and the usual Linux/Windows/macOS billing multipliers do not apply to it at all. It is about
+  # the two things that are genuinely scarce here - concurrent runner slots, where the macOS
+  # allowance is much smaller than the overall one, and the 10 GB per-repository Actions cache the
+  # duplicate run was evicting entries from.
   push:
     branches: [master]
   pull_request:
@@ -21,9 +25,9 @@ on:
     - cron: "0 4 * * *"
 
 # A new push supersedes the run still in flight for the same branch or PR instead of racing it to
-# completion on paid runners. `github.event_name` is part of the key as well as the ref, so that a
-# push to the default branch cannot cancel a `schedule` run that shares that ref - the nightly is
-# the only execution the `external` tier ever gets.
+# completion and holding runner slots nothing is waiting on. `github.event_name` is part of the key
+# as well as the ref, so that a push to the default branch cannot cancel a `schedule` run that
+# shares that ref - the nightly is the only execution the `external` tier ever gets.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
@@ -41,12 +45,65 @@ env:
   JERRY_DISABLE_PROVIDER_POLL: "1"
 
 jobs:
-  # Build + the workspace's own [workspace.lints]-backed clippy check + fmt on Linux. The test run
-  # is the separate `linux-test` job below, so a clippy failure and a test failure are two distinct
-  # red checks rather than one, and neither has to wait on the other's slowest step.
-  linux:
-    name: Linux (build, clippy, fmt)
+  # The platform-independent half of the gate, and the only job that is not tied to an OS.
+  # `cargo fmt`, the convention ratchet and the version check all read source text: their answer
+  # cannot differ between Linux, macOS and Windows, so running them three times would burn three
+  # runners to produce the same result. They run once, here, on the cheapest one.
+  #
+  # Deliberately compile-free - no system packages, no cargo cache, no `cargo build`. None of these
+  # three steps needs a compiled workspace, which is what makes this the fast "you got something
+  # obviously wrong" signal that lands in about a minute while the platform jobs are still linking.
+  #
+  # clippy is NOT here, and that is the one real asymmetry in this file: it is a *compiled* lint, so
+  # it only ever sees the `#[cfg(target_os = ...)]` code of the platform it runs on. Running it once
+  # on Linux would leave `status_bar::process_stats::{macos,windows}` - 14 `unsafe` FFI sites, the
+  # code this project's own standards are strictest about - linted by nobody. So each platform job
+  # below runs clippy over its own target instead.
+  lint:
+    name: Lint (fmt, conventions)
     runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt
+
+      # Deterministic ratchet, not a cargo lint: fails if the count of `use super::*` globs or
+      # of adapter calls in render.rs files rose vs .claude/conventions-baseline.json. See that
+      # script's own comments and docs/architecture/decisions.md (§3).
+      - name: Convention ratchet
+        run: .claude/hooks/check-conventions.sh
+
+      # Catches a crate manifest that regresses to a hardcoded version (issue #317).
+      - name: Crate version inheritance
+        run: .claude/hooks/check-release-version.sh
+
+      - name: cargo fmt --all -- --check
+        run: cargo fmt --all -- --check
+
+  # The three platform jobs below are deliberately the same shape: build, clippy, test. Whatever
+  # differs between them is a property of the platform, never of this file's own taste - the only
+  # intentional difference is Windows' test scope, which has its own comment.
+  #
+  # The test step is the `unit` and `ui` tiers of docs/testing.md, which is exactly what
+  # `cargo nextest run` executes by default - the `external` tier is `#[ignore]`d, and nextest skips
+  # ignored tests unless asked for them (`--run-ignored`, which only the `external` job passes).
+  #
+  # `nextest`, not `cargo test`: each test runs in its own process under `.config/nextest.toml`'s
+  # `slow-timeout`, so a test that blocks forever is a named, killed failure rather than a run that
+  # never ends.
+  linux:
+    name: Linux (build, clippy, test)
+    runs-on: ubuntu-latest
+    # A hard ceiling well above the ~10-minute target in issue #426, so a pathological hang still
+    # surfaces as a failed job rather than burning the six-hour default.
+    timeout-minutes: 45
     # System libraries GPUI's Linux backend (both the `wayland` and `x11`
     # gpui_platform features are compiled in, Revision R12 - see that file's own
     # Cargo.toml comment, and `crate::gpui_linux`'s real `guess_compositor()`-based
@@ -101,74 +158,7 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.95.0"
-          components: rustfmt, clippy
-
-      - name: Cache cargo/target
-        uses: Swatinem/rust-cache@v2
-
-      - name: cargo build --workspace
-        run: cargo build --workspace
-
-      # Deterministic ratchet, not a cargo lint: fails if the count of `use super::*` globs or
-      # of adapter calls in render.rs files rose vs .claude/conventions-baseline.json. See that
-      # script's own comments and docs/architecture/decisions.md (§3).
-      - name: Convention ratchet
-        run: .claude/hooks/check-conventions.sh
-
-      # Catches a crate manifest that regresses to a hardcoded version (issue #317).
-      - name: Crate version inheritance
-        run: .claude/hooks/check-release-version.sh
-
-      - name: cargo fmt --all -- --check
-        run: cargo fmt --all -- --check
-
-      - name: cargo clippy --workspace --all-targets -- -D warnings
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-  # The PR gate's test run: the `unit` and `ui` tiers of docs/testing.md, which is exactly what
-  # `cargo nextest run` executes by default - the `external` tier is `#[ignore]`d, and nextest
-  # skips ignored tests unless asked for them (`--run-ignored`, which only the `external` job
-  # below passes).
-  #
-  # `nextest`, not `cargo test`: each test runs in its own process under `.config/nextest.toml`'s
-  # `slow-timeout`, so a test that blocks forever is a named, killed failure rather than a run
-  # that never ends.
-  linux-test:
-    name: Linux (test)
-    runs-on: ubuntu-latest
-    # A hard ceiling well above the ~10-minute target in issue #426, so a pathological hang still
-    # surfaces as a failed job rather than burning the six-hour default.
-    timeout-minutes: 45
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 1
-
-      # The same list, for the same reasons, as the `linux` job above - see that job's own comment
-      # for why each package is on it and why several of upstream Zed's are not. Compiling the
-      # test binaries needs everything compiling the app needs.
-      - name: Install Linux system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential \
-            clang \
-            cmake \
-            pkg-config \
-            libfontconfig-dev \
-            libvulkan1 \
-            mesa-vulkan-drivers \
-            libwayland-dev \
-            libxkbcommon-dev \
-            libxkbcommon-x11-dev \
-            libx11-xcb-dev \
-            libasound2-dev
-
-      - name: Install Rust 1.95.0
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.95.0"
+          components: clippy
 
       # Pinned to the version this change was actually written and validated against, per this
       # project's "same version we verified against, not latest" convention (see
@@ -178,8 +168,15 @@ jobs:
         with:
           tool: cargo-nextest@0.9.143
 
+      # `save-if` keeps the restore on every run but writes the cache only from the default branch.
+      # A repository gets 10 GB of Actions cache in total and GitHub evicts the least recently used
+      # entry once that fills; four jobs each saving a multi-gigabyte Rust target dir on every PR
+      # push churns that budget hard enough to evict the very entries the next run wants. Writing
+      # from master alone keeps one warm, stable entry per job instead.
       - name: Cache cargo/target
         uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       # A fresh runner has no global git identity, unlike every developer machine. `wt-core`'s
       # `discard_worktree_refuses_when_stash_push_captures_nothing_and_an_unrelated_stash_already_exists`
@@ -192,19 +189,24 @@ jobs:
           git config --global user.email "ci@example.invalid"
           git config --global user.name "CI"
 
+      - name: cargo build --workspace
+        run: cargo build --workspace
+
+      - name: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
       - name: cargo nextest run --workspace --profile ci
         run: cargo nextest run --workspace --profile ci
 
-  # macOS and Windows are two separate jobs (not a matrix) so all three platforms read as
-  # peers in the Actions UI, rather than Linux standing alone against one oddly-combined
-  # "the other two" job. Not every contributor can build and run the suite on either of
+  # macOS and Windows are separate jobs rather than a matrix so all three platforms read as
+  # peers in the Actions UI. Not every contributor can build and run the suite on either of
   # these platforms locally, so these two jobs are the only verification that the workspace
   # works there at all.
   #
-  # They are deliberately *not* symmetric in what they test. macOS runs the full `unit`/`ui`
-  # suite; Windows runs the narrow `status_bar::process_stats` filter it ran before issue
-  # #426. See the Windows job's own comment for why - that asymmetry is a recorded decision,
-  # not an oversight.
+  # Same shape as the Linux job above - build, clippy, test - with one deliberate difference:
+  # Windows runs the narrow `status_bar::process_stats` filter it ran before issue #426 rather
+  # than the full suite. See the Windows job's own comment; that asymmetry is a recorded
+  # decision, not an oversight.
   #
   # macOS earned the full suite immediately: the bug that dominated this epic was a
   # macOS-specific path canonicalization difference (`/var` is a symlink to `/private/var`,
@@ -222,7 +224,7 @@ jobs:
   # needs no `--features` flag on either platform: per-target dependency/feature
   # selection is Cargo's job, resolved automatically from the actual build target.
   macos:
-    name: macOS (build + test)
+    name: macOS (build, clippy, test)
     runs-on: macos-latest
     timeout-minutes: 45
     # A real, platform-specific build-script requirement found by reading
@@ -241,16 +243,21 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.95.0"
+          components: clippy
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.143
 
+      # Same `save-if` reasoning as the Linux job - see that job's own comment on the 10 GB
+      # per-repository Actions cache budget.
       - name: Cache cargo/target
         uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
-      # Same reason as the Linux test job's identical step: `wt-core`'s submodule-commit test
+      # Same reason as the Linux job's identical step: `wt-core`'s submodule-commit test
       # needs a global git identity a fresh runner does not have.
       - name: Configure git identity
         run: |
@@ -259,6 +266,13 @@ jobs:
 
       - name: cargo build --workspace
         run: cargo build --workspace
+
+      # clippy runs per platform, not once on Linux, because it only ever lints the
+      # `#[cfg(target_os = ...)]` code of the target it runs against. This step is the only thing
+      # that lints `crate::status_bar::process_stats::macos` at all - 7 `unsafe` `proc_pid_rusage`
+      # FFI sites that a Linux-only clippy pass cannot even parse into its analysis.
+      - name: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       # This job is what makes GitHub issue #283's macOS per-process CPU/memory sampling backend
       # (`crate::status_bar::process_stats::macos`, real `proc_pid_rusage` FFI) actually get
@@ -285,7 +299,7 @@ jobs:
   # `status_bar::process_stats` filter it ran before #426. The full suite does not pass on
   # Windows yet; re-widening it before #440 is done just turns this check permanently red.
   windows:
-    name: Windows (build + sampling tests)
+    name: Windows (build, clippy, sampling tests)
     runs-on: windows-latest
     timeout-minutes: 45
     # A real, platform-specific build-script quirk found by reading
@@ -306,12 +320,26 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.95.0"
+          components: clippy
 
+      # Same `save-if` reasoning as the Linux job - see that job's own comment on the 10 GB
+      # per-repository Actions cache budget.
       - name: Cache cargo/target
         uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: cargo build --workspace
         run: cargo build --workspace
+
+      # The Windows twin of the macOS job's clippy step, and the only thing that lints
+      # `crate::status_bar::process_stats::windows` - 7 `unsafe` `GetProcessTimes`/PSAPI FFI sites
+      # written on a Linux machine and, until this step, never seen by clippy on any target where
+      # they actually compile. Note this lints the whole workspace for the Windows target even
+      # though the test step below is narrow: linting is cheap and has none of the 3073-test
+      # problems issue #440 tracks.
+      - name: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       # GitHub issue #283, the Windows twin of the macOS job's step above - same reasoning,
       # same narrow filter. `crate::status_bar::process_stats::windows` is real `GetProcessTimes`
@@ -402,10 +430,13 @@ jobs:
           npm ls -g --depth=0 || true
           rust-analyzer --version
 
+      # No `save-if` here, unlike the three platform jobs: this job only ever runs from
+      # `workflow_dispatch` or the nightly `schedule`, never on a PR, so it is not a source of
+      # cache churn and its own entry is worth keeping warm between nightlies.
       - name: Cache cargo/target
         uses: Swatinem/rust-cache@v2
 
-      # Same reason as the Linux test job's identical step: `wt-core`'s submodule-commit test
+      # Same reason as the Linux job's identical step: `wt-core`'s submodule-commit test
       # needs a global git identity a fresh runner does not have.
       - name: Configure git identity
         run: |
