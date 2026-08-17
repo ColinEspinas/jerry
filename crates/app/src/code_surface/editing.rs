@@ -1730,7 +1730,7 @@ pub(in crate::code_surface) fn render_editable_file_view_line(
             // Multi-cursor (Revision R13, issue #28): every *secondary* real cursor's own
             // selection fill/caret bar on this row, painted with the exact same real tokens as
             // the primary's own above - `theme.rs` has no separate "secondary cursor" color, and
-            // inventing one with no `design_handoff_jerry_ade` spec to back it would be an
+            // inventing one with no design spec to back it would be an
             // unjustified guess (`CONTRIBUTING.md`'s own "exact values" discipline) - so a real
             // multi-cursor agent simply shows several real, identically-styled carets/
             // selections rather than a fabricated visual distinction between them. Empty in

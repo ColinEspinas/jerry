@@ -1970,8 +1970,8 @@ impl AdeApp {
                     .text_color(theme::text::BODY)
                     .child(row.commit.subject.clone()),
             )
-            // The working-tree row's own union figure (GitHub issue #287) - `Jerry.dc.html`'s
-            // `Git graph` state carries `13 files · +319 −145` in this slot, between the subject
+            // The working-tree row's own union figure (GitHub issue #287) - the design carries
+            // `13 files · +319 −145` in this slot, between the subject
             // and the author column. Read straight off the uncommitted change set, so it is the
             // same number the Uncommitted section's header states rather than a second count of
             // the same working tree. A commit row has no note: what a commit changed is its own

@@ -75,7 +75,7 @@ button_disabled        = "#1b1e22"
 keycap                 = "#202429"
 keycap_hint            = "#1e2125"  # The hint-size keycap's own border
 selected_edge          = "#2d435b"  # 2px left edge on a selected row
-diagnostic_card        = "#321c1c"
+diagnostic_card        = "#321c1c"  # The Diagnostic popover's own border.
 diagnostic_card_footer = "#251d1e"  # The Diagnostic popover's own footer band's top border
 
 # The Files tree's own structural marks (GitHub issue #18 §3).
@@ -165,11 +165,10 @@ status_deleted  = "#854840"  # D
 tree_added      = "#347155"  # "A" mark
 tree_modified   = "#746019"  # "M" mark
 
-# Tokens used only by the Revision R12 rail rewrite (design_handoff_jerry_ade/revision 3/
-# REVISION-2026-07-31.md §2) that have no exact match elsewhere in this module - every other
-# colour that section calls for (the branch/note/model/activity greys, the amber flag, the
-# spine/selection edges) already has one, reused directly at the call site rather than
-# duplicated here under a second name.
+# Tokens the rail needs that have no exact match elsewhere in this module - every other colour
+# it calls for (the branch/note/model/activity greys, the amber flag, the spine/selection edges)
+# already has one, reused directly at the call site rather than duplicated here under a second
+# name.
 [rail]
 repo_header_name   = "#6b7177"  # Repo group header's uppercase name.
 worktree_active_bg = "#161a1d"
@@ -189,9 +188,8 @@ repo_fail_count    = "#934c43"  # The repo header's red urgency **count**
 "local.fg"  = "#596a9f"  # Steel blue - qwen-local.
 "local.bg"  = "#1b2238"  # Steel blue - qwen-local.
 
-# The Changes panel - four stacked, collapsible sections in one scroller
-# (design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md §1), plus the file row's own
-# seen/unseen and discard states (STAGE-A-CHANGELOG.md §4i).
+# The Changes panel - four stacked, collapsible sections in one scroller, plus the file row's
+# own seen/unseen and discard states.
 [changes]
 edge_uncommitted      = "#2d435b"  # UNCOMMITTED's 2px left edge - what is dirty in the checkout.
 edge_neutral          = "#1d2024"  # COMMITS' 2px left edge.
@@ -217,8 +215,7 @@ discard_fg            = "#a6574c"  # The armed Discard? pill's label.
 hover_action_hover_bg = "#1e2229"
 discard_hover_bg      = "#2e1616"  # The discard button's hover fill
 
-# Per-provider rate-limit budget - the meter on an agent tab and in the budget popover
-# (design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md §2).
+# Per-provider rate-limit budget - the meter on an agent tab and in the budget popover.
 [budget]
 ok       = "#468e6b"  # Above 40% remaining.
 warn     = "#8f6c1d"  # 15-40% remaining.
@@ -249,9 +246,7 @@ send_hover_bg    = "#192532"  # Its hover fill.
 send_fg          = "#6e8dae"  # Its label.
 send_cap_fg      = "#557699"  # Its ⌘⏎ keycaps' glyphs.
 
-# Agent history - the sidebar's run list and the run-transcript tab (GitHub issue #227,
-# design_handoff_jerry_ade/revision 5/REVISION-2026-08-13.md §4/§5, transcribed from that
-# revision's own tables and from revision 5/tokens.rs's history module).
+# Agent history - the sidebar's run list and the run-transcript tab (GitHub issue #227).
 [history]
 out_done_fg        = "#468e6b"  # done - its last turn ended cleanly and Jerry watched it end.
 out_done_bg        = "#12221b"
@@ -266,7 +261,7 @@ drift_near         = "#5e83a9"  # Drift dot, 1-2 commits since.
 drift_far          = "#8f6c1d"  # Drift dot, 3+ commits since.
 drift_text         = "#45494f"
 drift_far_text     = "#746019"
-scope_on_bg        = "#1a1e22"
+scope_on_bg        = "#1a1e22"  # The scope toggle's selected segment
 scope_on_border    = "#22282f"
 scope_on_fg        = "#85898e"
 scope_off_fg       = "#45494f"
@@ -274,7 +269,7 @@ scope_hover_bg     = "#181c1f"
 repo_label         = "#6b7177"
 group_label        = "#757a81"
 row_title          = "#85898e"  # A run row's title when the row is not the open one.
-transcript_prompt  = "#5e83a9"
+transcript_prompt  = "#5e83a9"  # The transcript body's four line tones
 transcript_body    = "#74787f"
 transcript_detail  = "#4d5258"
 transcript_lead    = "#8d9197"
@@ -348,7 +343,7 @@ error_underline           = "#ca5d4f"  # 2px dotted
 hover_underline           = "#5f81ab"  # 1px solid
 diagnostic_row_bg         = "#191415"
 diagnostic_inline_message = "#ae6e64"
-diagnostic_card_message   = "#b36b61"
+diagnostic_card_message   = "#b36b61"  # The Diagnostic state's card message headline.
 
 # The File view's structural chrome (GitHub issue #31's "editor chrome" checklist item) -
 # selection, the current-line highlight, the caret, and a handful of tokens for editor features
@@ -418,12 +413,12 @@ process_exited = "#b28c23"  # The process exited label, once the child is gone.
 "ansi.14"      = "#29b8db"
 "ansi.15"      = "#ffffff"
 
-# Exact colours for Surface C's real Completions popup item rows - read directly from
-# design_handoff_jerry_ade/revision/Jerry.dc.html's own completions/KBG/KFG data (the sel ? ...
+# Exact colours for Surface C's real Completions popup item rows - each its own token rather
+# than a reuse of a nearby-but-not-identical existing one (e.g.
 [completions_popup]
-item_selected_bg   = "#1c2f42"
-item_selected_fg   = "#9a9ea3"
-item_fg            = "#7f848b"
+item_selected_bg   = "#1c2f42"  # A selected completion row's background.
+item_selected_fg   = "#9a9ea3"  # A selected completion row's label colour.
+item_fg            = "#7f848b"  # An unselected completion row's label colour
 "kind_function.fg" = "#5e83a9"
 "kind_function.bg" = "#1c2f42"
 "kind_variable.fg" = "#99760b"
@@ -443,7 +438,7 @@ green_bg        = "#123f2e"
 green_bg_hover  = "#134a35"
 green_fg        = "#609b7d"
 green_keycap    = "#1b5139"
-green_keycap_fg = "#518f72"
+green_keycap_fg = "#518f72"  # The keycap glyph colour inside a green primary button
 blue_bg         = "#1c2f42"
 blue_bg_hover   = "#203850"
 blue_fg         = "#6e8dae"
@@ -462,35 +457,29 @@ knob_on        = "#82a392"
 knob_off       = "#4d5258"
 checkbox_hover = "#1e5b3e"
 
-# Settings-surface-only colours read directly from Jerry.dc.html's inline literals for the
-# settingsOpen block - real values present in the mockup but missing from tokens.rs's
-# transcription (predates the Settings section).
+# Settings-surface-only colours: the ones that have no equivalent in another module.
 [settings]
-nav_row_hover           = "#16181a"
-subtitle                = "#545a60"
-card_row_sep            = "#1b1e22"
+nav_row_hover           = "#16181a"  # A nav row's hover background
+subtitle                = "#545a60"  # The content column's page-subtitle text
+card_row_sep            = "#1b1e22"  # A card row's own bottom separator
 agent_ready             = "#208559"  # A binary-found status dot on the Agents page.
 agent_not_found         = "#aa3b2d"  # A binary-not-found status dot on the Agents page
 worktree_prunable_dot   = "#30353b"  # The Worktrees page's "merged and prunable" row dot
 card_selected_bg        = "#15191d"
 card_unselected_bg      = "#131619"
-theme_card_hover_border = "#2d3239"
-snippet_section         = "#9061a2"
+theme_card_hover_border = "#2d3239"  # A Theme card's hover border.
+snippet_section         = "#9061a2"  # The config snippet block's section-header line colour.
 
-# Palette-only (⌘P) colours read directly from Jerry.dc.html's inline literals for the
-# paletteOpen block - real values missing from tokens.rs's transcription (predates the palette
-# section).
+# Palette-only (⌘P) colours: the ones that have no equivalent in another module.
 [palette]
-prefix            = "#425b78"
-group_header      = "#43474d"
-row_hover         = "#171a1d"
-label_selected    = "#9a9ea3"
-"command_chip.fg" = "#596a9f"
-"command_chip.bg" = "#1a1f2c"
+prefix            = "#425b78"  # The input row's scope-prefix glyph.
+group_header      = "#43474d"  # A result group's uppercase header label
+row_hover         = "#171a1d"  # An unselected result row's hover background
+label_selected    = "#9a9ea3"  # The selected/first row's label colour
+"command_chip.fg" = "#596a9f"  # A command result's kind chip (fg, bg)
+"command_chip.bg" = "#1a1f2c"  # A command result's kind chip (fg, bg)
 
-# The git graph tab (design handoff design_handoff_jerry_ade/revision 2/CHANGELOG.md, 2026-07-31
-# entry, "git graph (issue #1)") - real hex values transcribed directly from that entry's
-# §2/§3, not paraphrased.
+# The git graph tab (GitHub issue #1).
 [graph]
 tab_chip_bg                = "#251b29"  # The tab chip's own background (§1: "#2a2030 bg").
 tab_chip_fg                = "#955f86"  # The tab chip's fork-glyph colour (§1: "#c98fbf fork glyph").
@@ -582,8 +571,7 @@ local_border = "#1d2024"  # Defaults to border::DIVIDER's own value.
 "unknown.fg" = "#4d5258"
 "unknown.bg" = "#1e2125"
 
-# The status bar's three type tiers (design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md
-# §3).
+# The status bar's three type tiers.
 [status_bar]
 primary       = "#757a81"  # Tier 1
 secondary     = "#595e65"  # Tier 2

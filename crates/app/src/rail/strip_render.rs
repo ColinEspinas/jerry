@@ -322,7 +322,7 @@ impl AdeApp {
     }
 
     /// One Problems row: a 5px severity square, the message, and the file/position/source line
-    /// under it - `Jerry.dc.html`'s own `probRows` markup - and the click that opens it.
+    /// under it, and the click that opens it.
     fn render_problem_row(
         &self,
         index: usize,
@@ -476,9 +476,8 @@ fn strip_glyph_hover(selected: bool) -> theme::ColorToken {
     }
 }
 
-/// A cell's state marker: the tabs' own 5px square dot, in the marker's hue, at `Jerry.dc.html`'s
-/// own `right:7 top:8` (§4v: "Badges moved to `right:5 top:6` - on a square cell, corner-anchored
-/// badges read as clipped", and the final markup settled one step further in again).
+/// A cell's state marker: the tabs' own 5px square dot, in the marker's hue, inset at
+/// `right:7 top:8`. On a square cell a corner-anchored badge reads as clipped, so it sits in.
 fn render_strip_marker(view: SidebarView, marker: StripMarker) -> impl IntoElement {
     let selector = match view {
         SidebarView::Worktrees => "sidebar-strip-worktrees-marker",

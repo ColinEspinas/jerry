@@ -490,10 +490,10 @@ pub fn replace_across(
 }
 
 /// How many characters of context sit before the hit on a match row before the prefix elides from
-/// the left. `Jerry.dc.html`'s own `trimPre`: `s.length > 16 ? '…' + s.slice(-15)`.
+/// the left.
 pub const ELIDE_PREFIX_MAX: usize = 16;
 
-/// The same for the tail. `Jerry.dc.html`'s own `trimPost`: `s.length > 26 ? s.slice(0, 25) + '…'`.
+/// The same for the tail.
 pub const ELIDE_SUFFIX_MAX: usize = 26;
 
 /// Splits `line` around `range` into the three spans a match row draws, with the design's own

@@ -64,8 +64,8 @@ impl AdeApp {
         }
     }
 
-    /// The Settings surface's own key handler - just `Esc`-to-close
-    /// (`design_handoff_jerry_ade/README.md`: "esc ... returns to the workspace"). Nav is
+    /// The Settings surface's own key handler - just `Esc`-to-close, returning to the
+    /// workspace. Nav is
     /// click-only, so unlike [`Self::handle_palette_key_down`] this needs no arrow-key/tab
     /// handling.
     pub(in crate::settings) fn handle_settings_key_down(
@@ -147,8 +147,7 @@ impl AdeApp {
         self._lsp_rows_task = Some(task);
     }
 
-    /// The Settings surface (`design_handoff_jerry_ade/README.md`'s "Settings" section): a
-    /// 212px nav plus a content column. `track_focus`/`on_key_down` here are what make `Esc`
+    /// The Settings surface (`docs/design/settings.md`): a 212px nav plus a content column. `track_focus`/`on_key_down` here are what make `Esc`
     /// actually reach [`Self::handle_settings_key_down`] - the same pattern `Self::render_palette`
     /// uses for its own panel (`vendor/zed/crates/gpui/src/elements/div.rs`'s `Div::track_focus`/
     /// `Interactivity::on_key_down`).
@@ -164,9 +163,9 @@ impl AdeApp {
             .child(self.render_settings_content(cx))
     }
 
-    /// The 212px nav column - `design_handoff_jerry_ade/revision/README.md`: "Nav 212 wide ...
-    /// Groups (Workspace, Interface, Editor, Other) with the same 9.5px uppercase header as the
-    /// rail." All eleven pages are clickable navigation (`crate::settings::state::nav_groups`); seven
+    /// The 212px nav column: four groups - Workspace, Interface, Editor, Other - under the same
+    /// uppercase header the rail uses.
+    /// All eleven pages are clickable navigation (`crate::settings::state::nav_groups`); seven
     /// render real content past this point - see `crate::settings::state`'s module docs.
     pub(in crate::settings) fn render_settings_nav(
         &self,
@@ -269,8 +268,7 @@ impl AdeApp {
                             .text_size(px(10.0))
                             .text_color(theme::text::HINT)
                             // Real crate name/version (`env!` reads this crate's own
-                            // `Cargo.toml` at compile time), not Jerry.dc.html's fabricated
-                            // "jerry 0.4.2".
+                            // `Cargo.toml` at compile time), never a hardcoded one.
                             .child(format!(
                                 "{} {} \u{b7} settings.toml",
                                 env!("CARGO_PKG_NAME"),
@@ -308,9 +306,8 @@ impl AdeApp {
             let badge = match page {
                 SettingsPage::Agents => Some(agent_count.to_string()),
                 SettingsPage::Worktrees => Some(worktree_count.to_string()),
-                // Live counts, not Jerry.dc.html's fabricated sample badges (Keybindings' mockup
-                // `48` doesn't match this app's real, smaller count - see
-                // `crate::settings::state::keybinding_rows`'s own docs).
+                // Live counts, never a fixed sample number - see
+                // `crate::settings::state::keybinding_rows`'s own docs.
                 // Built-in + real, disk-loaded custom themes (GitHub issue #5) - one combined
                 // count, matching `Self::render_settings_theme_page`'s own combined card list.
                 SettingsPage::Theme => {
@@ -391,10 +388,8 @@ impl AdeApp {
     }
 
     /// The content column: header block (title + subtitle) plus whichever page's real (or
-    /// honestly placeholder) body - `design_handoff_jerry_ade/revision/README.md`'s "Content
-    /// column" section. Header and scrollable body are both capped at
-    /// `theme::zone::SETTINGS_CONTENT_MAX_WIDTH` (700px), left-aligned inside the 26px padding -
-    /// matching `Jerry.dc.html`'s own `max-width:700px` wrapper.
+    /// honestly placeholder) body. Header and scrollable body are both capped at
+    /// `theme::zone::SETTINGS_CONTENT_MAX_WIDTH` (700px), left-aligned inside the 26px padding.
     pub(in crate::settings) fn render_settings_content(
         &mut self,
         cx: &mut Context<Self>,
@@ -501,9 +496,9 @@ impl AdeApp {
             )
     }
 
-    /// *Agents › Installed* - `design_handoff_jerry_ade/README.md`: "bordered card ... of four
-    /// rows ... agent badge ... name ... binary path ... model ... a `default` pill ... green
-    /// dot + 'ready' ... Edit." This app drops the `model`/`default`/`Edit` pieces (see
+    /// *Agents › Installed* - the designed card: agent badge, name, binary path, model, a
+    /// `default` pill, a green dot and `ready`, then `Edit`. This app drops the
+    /// `model`/`default`/`Edit` pieces (see
     /// `crate::settings::state`'s module docs for why) and shows [`settings::AGENT_KINDS`]'s two real
     /// rows instead of the mockup's four fabricated ones, each with a live PATH-derived status.
     pub(in crate::settings) fn render_settings_agents_page(
@@ -630,8 +625,8 @@ impl AdeApp {
             )
     }
 
-    /// The Installed card's footer - `design_handoff_jerry_ade/README.md`: "Card footer ...
-    /// '+ Add an agent — any binary that speaks a resumable agent on stdin'." Rendered dimmed
+    /// The Installed card's footer - `+ Add an agent — any binary that speaks a resumable agent
+    /// on stdin`, which is the product position stated in the design. Rendered dimmed
     /// and inert (no `on_click`) - `crate::work_surface::agents::AgentKind` is a fixed Rust enum,
     /// so there is no runtime "register a new agent binary" flow to wire this to yet.
     pub(in crate::settings) fn render_settings_agents_footer(&self) -> impl IntoElement {
@@ -666,9 +661,9 @@ impl AdeApp {
             )
     }
 
-    /// *Worktrees › Disk* - `design_handoff_jerry_ade/README.md`: "same card shape: status dot
-    /// ... worktree path ... branch ... size ... a right-aligned Open ... or Prune ...
-    /// action. Footer totals ... and a Prune 1 merged action." Every row and total here reads
+    /// *Worktrees › Disk* - the same card shape as Agents: status dot, worktree path, branch,
+    /// size, and a right-aligned `Open` or `Prune`, over a footer of totals and a prune action.
+    /// Every row and total here reads
     /// existing state (`Self::worktrees`, `Self::worktree_notes`, `Self::worktree_disk_usage`/
     /// `Self::disk_usage`), and Prune - both the row action and the footer action - dispatches
     /// through the same `Self::request_prune`/`Self::execute_prune` two-click-confirmation path
@@ -2936,8 +2931,8 @@ impl AdeApp {
 
     /// *Language servers* - PATH-detection rows, following the same pattern as
     /// [`Self::render_settings_agents_page`] (`crate::settings::state::detect_lsp_rows`, cached in
-    /// [`Self::lsp_rows`]). `format on save`/`inlay hints`/`diagnostics in the rail` toggles from
-    /// `Jerry.dc.html`'s own `settingsRows.lsp` fixture are left out for the same reason as the
+    /// [`Self::lsp_rows`]). The designed `format on save`/`inlay hints`/`diagnostics in the rail`
+    /// toggles are left out for the same reason as the
     /// Agents/Worktrees toggle sections (see `crate::settings::state`'s module docs). No config
     /// banner/snippet either: these rows are live-detected `$PATH` state, not `settings.toml`
     /// keys.
@@ -5106,8 +5101,8 @@ mod export_theme_name_tests {
     }
 }
 
-/// A nav-only Settings page's placeholder body - `Jerry.dc.html`'s own `setStub` copy, "not
-/// designed in this mockup". Used for every page [`SettingsPage::is_implemented`] reports
+/// A nav-only Settings page's placeholder body, saying so out loud rather than faking content.
+/// Used for every page [`SettingsPage::is_implemented`] reports
 /// `false` for - see `crate::settings::state`'s module docs for why.
 pub(in crate::settings) fn render_settings_placeholder_page() -> impl IntoElement {
     div()

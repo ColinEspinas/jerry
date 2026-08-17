@@ -1,6 +1,6 @@
 //! The File view breadcrumb's **symbol path** - the real chain of enclosing declarations around
-//! wherever the caret currently sits (`design_handoff_jerry_ade/README.md`: "Breadcrumb 26
-//! (`src › db › query_builder.rs › impl QueryBuilder › build`, ...)").
+//! wherever the caret currently sits, the `impl QueryBuilder › build` tail of
+//! `src › db › query_builder.rs › impl QueryBuilder › build`.
 
 use std::ops::Range;
 

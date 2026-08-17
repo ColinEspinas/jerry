@@ -114,8 +114,8 @@ pub(crate) struct GraphBranchMergeFacts {
 
 /// Whether the branch menu's "Merge into current branch…" row is live, and if not, the real
 /// reason - rendered *on the row itself*, dimmed and un-clickable, never a silent no-op (GitHub
-/// issue #241; `design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §1 rule 3: "disabled
-/// while anything is uncommitted, with the reason on the button itself").
+/// issue #241). The design's rule: "disabled while anything is uncommitted, with the reason on
+/// the button itself".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GraphBranchMergeGate {
     /// Every precondition holds. `current_branch` is the branch the merge would land in - the

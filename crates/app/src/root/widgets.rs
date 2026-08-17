@@ -162,9 +162,8 @@ pub(crate) fn render_sidebar_message(text: String, color: gpui::Rgba) -> gpui::A
         .into_any_element()
 }
 
-/// Git's own status letter for one file - `A`/`M`/`D` - in the fixed 9px, centred column
-/// `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4j specifies, with the tooltip
-/// that spells it out.
+/// Git's own status letter for one file - `A`/`M`/`D` - in a fixed 9px, centred column, with the
+/// tooltip that spells it out.
 pub(crate) fn render_status_letter(
     id: impl Into<gpui::ElementId>,
     letter: changes::StatusLetter,

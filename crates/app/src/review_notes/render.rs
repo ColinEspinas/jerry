@@ -1,8 +1,7 @@
 //! The two surfaces GitHub issue #288 adds: the **notes bar** above the hunks, and the **card**
 //! pinned beneath a line.
 //!
-//! Both are transcribed from `Jerry.dc.html`'s `Review · uncommitted` state - the bar is the
-//! `hasNotes` block, the card is the `l.isNote` branch of the diff row loop. Every colour is a
+//! Both come from the design's `Review · uncommitted` state. Every colour is a
 //! [`crate::theme::notes`] token, and every string that is design copy is quoted in the doc
 //! comment beside it.
 
@@ -38,9 +37,9 @@ fn note_draft_handle() -> TextFieldHandle {
         })
 }
 
-/// The bar's fixed second line, **verbatim** from `Jerry.dc.html` and from `STAGE-A-CHANGELOG.md`
-/// §1's own row for this feature: *"A notes bar above the hunks: count, the line `one prompt,
-/// line-anchored · pinned after the revision`, and `Send notes to <agent>` with `⌘⏎` keycaps"*.
+/// The bar's fixed second line, **verbatim** design copy: *"A notes bar above the hunks: count,
+/// the line `one prompt, line-anchored · pinned after the revision`, and `Send notes to <agent>`
+/// with `⌘⏎` keycaps"*.
 pub const NOTES_BAR_META: &str = "one prompt, line-anchored \u{b7} pinned after the revision";
 
 /// The send button's tooltip, verbatim from the mock's own `title=` attribute.
@@ -515,8 +514,7 @@ impl AdeApp {
             //
             // `w_full` is a percentage against the definite width `uniform_list` really hands
             // each item, so the card is the pane's width less the insets below, whatever it says.
-            // `Jerry.dc.html`'s own card is a block in normal flow with `margin:3px 14px 5px
-            // 74px`, i.e. exactly this: full width, inset.
+            // The designed card is a block in normal flow, inset on all four sides - exactly this.
             .w_full()
             // The mock's own inset: the card starts where the code text does, not at the gutter,
             // so it visibly belongs to the line above it.

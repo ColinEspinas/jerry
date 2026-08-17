@@ -292,8 +292,9 @@ itself should look, for humans and agents alike.
 
 The workspace is four crates — `wt-core` (git), `pty-core` (processes), `lsp-core` (language servers)
 and `app` (the GPUI application, and the only crate allowed to depend on GPUI). The rules behind that
-split, and the reasoning for each, are in [`docs/architecture/`](docs/architecture/overview.md); how
-a change moves from issue to merged PR is in
+split, and the reasoning for each, are in [`docs/architecture/`](docs/architecture/overview.md); what
+each UI surface is for and the rules a change must not break are in
+[`docs/design/`](docs/design/README.md); how a change moves from issue to merged PR is in
 [`docs/development-workflow.md`](docs/development-workflow.md).
 
 Tests run under [`cargo-nextest`](https://nexte.st) rather than `cargo test`, for the per-test

@@ -41,8 +41,7 @@ dbg_macro = "warn"
 gpui = { git = "https://github.com/zed-industries/zed", rev = "7b030b500810b04cf5fb4aa5973be99a502d9f36" }
 anyhow = "1"
 thiserror = "1"
-# Real config-file (de)serialization for `crate::settings_store::Settings`
-# (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s 2026-07-29 entry, change 3). Pinned to
+# Real config-file (de)serialization for `crate::settings_store::Settings`. Pinned to
 # the exact major versions `vendor/zed/Cargo.toml` itself pins (`serde = "1.0.221"`,
 # `toml = "0.8"`), matching this project's established "same versions Zed verified against"
 # convention for shared dependencies (see `crates/app/Cargo.toml`'s own `tree-sitter`/

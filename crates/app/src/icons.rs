@@ -1,6 +1,6 @@
 //! The app's shipped icon set: real [Phosphor Icons](https://phosphoricons.com) SVGs (MIT),
 //! vendored under `assets/icons/`, plus the one render helper every consuming surface draws them
-//! through (GitHub issue #282, `design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §8).
+//! through (GitHub issue #282).
 
 use std::borrow::Cow;
 use std::path::PathBuf;
@@ -159,8 +159,7 @@ impl Icon {
 }
 
 /// A named optical box: the one square every icon in a given row is drawn inside. Each variant is
-/// a real measurement off the reviewed mock (`design_handoff_jerry_ade/revision 5/Jerry.dc.html`),
-/// not a round number picked here - the surfaces these serve are being rebuilt against that file.
+/// a real measurement off the surface it serves, not a round number picked here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IconSize {
     /// 11px - the right panel's segmented Files/Search/Changes tabs. `STAGE-A-CHANGELOG.md` §4w:
@@ -169,17 +168,17 @@ pub enum IconSize {
     /// magnifier 8x8, diff 7x7 - so three icons on one row had three weights". The mock's own
     /// shapes actually span y 3.5-14.5, i.e. 11x11; 11 is the box both readings agree on.
     PanelTab,
-    /// 13px - a row of the app's shared menu (`crate::menu`). `Jerry.dc.html`'s own context-menu
-    /// row draws its leading glyph in a `width:13px;height:13px` box.
+    /// 13px - a row of the app's shared menu (`crate::menu`), whose leading glyph sits in a
+    /// 13x13 box.
     MenuRow,
-    /// 14px - the work-surface tab strip's per-tab chip (`Jerry.dc.html`:
-    /// `width:14px;height:14px`), shared by every tab kind on that strip, terminal included.
+    /// 14px - the work-surface tab strip's per-tab chip, shared by every tab kind on that strip,
+    /// terminal included.
     TabChip,
-    /// 15px - the sidebar strip's buttons (`Jerry.dc.html`: each strip glyph sits in a
-    /// `position:relative;width:15px;height:15px` wrapper inside a 38px-wide cell).
+    /// 15px - the sidebar strip's buttons: each strip glyph sits in a 15x15 wrapper inside a
+    /// 38px-wide cell.
     Strip,
     /// 12px - the icon buttons: the search panel's count row (replace / filter) and the rail
-    /// footer's prune button. `Jerry.dc.html`'s `width:17px;height:17px` on these controls is the
+    /// footer's prune button. The designed 17px on these controls is the
     /// **hit box** (`theme::band::ICON_BUTTON_HIT`), not the glyph's own optical size - a
     /// distinction this size got wrong the first time round (GitHub issue filed 2026-08-16,
     /// screenshot-reported: "icons in buttons are too big"). The hand-drawn stand-ins actually
@@ -366,7 +365,7 @@ mod tests {
     ];
 
     #[test]
-    fn every_mapped_slot_from_the_design_handoff_has_its_phosphor_glyph() {
+    fn every_mapped_icon_slot_has_its_phosphor_glyph() {
         assert_eq!(
             MAPPING.len(),
             Icon::ALL.len(),
@@ -510,7 +509,7 @@ mod tests {
         assert_eq!(IconSize::PanelTab.box_size(), px(11.0));
         assert_eq!(IconSize::TabChip.box_size(), px(14.0));
         assert_eq!(IconSize::Strip.box_size(), px(15.0));
-        // 12, not 17 - `Jerry.dc.html`'s 17px on these controls is the surrounding hit box
+        // 12, not 17 - the designed 17px on these controls is the surrounding hit box
         // (`theme::band::ICON_BUTTON_HIT`); the funnel/trash hand-drawn glyphs inside it only
         // really occupy up to 11x7 and 9x12 respectively. See `IconSize::Control`'s doc comment.
         assert_eq!(IconSize::Control.box_size(), px(12.0));

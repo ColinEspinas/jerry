@@ -1,6 +1,5 @@
 //! A **repo**: one git repository the user has added to Jerry - the top level of the rail's
-//! two-level grouping, `design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §2.0 ("What
-//! a repo is here, and why the rail groups by one"). A real checkout on disk (`~/code/
+//! two-level grouping (`docs/design/rail.md`). A real checkout on disk (`~/code/
 //! jerry-core`); every worktree belongs to exactly one repo and carries it (`repo:` on the
 //! worktree record, a later phase's concern - see [`Repo::worktrees`]'s own docs for why that
 //! field can't just be derived by walking up a worktree's path).
@@ -35,9 +34,9 @@ pub struct Repo {
     /// [`display_name`]), persisted alongside the path so a repo whose directory has since been
     /// renamed or gone missing still has something honest to call itself.
     pub name: String,
-    /// Every worktree belonging to this repo, main checkout included (`design_handoff_jerry_ade/
-    /// revision 3/REVISION-2026-07-31.md` §2.0: "The repo's main checkout is itself a worktree
-    /// row in its group"). Populated by a real `wt_core::list_worktrees_porcelain` fetch for
+    /// Every worktree belonging to this repo, main checkout included - the repo's main checkout
+    /// is itself a worktree row in its group. Populated by a real
+    /// `wt_core::list_worktrees_porcelain` fetch for
     /// *every* repo, not just the focused one - `crate::root::AdeApp::load_repo_worktrees`
     /// (a one-shot fetch, run once per newly [`crate::root::AdeApp::add_repo`]-ed repo and once
     /// per repo restored from `repos.toml` at startup) and `crate::root::AdeApp::

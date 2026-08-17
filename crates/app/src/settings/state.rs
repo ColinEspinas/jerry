@@ -1,5 +1,5 @@
-//! Pure data model for the Settings surface (`design_handoff_jerry_ade/revision/README.md`'s
-//! "Settings" section). Maps already-real app state (agent binaries on `$PATH`, the worktree
+//! Pure data model for the Settings surface (`docs/design/settings.md`). Maps already-real app
+//! state (agent binaries on `$PATH`, the worktree
 //! list, the registered global keybindings) to what a settings row should show, with no `gpui`
 //! dependency so it's directly unit-testable; `crate::root` turns the result into `gpui::Div`
 //! trees. Config-file-backed values live in `crate::settings::store` instead - this module is
@@ -10,8 +10,7 @@ use std::path::PathBuf;
 use crate::rail::state::WorktreeNote;
 use crate::work_surface::agents::AgentKind;
 
-/// Every page `Jerry.dc.html`'s `settingsNavDefs` fixture lists, in the order the design's four
-/// nav groups present them (see [`nav_groups`]).
+/// Every Settings page, in the order the four nav groups present them (see [`nav_groups`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsPage {
     General,
@@ -93,11 +92,10 @@ impl SettingsPage {
         )
     }
 
-    /// The content column's one-line rationale under the page title
-    /// (`design_handoff_jerry_ade/revision/README.md`'s "Content column" section) - app-authored
-    /// text, not copy from the mockup (`Jerry.dc.html` has no per-page subtitle fixture). Every
-    /// nav-only page shares the same placeholder text; the placeholder page *body* is separately
-    /// the mockup's verbatim `setStub` copy - see `crate::settings::render::render_settings_placeholder_page`.
+    /// The content column's one-line rationale under the page title - app-authored text, the
+    /// design carrying no per-page subtitle. Every nav-only page shares the same placeholder
+    /// text; the placeholder page *body* is separate - see
+    /// `crate::settings::render::render_settings_placeholder_page`.
     pub fn subtitle(self) -> &'static str {
         match self {
             SettingsPage::General => {
@@ -139,7 +137,7 @@ pub struct NavGroup {
     pub pages: Vec<SettingsPage>,
 }
 
-/// The fixed nav structure - `Jerry.dc.html`'s own `settingsNavDefs` grouping and order,
+/// The fixed nav structure - the design's own grouping and order,
 /// unchanged. Every page is clickable navigation even though not every page renders real
 /// content past that point (see [`SettingsPage::is_implemented`]).
 pub fn nav_groups() -> Vec<NavGroup> {
@@ -200,8 +198,8 @@ impl AgentRow {
         self.resolved_path.is_some()
     }
 
-    /// The status label next to the row's status dot ("green dot + 'ready'" per
-    /// `design_handoff_jerry_ade/revision/README.md`), or the honest opposite when not found.
+    /// The status label next to the row's status dot - a green dot and `ready`, or the honest
+    /// opposite when not found.
     pub fn status_label(&self) -> &'static str {
         if self.is_ready() {
             "ready"
@@ -263,9 +261,8 @@ pub fn worktree_dot_status(is_main: bool, note: &WorktreeNote) -> WorktreeDotSta
     }
 }
 
-/// A worktree row's right-aligned action - `design_handoff_jerry_ade/README.md`'s "a
-/// right-aligned Open ... or Prune ... action" (the main checkout's row has no action at all;
-/// every other row is `Open` or `Prune`, never both).
+/// A worktree row's right-aligned action - `Open` or `Prune`, never both. The main checkout's
+/// row has no action at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorktreeRowAction {
     /// The main checkout - `git worktree remove` refuses it outright, and there's nowhere else
@@ -345,10 +342,10 @@ pub struct LspLanguage {
     /// file-tree row for that language would show.
     pub ext: &'static str,
     pub binary: &'static str,
-    /// Generic descriptive copy, not a live count - `Jerry.dc.html`'s own `lspDefs` notes mix
-    /// this with fabricated live data ("1,284 crates indexed") this app has no per-language
-    /// agent summary to back (`crate::lsp::client`'s server clients are keyed by worktree, not
-    /// surfaced here). Every note here is deliberately the descriptive kind only.
+    /// Generic descriptive copy, not a live count. The design mixes this slot with live figures
+    /// ("1,284 crates indexed") this app has no per-language agent summary to back
+    /// (`crate::lsp::client`'s server clients are keyed by worktree, not surfaced here), so every
+    /// note here is deliberately the descriptive kind only.
     pub note: &'static str,
     /// This server's real official install/docs page - see
     /// `crate::language::SettingsLspRow::install_url`'s own docs for how each was verified.
@@ -410,8 +407,8 @@ impl LspRow {
         self.resolved_path.is_some()
     }
 
-    /// `Jerry.dc.html`'s own word for the not-found state - `"not installed"`, distinct from the
-    /// Agents page's `"not found"`; each page keeps its own mockup's wording.
+    /// This page's own word for the not-found state - `"not installed"`, distinct from the
+    /// Agents page's `"not found"`; each page keeps its own designed wording.
     pub fn status_label(&self) -> &'static str {
         if self.is_ready() {
             "ready"

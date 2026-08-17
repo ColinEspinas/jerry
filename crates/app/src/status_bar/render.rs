@@ -18,11 +18,8 @@ pub(crate) fn available_cores() -> usize {
     })
 }
 
-/// The three type tiers rev 6 rebuilt the bar around
-/// (`design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §3, and
-/// `STAGE-A-CHANGELOG.md` §4c's diagnosis: "the cause was not density - it was that after the
-/// cut, **all thirteen-then-five readouts sat at 10px in `#4a5057`**, one flat tone on `#101214`.
-/// No hierarchy means the eye has to read all of it to find any of it").
+/// The three type tiers the bar is built around. One flat tone across every readout is what this
+/// replaced: with no hierarchy, the eye has to read all of it to find any of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StatusTier {
     /// §3: `main ↑2 ↓0`'s branch, `4 agents running` - "the readouts you are meant to find

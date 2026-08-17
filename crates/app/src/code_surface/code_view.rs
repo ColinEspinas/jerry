@@ -1,5 +1,5 @@
-//! Pure logic for Surface C's File view (`design_handoff_jerry_ade/README.md`'s "File view"
-//! subsection): reads a file off disk, detects its line-ending style, picks a language label
+//! Pure logic for Surface C's File view (`docs/design/work-surface.md`): reads a file off disk,
+//! detects its line-ending style, picks a language label
 //! from its extension, and - for a real subset of extensions - produces syntax-colored spans by
 //! parsing with `tree-sitter` and walking the resulting AST. Deliberately `gpui`-window-free
 //! (only [`gpui::Rgba`] is used, for plain colour data), mirroring this crate's split between
@@ -27,8 +27,7 @@ use wt_core::diff::{DiffFile, DiffLineKind};
 /// consistent rather than picking a second, arbitrary number.
 pub const MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
 
-/// Which of Surface C's two views is showing - `design_handoff_jerry_ade/README.md`'s
-/// `code_view` state field (`Diff | File`).
+/// Which of Surface C's two views is showing (`Diff | File`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CodeView {
     #[default]
@@ -118,8 +117,8 @@ pub fn highlighter_for_extension(
 }
 
 /// A syntax span's classification - GitHub issue #31's extended scope-coverage checklist (22 real
-/// `tree-sitter-highlight` buckets, up from the original six-bucket
-/// `design_handoff_jerry_ade/README.md` File view table), plus the [`Text`](HighlightKind::Text)
+/// `tree-sitter-highlight` buckets, up from the File view's original six-bucket designed
+/// table), plus the [`Text`](HighlightKind::Text)
 /// fallback every byte a query doesn't classify at all still receives. See [`HIGHLIGHT_NAMES`] for
 /// the real, verified capture names each variant is reached through, and
 /// `theme::syntax`'s own module docs for the palette design (which variants are real,
@@ -1936,8 +1935,8 @@ pub fn cache_is_fresh(
     cached.path == path && cached.mtime == mtime && cached.len == len
 }
 
-/// The File view breadcrumb's path segments (`design_handoff_jerry_ade/README.md`: "`src ›
-/// db › query_builder.rs`") - every `Normal` path component of `path`, in order. Root/prefix/
+/// The File view breadcrumb's path segments (`src › db › query_builder.rs`) - every `Normal`
+/// path component of `path`, in order. Root/prefix/
 /// `.`/`..` components are skipped.
 pub fn breadcrumb_segments(path: &Path) -> Vec<String> {
     path.components()
@@ -1948,8 +1947,8 @@ pub fn breadcrumb_segments(path: &Path) -> Vec<String> {
         .collect()
 }
 
-/// The File view's 3px git-gutter marker set (`design_handoff_jerry_ade/README.md`: "a 3px git
-/// gutter (`#2c6244` for agent-touched lines, transparent otherwise)") - the new-file line
+/// The File view's 3px git-gutter marker set - tinted for agent-touched lines, transparent
+/// otherwise - the new-file line
 /// numbers (1-indexed) a hunk actually *added*, derived from `file`'s hunks via
 /// `crate::sidebar::changes::parse_hunk_new_range`. Context lines advance the new-file line counter
 /// without being marked; removed lines don't exist in the new file, so they never advance it.

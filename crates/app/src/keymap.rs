@@ -45,9 +45,8 @@ fn detected_platform_is_macos() -> bool {
     std::env::consts::OS == "macos"
 }
 
-/// The two-column glyph table `design_handoff_jerry_ade/README.md`'s "Keyboard affordances"
-/// section describes: `mod alt ctrl shift enter esc tab bksp` on macOS vs. Windows/Linux.
-/// Transcribed from `Jerry.dc.html`'s own `KEYMAPS` fixture.
+/// The two-column glyph table (`docs/design/vocabulary.md`): `mod alt ctrl shift enter esc tab
+/// bksp` on macOS vs. Windows/Linux.
 struct KeymapTable {
     modifier: &'static str,
     alt: &'static str,
@@ -83,8 +82,7 @@ const WINDOWS_LINUX_TABLE: KeymapTable = KeymapTable {
 
 /// Resolves one spec token (`"mod"`, `"shift"`, ...) to its platform glyph, or returns the
 /// token unchanged if it isn't one of the eight recognized modifier/key names - a bare letter
-/// (`"N"`, `"K"`) or a decorative placeholder (`"1…8"`) passes straight through unresolved,
-/// matching `Jerry.dc.html`'s own `combo(spec)`.
+/// (`"N"`, `"K"`) or a decorative placeholder (`"1…8"`) passes straight through unresolved.
 pub fn resolve_token(token: &str, macos: bool) -> String {
     let table = if macos {
         &MACOS_TABLE

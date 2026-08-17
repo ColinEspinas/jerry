@@ -1055,9 +1055,8 @@ mod editor_scrollbar_mark_tests {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::code_surface) struct Crumb {
     pub text: String,
-    /// `true` for exactly one crumb: the file's own name. The design (`design_handoff_jerry_ade/
-    /// revision/Jerry.dc.html`, the File view breadcrumb band) renders that one at `#a9b0b7` and
-    /// every other crumb - ancestor directories *and* enclosing symbols alike - at `#5e646a`.
+    /// `true` for exactly one crumb: the file's own name. The breadcrumb band renders that one
+    /// brighter than every other crumb - ancestor directories *and* enclosing symbols alike.
     pub active: bool,
 }
 
@@ -1085,9 +1084,8 @@ pub(in crate::code_surface) fn breadcrumb_crumbs(
     crumbs
 }
 
-/// The File view's breadcrumb (`design_handoff_jerry_ade/README.md`: "Breadcrumb 26 (`src › db ›
-/// query_builder.rs › impl QueryBuilder › build`, 10.5px mono, separators `#3d4248`, active crumb
-/// `#a9b0b7`) with error/warning counts right").
+/// The File view's breadcrumb - `src › db › query_builder.rs › impl QueryBuilder › build` in
+/// 10.5px mono, with the error/warning counts right-aligned.
 pub(in crate::code_surface) fn render_file_breadcrumb(
     relative_path: &Path,
     symbol_path: &[String],
@@ -1220,8 +1218,7 @@ mod db {
                 "impl QueryBuilder",
                 "build",
             ],
-            "design_handoff_jerry_ade/README.md's own breadcrumb example, minus the mockup's \
-             elided `mod db`"
+            "the design's own breadcrumb example, minus its elided `mod db`"
         );
     }
 

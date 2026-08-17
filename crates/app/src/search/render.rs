@@ -1267,9 +1267,7 @@ mod panel_tests {
     use crate::test_support::open_test_app;
     use gpui::TestAppContext;
 
-    /// A real worktree on disk with `refresh_token` across four files - the same corpus
-    /// `Jerry.dc.html`'s own search fixture uses, so what these tests see is what the design was
-    /// drawn against.
+    /// A real worktree on disk with `refresh_token` across four files.
     fn fixture_repo() -> crate::search::fixtures::TempRepo {
         let repo = crate::search::fixtures::temp_repo();
         let write = |relative: &str, content: &str| {

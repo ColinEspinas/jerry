@@ -295,9 +295,8 @@ mod tests {
     use crate::provenance::store::ProvenanceStore;
     use crate::sidebar::changes::diff_file_stats;
 
-    /// The base content of the mock's shared file, as committed - the `Review · uncommitted`
-    /// fixture from `design_handoff_jerry_ade/revision 5/Jerry.dc.html` (`changeSets.s3` →
-    /// `src/api/users.rs`), reduced to the lines its hunks actually show.
+    /// The base content of the design's shared file, as committed - its `Review · uncommitted`
+    /// example (`src/api/users.rs`), reduced to the lines its hunks actually show.
     const USERS_RS_BASE: &str = "\
 impl UserApi {
     pub async fn list(&self, page: Page) -> Result<Vec<User>> {
@@ -616,8 +615,8 @@ impl UserApi {
             "and the human's own hand edit flipped that line back to `you` (Orca's second rule)"
         );
 
-        // Context lines are nobody's. `Jerry.dc.html` gives its unchanged rows no author at all,
-        // and painting one would tint a line this diff does not change.
+        // Context lines are nobody's. The design gives its unchanged rows no author at all, and
+        // painting one would tint a line this diff does not change.
         for (hunk, hunk_authors) in file.hunks.iter().zip(&authors) {
             for (line, author) in hunk.lines.iter().zip(hunk_authors) {
                 if line.kind == DiffLineKind::Context {

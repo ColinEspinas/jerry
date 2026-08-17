@@ -64,7 +64,7 @@ impl Outcome {
         }
     }
 
-    /// How the synthesised closing line opens, per outcome - `Jerry.dc.html`'s own four strings.
+    /// How the synthesised closing line opens, per outcome - the design's own four strings.
     pub const fn closing_lead(self) -> &'static str {
         match self {
             Outcome::Done => "Finished.",

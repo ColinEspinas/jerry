@@ -35,10 +35,9 @@ impl SidebarView {
         }
     }
 
-    /// The view's hint - the second half of its tooltip, quoted from `Jerry.dc.html`'s own
-    /// `sideViews` table. §1 explains why every cell needs one: "With labels gone, [the] glyphs
-    /// are the only affordance identifying the views, so the hint has to live somewhere
-    /// reachable."
+    /// The view's hint - the second half of its tooltip. Every cell needs one: with labels gone,
+    /// the glyphs are the only affordance identifying the views, so the hint has to live
+    /// somewhere reachable.
     pub const fn hint(self) -> &'static str {
         match self {
             SidebarView::Worktrees => "repo \u{b7} worktree \u{b7} agent",
@@ -64,9 +63,8 @@ impl SidebarView {
         }
     }
 
-    /// The cell's `title="<view> — <hint>"` tooltip (§1), with the marker's real count appended in
-    /// parentheses when there is one - `Jerry.dc.html`'s own
-    /// `v.label + ' — ' + v.hint + (badge ? ' (' + badge + ')' : '')`.
+    /// The cell's `title="<view> — <hint>"` tooltip, with the marker's real count appended in
+    /// parentheses when there is one.
     pub fn tooltip(self, marker: Option<StripMarker>) -> String {
         match marker {
             Some(marker) => format!(
@@ -137,8 +135,7 @@ impl StripCell {
     }
 
     /// The colour this cell's glyph rests at: [`theme::text::SELECTED`] for the view you are in,
-    /// [`theme::text::FAINTER`] for one you are not (`Jerry.dc.html`'s own
-    /// `fg: on ? '#dde2e7' : '#5e646a'`).
+    /// [`theme::text::FAINTER`] for one you are not.
     pub const fn glyph_color(self) -> theme::ColorToken {
         if self.selected {
             theme::text::SELECTED
@@ -173,7 +170,7 @@ pub struct Problem {
 }
 
 impl Problem {
-    /// `line:column`, the way `Jerry.dc.html`'s own `p.line` prints it (`212:17`).
+    /// `line:column`, the way every compiler prints one (`212:17`).
     pub fn position(&self) -> String {
         format!("{}:{}", self.line, self.column)
     }

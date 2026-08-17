@@ -56,7 +56,7 @@ impl AdeApp {
         // badge", and this toolbar is one of them. Unlike the Changes rows, it keeps the slot the
         // word pill had - after the name rather than ahead of the directory - because a single
         // header line has no column of siblings to align with, which is exactly what the fixed
-        // column exists for. That is `Jerry.dc.html`'s own diff toolbar order too.
+        // column exists for. That is the designed diff toolbar order too.
         let letter = diff_file.map(|file| changes::status_letter(file.status));
         let stats = diff_file.map(changes::diff_file_stats);
         let rename_label = diff_file.and_then(changes::rename_label);
@@ -135,8 +135,8 @@ impl AdeApp {
                         .child(label),
                 )
             })
-            // GitHub issue #287 / `STAGE-A-CHANGELOG.md` §4b: the one dismissible `<agent> only ✕`
-            // indicator, in `Jerry.dc.html`'s own slot - after the diffstat, before the toolbar's
+            // GitHub issue #287: the one dismissible `<agent> only ✕`
+            // indicator, in the design's own slot - after the diffstat, before the toolbar's
             // spacer - and present *only* while a filter is really in force, so a filtered diff
             // can never read as the whole diff and an unfiltered one carries no dead control.
             .children(self.render_author_filter_indicator(cx))

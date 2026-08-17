@@ -858,7 +858,7 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         // No `border_b` here, deliberately: the *children* own this column's bottom edge. GitHub
-        // issue #291 / `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4v, verbatim -
+        // issue #291 - the defect this fixes was that
         // "the centre column drew its bottom edge **twice** - once on the tab-strip container and
         // once on every tab - so under an inactive tab the rule was 1.6px of two shades stacked,
         // and the active tab's cut-out (its `border-bottom` set to its own background, so it joins
@@ -2428,11 +2428,10 @@ impl AdeApp {
                                 .overflow_hidden()
                                 .child(agent.pane.clone().into_any_element()),
                         )
-                        // One bottom bar per pane, picked by pane kind - never both stacked.
-                        // `Jerry.dc.html`'s two pane branches are mutually exclusive `sc-if`
-                        // siblings: `isTerminal` gets `pid │ 148×38 │ [wsl] … file:line
-                        // references open in a tab`, `isChat` gets the `hasBar` readout strip
-                        // (actions · cost · budget) and puts its pid in the header instead.
+                        // One bottom bar per pane, picked by pane kind - never both stacked. A
+                        // shell gets `pid │ 148×38 │ [wsl] … file:line references open in a tab`;
+                        // an agent gets the readout strip (actions · cost · budget) and puts its
+                        // pid in the header instead.
                         // Rendering both under every pane is the duplication reported live
                         // against the shipped build - see the two methods' own docs.
                         .child(match agent.kind {
@@ -4783,8 +4782,7 @@ mod select_agent_cross_repo_tests {
 }
 
 /// GitHub issue #295: the agent pane's context bar is identity-only, and its bottom strip is a
-/// readout rather than an action bar (`design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md`
-/// §4e/§4r/§4t).
+/// readout rather than an action bar.
 #[cfg(test)]
 mod agent_pane_readout_tests {
     use super::*;

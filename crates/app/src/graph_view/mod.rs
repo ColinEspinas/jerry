@@ -1,5 +1,4 @@
-//! The git graph tab (GitHub issue #1, phase (a) - design handoff
-//! `design_handoff_jerry_ade/revision 2/CHANGELOG.md`, 2026-07-31 entry).
+//! The git graph tab (GitHub issue #1, phase (a)).
 
 use crate::root::*;
 use crate::theme;

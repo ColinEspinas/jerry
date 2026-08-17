@@ -1,8 +1,7 @@
-//! Pure width-clamping logic for Zone 1/Zone 3's drag-to-resize splitters
-//! (`design_handoff_jerry_ade/README.md`'s Layout table: rail "276 (range 240–340)", files/
-//! changes panel "320 (260 in empty states)").
+//! Pure width-clamping logic for Zone 1/Zone 3's drag-to-resize splitters: the rail is 276 wide
+//! (range 240–340), the files/changes panel 320 (260 in empty states). See `docs/design/layout.md`.
 
-/// The rail's default width and adjustable range (README Layout table: "276 (range 240–340)").
+/// The rail's default width and adjustable range.
 pub const RAIL_DEFAULT: f32 = 276.0;
 pub const RAIL_MIN: f32 = 240.0;
 pub const RAIL_MAX: f32 = 340.0;

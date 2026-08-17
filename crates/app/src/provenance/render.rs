@@ -15,8 +15,7 @@ use crate::work_surface;
 use crate::work_surface::agents::ProcessKind;
 
 /// How far a line that is **not** the filtered author's is dimmed while a per-author filter is
-/// active - `Jerry.dc.html`'s own `opacity: .32`, quoted as an acceptance criterion by GitHub
-/// issue #287 ("other authors' lines dim (the mock uses 0.32 opacity)").
+/// active - `0.32` opacity, an acceptance criterion of GitHub issue #287.
 pub const FILTER_DIM_OPACITY: f32 = 0.32;
 
 /// One author, as this app draws it: the tint its gutter bar and chip wear, the single glyph the
@@ -102,7 +101,7 @@ pub fn line_is_dimmed(author: Option<&Author>, filter: Option<&Author>) -> bool 
 pub const SHARED_RING_TOOLTIP: &str =
     "Two agents edited this file \u{2014} click to filter the diff by author";
 
-/// The filter indicator's tooltip, verbatim from `Jerry.dc.html`'s own `title=`.
+/// The filter indicator's tooltip, verbatim from the design.
 pub const FILTER_INDICATOR_TOOLTIP: &str =
     "Showing one author's lines \u{2014} click to show every author";
 
@@ -340,7 +339,7 @@ impl AdeApp {
         let author = self.active_author_filter()?;
         let style = author_style(author)?;
         let dot = author_gutter_color(author)?;
-        // `your lines only` rather than `you only` - `Jerry.dc.html`'s own `attrFilterLabel`.
+        // `your lines only` rather than `you only` - the design's own wording.
         let label = match author {
             Author::You => "your lines".to_string(),
             _ => style.label.clone(),

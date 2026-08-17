@@ -306,11 +306,9 @@ pub struct TabColors {
 }
 
 /// An inactive tab's `underline` is the **window's column rule**, not a tab-level decoration -
-/// which is why it is [`theme::border::RAIL_INNER`] and not [`theme::border::ZONE`]. GitHub issue
-/// #291 / `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4v: once the three column
-/// headers line up, "**All three column headers are now 36** ... and all three borders are
-/// `#191c1f` - the centre strip had been `#1e2225`, which once the rules lined up would have read
-/// as one rule changing shade mid-span."
+/// which is why it is [`theme::border::RAIL_INNER`] and not [`theme::border::ZONE`]. All three
+/// column headers are 36 high and share one border colour (GitHub issue #291): a centre strip on
+/// its own shade would read as one rule changing shade mid-span.
 pub fn tab_colors(active: bool) -> TabColors {
     if active {
         TabColors {
@@ -358,9 +356,8 @@ pub fn live_tab_label(title: Option<&str>, program: &str) -> String {
     }
 }
 
-/// The `+` menu's "New agent" row secondary text (`design_handoff_jerry_ade/revision 3/
-/// REVISION-2026-07-31.md` §3: "*New agent* (`runs in <branch>`)") - the real, currently selected
-/// worktree's branch substituted in, never a hardcoded model/kind name (that was the pre-fix
+/// The `+` menu's "New agent" row secondary text - `runs in <branch>`, with the real, currently
+/// selected worktree's branch substituted in, never a hardcoded model/kind name (that was the pre-fix
 /// bug: the row showed `agent.kind.label()`, e.g. `"Claude"`, which is not what this spec item
 /// asks for at all). Falls back to `(detached)` for a worktree with no recorded branch, mirroring
 /// `crate::work_surface::render::AdeApp::render_agent_context_bar`'s own branch fallback so the
@@ -559,8 +556,8 @@ mod tests {
     }
 
     /// An active tab's underline matches its own background - that is how it visually merges
-    /// into the surface below it (`design_handoff_jerry_ade/README.md`) - while an inactive one
-    /// is transparent and carries a different underline entirely.
+    /// into the surface below it - while an inactive one is transparent and carries a different
+    /// underline entirely.
     #[test]
     fn an_active_tab_merges_into_the_surface_and_an_inactive_one_does_not() {
         let active = tab_colors(true);

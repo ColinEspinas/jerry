@@ -849,8 +849,8 @@ pub(in crate::code_surface) fn render_diff_line(
         })
 }
 
-/// `Jerry.dc.html`'s own 14px note column: `●` for a pinned note, `○` for the note cursor, and
-/// genuinely nothing for a line that is neither.
+/// The 14px note column: `●` for a pinned note, `○` for the note cursor, and genuinely nothing
+/// for a line that is neither.
 fn render_note_column(note: Option<NoteMark>, is_note_cursor: bool) -> impl IntoElement {
     let (glyph, color) = match (note, is_note_cursor) {
         (Some(_), _) => ("\u{25cf}", theme::notes::DOT),

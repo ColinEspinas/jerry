@@ -134,7 +134,7 @@ pub const MENU_EDGE_MARGIN: f32 = 4.0;
 pub const MENU_BORDER: f32 = 2.0;
 
 /// The gap the `⋯` overflow menu leaves between the button it hangs off and its own top edge, in
-/// px (`Jerry.dc.html`'s own `br.bottom + 4`).
+/// px.
 pub const MENU_ANCHOR_GAP: f32 = 4.0;
 
 /// The popover's real painted height for exactly the `rows` it is about to paint - action rows

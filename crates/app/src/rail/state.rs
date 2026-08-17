@@ -1,5 +1,5 @@
-//! The agent rail's data model: pure, GPUI-free types and functions for grouping and
-//! filtering (`design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md`'s Zone 1). No `gpui`
+//! The agent rail's data model: pure, GPUI-free types and functions for grouping and filtering
+//! (`docs/design/rail.md`). No `gpui`
 //! dependency, so this logic is unit-testable without a real window, terminal, or git state.
 //! `crate::root` gathers the real signals (`TerminalPane`, `wt_core::list_worktrees`,
 //! `wt_core::diff::diff_against_base`) into the plain types this module operates on, and renders
@@ -33,9 +33,8 @@ pub struct AgentRow {
     /// The process exit code, only for [`Status::Fail`]/[`Status::Review`]/exited-`Idle`
     /// rows. `None` while still running or never started.
     pub exit_code: Option<u32>,
-    /// The agent row's "what it is doing" trailing text for a [`Status::Run`] row -
-    /// `design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §2.3: "the live tool call -
-    /// `writing auth.rs`, `editing reports.rs`, `bench 3 of 5`, `148 of 312`".
+    /// The agent row's "what it is doing" trailing text for a [`Status::Run`] row - the live tool
+    /// call: `writing auth.rs`, `editing reports.rs`, `bench 3 of 5`, `148 of 312`.
     pub activity: Option<String>,
     /// Wall-clock time since `crate::work_surface::agents::Agent::spawned_at` - the agent
     /// row's line-1 elapsed time (§2.3: "elapsed 9.5px mono right"). See [`format_elapsed`] for
@@ -104,8 +103,8 @@ pub fn sum_diff_stat(diff: &WorktreeDiff) -> (usize, usize) {
     (add, del)
 }
 
-/// Real per-status counts across every agent row, in [`Status::ORDER`] - the status bar's
-/// five urgency-counter squares (`design_handoff_jerry_ade/revision/CHANGELOG.md`'s change 7).
+/// Real per-status counts across every agent row, in [`Status::ORDER`] - the five
+/// urgency-counter squares.
 /// Unlike [`group_worktrees_by_repo`], a status with zero matching rows still gets a real `0`
 /// entry rather than being omitted, since the status bar always shows all five squares. Built
 /// from the
@@ -268,8 +267,8 @@ impl WorktreeRow {
     }
 
     /// This row's rank for sorting *inside* a repo group (and, via [`RepoGroup::rank`], the
-    /// groups themselves) - `design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §2.1's
-    /// full seven-step order: `input → failed → review → running → idle → bare → prunable`.
+    /// groups themselves) - the full seven-step order:
+    /// `input → failed → review → running → idle → bare → prunable`.
     /// Lower sorts first (more urgent).
     pub fn urgency_rank(&self) -> u8 {
         if self.agents.is_empty() {
@@ -395,9 +394,8 @@ pub struct RepoWorktrees {
     pub repo_id: RepoId,
     pub repo_name: String,
     /// This repo's real, complete worktree list - unaffected by the rail's filter box. The
-    /// source of the group header's `N wt` and `N worktrees waiting` counts
-    /// (`design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §2.0: "a repo you have
-    /// scrolled past still reports that something in it wants a human" - a header that shrank
+    /// source of the group header's `N wt` and `N worktrees waiting` counts: a repo you have
+    /// scrolled past still reports that something in it wants a human, and a header that shrank
     /// or grew as the *filter box* was typed into would break that same promise for the repo
     /// you're currently looking at). See [`Self::rows`] for the separate, filtered list.
     pub all_rows: Vec<WorktreeRow>,
@@ -421,9 +419,8 @@ pub struct RepoWorktrees {
     pub rows_loaded: bool,
 }
 
-/// One repo group in the rail - `design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md`
-/// §2.0-2.1: the rail's only grouping axis, always present (even for a single repo), with its
-/// own worktree rows ranked most-urgent-first inside it.
+/// One repo group in the rail - the rail's only grouping axis, always present (even for a single
+/// repo), with its own worktree rows ranked most-urgent-first inside it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RepoGroup {
     pub repo_id: RepoId,

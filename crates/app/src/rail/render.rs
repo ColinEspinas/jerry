@@ -57,7 +57,7 @@ fn agent_trailing_text(agent: &AgentRow) -> String {
     }
 }
 
-/// An agent row's title colour (`STAGE-A-CHANGELOG.md` §4n, `Jerry.dc.html`'s own `titleFg`).
+/// An agent row's title colour.
 fn agent_title_color(status: Status, is_selected: bool) -> theme::ColorToken {
     if is_selected {
         theme::text::SELECTED
@@ -77,9 +77,8 @@ fn worktree_row_edge(
     is_selected.then_some(theme::border::SELECTED_EDGE)
 }
 
-/// Which of the repo header's **two** urgency counts a dot+count pair is
-/// (`design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §4: "`● 2` amber... needs input
-/// and `● 1` red... failed").
+/// Which of the repo header's **two** urgency counts a dot+count pair is: `● 2` amber for needs
+/// input, `● 1` red for failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UrgencyCount {
     /// Worktrees needing input - amber.
@@ -671,10 +670,9 @@ impl AdeApp {
         self._prune_task = Some(task);
     }
 
-    /// The whole left column (`design_handoff_jerry_ade/README.md`'s Zone 1): the sidebar strip,
-    /// the filter row, the real scrollable body of whichever view the strip has selected, and the
-    /// footer - see the README's "Rail chrome" section for the exact band heights this composes
-    /// (`theme::band::{CHROME_HEADER,FILTER_ROW,SURFACE_FOOTER}`).
+    /// The whole left column (`docs/design/rail.md`): the sidebar strip, the filter row, the real
+    /// scrollable body of whichever view the strip has selected, and the footer. The exact band
+    /// heights this composes are `theme::band::{CHROME_HEADER,FILTER_ROW,SURFACE_FOOTER}`.
     pub(crate) fn render_rail(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         // `Rc`, not a plain `Vec`: `Self::render_rail_list`'s own `gpui::list` render-item
         // closure captures this and is kept around by GPUI across frames, so it must be cheap to
@@ -817,7 +815,6 @@ impl AdeApp {
             .flex_none()
             .items_center()
             .gap(px(6.0))
-            // `Jerry.dc.html:109` - `padding:0 12px`, not 10px.
             .px(px(12.0))
             .h(theme::band::FILTER_ROW)
             .border_b_1()
@@ -915,10 +912,9 @@ impl AdeApp {
         rail::group_worktrees_by_repo(repo_inputs)
     }
 
-    /// The rail's one real structure (`design_handoff_jerry_ade/revision 3/
-    /// REVISION-2026-07-31.md` §2.1: "Two levels, always: **repo group → worktree → agents**.
-    /// There is **no rail mode toggle**"). See [`Self::build_repo_groups`] for how the groups
-    /// themselves are built.
+    /// The rail's one real structure: two levels, always - **repo group → worktree → agents**,
+    /// with no rail mode toggle (`docs/design/rail.md`). See [`Self::build_repo_groups`] for how
+    /// the groups themselves are built.
     pub(in crate::rail) fn render_rail_list(
         &self,
         groups: &std::rc::Rc<Vec<RepoGroup>>,
@@ -1355,8 +1351,7 @@ impl AdeApp {
         // The slot itself is always emitted, even for a childless worktree - it stays empty
         // (no glyph, no tooltip, no hover, no click) rather than disappearing, so every row's
         // branch label lands at the same x offset regardless of whether that row has anything to
-        // expand (design_handoff_jerry_ade revision 5's own `w.caret` binding does the same: the
-        // glyph is emptied to "" but its fixed-width wrapper div never leaves the layout).
+        // expand - the glyph is emptied but its fixed-width wrapper never leaves the layout.
         let caret = {
             let worktree_path = row.path.clone();
             div()
@@ -1379,10 +1374,9 @@ impl AdeApp {
                         // no colour of its own - the glyph inherits this wrapper's, which is the
                         // element the hover is armed on.
                         .hover(|el| el.text_color(theme::text::STRONG))
-                        // §4's "tooltips on every icon-only control". The wording is
-                        // `Jerry.dc.html`'s own, which states the thing the glyph cannot: this
-                        // control toggles the group *without* selecting the worktree, which is
-                        // what the `stop_propagation` below actually does.
+                        // Tooltips on every icon-only control. The wording states the thing the
+                        // glyph cannot: this control toggles the group *without* selecting the
+                        // worktree, which is what the `stop_propagation` below actually does.
                         .tooltip(text_tooltip("Collapse or expand without selecting"))
                         // `STAGE-A-CHANGELOG.md` §4o/§4p: this used to be its own hand-drawn
                         // glyph, which is exactly the drift §4p closed - "every disclosure caret
@@ -1568,9 +1562,8 @@ impl AdeApp {
             header.into_any_element()
         };
 
-        // No question-preview card renders here, deliberately. `design_handoff_jerry_ade/revision
-        // 3/REVISION-2026-07-31.md` §2.3, verbatim: "**No question preview.** The amber ask box is
-        // gone from the rail; the question belongs in the agent pane where it can be answered."
+        // No question-preview card renders here, deliberately: the question belongs in the agent
+        // pane where it can be answered, not in a rail row that cannot answer it.
         // This is a design-driven removal of a card that really did ship (GitHub issue #268),
         // confirmed as deliberate on 2026-08-14, not a regression: an amber box quoting a question
         // in a surface with no way to answer it costs the rail's densest column two lines per
@@ -1647,16 +1640,15 @@ impl AdeApp {
             // after it), carrying the 1px `#1e2225` connector line, then the agent's own content
             // box - never padding *on* that content box, which would draw its border-left (the
             // status edge) flush with the worktree row's own left edge instead of indented under
-            // it. `Jerry.dc.html`'s own agent row is exactly this shape (an outer
-            // `padding-left:13px` flex wrapper holding the connector `div`, then the content
-            // `div` with its own `border-left`) - GPUI's border draws at a box's outer edge same
+            // it. The designed agent row is exactly this shape - an outer `padding-left:13px`
+            // flex wrapper holding the connector, then the content box with its own
+            // `border-left`. GPUI's border draws at a box's outer edge same
             // as CSS, so folding padding-left and border-left onto one div here reproduced the
             // bug the opposite way.
             .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
                 this.select_agent(id, window, cx);
             }))
-            // The agent row's context menu (GitHub issue #290). It sits on this outer wrapper -
-            // the same element `Jerry.dc.html` hangs its own `onContextMenu="{{ a.ctx }}"` on -
+            // The agent row's context menu (GitHub issue #290). It sits on this outer wrapper,
             // so the whole row, indent and connector included, is a right-click target rather
             // than just the content box. `stop_propagation` keeps the event from also reaching an
             // ancestor's handler and replacing this menu with a worktree one - the same guard the
@@ -1684,13 +1676,12 @@ impl AdeApp {
                     .flex_col()
                     .pl(px(7.0))
                     .pr(px(10.0))
-                    // §4n's tighter agent block: `5 10 6 7` -> `4 10 5 7`.
+                    // The tighter agent block: `5 10 6 7` -> `4 10 5 7`.
                     .pt(px(4.0))
                     .pb(px(5.0))
                     .gap(px(2.0))
-                    // `Jerry.dc.html`'s own agent row: `border-left:2px solid {{ a.edge }}`, with
-                    // `edge: live ? st.color : 'transparent'` - a *fixed* 2px slot painted only
-                    // for the focused agent. Two things were wrong with the width/colour pair
+                    // The designed agent row carries a *fixed* 2px edge slot, painted only for
+                    // the focused agent. Two things were wrong with the width/colour pair
                     // this replaces (`2px status` selected, `1px #1e2225` otherwise), both of
                     // them created by moving the indent onto the wrapper above: the 1px fallback
                     // is the *same* `#1e2225` as the connector `div` immediately to its left, so
@@ -2151,10 +2142,9 @@ mod prune_regression_tests {
     }
 }
 
-/// Real, `Context<AdeApp>`-driven coverage for Revision R12's rail rewrite: the repo-group →
-/// worktree-row → agent-row structure (`design_handoff_jerry_ade/revision 3/
-/// REVISION-2026-07-31.md` §2), the per-worktree collapse memory, and the agent row's "select
-/// the worktree and raise this agent's tab" click behaviour.
+/// Real, `Context<AdeApp>`-driven coverage for the rail's structure: the repo-group →
+/// worktree-row → agent-row nesting, the per-worktree collapse memory, and the agent row's
+/// "select the worktree and raise this agent's tab" click behaviour.
 #[cfg(test)]
 mod rail_row_tests {
     use super::*;
@@ -3969,9 +3959,8 @@ mod agent_chip_icon_pack_tests {
     }
 }
 
-/// Revision 6's status rename (`design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4g,
-/// GitHub issue #280): [`Status::Review`] renders as `Finished`/`finished`, and the old
-/// `Review ready` wording must never come back to any rendered surface.
+/// The status rename (GitHub issue #280): [`Status::Review`] renders as `Finished`/`finished`,
+/// and the old `Review ready` wording must never come back to any rendered surface.
 #[cfg(test)]
 mod status_wording_tests {
     use super::*;
@@ -4073,10 +4062,8 @@ mod status_wording_tests {
     }
 }
 
-/// Revision 6's rail corrections (GitHub issue #289, `design_handoff_jerry_ade/revision 5/
-/// REVISION-2026-08-14.md` §4 and `STAGE-A-CHANGELOG.md` §4k-§4s), in their pure, window-free
-/// half: the two colour decisions that were structurally wrong before, and the deletion of the
-/// rail's ask card.
+/// The rail's corrections (GitHub issue #289), in their pure, window-free half: the two colour
+/// decisions that were structurally wrong before, and the deletion of the rail's ask card.
 #[cfg(test)]
 mod rail_correction_tests {
     use super::*;
