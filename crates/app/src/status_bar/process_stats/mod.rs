@@ -449,11 +449,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn sample_processes_reports_real_nonzero_cpu_for_a_real_busy_child() {
-        use std::process::{Child, Command, Stdio};
+        use std::process::{Command, Stdio};
 
-        let mut child: Child = Command::new("yes")
-            .stdout(Stdio::null())
-            .spawn()
+        // `ChildGuard`, not a manual `kill`/`wait` after the sampling: `yes` pins a core, and an
+        // assertion that fired before the old teardown left it doing so for the whole run.
+        let mut child = test_support::ChildGuard::spawn(Command::new("yes").stdout(Stdio::null()))
             .expect("spawn a real `yes` child process");
         let pid = child.id();
 
@@ -461,8 +461,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(500));
         let (second, _raw) = sample_processes(&[pid], raw);
 
-        let _ = child.kill();
-        let _ = child.wait();
+        child.kill_and_wait().expect("reap the busy child");
 
         let sample = second
             .get(&pid)

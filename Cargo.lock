@@ -312,6 +312,7 @@ dependencies = [
  "sha2",
  "streaming-iterator",
  "tempfile",
+ "test-support",
  "toml 0.8.23",
  "tree-sitter",
  "tree-sitter-c",
@@ -4776,6 +4777,7 @@ name = "lsp-core"
 version = "0.1.1"
 dependencies = [
  "dunce",
+ "libc",
  "log",
  "lsp-types",
  "nix",
@@ -4783,6 +4785,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "test-support",
  "thiserror 1.0.69",
  "url",
 ]
@@ -6148,9 +6151,11 @@ version = "0.1.1"
 dependencies = [
  "anyhow",
  "filedescriptor",
+ "libc",
  "nix",
  "portable-pty",
  "tempfile",
+ "test-support",
  "thiserror 1.0.69",
 ]
 
@@ -7926,6 +7931,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "test-support"
+version = "0.1.1"
+dependencies = [
+ "tempfile",
 ]
 
 [[package]]
@@ -9890,6 +9902,7 @@ dependencies = [
  "gix",
  "sha2",
  "tempfile",
+ "test-support",
  "thiserror 1.0.69",
 ]
 

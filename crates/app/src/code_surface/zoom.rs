@@ -3,8 +3,10 @@
 
 use super::*;
 #[cfg(test)]
-use crate::root::focus::palette_focus_tests;
+use crate::code_surface::fixtures::temp_repo;
 use crate::root::rem_scope::WithRemSize;
+#[cfg(test)]
+use crate::test_support::open_test_app;
 
 impl AdeApp {
     /// Editor-zoom range (70-200%, in steps of 10) and default (100%) - re-exported from
@@ -232,9 +234,9 @@ mod code_zoom_tests {
     fn zoom_in_and_out_clamp_at_the_documented_boundaries_through_the_real_app(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_single_file(repo.path());
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(file_path, window, cx);
         });
@@ -270,9 +272,9 @@ mod code_zoom_tests {
 
     #[gpui::test]
     fn resetting_zoom_returns_to_100_percent(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = write_single_file(repo.path());
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(file_path, window, cx);
         });
@@ -298,12 +300,12 @@ mod code_zoom_tests {
 
     #[gpui::test]
     fn zoom_applies_globally_to_every_open_file_not_just_the_active_one(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let a = repo.path().join("a.rs");
         let b = repo.path().join("b.rs");
         std::fs::write(&a, "fn a() {}\n").expect("write a.rs");
         std::fs::write(&b, "fn b() {}\n").expect("write b.rs");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(a.clone(), window, cx);
@@ -334,9 +336,9 @@ mod code_zoom_tests {
 
     #[gpui::test]
     fn zoom_survives_a_worktree_switch(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let worktree_b = tempfile::tempdir().expect("tempdir b");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = temp_repo();
+        let worktree_b = temp_repo();
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
         // A plain, directly-seeded `worktrees` list (mirroring
         // `lsp_client_eviction_tests::switching_between_several_worktrees_never_lets_lsp_clients_
@@ -396,10 +398,10 @@ mod code_zoom_tests {
 
     #[gpui::test]
     fn closing_and_reopening_a_tab_keeps_the_same_global_zoom(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let a = repo.path().join("a.rs");
         std::fs::write(&a, "fn a() {}\n").expect("write a.rs");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(a.clone(), window, cx);
@@ -437,11 +439,11 @@ mod code_zoom_tests {
 
     #[gpui::test]
     fn zoom_scales_text_but_not_the_gutter_width(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         // 1200 lines - enough to reach a 4-digit line number (1000), which the second half
         // needs; line 1 (used by the first half) exists regardless of file size.
         let file_path = write_many_line_file(repo.path(), 1200);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(file_path, window, cx);
         });

@@ -288,81 +288,155 @@ mod tests {
         }
     }
 
+    /// The exact facts first: an exit code and a missing process both settle the answer outright,
+    /// and only a real *agent session*'s clean exit can mean "review ready" - a plain shell
+    /// closing next to an unrelated worktree diff is a terminal that closed, not finished
+    /// reviewable work (see `ProcessKind::is_agent_session`'s docs).
     #[test]
-    fn no_process_is_idle_regardless_of_kind_or_diff() {
-        assert_eq!(
-            derive_status(ProcessKind::Shell, ProcessSignal::NoProcess, quiet(), true),
-            Status::Idle
-        );
-        assert_eq!(
-            derive_status(
+    fn an_exit_or_a_missing_process_settles_the_status_outright() {
+        let cases: &[(ProcessKind, ProcessSignal, bool, Status, &str)] = &[
+            (
+                ProcessKind::Shell,
+                ProcessSignal::NoProcess,
+                true,
+                Status::Idle,
+                "a process that never started is idle whatever the diff says",
+            ),
+            (
                 ProcessKind::claude(),
                 ProcessSignal::NoProcess,
-                quiet(),
-                true
+                true,
+                Status::Idle,
+                "and that holds for an agent too",
             ),
-            Status::Idle
-        );
+            (
+                ProcessKind::Shell,
+                ProcessSignal::Exited { success: false },
+                true,
+                Status::Fail,
+                "a non-zero exit is a failure whatever the diff says",
+            ),
+            (
+                ProcessKind::claude(),
+                ProcessSignal::Exited { success: false },
+                false,
+                Status::Fail,
+                "for an agent as much as a shell",
+            ),
+            (
+                ProcessKind::claude(),
+                ProcessSignal::Exited { success: true },
+                true,
+                Status::Review,
+                "an agent session's clean exit with real changes is review-ready",
+            ),
+            (
+                ProcessKind::claude(),
+                ProcessSignal::Exited { success: true },
+                false,
+                Status::Idle,
+                "with nothing to review it is idle, not an empty review row",
+            ),
+            (
+                ProcessKind::Shell,
+                ProcessSignal::Exited { success: true },
+                true,
+                Status::Idle,
+                "a shell isn't an agent session - its exit can't be \"review ready\"",
+            ),
+        ];
+        for (kind, signal, has_diff, expected, why) in cases {
+            assert_eq!(
+                derive_status(*kind, *signal, quiet(), *has_diff),
+                *expected,
+                "{why}"
+            );
+        }
     }
 
+    /// The quiescence ladder, with no other signal in play: recent output is `Run` for every
+    /// kind; past the recent window a shell is `Idle` (it is sitting at its prompt, not asking
+    /// anything) while an agent is still `Run` - the whole reason the second, longer threshold
+    /// exists is that normal tool-call latency must not flicker to "needs input" - and only past
+    /// that agent threshold does an agent reach `Ask`.
     #[test]
-    fn running_within_the_recent_window_is_run_for_every_kind() {
-        let signal = ProcessSignal::Running {
-            idle: Duration::from_millis(500),
-        };
-        assert_eq!(
-            derive_status(ProcessKind::Shell, signal, quiet(), false),
-            Status::Run
-        );
-        assert_eq!(
-            derive_status(ProcessKind::claude(), signal, quiet(), false),
-            Status::Run
-        );
-        assert_eq!(
-            derive_status(ProcessKind::codex(), signal, quiet(), false),
-            Status::Run
-        );
+    fn quiescence_alone_walks_the_two_thresholds_per_process_kind() {
+        let recent = Duration::from_millis(500);
+        let between = RUN_RECENT_OUTPUT_WINDOW + Duration::from_secs(1);
+        let long = AGENT_ASK_IDLE_THRESHOLD + Duration::from_secs(1);
+        let cases: &[(ProcessKind, Duration, Status, &str)] = &[
+            (
+                ProcessKind::Shell,
+                recent,
+                Status::Run,
+                "a shell just wrote something",
+            ),
+            (
+                ProcessKind::claude(),
+                recent,
+                Status::Run,
+                "and so did claude",
+            ),
+            (
+                ProcessKind::codex(),
+                recent,
+                Status::Run,
+                "and so did codex",
+            ),
+            (
+                ProcessKind::Shell,
+                between,
+                Status::Idle,
+                "a shell at its prompt is idle, not \"needs input\" - it isn't asking anything",
+            ),
+            (
+                ProcessKind::claude(),
+                between,
+                Status::Run,
+                "an agent between the two thresholds is still working",
+            ),
+            (ProcessKind::codex(), between, Status::Run, "codex likewise"),
+            (
+                ProcessKind::claude(),
+                long,
+                Status::Ask,
+                "past its own threshold a silent agent is asking",
+            ),
+            (ProcessKind::codex(), long, Status::Ask, "codex likewise"),
+        ];
+        for (kind, idle, expected, why) in cases {
+            assert_eq!(
+                derive_status(
+                    *kind,
+                    ProcessSignal::Running { idle: *idle },
+                    quiet(),
+                    false
+                ),
+                *expected,
+                "{why}"
+            );
+        }
     }
 
+    /// The real false-positive class the terminal signal exists to fix (GitHub issue #239), one
+    /// observed live: Claude Code kept its `\u{25d0}`/`\u{25d1}` spinner animating through a
+    /// 9-second run of `sleep 3` tool calls that wrote nothing at all. Purely by idle time that
+    /// agent is "needs input"; by its own title it is plainly still working. An advancing
+    /// progress report says the same thing - but a stalled or paused one is exactly when the
+    /// human may be wanted, so it buys no indefinite reprieve.
     #[test]
-    fn a_quiet_shell_past_the_recent_window_is_idle_not_ask() {
-        let signal = ProcessSignal::Running {
-            idle: RUN_RECENT_OUTPUT_WINDOW + Duration::from_secs(1),
-        };
-        assert_eq!(
-            derive_status(ProcessKind::Shell, signal, quiet(), false),
-            Status::Idle,
-            "a shell sitting at its prompt is idle, not \"needs input\" - it isn't asking anything"
-        );
-    }
-
-    #[test]
-    fn an_agent_paused_between_the_two_thresholds_is_still_run() {
-        // Past the "recent" window but not yet past the longer agent-specific ask threshold:
-        // this is the whole reason the second threshold exists (see the module docs) - normal
-        // tool-call/thinking latency must not flicker to "needs input".
-        let signal = ProcessSignal::Running {
-            idle: RUN_RECENT_OUTPUT_WINDOW + Duration::from_secs(1),
-        };
-        assert_eq!(
-            derive_status(ProcessKind::claude(), signal, quiet(), false),
-            Status::Run
-        );
-        assert_eq!(
-            derive_status(ProcessKind::codex(), signal, quiet(), false),
-            Status::Run
-        );
-    }
-
-    #[test]
-    fn a_busy_title_keeps_a_long_quiet_agent_on_run_instead_of_ask() {
-        // The real false-positive class this signal exists to fix (GitHub issue #239), and one
-        // observed live: Claude Code kept its `\u{25d0}`/`\u{25d1}` spinner animating through a
-        // 9-second run of `sleep 3` tool calls that wrote nothing at all to the terminal. Purely
-        // by idle time that agent is "needs input"; by its own title it is plainly still working.
+    fn a_live_work_signal_holds_a_long_quiet_agent_on_run_but_a_stalled_one_does_not() {
         let long_quiet = ProcessSignal::Running {
             idle: AGENT_ASK_IDLE_THRESHOLD * 20,
         };
+        let progress = |state| TerminalSignal {
+            progress: Some(Progress {
+                state,
+                percent: Some(40),
+            }),
+            ..TerminalSignal::default()
+        };
+
         assert_eq!(
             derive_status(ProcessKind::claude(), long_quiet, quiet(), false),
             Status::Ask,
@@ -378,50 +452,28 @@ mod tests {
             Status::Run,
             "an agent whose own title says it is working must not be reported as needing input"
         );
-    }
-
-    #[test]
-    fn an_active_progress_report_also_keeps_a_long_quiet_agent_on_run() {
-        let long_quiet = ProcessSignal::Running {
-            idle: AGENT_ASK_IDLE_THRESHOLD * 20,
-        };
         for state in [ProgressState::Normal, ProgressState::Indeterminate] {
-            let terminal = TerminalSignal {
-                progress: Some(Progress {
-                    state,
-                    percent: Some(40),
-                }),
-                ..TerminalSignal::default()
-            };
             assert_eq!(
-                derive_status(ProcessKind::claude(), long_quiet, terminal, false),
+                derive_status(ProcessKind::claude(), long_quiet, progress(state), false),
                 Status::Run,
                 "{state:?} is work actually advancing"
             );
         }
-        // A stalled or paused report is exactly when the human may be wanted, so it must not buy
-        // the process an indefinite "still running" - the idle clock takes over again.
         for state in [ProgressState::Error, ProgressState::Paused] {
-            let terminal = TerminalSignal {
-                progress: Some(Progress {
-                    state,
-                    percent: Some(40),
-                }),
-                ..TerminalSignal::default()
-            };
             assert_eq!(
-                derive_status(ProcessKind::claude(), long_quiet, terminal, false),
+                derive_status(ProcessKind::claude(), long_quiet, progress(state), false),
                 Status::Ask,
                 "{state:?} must not be able to claim the agent is still working"
             );
         }
     }
 
+    /// The threshold exists only because Jerry used to have no better signal. When the agent says
+    /// outright that it is blocked on the human - a `NeedsAttention` title, an unanswered OSC 9
+    /// notification, or both alongside a still-spinning busy glyph - waiting the timer out is
+    /// pure added latency, so attention outranks everything short of an exact fact.
     #[test]
-    fn a_needs_attention_title_reaches_ask_long_before_the_idle_threshold() {
-        // The 15s threshold exists only because Jerry used to have no better signal. When the
-        // agent says outright that it's blocked on the human, waiting the timer out is pure
-        // added latency.
+    fn a_real_attention_claim_reaches_ask_immediately_and_outranks_a_busy_one() {
         let barely_quiet = ProcessSignal::Running {
             idle: Duration::from_millis(100),
         };
@@ -439,41 +491,34 @@ mod tests {
             ),
             Status::Ask
         );
-    }
-
-    #[test]
-    fn an_unanswered_osc_notification_reaches_ask_long_before_the_idle_threshold() {
-        let barely_quiet = ProcessSignal::Running {
-            idle: Duration::from_millis(100),
-        };
-        let terminal = TerminalSignal {
-            attention_pinged: true,
-            ..TerminalSignal::default()
-        };
         assert_eq!(
-            derive_status(ProcessKind::claude(), barely_quiet, terminal, false),
+            derive_status(
+                ProcessKind::claude(),
+                barely_quiet,
+                TerminalSignal {
+                    attention_pinged: true,
+                    ..TerminalSignal::default()
+                },
+                false
+            ),
             Status::Ask
         );
-    }
-
-    #[test]
-    fn attention_outranks_busy_when_an_agent_claims_both() {
-        // An agent that is both spinning a busy glyph and has an unanswered notification out is
-        // one that needs the human now and happens to still be rendering - see the module docs.
-        let terminal = TerminalSignal {
-            title: Some(TitleSignal::Busy),
-            attention_pinged: true,
-            progress: Some(Progress {
-                state: ProgressState::Normal,
-                percent: Some(10),
-            }),
-        };
-        let signal = ProcessSignal::Running {
-            idle: Duration::from_millis(100),
-        };
         assert_eq!(
-            derive_status(ProcessKind::claude(), signal, terminal, false),
-            Status::Ask
+            derive_status(
+                ProcessKind::claude(),
+                barely_quiet,
+                TerminalSignal {
+                    title: Some(TitleSignal::Busy),
+                    attention_pinged: true,
+                    progress: Some(Progress {
+                        state: ProgressState::Normal,
+                        percent: Some(10),
+                    }),
+                },
+                false
+            ),
+            Status::Ask,
+            "an agent that is both spinning and has an unanswered ping out needs the human now"
         );
     }
 
@@ -496,13 +541,16 @@ mod tests {
         }
     }
 
+    /// Neither side channel may move a shell row. A shell prompt, a `vim` session, or a stray
+    /// `printf '\e]0;...\a'` in someone's `.bashrc` can put any glyph or word in a shell's title,
+    /// and none of that makes a shell an agent session that can need input. The hook half is
+    /// deliberately defensive: hooks are only ever installed for `AgentKind::Claude` spawns, so a
+    /// shell should structurally never carry one - but "structurally impossible" is exactly the
+    /// kind of claim that quietly stops being true, and a shell driven to `Ask`/`Review`/`Fail`
+    /// by an inbox entry would be a real bug.
     #[test]
-    fn a_shell_never_reaches_ask_no_matter_how_agent_like_its_title_looks() {
-        // A shell prompt, a `vim` session, or a stray `printf '\e]0;...\a'` in someone's
-        // `.bashrc` can put any glyph or word in a shell's title. None of that makes a shell an
-        // agent session that can need input - see the module docs. This also covers the reverse
-        // direction: a busy-looking title must not hold a shell on `Run` either.
-        let every_signal = [
+    fn neither_a_terminal_signal_nor_a_hook_fact_can_move_a_shell_row() {
+        let every_terminal_signal = [
             titled(TitleSignal::NeedsAttention),
             titled(TitleSignal::Busy),
             titled(TitleSignal::Idle),
@@ -520,38 +568,54 @@ mod tests {
                 }),
             },
         ];
-        for terminal in every_signal {
-            assert_eq!(
-                derive_status(
-                    ProcessKind::Shell,
-                    ProcessSignal::Running {
-                        idle: AGENT_ASK_IDLE_THRESHOLD * 2
-                    },
-                    terminal,
-                    false
-                ),
-                Status::Idle,
-                "a quiet shell stays Idle regardless of {terminal:?}"
-            );
-            assert_eq!(
-                derive_status(
-                    ProcessKind::Shell,
-                    ProcessSignal::Running {
-                        idle: Duration::from_millis(100)
-                    },
-                    terminal,
-                    false
-                ),
-                Status::Run,
-                "a freshly-active shell stays Run regardless of {terminal:?}"
-            );
+        for terminal in every_terminal_signal {
+            for (idle, expected) in [
+                (AGENT_ASK_IDLE_THRESHOLD * 2, Status::Idle),
+                (Duration::from_millis(100), Status::Run),
+            ] {
+                assert_eq!(
+                    derive_status(
+                        ProcessKind::Shell,
+                        ProcessSignal::Running { idle },
+                        terminal,
+                        false
+                    ),
+                    expected,
+                    "a shell at idle={idle:?} must stay {expected:?} regardless of {terminal:?}"
+                );
+            }
+        }
+
+        for fact in [
+            HookFact::Working,
+            HookFact::NeedsInput,
+            HookFact::TurnEnded,
+            HookFact::TurnFailed,
+        ] {
+            for (idle, expected) in [
+                (AGENT_ASK_IDLE_THRESHOLD * 2, Status::Idle),
+                (Duration::from_millis(50), Status::Run),
+            ] {
+                assert_eq!(
+                    super::derive_status(
+                        ProcessKind::Shell,
+                        ProcessSignal::Running { idle },
+                        quiet(),
+                        hooked(fact),
+                        true
+                    ),
+                    expected,
+                    "a shell at idle={idle:?} must stay {expected:?} regardless of a {fact:?} hook"
+                );
+            }
         }
     }
 
+    /// An exit is an exact fact: neither a stale title glyph from just before the process died
+    /// nor a `Working` hook from the same moment may argue with it, or resurrect a process that
+    /// was never started.
     #[test]
-    fn a_terminal_signal_never_overrides_an_exit_or_a_missing_process() {
-        // An exit is an exact fact - a stale title glyph from just before the process died must
-        // not be able to argue with it.
+    fn no_side_channel_overrides_an_exit_or_a_missing_process() {
         let shouting = TerminalSignal {
             title: Some(TitleSignal::Busy),
             attention_pinged: true,
@@ -560,91 +624,63 @@ mod tests {
                 percent: Some(50),
             }),
         };
-        assert_eq!(
-            derive_status(
-                ProcessKind::claude(),
+        for (signal, has_diff, expected) in [
+            (
                 ProcessSignal::Exited { success: false },
-                shouting,
-                false
+                false,
+                Status::Fail,
             ),
-            Status::Fail
-        );
+            (
+                ProcessSignal::Exited { success: true },
+                true,
+                Status::Review,
+            ),
+            (ProcessSignal::NoProcess, true, Status::Idle),
+        ] {
+            assert_eq!(
+                derive_status(ProcessKind::claude(), signal, shouting, has_diff),
+                expected
+            );
+        }
+
+        for fact in [
+            HookFact::Working,
+            HookFact::NeedsInput,
+            HookFact::TurnEnded,
+            HookFact::TurnFailed,
+        ] {
+            assert_eq!(
+                super::derive_status(
+                    ProcessKind::claude(),
+                    ProcessSignal::Exited { success: false },
+                    quiet(),
+                    hooked(fact),
+                    false
+                ),
+                Status::Fail,
+                "{fact:?} must not argue with a non-zero exit"
+            );
+            assert_eq!(
+                super::derive_status(
+                    ProcessKind::claude(),
+                    ProcessSignal::NoProcess,
+                    quiet(),
+                    hooked(fact),
+                    true
+                ),
+                Status::Idle,
+                "{fact:?} must not invent a process that was never started"
+            );
+        }
         assert_eq!(
-            derive_status(
+            super::derive_status(
                 ProcessKind::claude(),
                 ProcessSignal::Exited { success: true },
-                shouting,
+                quiet(),
+                hooked(HookFact::Working),
                 true
             ),
             Status::Review
-        );
-        assert_eq!(
-            derive_status(
-                ProcessKind::claude(),
-                ProcessSignal::NoProcess,
-                shouting,
-                true
-            ),
-            Status::Idle
-        );
-    }
-
-    #[test]
-    fn an_agent_quiet_past_the_ask_threshold_is_ask() {
-        let signal = ProcessSignal::Running {
-            idle: AGENT_ASK_IDLE_THRESHOLD + Duration::from_secs(1),
-        };
-        assert_eq!(
-            derive_status(ProcessKind::claude(), signal, quiet(), false),
-            Status::Ask
-        );
-        assert_eq!(
-            derive_status(ProcessKind::codex(), signal, quiet(), false),
-            Status::Ask
-        );
-    }
-
-    #[test]
-    fn nonzero_exit_is_fail_regardless_of_diff() {
-        let signal = ProcessSignal::Exited { success: false };
-        assert_eq!(
-            derive_status(ProcessKind::Shell, signal, quiet(), true),
-            Status::Fail
-        );
-        assert_eq!(
-            derive_status(ProcessKind::claude(), signal, quiet(), false),
-            Status::Fail
-        );
-    }
-
-    #[test]
-    fn zero_exit_with_a_real_diff_is_review() {
-        let signal = ProcessSignal::Exited { success: true };
-        assert_eq!(
-            derive_status(ProcessKind::claude(), signal, quiet(), true),
-            Status::Review
-        );
-    }
-
-    #[test]
-    fn a_shell_zero_exit_with_a_real_diff_is_idle_not_review() {
-        // A plain shell exiting next to an unrelated worktree diff isn't a session that
-        // finished reviewable work - it's a terminal that closed. Only a real agent session's
-        // clean exit means "review ready" (see `ProcessKind::is_agent_session`'s docs).
-        let signal = ProcessSignal::Exited { success: true };
-        assert_eq!(
-            derive_status(ProcessKind::Shell, signal, quiet(), true),
-            Status::Idle,
-            "a shell isn't an agent session - its exit can't be \"review ready\""
-        );
-    }
-
-    #[test]
-    fn zero_exit_with_no_diff_is_idle_not_review() {
-        let signal = ProcessSignal::Exited { success: true };
-        assert_eq!(
-            derive_status(ProcessKind::claude(), signal, quiet(), false),
-            Status::Idle
         );
     }
 
@@ -814,93 +850,6 @@ mod tests {
             ),
             Status::Run
         );
-    }
-
-    #[test]
-    fn a_hook_fact_never_overrides_an_exit_or_a_missing_process() {
-        // An exit is an exact fact. A `Working` hook from just before the process died must not
-        // resurrect it - the same rule `TerminalSignal` already obeys.
-        for fact in [
-            HookFact::Working,
-            HookFact::NeedsInput,
-            HookFact::TurnEnded,
-            HookFact::TurnFailed,
-        ] {
-            assert_eq!(
-                super::derive_status(
-                    ProcessKind::claude(),
-                    ProcessSignal::Exited { success: false },
-                    quiet(),
-                    hooked(fact),
-                    false
-                ),
-                Status::Fail,
-                "{fact:?} must not argue with a non-zero exit"
-            );
-            assert_eq!(
-                super::derive_status(
-                    ProcessKind::claude(),
-                    ProcessSignal::NoProcess,
-                    quiet(),
-                    hooked(fact),
-                    true
-                ),
-                Status::Idle,
-                "{fact:?} must not invent a process that was never started"
-            );
-        }
-        assert_eq!(
-            super::derive_status(
-                ProcessKind::claude(),
-                ProcessSignal::Exited { success: true },
-                quiet(),
-                hooked(HookFact::Working),
-                true
-            ),
-            Status::Review
-        );
-    }
-
-    #[test]
-    fn a_hook_fact_can_never_change_a_shell_row() {
-        // Defensive, and deliberately so. Hooks are only ever installed for `AgentKind::Claude`
-        // spawns, so a shell should structurally never carry one - but "structurally impossible"
-        // is exactly the kind of claim that quietly stops being true, and a shell that could be
-        // driven to `Ask`/`Review`/`Fail` by an inbox entry would be a real bug. This pins the
-        // gate rather than trusting the surrounding architecture to keep holding.
-        for fact in [
-            HookFact::Working,
-            HookFact::NeedsInput,
-            HookFact::TurnEnded,
-            HookFact::TurnFailed,
-        ] {
-            assert_eq!(
-                super::derive_status(
-                    ProcessKind::Shell,
-                    ProcessSignal::Running {
-                        idle: AGENT_ASK_IDLE_THRESHOLD * 2
-                    },
-                    quiet(),
-                    hooked(fact),
-                    true
-                ),
-                Status::Idle,
-                "a quiet shell stays Idle regardless of a {fact:?} hook"
-            );
-            assert_eq!(
-                super::derive_status(
-                    ProcessKind::Shell,
-                    ProcessSignal::Running {
-                        idle: Duration::from_millis(50)
-                    },
-                    quiet(),
-                    hooked(fact),
-                    true
-                ),
-                Status::Run,
-                "a freshly-active shell stays Run regardless of a {fact:?} hook"
-            );
-        }
     }
 
     #[test]

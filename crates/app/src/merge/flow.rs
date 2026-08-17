@@ -983,63 +983,43 @@ fn fold_merge_result(
 #[cfg(test)]
 mod merge_regression_tests {
     use super::*;
+    use crate::test_support::{temp_repo_with, TempRoot};
     use gpui::{EntityInputHandler, TestAppContext};
     use std::fs;
     use std::process::Command;
     use tempfile::TempDir;
+    use test_support::{git, git_output};
 
-    fn git(dir: &std::path::Path, args: &[&str]) {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+    fn init_repo() -> TempRoot {
+        temp_repo_with(|root| {
+            test_support::seed_empty_repo_at(root);
+            test_support::commit(root, "base.txt", "base\n", "initial");
+        })
     }
 
-    fn init_repo() -> TempDir {
-        let dir = TempDir::new().expect("tempdir");
-        git(dir.path(), &["init", "-b", "main"]);
-        git(dir.path(), &["config", "user.email", "test@example.com"]);
-        git(dir.path(), &["config", "user.name", "Test User"]);
-        fs::write(dir.path().join("base.txt"), "base\n").expect("write");
-        git(dir.path(), &["add", "base.txt"]);
-        git(dir.path(), &["commit", "-m", "initial"]);
-        dir
-    }
-
-    /// Same real-linked-worktree idiom as `wt_core::merge`'s own test module.
+    /// Same real-linked-worktree idiom as `wt_core::merge`'s own test module. The path is
+    /// canonicalized for the same reason [`temp_repo`] canonicalizes a repo root: the app keys
+    /// worktrees by exact `PathBuf`, and on macOS the temp directory is behind a symlink.
     fn add_worktree(repo_path: &std::path::Path, branch: &str, name: &str) -> PathBuf {
         let container = TempDir::new().expect("tempdir");
-        let path = container.path().join(name);
-        drop(container);
-        git(
-            repo_path,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                branch,
-                path.to_str().expect("utf8 path"),
-            ],
-        );
+        let root = container
+            .path()
+            .canonicalize()
+            .expect("canonicalize tempdir");
+        // `keep()`, not `drop()`: dropping the container deleted the directory and freed its
+        // random name for reuse, so under the parallel suite another fixture could be handed the
+        // same name and create `<name>` inside it first - `git worktree add` then failed with
+        // "already exists". Reproduced directly: 1 run in ~7 of the merge module under load.
+        // Keeping the (empty) directory costs nothing the old code did not already leak, since
+        // git recreated the path afterwards and nothing ever removed it.
+        let _ = container.keep();
+        let path = root.join(name);
+        test_support::add_worktree(repo_path, branch, &path);
         path
     }
 
     fn status(dir: &std::path::Path) -> String {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(["status", "--porcelain"])
-            .output()
-            .expect("git status");
-        String::from_utf8_lossy(&output.stdout).into_owned()
+        git_output(dir, &["status", "--porcelain"])
     }
 
     /// Real parent-commit count for `rev` - the same real check `wt_core::merge`'s own test

@@ -319,32 +319,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::process::Command;
-    use tempfile::TempDir;
-
-    fn git(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn git_stdout(dir: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        String::from_utf8_lossy(&output.stdout).into_owned()
-    }
+    use test_support::{git, git_output, git_try, seed_repo};
 
     /// Snapshots, asserts untracked content was captured, and returns just the tree id.
     fn snapshot_tree(path: &Path) -> String {
@@ -358,20 +333,13 @@ mod tests {
         snapshot.tree_id
     }
 
-    fn init_repo() -> TempDir {
-        let dir = TempDir::new().expect("tempdir");
-        git(dir.path(), &["init", "-b", "main"]);
-        git(dir.path(), &["config", "user.email", "test@example.com"]);
-        git(dir.path(), &["config", "user.name", "Test User"]);
-        fs::write(dir.path().join("file.txt"), "hello\n").expect("write file");
-        git(dir.path(), &["add", "file.txt"]);
-        git(dir.path(), &["commit", "-m", "initial commit"]);
-        dir
-    }
-
+    /// The core promise of a baseline: nothing has changed since it was taken, so the review
+    /// diff against it is genuinely empty - even though this worktree has a real, non-empty
+    /// *git* diff (an uncommitted edit and an untracked file), which is exactly the distinction
+    /// GitHub issue #225 is about.
     #[test]
     fn a_fresh_snapshot_reports_no_review_changes_even_when_the_git_diff_is_not_empty() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("file.txt"), "hello\nedited\n").expect("write");
         fs::write(repo.path().join("untracked.txt"), "brand new\n").expect("write");
 
@@ -407,7 +375,7 @@ mod tests {
 
     #[test]
     fn changes_made_after_a_snapshot_show_up_in_the_review_diff_with_real_hunks() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let tree = snapshot_tree(repo.path());
 
         fs::write(repo.path().join("file.txt"), "hello\nafter the snapshot\n").expect("write");
@@ -438,7 +406,7 @@ mod tests {
 
     #[test]
     fn an_untracked_file_created_after_a_snapshot_is_reported_as_an_addition() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let tree = snapshot_tree(repo.path());
 
         fs::write(repo.path().join("brand_new.txt"), "written by an agent\n").expect("write");
@@ -457,7 +425,7 @@ mod tests {
 
     #[test]
     fn a_file_untracked_at_snapshot_time_is_captured_with_its_real_content() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("notes.txt"), "line one\n").expect("write");
 
         let tree = snapshot_tree(repo.path());
@@ -489,43 +457,48 @@ mod tests {
 
     #[test]
     fn snapshotting_a_worktree_leaves_real_git_status_byte_identical() {
-        let repo = init_repo();
+        let repo = seed_repo();
+        // A genuinely mixed state: one staged change, one unstaged change, one untracked file.
         fs::write(repo.path().join("staged.txt"), "staged content\n").expect("write");
         git(repo.path(), &["add", "staged.txt"]);
         fs::write(repo.path().join("file.txt"), "hello\nunstaged edit\n").expect("write");
         fs::write(repo.path().join("untracked.txt"), "untracked\n").expect("write");
 
-        let status_before = git_stdout(repo.path(), &["status", "--porcelain"]);
-        let head_before = git_stdout(repo.path(), &["rev-parse", "HEAD"]);
+        // Raw stdout, not `git_output`: this test's subject is byte-identity, so it must not
+        // compare through a helper that trims.
+        let status = |dir: &Path| git_try(dir, &["status", "--porcelain"]).stdout;
+        let status_before = status(repo.path());
+        let head_before = git_output(repo.path(), &["rev-parse", "HEAD"]);
         let index_before = fs::read(repo.path().join(".git").join("index")).expect("read index");
-        let stash_before = git_stdout(repo.path(), &["stash", "list"]);
+        let stash_before = git_output(repo.path(), &["stash", "list"]);
+        let rendered = String::from_utf8_lossy(&status_before).into_owned();
         assert!(
-            status_before.contains("A  staged.txt")
-                && status_before.contains(" M file.txt")
-                && status_before.contains("?? untracked.txt"),
+            rendered.contains("A  staged.txt")
+                && rendered.contains(" M file.txt")
+                && rendered.contains("?? untracked.txt"),
             "the test fixture must really have staged, unstaged and untracked entries - got:\n\
-             {status_before}"
+             {rendered}"
         );
 
         snapshot_worktree_tree(repo.path()).expect("snapshot");
 
         assert_eq!(
-            git_stdout(repo.path(), &["status", "--porcelain"]),
+            status(repo.path()),
             status_before,
             "snapshotting must not change one byte of what git reports about the worktree"
         );
-        assert_eq!(git_stdout(repo.path(), &["rev-parse", "HEAD"]), head_before);
+        assert_eq!(git_output(repo.path(), &["rev-parse", "HEAD"]), head_before);
         assert_eq!(
             fs::read(repo.path().join(".git").join("index")).expect("read index"),
             index_before,
             "the real index file must be untouched - every mutation goes to the shadow copy"
         );
-        assert_eq!(git_stdout(repo.path(), &["stash", "list"]), stash_before);
+        assert_eq!(git_output(repo.path(), &["stash", "list"]), stash_before);
     }
 
     #[test]
     fn a_snapshot_id_tracks_real_content_not_the_time_it_was_taken() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let first = snapshot_tree(repo.path());
         let unchanged = snapshot_tree(repo.path());
         assert_eq!(
@@ -543,7 +516,7 @@ mod tests {
 
     #[test]
     fn changed_paths_agrees_with_the_full_review_diffs_file_list() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let tree = snapshot_tree(repo.path());
 
         fs::write(repo.path().join("file.txt"), "hello\nedited\n").expect("write");
@@ -574,7 +547,7 @@ mod tests {
 
     #[test]
     fn changed_paths_is_empty_immediately_after_a_snapshot() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("file.txt"), "hello\nedited\n").expect("write");
         let tree = snapshot_tree(repo.path());
         assert!(
@@ -607,7 +580,9 @@ mod tests {
 
     #[test]
     fn an_oversized_untracked_set_is_never_hashed_into_the_object_database() {
-        let repo = init_repo();
+        let repo = seed_repo();
+        // Comfortably past the file cap, deliberately tiny so the test stays fast - the file cap
+        // exists precisely because many small files are as expensive as a few large ones.
         let junk = repo.path().join("build-output");
         std::fs::create_dir_all(&junk).expect("mkdir");
         for index in 0..(MAX_UNTRACKED_SNAPSHOT_FILES + 10) {
@@ -646,7 +621,7 @@ mod tests {
 
     #[test]
     fn an_ordinary_untracked_set_is_still_captured_in_full() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("scratch.txt"), "a normal untracked file\n").expect("write");
 
         let snapshot = snapshot_worktree_tree(repo.path()).expect("snapshot");
@@ -656,7 +631,7 @@ mod tests {
 
     #[test]
     fn gitignored_content_does_not_count_toward_the_untracked_cap() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join(".gitignore"), "ignored/\n").expect("write");
         let ignored = repo.path().join("ignored");
         std::fs::create_dir_all(&ignored).expect("mkdir");
@@ -680,7 +655,7 @@ mod tests {
 
     #[test]
     fn an_anchored_baseline_survives_a_real_aggressive_gc() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("only_here.txt"), "unreferenced content\n").expect("write");
         let tree = snapshot_tree(repo.path());
 
@@ -690,16 +665,17 @@ mod tests {
         git(repo.path(), &["gc", "--prune=now", "--aggressive"]);
 
         assert_eq!(
-            git_stdout(repo.path(), &["rev-parse", &ref_name]).trim(),
+            git_output(repo.path(), &["rev-parse", &ref_name]),
             tree,
             "the anchored ref must still resolve to the same tree after a real gc"
         );
-        assert!(git_stdout(repo.path(), &["cat-file", "-p", &tree]).contains("only_here.txt"));
+        // And the tree's real content is still readable - not just the ref surviving.
+        assert!(git_output(repo.path(), &["cat-file", "-p", &tree]).contains("only_here.txt"));
     }
 
     #[test]
     fn anchoring_again_moves_an_existing_baseline_ref_rather_than_failing() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let first = snapshot_tree(repo.path());
         let ref_name = baseline_ref_name("key");
         anchor_tree(repo.path(), &ref_name, &first).expect("anchor");
@@ -709,7 +685,7 @@ mod tests {
         anchor_tree(repo.path(), &ref_name, &second).expect("re-anchor");
 
         assert_eq!(
-            git_stdout(repo.path(), &["rev-parse", &ref_name]).trim(),
+            git_output(repo.path(), &["rev-parse", &ref_name]),
             second,
             "'Mark reviewed' advances the same ref onto the new snapshot"
         );
@@ -717,15 +693,15 @@ mod tests {
 
     #[test]
     fn deleting_a_baseline_ref_removes_it_and_is_idempotent() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let tree = snapshot_tree(repo.path());
         let ref_name = baseline_ref_name("key");
         anchor_tree(repo.path(), &ref_name, &tree).expect("anchor");
 
         delete_ref(repo.path(), &ref_name).expect("delete");
         assert!(
-            git_stdout(repo.path(), &["rev-parse", "--verify", &ref_name])
-                .trim()
+            git_try(repo.path(), &["rev-parse", "--verify", &ref_name])
+                .stdout
                 .is_empty(),
             "the ref must really be gone"
         );
@@ -736,15 +712,15 @@ mod tests {
 
     #[test]
     fn a_ref_outside_the_review_namespace_is_refused_and_the_branch_survives() {
-        let repo = init_repo();
-        let head_before = git_stdout(repo.path(), &["rev-parse", "refs/heads/main"]);
+        let repo = seed_repo();
+        let head_before = git_output(repo.path(), &["rev-parse", "refs/heads/main"]);
 
         assert!(delete_ref(repo.path(), "refs/heads/main").is_err());
         assert!(anchor_tree(repo.path(), "refs/heads/main", &"0".repeat(40)).is_err());
         assert!(delete_ref(repo.path(), "refs/jerry/review/../../heads/main").is_err());
 
         assert_eq!(
-            git_stdout(repo.path(), &["rev-parse", "refs/heads/main"]),
+            git_output(repo.path(), &["rev-parse", "refs/heads/main"]),
             head_before,
             "the real branch must be completely untouched"
         );
@@ -769,7 +745,8 @@ mod tests {
 
     #[test]
     fn a_long_worktree_path_still_produces_a_usable_ref_name() {
-        let repo = init_repo();
+        let repo = seed_repo();
+        // A perfectly ordinary deep layout, well past the ~107-byte ceiling raw hex imposed.
         let long_key = format!(
             "/home/developer/Developer/some-organisation/{}/.worktrees/{}|Claude|1700000000",
             "a-reasonably-long-repository-name", "feature/a-descriptive-branch-name-here"
@@ -793,10 +770,7 @@ mod tests {
 
         let tree = snapshot_tree(repo.path());
         anchor_tree(repo.path(), &ref_name, &tree).expect("a long key must still anchor");
-        assert_eq!(
-            git_stdout(repo.path(), &["rev-parse", &ref_name]).trim(),
-            tree
-        );
+        assert_eq!(git_output(repo.path(), &["rev-parse", &ref_name]), tree);
         delete_ref(repo.path(), &ref_name).expect("and must still be deletable");
     }
 
@@ -810,7 +784,7 @@ mod tests {
 
     #[test]
     fn an_encoded_ref_name_is_accepted_by_real_git_check_ref_format() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let nasty = "/home/u/my repo/../wt~1^2:3?4*5[6\\7.lock|Claude|1700000000";
         let ref_name = baseline_ref_name(nasty);
 
@@ -827,15 +801,12 @@ mod tests {
 
         let tree = snapshot_tree(repo.path());
         anchor_tree(repo.path(), &ref_name, &tree).expect("anchor");
-        assert_eq!(
-            git_stdout(repo.path(), &["rev-parse", &ref_name]).trim(),
-            tree
-        );
+        assert_eq!(git_output(repo.path(), &["rev-parse", &ref_name]), tree);
     }
 
     #[test]
     fn a_tree_id_that_is_not_a_hex_object_id_is_refused_before_git_ever_runs() {
-        let repo = init_repo();
+        let repo = seed_repo();
         assert!(diff_against_tree(
             repo.path(),
             "--upload-pack=evil",
@@ -855,7 +826,7 @@ mod tests {
 
     #[test]
     fn snapshots_are_scoped_to_the_worktree_they_were_taken_in() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let other = repo.path().parent().expect("parent").join("linked-wt");
         git(
             repo.path(),

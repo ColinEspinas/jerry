@@ -61,28 +61,11 @@ pub fn list_worktree_files(worktree_path: &Path) -> Result<WorktreeFileList, Err
 mod tests {
     use super::*;
     use std::fs;
-    use std::process::Command;
-
-    fn git(dir: &Path, args: &[&str]) {
-        let status = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .status()
-            .expect("git runs");
-        assert!(status.success(), "git {args:?} failed");
-    }
-
-    fn init_repo() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().expect("tempdir");
-        git(dir.path(), &["init", "-q"]);
-        git(dir.path(), &["config", "user.email", "t@example.com"]);
-        git(dir.path(), &["config", "user.name", "Test"]);
-        dir
-    }
+    use test_support::{git, seed_empty_repo};
 
     #[test]
     fn lists_tracked_and_untracked_but_never_a_gitignored_build_directory() {
-        let dir = init_repo();
+        let dir = seed_empty_repo();
         let root = dir.path();
         fs::write(root.join(".gitignore"), "target/\n").expect("write");
         fs::create_dir_all(root.join("src")).expect("mkdir");
@@ -121,7 +104,7 @@ mod tests {
 
     #[test]
     fn an_explicitly_tracked_file_stays_listed_even_under_a_later_ignore_rule() {
-        let dir = init_repo();
+        let dir = seed_empty_repo();
         let root = dir.path();
         fs::create_dir_all(root.join("generated")).expect("mkdir");
         fs::write(root.join("generated/schema.rs"), "// generated\n").expect("write");

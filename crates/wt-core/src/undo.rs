@@ -626,47 +626,7 @@ mod tests {
     use std::path::PathBuf;
     use std::process::Command;
     use tempfile::TempDir;
-
-    fn git(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn git_output(dir: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(output.status.success(), "git {args:?} failed in {dir:?}");
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
-    }
-
-    fn init_repo_at(dir: &Path) {
-        git(dir, &["init", "-b", "main"]);
-        git(dir, &["config", "user.email", "test@example.com"]);
-        git(dir, &["config", "user.name", "Test User"]);
-        fs::write(dir.join("file.txt"), "hello\n").expect("write file");
-        git(dir, &["add", "file.txt"]);
-        git(dir, &["commit", "-m", "initial commit"]);
-    }
-
-    fn init_repo() -> TempDir {
-        let dir = TempDir::new().expect("tempdir");
-        init_repo_at(dir.path());
-        dir
-    }
+    use test_support::{git, git_output, seed_repo, seed_repo_at};
 
     /// A session worktree on branch `name`, checked out from `main`'s tip.
     fn add_session_worktree(repo: &Path, path: &Path, branch: &str) {
@@ -686,7 +646,7 @@ mod tests {
 
     #[test]
     fn commit_all_changes_stages_and_commits_modified_new_and_deleted_files() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("file.txt"), "changed\n").expect("modify");
         fs::write(repo.path().join("new.txt"), "new\n").expect("new file");
         fs::write(repo.path().join("to-delete.txt"), "bye\n").expect("write");
@@ -718,7 +678,7 @@ mod tests {
 
     #[test]
     fn commit_all_changes_refuses_on_a_clean_worktree() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let err = commit_all_changes(repo.path(), "nothing to do").unwrap_err();
         assert!(matches!(err, Error::NothingToCommit { .. }));
     }
@@ -727,7 +687,7 @@ mod tests {
 
     #[test]
     fn commit_paths_commits_only_the_given_paths_leaving_other_changes_uncommitted() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("file.txt"), "changed\n").expect("modify");
         fs::write(repo.path().join("untouched.txt"), "not staged\n").expect("new file");
 
@@ -756,7 +716,7 @@ mod tests {
 
     #[test]
     fn commit_paths_never_commits_a_path_that_was_staged_by_something_else() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("file.txt"), "changed\n").expect("modify");
         fs::write(repo.path().join("also-staged.txt"), "staged elsewhere\n")
             .expect("write also-staged.txt");
@@ -787,7 +747,7 @@ mod tests {
 
     #[test]
     fn commit_paths_refuses_an_empty_path_list() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("file.txt"), "changed\n").expect("modify");
         let err = commit_paths(repo.path(), &[], "nothing selected").unwrap_err();
         assert!(matches!(err, Error::NothingToCommit { .. }));
@@ -799,7 +759,7 @@ mod tests {
 
     #[test]
     fn commit_paths_real_message_becomes_the_real_commit_message() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("file.txt"), "changed\n").expect("modify");
         commit_paths(
             repo.path(),
@@ -813,7 +773,7 @@ mod tests {
 
     #[test]
     fn undo_commit_all_changes_restores_the_exact_pre_commit_uncommitted_state() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("file.txt"), "changed\n").expect("modify");
         fs::write(repo.path().join("new.txt"), "new\n").expect("new file");
         let outcome =
@@ -841,7 +801,7 @@ mod tests {
 
     #[test]
     fn undo_commit_all_changes_refuses_when_head_moved_since() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("file.txt"), "changed\n").expect("modify");
         let outcome =
             commit_all_changes(repo.path(), "ade: keep all changes").expect("commit_all_changes");
@@ -860,7 +820,7 @@ mod tests {
 
     #[test]
     fn redo_commit_all_changes_moves_head_forward_again_to_the_exact_same_commit() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("file.txt"), "changed\n").expect("modify");
         let outcome =
             commit_all_changes(repo.path(), "ade: keep all changes").expect("commit_all_changes");
@@ -884,7 +844,7 @@ mod tests {
 
     #[test]
     fn redo_commit_all_changes_refuses_when_head_moved_since_the_undo() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("file.txt"), "changed\n").expect("modify");
         let outcome =
             commit_all_changes(repo.path(), "ade: keep all changes").expect("commit_all_changes");
@@ -908,9 +868,15 @@ mod tests {
         // `A <- B <- C`, `parent` records `A`, and the `HEAD == outcome.commit` guard cannot see
         // it - `HEAD` really is `C` - so the undo resets to `A` and discards `B`.
         //
-        // The race itself is not reproducible against a sequential blocking call, so this pins
-        // the invariant instead: an interleaved commit lands first, and `parent` must record it.
-        let repo = init_repo();
+        // This can't be reproduced by literally racing a second thread against
+        // `commit_all_changes` (it's a single, sequential blocking call), but the fix is
+        // structural: `parent` must always be derived from the real commit's own immutable
+        // parent (`<commit>^`), never from a pre-commit snapshot. This test proves that
+        // invariant directly: a real second commit interleaves *before* `commit_all_changes`
+        // ever runs (standing in for the vulnerable window an earlier implementation had), and
+        // `commit_all_changes`'s own recorded `parent` must be that real interleaved commit, not
+        // the one further back - and undoing must preserve it, never silently drop it.
+        let repo = seed_repo();
         let commit_a = git_output(repo.path(), &["rev-parse", "HEAD"]);
 
         fs::write(
@@ -985,7 +951,7 @@ mod tests {
 
     #[test]
     fn discard_worktree_snapshots_a_dirty_worktree_then_removes_it() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let wt_path = repo.path().join("session-a");
         add_session_worktree(repo.path(), &wt_path, "session-a");
         fs::write(wt_path.join("scratch.txt"), "wip\n").expect("write untracked file");
@@ -1007,7 +973,7 @@ mod tests {
 
     #[test]
     fn discard_worktree_on_a_clean_worktree_records_no_stash() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let wt_path = repo.path().join("session-clean");
         add_session_worktree(repo.path(), &wt_path, "session-clean");
 
@@ -1022,9 +988,11 @@ mod tests {
 
     #[test]
     fn a_stash_created_and_stored_from_a_worktree_survives_that_worktrees_own_removal() {
-        // `refs/stash` lives in the repository's shared refs, not the worktree's private files,
-        // so it survives - and stays appliable - after that worktree is gone.
-        let repo = init_repo();
+        // Direct, empirical verification of this module's own core claim (see its module docs):
+        // `refs/stash` (which `git stash push` moves) lives in the *repository's* shared refs,
+        // not inside the worktree's own private files, so it is genuinely still there - and
+        // still `git stash apply`-able - after the worktree that created it is gone.
+        let repo = seed_repo();
         let wt_path = repo.path().join("session-b");
         add_session_worktree(repo.path(), &wt_path, "session-b");
         fs::write(wt_path.join("scratch.txt"), "real content\n").expect("write");
@@ -1042,7 +1010,7 @@ mod tests {
 
     #[test]
     fn undo_discard_worktree_recreates_the_worktree_and_restores_the_real_stash_content() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let wt_path = repo.path().join("session-c");
         add_session_worktree(repo.path(), &wt_path, "session-c");
         fs::write(wt_path.join("scratch.txt"), "wip content\n").expect("write");
@@ -1068,7 +1036,7 @@ mod tests {
 
     #[test]
     fn undo_discard_worktree_on_a_clean_snapshot_just_recreates_the_worktree() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let wt_path = repo.path().join("session-clean2");
         add_session_worktree(repo.path(), &wt_path, "session-clean2");
         let snapshot = discard_worktree(repo.path(), &wt_path).expect("discard_worktree");
@@ -1086,7 +1054,7 @@ mod tests {
 
     #[test]
     fn undo_discard_worktree_refuses_when_the_path_was_reoccupied() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let wt_path = repo.path().join("session-d");
         add_session_worktree(repo.path(), &wt_path, "session-d");
         let snapshot = discard_worktree(repo.path(), &wt_path).expect("discard_worktree");
@@ -1099,7 +1067,7 @@ mod tests {
 
     #[test]
     fn undo_discard_worktree_refuses_when_the_branch_moved_since() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let wt_path = repo.path().join("session-e");
         add_session_worktree(repo.path(), &wt_path, "session-e");
         let snapshot = discard_worktree(repo.path(), &wt_path).expect("discard_worktree");
@@ -1128,7 +1096,7 @@ mod tests {
 
     #[test]
     fn undo_discard_worktree_refuses_when_the_branch_was_deleted() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let wt_path = repo.path().join("session-f");
         add_session_worktree(repo.path(), &wt_path, "session-f");
         let snapshot = discard_worktree(repo.path(), &wt_path).expect("discard_worktree");
@@ -1141,7 +1109,7 @@ mod tests {
 
     #[test]
     fn undo_discard_worktree_refuses_when_the_branch_is_checked_out_elsewhere_already() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let wt_path = repo.path().join("session-g");
         add_session_worktree(repo.path(), &wt_path, "session-g");
         let snapshot = discard_worktree(repo.path(), &wt_path).expect("discard_worktree");
@@ -1174,11 +1142,15 @@ mod tests {
         // The undo's identity guard makes a conflict essentially unreachable through the full
         // flow, but `apply_stash` must still handle one rather than assume its caller's guard.
         //
-        // An *uncommitted* conflicting edit is the wrong setup: `git stash apply` refuses
-        // outright ("local changes would be overwritten") without attempting a merge, which is a
-        // non-restore failure and belongs in `Err`. Producing real markers needs a clean working
-        // tree with `HEAD` moved - a committed change to the line the stash diverges from.
-        let repo = init_repo();
+        // An earlier version of this test used a real *uncommitted* conflicting edit to trigger
+        // this - live-reproduced as the wrong scenario during an audit: `git stash apply`
+        // refuses outright ("Your local changes ... would be overwritten by merge") rather than
+        // attempting a merge at all when the working tree already has uncommitted changes to the
+        // same file, which is a real *non-restore failure* (case for a genuine `Err`, not
+        // `RestoredWithConflicts` - nothing was restored), not a real conflict. A genuine
+        // conflict-with-markers instead needs the working tree *clean* but `HEAD` moved: a new,
+        // real *committed* change to the same line the stash's own base diverges from.
+        let repo = seed_repo();
         fs::write(repo.path().join("file.txt"), "stash content\n").expect("edit for stash");
         let stash = push_and_capture_stash(repo.path()).expect("push_and_capture_stash");
         assert_eq!(
@@ -1223,7 +1195,7 @@ mod tests {
         // working tree already has real uncommitted changes to the same file - this must
         // surface as a genuine `Err`, not `RestoredWithConflicts` (which would falsely claim
         // something was restored).
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("file.txt"), "stash content\n").expect("edit for stash");
         let stash = push_and_capture_stash(repo.path()).expect("push_and_capture_stash");
 
@@ -1244,7 +1216,7 @@ mod tests {
 
     #[test]
     fn apply_stash_reports_a_real_error_for_a_stash_id_that_no_longer_exists() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let fake_stash = "0000000000000000000000000000000000000000";
         let err = apply_stash(repo.path(), fake_stash).unwrap_err();
         assert!(matches!(err, Error::GitCommand { .. }));
@@ -1254,7 +1226,7 @@ mod tests {
 
     #[test]
     fn discard_worktree_refuses_the_main_worktree_and_touches_nothing() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("wip.txt"), "real uncommitted work\n").expect("write");
 
         let err = discard_worktree(repo.path(), repo.path()).unwrap_err();
@@ -1274,7 +1246,7 @@ mod tests {
 
     #[test]
     fn discard_worktree_reports_ignored_content_honestly() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let wt_path = repo.path().join("session-h");
         add_session_worktree(repo.path(), &wt_path, "session-h");
         fs::write(wt_path.join(".gitignore"), "ignored.txt\n").expect("write");
@@ -1297,7 +1269,7 @@ mod tests {
 
     #[test]
     fn discard_worktree_reports_no_ignored_content_when_there_is_none() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let wt_path = repo.path().join("session-i");
         add_session_worktree(repo.path(), &wt_path, "session-i");
         fs::write(wt_path.join("scratch.txt"), "wip\n").expect("write");
@@ -1319,10 +1291,10 @@ mod tests {
         // sha back as if it were this worktree's own snapshot, then proceed to force-remove the
         // real worktree believing its content was captured. This must instead refuse outright,
         // before anything real is destroyed.
-        let repo = init_repo();
+        let repo = seed_repo();
 
         let sub_dir = TempDir::new().expect("tempdir for submodule");
-        init_repo_at(sub_dir.path());
+        seed_repo_at(sub_dir.path());
         let sub_url = format!("file://{}", sub_dir.path().display());
         git(
             repo.path(),
@@ -1420,7 +1392,7 @@ mod tests {
         // directory itself.
         use std::os::unix::fs::PermissionsExt;
 
-        let repo = init_repo();
+        let repo = seed_repo();
         let container = TempDir::new().expect("tempdir");
         let wt_path = container.path().join("session-j");
         git(
@@ -1464,7 +1436,7 @@ mod tests {
     /// A branch whose tip commit is amendable, with a second path staged alongside - the exact
     /// interleaving `amend_head_with_paths`' `--only` exists to keep out of the amend.
     fn repo_with_an_amendable_tip() -> TempDir {
-        let repo = init_repo();
+        let repo = seed_repo();
         git(repo.path(), &["checkout", "-b", "feature"]);
         fs::write(repo.path().join("a.txt"), "a1\n").expect("write a");
         fs::write(repo.path().join("b.txt"), "b1\n").expect("write b");

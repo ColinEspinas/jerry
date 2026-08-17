@@ -1217,6 +1217,10 @@ mod tests {
         );
     }
 
+    /// Save then load has to be the identity on every field a user can change - a field that
+    /// silently reverts to its default on the next launch is not a real setting. Asserted as a
+    /// whole-value equality rather than field by field, so a newly added field is covered here
+    /// the moment it is mutated below.
     #[test]
     fn a_settings_value_round_trips_through_real_toml_save_and_load() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1226,6 +1230,10 @@ mod tests {
         settings.window.controls = WindowControlsStyle::MacosStyle;
         settings.appearance.interface_scale_percent = 125;
         settings.appearance.editor_font_size = 15.5;
+        assert!(
+            settings.appearance.show_indent_guides,
+            "premise: the real default is guides on, so `false` below is a real change"
+        );
         settings.appearance.show_indent_guides = false;
         settings.theme.name = "Slate".to_string();
         settings.theme.high_contrast_diff = true;
@@ -1234,25 +1242,6 @@ mod tests {
         let loaded = Settings::load_or_init_at(&path);
 
         assert_eq!(settings, loaded);
-    }
-
-    #[test]
-    fn show_indent_guides_round_trips_through_real_toml_save_and_load() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("settings.toml");
-
-        assert!(
-            Settings::default().appearance.show_indent_guides,
-            "sanity check: the real default is guides on"
-        );
-
-        let mut settings = Settings::default();
-        settings.appearance.show_indent_guides = false;
-        settings.save_at(&path).expect("save should succeed");
-        let loaded = Settings::load_or_init_at(&path);
-
-        assert_eq!(settings, loaded);
-        assert!(!loaded.appearance.show_indent_guides);
     }
 
     #[test]

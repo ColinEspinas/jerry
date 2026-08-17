@@ -794,30 +794,7 @@ mod tests {
     use std::fs;
     use std::process::Command;
     use tempfile::TempDir;
-
-    fn git(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn init_repo() -> TempDir {
-        let dir = TempDir::new().expect("tempdir");
-        git(dir.path(), &["init", "-b", "main"]);
-        git(dir.path(), &["config", "user.email", "test@example.com"]);
-        git(dir.path(), &["config", "user.name", "Test User"]);
-        dir
-    }
+    use test_support::{git, git_output, seed_empty_repo};
 
     fn commit(dir: &Path, file: &str, contents: &str, message: &str) {
         fs::write(dir.join(file), contents).expect("write file");
@@ -864,7 +841,7 @@ mod tests {
 
     #[test]
     fn resolve_commit_reports_a_branchs_real_tip_in_both_forms() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit(repo.path(), "a.txt", "base", "base");
         git(repo.path(), &["checkout", "-b", "feature"]);
         commit(repo.path(), "b.txt", "feature", "feature work");
@@ -894,7 +871,7 @@ mod tests {
 
     #[test]
     fn resolve_commit_refuses_to_fabricate_a_commit_for_a_branch_that_does_not_exist() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit(repo.path(), "a.txt", "base", "base");
 
         let err = resolve_commit(repo.path(), "no-such-branch").expect_err(
@@ -911,7 +888,7 @@ mod tests {
 
     #[test]
     fn resolve_commit_treats_a_flag_shaped_branch_name_as_an_ordinary_ref_lookup() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit(repo.path(), "a.txt", "base", "base");
 
         let err = resolve_commit(repo.path(), "--evil").expect_err(
@@ -1226,7 +1203,7 @@ mod tests {
 
     #[test]
     fn build_graph_walks_linear_history_newest_first() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit(repo.path(), "a.txt", "1", "first");
         commit(repo.path(), "a.txt", "2", "second");
         commit(repo.path(), "a.txt", "3", "third");
@@ -1244,7 +1221,7 @@ mod tests {
 
     #[test]
     fn build_graph_reports_a_real_merge_commit_and_branch_chip() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit_at(repo.path(), "a.txt", "1", "base", 1_700_000_000);
         git(repo.path(), &["checkout", "-b", "feature"]);
         commit_at(repo.path(), "b.txt", "1", "feature work", 1_700_000_100);
@@ -1288,7 +1265,7 @@ mod tests {
         // rendered as a plain `Head` dot instead. `HEAD` is already shown separately and
         // unambiguously via the branch's own ref-chip styling, so prioritizing `Merge` here
         // loses no real information.
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit_at(repo.path(), "a.txt", "1", "base", 1_700_000_000);
         git(repo.path(), &["checkout", "-b", "feature"]);
         commit_at(repo.path(), "b.txt", "1", "feature work", 1_700_000_100);
@@ -1317,7 +1294,7 @@ mod tests {
 
     #[test]
     fn build_graph_current_scope_is_first_parent_only() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit_at(repo.path(), "a.txt", "1", "base", 1_700_000_000);
         git(repo.path(), &["checkout", "-b", "feature"]);
         commit_at(repo.path(), "b.txt", "1", "feature work", 1_700_000_100);
@@ -1341,7 +1318,7 @@ mod tests {
 
     #[test]
     fn build_graph_ref_chips_reflect_real_branches() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit(repo.path(), "a.txt", "1", "base");
         git(repo.path(), &["branch", "topic"]);
 
@@ -1367,14 +1344,14 @@ mod tests {
 
     #[test]
     fn build_graph_on_empty_repo_returns_no_rows() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         let graph = build_graph(repo.path(), GraphScope::All, 0).expect("build_graph");
         assert!(graph.rows.is_empty());
     }
 
     #[test]
     fn build_graph_worktrees_scope_is_limited_to_checked_out_branches() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit(repo.path(), "a.txt", "1", "base");
         git(repo.path(), &["checkout", "-b", "no-worktree-branch"]);
         commit(repo.path(), "b.txt", "1", "only on no-worktree-branch");
@@ -1393,7 +1370,7 @@ mod tests {
 
     #[test]
     fn ahead_behind_against_upstream_is_none_without_a_configured_upstream() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit(repo.path(), "a.txt", "1", "base");
         let result =
             ahead_behind_against_upstream(repo.path()).expect("ahead_behind_against_upstream");
@@ -1402,7 +1379,7 @@ mod tests {
 
     #[test]
     fn ahead_behind_against_upstream_counts_real_divergence() {
-        let remote = init_repo();
+        let remote = seed_empty_repo();
         commit(remote.path(), "a.txt", "1", "base");
 
         let local_dir = TempDir::new().expect("tempdir");
@@ -1426,7 +1403,7 @@ mod tests {
 
     #[test]
     fn commits_already_on_upstream_is_none_without_a_configured_upstream() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit(repo.path(), "a.txt", "1", "base");
         let head = git_output(repo.path(), &["rev-parse", "HEAD"]);
         let result =
@@ -1436,7 +1413,7 @@ mod tests {
 
     #[test]
     fn commits_already_on_upstream_distinguishes_pushed_from_local_only_commits() {
-        let remote = init_repo();
+        let remote = seed_empty_repo();
         commit(remote.path(), "a.txt", "1", "base");
 
         let local_dir = TempDir::new().expect("tempdir");
@@ -1466,16 +1443,6 @@ mod tests {
         assert!(!result.contains(&local_only));
     }
 
-    fn git_output(dir: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(output.status.success(), "git {args:?} failed in {dir:?}");
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
-    }
-
     #[test]
     fn build_graph_row_order_is_stable_even_with_tied_commit_timestamps() {
         // Regression test for a real failure mode found while building this module: with
@@ -1484,7 +1451,7 @@ mod tests {
         // timestamp. The old time-sorted walk could then hand back a parent before one of its
         // own children; the topological walk must instead keep the order sound (and
         // `layout_lanes`'s defense-in-depth must keep even unsound input from panicking).
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit(repo.path(), "a.txt", "1", "base");
         git(repo.path(), &["checkout", "-b", "feature"]);
         commit(repo.path(), "b.txt", "1", "feature work");
@@ -1514,7 +1481,7 @@ mod tests {
 
     #[test]
     fn graph_walk_is_prefix_stable_across_caps() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit_at(repo.path(), "a.txt", "1", "base", 1_700_000_000);
         git(repo.path(), &["checkout", "-b", "feature"]);
         commit_at(repo.path(), "b.txt", "1", "feature 1", 1_700_000_100);
@@ -1609,7 +1576,7 @@ mod tests {
 
     #[test]
     fn a_clock_skewed_branch_still_connects_to_its_parent() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit_at(repo.path(), "a.txt", "1", "base", 1_700_000_300);
         git(repo.path(), &["branch", "skewed"]);
         commit_at(repo.path(), "a.txt", "2", "main 1", 1_700_000_400);
@@ -1648,7 +1615,7 @@ mod tests {
 
     #[test]
     fn same_second_parent_child_pairs_stay_topologically_ordered() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         let t = 1_700_000_000;
         commit_at(repo.path(), "a.txt", "1", "base", t);
         git(repo.path(), &["checkout", "-b", "side"]);
@@ -1667,7 +1634,7 @@ mod tests {
 
     #[test]
     fn graph_walk_prefix_stays_stable_across_caps_on_a_skewed_history() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit_at(repo.path(), "a.txt", "1", "base", 1_700_000_300);
         git(repo.path(), &["branch", "skewed"]);
         commit_at(repo.path(), "a.txt", "2", "main 1", 1_700_000_400);
@@ -1692,7 +1659,7 @@ mod tests {
 
     #[test]
     fn commit_changed_files_reports_real_add_modify_delete() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit(repo.path(), "a.txt", "1", "first");
         fs::write(repo.path().join("a.txt"), "2").expect("write");
         fs::write(repo.path().join("b.txt"), "new").expect("write");
@@ -1733,7 +1700,7 @@ mod tests {
 
     #[test]
     fn commit_changed_files_rejects_a_non_hex_commit_id() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit(repo.path(), "a.txt", "1", "first");
         let err = commit_changed_files(repo.path(), "not-a-sha; rm -rf /")
             .expect_err("must reject a non-hex commit id");
@@ -1742,7 +1709,7 @@ mod tests {
 
     #[test]
     fn commit_changed_files_on_a_merge_is_honestly_empty() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit_at(repo.path(), "a.txt", "1", "base", 1_700_000_000);
         git(repo.path(), &["checkout", "-b", "feature"]);
         commit_at(repo.path(), "b.txt", "1", "feature work", 1_700_000_100);

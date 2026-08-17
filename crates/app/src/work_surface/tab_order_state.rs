@@ -407,6 +407,12 @@ mod tests {
             state.worktrees.is_empty(),
             "closing every file tab must not leave an empty entry behind forever"
         );
+
+        // A session whose every entry is unrecordable (outside the root) encodes to nothing, and
+        // must be forgotten the same way an explicitly empty one is.
+        state.set_session_tabs(root, &file_session(&[root.join("a.rs")]));
+        state.set_session_tabs(root, &file_session(&[PathBuf::from("/etc/passwd")]));
+        assert!(state.worktrees.is_empty());
     }
 
     #[test]
@@ -446,7 +452,7 @@ mod tests {
 
     #[test]
     fn saving_and_reloading_round_trips_through_a_real_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::temp_root();
         let path = dir.path().join("tab-order.toml");
         let root = Path::new("/repo/worktree-a");
 
@@ -464,7 +470,7 @@ mod tests {
 
     #[test]
     fn saving_merges_with_another_instances_entries_instead_of_erasing_them() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::temp_root();
         let path = dir.path().join("tab-order.toml");
         let a = Path::new("/repo/worktree-a");
         let b = Path::new("/repo/worktree-b");
@@ -488,42 +494,24 @@ mod tests {
         assert_eq!(on_disk.file_order(b), vec![b.join("b.rs")]);
     }
 
+    /// Neither a file that is not there nor one that is not valid TOML may fail the load - a
+    /// hand-edited or half-written `tab-order.toml` degrades to the empty state.
     #[test]
-    fn a_missing_file_loads_as_empty_state_rather_than_failing() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state = TabOrderState::load_at(&dir.path().join("does-not-exist.toml"));
-        assert_eq!(state, TabOrderState::default());
-    }
+    fn a_missing_or_corrupted_file_loads_as_empty_state_rather_than_failing() {
+        let dir = crate::test_support::temp_root();
+        assert_eq!(
+            TabOrderState::load_at(&dir.path().join("does-not-exist.toml")),
+            TabOrderState::default()
+        );
 
-    #[test]
-    fn a_corrupted_file_loads_as_empty_state_rather_than_failing() {
-        let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("tab-order.toml");
         std::fs::write(&path, "this is not valid toml {{{").expect("write");
         assert_eq!(TabOrderState::load_at(&path), TabOrderState::default());
     }
 
     #[test]
-    fn a_traversal_entry_in_a_hand_edited_file_is_ignored() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("tab-order.toml");
-        std::fs::write(
-            &path,
-            "[worktrees.\"/repo/worktree-a\"]\nfiles = [\"../worktree-b/secret.rs\", \"src/main.rs\"]\n",
-        )
-        .expect("write");
-
-        let state = TabOrderState::load_at(&path);
-        assert_eq!(
-            state.file_order(Path::new("/repo/worktree-a")),
-            vec![PathBuf::from("/repo/worktree-a/src/main.rs")],
-            "the `..` entry must be silently dropped, and the good one kept"
-        );
-    }
-
-    #[test]
     fn saving_leaves_no_temp_file_behind_and_the_result_parses() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::temp_root();
         let path = dir.path().join("nested").join("tab-order.toml");
         let root = Path::new("/repo/worktree-a");
         let mut state = TabOrderState::default();
@@ -547,7 +535,7 @@ mod tests {
 
     #[test]
     fn a_mixed_session_round_trips_through_a_real_file_with_its_order_intact() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::temp_root();
         let path = dir.path().join("tab-order.toml");
         let root = Path::new("/repo/worktree-a");
         let session = vec![
@@ -617,7 +605,7 @@ mod tests {
 
     #[test]
     fn a_file_written_before_sessions_existed_still_restores_its_file_tabs() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::temp_root();
         let path = dir.path().join("tab-order.toml");
         std::fs::write(
             &path,
@@ -637,7 +625,7 @@ mod tests {
 
     #[test]
     fn an_unrecognised_record_is_skipped_without_losing_the_real_tabs_around_it() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::temp_root();
         let path = dir.path().join("tab-order.toml");
         std::fs::write(
             &path,
@@ -665,7 +653,7 @@ mod tests {
 
     #[test]
     fn a_traversal_session_entry_in_a_hand_edited_file_is_ignored() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::temp_root();
         let path = dir.path().join("tab-order.toml");
         std::fs::write(
             &path,
@@ -686,14 +674,16 @@ mod tests {
                 "/repo/worktree-a/src/main.rs"
             ))],
         );
-    }
 
-    #[test]
-    fn a_session_that_encodes_to_nothing_forgets_the_worktree() {
-        let root = Path::new("/repo/worktree-a");
-        let mut state = TabOrderState::default();
-        state.set_session_tabs(root, &file_session(&[root.join("a.rs")]));
-        state.set_session_tabs(root, &file_session(&[PathBuf::from("/etc/passwd")]));
-        assert!(state.worktrees.is_empty());
+        std::fs::write(
+            &path,
+            "[worktrees.\"/repo/worktree-a\"]\nfiles = [\"../worktree-b/secret.rs\", \"src/main.rs\"]\n",
+        )
+        .expect("write");
+        assert_eq!(
+            TabOrderState::load_at(&path).file_order(Path::new("/repo/worktree-a")),
+            vec![PathBuf::from("/repo/worktree-a/src/main.rs")],
+            "the legacy `files` list drops its `..` entry and keeps the good one too"
+        );
     }
 }

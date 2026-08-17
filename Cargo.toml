@@ -5,6 +5,9 @@ members = [
     "crates/pty-core",
     "crates/lsp-core",
     "crates/app",
+    # Dev-dependency only, and deliberately gpui-free so the core crates can use it too
+    # (docs/architecture/decisions.md §1, docs/testing.md).
+    "crates/test-support",
 ]
 
 [workspace.package]

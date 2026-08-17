@@ -23,7 +23,12 @@ pub fn spawn_file_tree_watcher(
         return None;
     }
     wt_core::git_common_dir(worktree_root).ok()?;
-    let git_dir: PathBuf = worktree_root.join(".git");
+    // The OS reports every event path resolved (macOS `FSEvents` hands back `/private/var/...` for
+    // a watch armed on `/var/...`), so a `.git` prefix built from an unresolved root would match
+    // nothing and every one of git's own internal writes would mark the tree dirty.
+    let resolved =
+        std::fs::canonicalize(worktree_root).unwrap_or_else(|_| worktree_root.to_path_buf());
+    let git_dir: PathBuf = resolved.join(".git");
 
     let mut watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
         let Ok(event) = result else {
@@ -45,123 +50,63 @@ pub fn spawn_file_tree_watcher(
 }
 
 #[cfg(test)]
-mod tests {
+mod file_tree_watcher_tests {
     use super::*;
     use std::fs;
-    use std::process::Command;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     use tempfile::TempDir;
+    use test_support::{git, seed_repo, stays_false, wait_until};
 
-    fn git(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}",
-            args,
-            dir
-        );
-    }
-
-    /// A real git repository - see [`spawn_file_tree_watcher`]'s own docs on why its
-    /// `wt_core::git_common_dir` gate means every one of this module's tests needs a real repo,
-    /// not just a plain temp directory.
-    fn init_repo() -> TempDir {
-        let dir = TempDir::new().expect("tempdir");
-        git(dir.path(), &["init", "-b", "main"]);
-        git(dir.path(), &["config", "user.email", "test@example.com"]);
-        git(dir.path(), &["config", "user.name", "Test User"]);
-        fs::write(dir.path().join("base.txt"), "base\n").expect("write");
-        git(dir.path(), &["add", "base.txt"]);
-        git(dir.path(), &["commit", "-m", "initial"]);
-        dir
-    }
-
-    /// Real-time bounded wait for the watcher's async, OS-thread-delivered callback to fire - see
-    /// `crate::rail::worktree_watch::tests::wait_until_dirty`'s identical own docs for why this
-    /// can't be a simulated/deterministic clock.
+    /// The watcher's callback is delivered by an OS thread, not by a GPUI executor, so there is
+    /// no deterministic clock to park - a real-time bounded wait is the only option.
     fn wait_until_dirty(dirty: &DirtyFlag) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline {
-            if dirty.swap(false, Ordering::SeqCst) {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        false
+        wait_until(Duration::from_secs(3), || {
+            dirty.swap(false, Ordering::SeqCst)
+        })
     }
 
-    /// The inverse of [`wait_until_dirty`]: asserts the flag stays clear for a real, bounded
-    /// window - used to prove `.git/` churn is genuinely filtered out, not just "usually" missed
-    /// by a race.
+    /// The inverse of [`wait_until_dirty`]: proves `.git/` churn is genuinely filtered out
+    /// rather than just slow to arrive.
     fn assert_stays_clean(dirty: &DirtyFlag) {
-        std::thread::sleep(Duration::from_millis(500));
         assert!(
-            !dirty.load(Ordering::SeqCst),
+            stays_false(Duration::from_millis(500), || dirty.load(Ordering::SeqCst)),
             "a change confined to .git/ must never mark the file tree dirty"
         );
     }
 
+    /// Creation, a nested edit and a deletion are the three real working-tree changes the Files
+    /// tab has to notice, and one recursive watch is what notices all three - so they are one
+    /// test over one watcher rather than three that differ only in which `fs` call they make.
     #[test]
-    fn a_real_new_file_is_noticed() {
-        let dir = init_repo();
-        let dirty: DirtyFlag = Arc::new(AtomicBool::new(false));
-        let _watcher =
-            spawn_file_tree_watcher(dir.path(), dirty.clone()).expect("spawn_file_tree_watcher");
-
-        fs::write(dir.path().join("new.txt"), "content").expect("write");
-
-        assert!(
-            wait_until_dirty(&dirty),
-            "creating a real file must be observed within the real-time budget"
-        );
-    }
-
-    #[test]
-    fn a_real_file_edit_in_a_nested_directory_is_noticed() {
-        let dir = init_repo();
+    fn every_real_working_tree_change_marks_the_tree_dirty() {
+        let dir = seed_repo();
         fs::create_dir_all(dir.path().join("src/nested")).expect("mkdir");
-        let file = dir.path().join("src/nested/a.rs");
-        fs::write(&file, "fn main() {}").expect("write");
+        let nested = dir.path().join("src/nested/a.rs");
+        fs::write(&nested, "fn main() {}").expect("write");
 
         let dirty: DirtyFlag = Arc::new(AtomicBool::new(false));
         let _watcher =
             spawn_file_tree_watcher(dir.path(), dirty.clone()).expect("spawn_file_tree_watcher");
 
-        fs::write(&file, "fn main() { println!(\"hi\"); }").expect("write");
+        let created = dir.path().join("new.txt");
+        fs::write(&created, "content").expect("write");
+        assert!(wait_until_dirty(&dirty), "a created file must be observed");
 
+        fs::write(&nested, "fn main() { println!(\"hi\"); }").expect("write");
         assert!(
             wait_until_dirty(&dirty),
-            "editing a real file nested several directories deep must be observed"
+            "an edit several directories deep must be observed - the watch is recursive"
         );
-    }
 
-    #[test]
-    fn a_real_deletion_is_noticed() {
-        let dir = init_repo();
-        let file = dir.path().join("gone.txt");
-        fs::write(&file, "content").expect("write");
-
-        let dirty: DirtyFlag = Arc::new(AtomicBool::new(false));
-        let _watcher =
-            spawn_file_tree_watcher(dir.path(), dirty.clone()).expect("spawn_file_tree_watcher");
-
-        fs::remove_file(&file).expect("remove");
-
-        assert!(
-            wait_until_dirty(&dirty),
-            "deleting a real file must be observed"
-        );
+        fs::remove_file(&created).expect("remove");
+        assert!(wait_until_dirty(&dirty), "a deletion must be observed");
     }
 
     #[test]
     fn a_change_confined_to_dot_git_is_filtered_out() {
-        let dir = init_repo();
+        let dir = seed_repo();
 
         let dirty: DirtyFlag = Arc::new(AtomicBool::new(false));
         let _watcher =
@@ -178,7 +123,7 @@ mod tests {
 
     #[test]
     fn a_real_change_alongside_dot_git_churn_is_still_noticed() {
-        let dir = init_repo();
+        let dir = seed_repo();
 
         let dirty: DirtyFlag = Arc::new(AtomicBool::new(false));
         let _watcher =
@@ -195,7 +140,7 @@ mod tests {
 
     #[test]
     fn a_missing_directory_yields_no_watcher_rather_than_panicking() {
-        let dir = init_repo();
+        let dir = seed_repo();
         let missing = dir.path().join("does-not-exist");
         let dirty: DirtyFlag = Arc::new(AtomicBool::new(false));
         assert!(spawn_file_tree_watcher(&missing, dirty).is_none());

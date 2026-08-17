@@ -851,13 +851,12 @@ mod tests {
         assert!(!directory.exists(), "the launch directory must be removed");
     }
 
+    /// `#[cfg(unix)]`: the whole body is a real `/bin/sh` run of the generated forwarder.
+    #[cfg(unix)]
     #[test]
     fn the_forwarder_no_ops_without_jerry_env_vars_and_never_reports_failure() {
         // The property that makes the generated command safe to run outside Jerry (see the module
         // docs). Run the real script, with a real JSON payload on stdin, with no JERRY_* set.
-        if !cfg!(unix) {
-            return;
-        }
         let temp = tempfile::tempdir().expect("temp dir");
         let files = HookFiles::write_in(temp.path()).expect("must write");
         let forwarder = files.settings_path().with_file_name(FORWARDER_NAME);
@@ -882,13 +881,12 @@ mod tests {
         );
     }
 
+    /// `#[cfg(unix)]`: as above, the body is a real `/bin/sh` run.
+    #[cfg(unix)]
     #[test]
     fn the_forwarder_exits_zero_even_when_the_listener_is_dead() {
         // A hook that exits non-zero blocks the agent's tool call. Jerry having quit must never
         // do that, so this points the forwarder at a port nothing is listening on.
-        if !cfg!(unix) {
-            return;
-        }
         let temp = tempfile::tempdir().expect("temp dir");
         let files = HookFiles::write_in(temp.path()).expect("must write");
         let forwarder = files.settings_path().with_file_name(FORWARDER_NAME);
@@ -961,7 +959,9 @@ mod tests {
             assert!(command.starts_with('\''), "got {command:?}");
         }
 
-        if cfg!(unix) {
+        #[cfg(unix)]
+        {
+            // Run the generated command string through a real shell to prove it resolves.
             let output = std::process::Command::new("/bin/sh")
                 .arg("-c")
                 .arg(command)
@@ -1200,12 +1200,17 @@ mod tests {
         }
     }
 
+    /// `#[cfg(unix)]` on a test about the *Windows* command string is not a mistake: the claim
+    /// under test is that that string is *also* a valid Git Bash command line, so checking it
+    /// requires a real POSIX shell and a real `sh`-executable stand-in interpreter. It is the
+    /// POSIX tokenizer that is the subject; Windows is only where the string is destined.
+    #[cfg(unix)]
     #[test]
     // Flaky under the full parallel suite: GitHub issue #320 (ETXTBSY - another test's
     // Command::spawn can fork while this test's stand-in script is still open for writing).
     // Ignored here so `cargo test --workspace` in CI is a trustworthy gate; run directly with
     // `cargo test -p app the_generated_windows_command_tokenizes -- --ignored` to exercise it.
-    #[ignore]
+    #[ignore = "flaky under the parallel suite: ETXTBSY, GitHub issue #320; see docs/testing.md"]
     fn the_generated_windows_command_tokenizes_identically_under_a_real_posix_shell() {
         // The module docs claim the Windows command string is deliberately *also* a valid Git Bash
         // command line, as insurance against a Claude Code that ignores the `shell` field. That is
@@ -1216,9 +1221,6 @@ mod tests {
         // A stand-in `powershell.exe` on `PATH` prints its argument vector one element per line,
         // so this pins the real thing that matters: that a temp path full of spaces, parentheses,
         // dollars and backticks arrives as exactly *one* argument, unexpanded.
-        if !cfg!(unix) {
-            return;
-        }
         let temp = tempfile::tempdir().expect("temp dir");
         let bin = temp.path().join("bin");
         std::fs::create_dir_all(&bin).expect("bin");
@@ -1249,23 +1251,26 @@ mod tests {
         // exec specifically on that signature - rather than looping on some fd of our own - is
         // the correct fix, not a band-aid: it is bounded, narrowly targeted at the one known
         // transient cause, and does not mask any other failure mode.
-        let mut attempt = 0;
-        let output = loop {
-            attempt += 1;
-            let output = std::process::Command::new("/bin/sh")
+        let run = || {
+            std::process::Command::new("/bin/sh")
                 .arg("-c")
                 .arg(command)
                 .env("PATH", &bin)
                 .stdin(std::process::Stdio::null())
                 .output()
-                .expect("the generated command must be runnable by a real POSIX shell");
-            let is_etxtbsy = !output.status.success()
-                && String::from_utf8_lossy(&output.stderr).contains("Text file busy");
-            if !is_etxtbsy || attempt >= 20 {
-                break output;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
+                .expect("the generated command must be runnable by a real POSIX shell")
         };
+        let mut output = run();
+        // Retrying *is* the wait here: the condition is "the exec stopped hitting the transient
+        // ETXTBSY", so each poll re-runs the command rather than sleeping beside it.
+        test_support::wait_until(std::time::Duration::from_millis(100), || {
+            let settled = output.status.success()
+                || !String::from_utf8_lossy(&output.stderr).contains("Text file busy");
+            if !settled {
+                output = run();
+            }
+            settled
+        });
         assert!(
             output.status.success(),
             "the generated command must parse: {}",
@@ -1613,19 +1618,18 @@ mod tests {
             }
 
             let mut seen: Vec<String> = Vec::new();
-            for _ in 0..20 {
-                seen.extend(
-                    std::fs::read_dir(&directory)
-                        .expect("read launch dir")
-                        .flatten()
-                        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                        .filter(|name| name != SETTINGS_NAME && name != WINDOWS_FORWARDER_NAME),
-                );
-                if !seen.is_empty() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
+            let extra_entries = || {
+                std::fs::read_dir(&directory)
+                    .expect("read launch dir")
+                    .flatten()
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .filter(|name| name != SETTINGS_NAME && name != WINDOWS_FORWARDER_NAME)
+                    .collect::<Vec<_>>()
+            };
+            test_support::wait_until(std::time::Duration::from_secs(1), || {
+                seen = extra_entries();
+                !seen.is_empty()
+            });
             let output = child.wait_with_output().expect("wait");
             seen.extend(
                 std::fs::read_dir(&directory)

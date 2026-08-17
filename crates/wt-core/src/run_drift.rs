@@ -85,37 +85,21 @@ fn parse_commit_dates(text: &str) -> Vec<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use test_support::{git, git_with_env, seed_empty_repo};
 
-    fn git(dir: &Path, args: &[&str]) {
-        git_at(dir, args, None);
-    }
-
-    /// `at` pins both author and committer date, so commits land on a chosen side of a mark
-    /// deterministically rather than racing the wall clock.
-    fn git_at(dir: &Path, args: &[&str], at: Option<i64>) {
-        let mut command = Command::new("git");
-        command
-            .current_dir(dir)
-            .args(args)
-            .env("GIT_AUTHOR_NAME", "Test")
-            .env("GIT_AUTHOR_EMAIL", "test@example.com")
-            .env("GIT_COMMITTER_NAME", "Test")
-            .env("GIT_COMMITTER_EMAIL", "test@example.com");
-        if let Some(at) = at {
-            command
-                .env("GIT_AUTHOR_DATE", format!("@{at} +0000"))
-                .env("GIT_COMMITTER_DATE", format!("@{at} +0000"));
-        }
-        let status = command.status().expect("git must run");
-        assert!(status.success(), "git {args:?} must succeed");
-    }
-
+    /// `at` pins the commit's real author *and* committer date, so a test can place commits on
+    /// either side of a mark deterministically rather than racing the wall clock (the counting
+    /// this module does is by committer date - see [`commits_since`]'s own docs).
     fn commit_at(dir: &Path, name: &str, at: i64) {
         std::fs::write(dir.join(name), name).expect("write");
-        git_at(dir, &["add", "."], Some(at));
-        git_at(dir, &["commit", "-m", name], Some(at));
+        let date = format!("@{at} +0000");
+        let env = [
+            ("GIT_AUTHOR_DATE", date.as_str()),
+            ("GIT_COMMITTER_DATE", date.as_str()),
+        ];
+        git_with_env(dir, &["add", "."], &env);
+        git_with_env(dir, &["commit", "-m", name], &env);
     }
 
     fn commit(dir: &Path, name: &str) {
@@ -133,9 +117,8 @@ mod tests {
 
     #[test]
     fn a_real_repository_reports_the_real_number_of_commits_since_a_moment() {
-        let dir = tempfile::tempdir().expect("temp dir");
+        let dir = seed_empty_repo();
         let path = dir.path();
-        git(path, &["init", "-b", "main"]);
         commit_at(path, "before-a", 1_700_000_000);
         commit_at(path, "before-b", 1_700_000_100);
 
@@ -159,8 +142,7 @@ mod tests {
 
     #[test]
     fn an_unborn_head_has_no_answer_rather_than_a_fabricated_zero() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        git(dir.path(), &["init", "-b", "main"]);
+        let dir = seed_empty_repo();
         assert_eq!(
             commits_since(dir.path(), now()).expect("must not error"),
             None,
@@ -170,8 +152,7 @@ mod tests {
 
     #[test]
     fn a_nonsense_timestamp_is_refused_rather_than_traversing_everything() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        git(dir.path(), &["init", "-b", "main"]);
+        let dir = seed_empty_repo();
         commit(dir.path(), "one");
         assert_eq!(commits_since(dir.path(), 0).expect("must not error"), None);
         assert_eq!(commits_since(dir.path(), -5).expect("must not error"), None);
@@ -192,9 +173,8 @@ mod tests {
 
     #[test]
     fn every_run_in_one_checkout_is_answered_from_one_traversal() {
-        let dir = tempfile::tempdir().expect("temp dir");
+        let dir = seed_empty_repo();
         let path = dir.path();
-        git(path, &["init", "-b", "main"]);
         commit_at(path, "a", 1_700_000_000);
         commit_at(path, "b", 1_700_001_000);
         commit_at(path, "c", 1_700_002_000);
@@ -216,7 +196,7 @@ mod tests {
 
     #[test]
     fn asking_about_no_runs_at_all_spawns_nothing_and_answers_nothing() {
-        let dir = tempfile::tempdir().expect("temp dir");
+        let dir = seed_empty_repo();
         assert_eq!(
             commits_since_each(dir.path(), &[]).expect("must not error"),
             Some(Vec::new()),

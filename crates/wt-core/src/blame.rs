@@ -192,30 +192,7 @@ mod tests {
     use std::fs;
     use std::process::Command;
     use tempfile::TempDir;
-
-    fn git(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn init_repo() -> TempDir {
-        let dir = TempDir::new().expect("tempdir");
-        git(dir.path(), &["init", "-b", "main"]);
-        git(dir.path(), &["config", "user.email", "test@example.com"]);
-        git(dir.path(), &["config", "user.name", "Test User"]);
-        dir
-    }
+    use test_support::{git, seed_empty_repo};
 
     #[test]
     fn not_a_repo_is_graceful() {
@@ -227,7 +204,7 @@ mod tests {
 
     #[test]
     fn untracked_file_is_graceful() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         fs::write(repo.path().join("untracked.txt"), "hello\n").expect("write");
         let outcome = blame_file(repo.path(), Path::new("untracked.txt")).expect("blame_file");
         assert_eq!(outcome, BlameOutcome::NotTracked);
@@ -235,7 +212,7 @@ mod tests {
 
     #[test]
     fn nonexistent_path_is_graceful() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         fs::write(repo.path().join("file.txt"), "hello\n").expect("write");
         git(repo.path(), &["add", "file.txt"]);
         git(repo.path(), &["commit", "-m", "initial"]);
@@ -245,7 +222,7 @@ mod tests {
 
     #[test]
     fn committed_lines_are_attributed_to_the_real_commit() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         fs::write(repo.path().join("file.txt"), "line one\nline two\n").expect("write");
         git(repo.path(), &["add", "file.txt"]);
         git(
@@ -277,7 +254,7 @@ mod tests {
 
     #[test]
     fn uncommitted_local_modification_is_flagged() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         fs::write(repo.path().join("file.txt"), "line one\nline two\n").expect("write");
         git(repo.path(), &["add", "file.txt"]);
         git(repo.path(), &["commit", "-m", "initial"]);
@@ -299,7 +276,7 @@ mod tests {
 
     #[test]
     fn commit_message_returns_the_real_full_body() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         fs::write(repo.path().join("file.txt"), "hello\n").expect("write");
         git(repo.path(), &["add", "file.txt"]);
         git(
@@ -328,14 +305,14 @@ mod tests {
 
     #[test]
     fn commit_message_is_none_for_the_synthetic_uncommitted_sha() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         let message = commit_message(repo.path(), &"0".repeat(40)).expect("commit_message");
         assert_eq!(message, None);
     }
 
     #[test]
     fn commit_message_rejects_non_hex_input_without_spawning_a_bad_argument() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         let message =
             commit_message(repo.path(), "--not-a-sha").expect("commit_message should not error");
         assert_eq!(message, None);
@@ -343,7 +320,7 @@ mod tests {
 
     #[test]
     fn blame_file_reports_the_real_current_head_commit() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         fs::write(repo.path().join("file.txt"), "hello\n").expect("write");
         git(repo.path(), &["add", "file.txt"]);
         git(repo.path(), &["commit", "-m", "initial"]);

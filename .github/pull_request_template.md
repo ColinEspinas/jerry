@@ -14,10 +14,12 @@
 
 ## Testing
 
-- [ ] `/check` (conventions + fmt + clippy `-D warnings`) passes locally
+- [ ] `/check` (conventions + fmt + clippy `-D warnings` + `cargo nextest run --workspace`) passes
+      locally
 - [ ] `verify` capture attached below, if this touches `render.rs`/`theme.rs`/layout
-- [ ] New/changed behavior has a real test, run manually and confirmed passing (`cargo test
-      --workspace` isn't part of the gate right now - issue #348)
+- [ ] New/changed behavior has a real test, in the right tier (docs/testing.md)
+- [ ] If this touches the `external` tier, it was run with the servers installed:
+      `cargo nextest run --workspace --profile external --run-ignored all`
 
 <!-- Note anything that couldn't be run and why ("not run: needs a live rust-analyzer") rather
      than silently leaving a box unchecked. -->

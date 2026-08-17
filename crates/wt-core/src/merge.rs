@@ -744,31 +744,19 @@ mod tests {
     use std::fs;
     use std::process::Command;
     use tempfile::TempDir;
+    use test_support::{commit, git, seed_empty_repo};
 
-    fn git(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
+    /// `seed_empty_repo` plus this module's own base commit: every merge test needs a common
+    /// ancestor to diverge from.
     fn init_repo() -> TempDir {
-        let dir = TempDir::new().expect("tempdir");
-        git(dir.path(), &["init", "-b", "main"]);
-        git(dir.path(), &["config", "user.email", "test@example.com"]);
-        git(dir.path(), &["config", "user.name", "Test User"]);
-        fs::write(dir.path().join("base.txt"), "base\n").expect("write");
-        git(dir.path(), &["add", "base.txt"]);
-        git(dir.path(), &["commit", "-m", "initial"]);
+        let dir = seed_empty_repo();
+        commit(
+            dir.path(),
+            "base.txt",
+            "base
+",
+            "initial",
+        );
         dir
     }
 

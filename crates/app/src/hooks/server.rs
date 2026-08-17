@@ -1151,8 +1151,14 @@ mod tests {
         let listener = HookListener::start().expect("listener");
         let port = listener.port();
 
+        // Every slot occupied by a client that drips for ~25s and never completes a request. Each
+        // reports when the server let go of it - a failed write is the drip-feeder's own view of
+        // the handler giving up, and counting them is what turns the wait below into an observed
+        // event rather than a guessed duration.
+        let cut_off = Arc::new(AtomicUsize::new(0));
         let mut drips = Vec::new();
         for _ in 0..MAX_IN_FLIGHT {
+            let cut_off = Arc::clone(&cut_off);
             drips.push(std::thread::spawn(move || {
                 let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) else {
                     return;
@@ -1164,13 +1170,26 @@ mod tests {
                     let _ = stream.flush();
                     std::thread::sleep(Duration::from_millis(500));
                 }
+                cut_off.fetch_add(1, Ordering::SeqCst);
             }));
         }
 
-        // A fixed wait, longer than the handler deadline but well inside the drippers' lifetime,
-        // so the only way real traffic gets served here is if the handlers really did give up.
-        // Absolute rather than derived from `REQUEST_DEADLINE` - see the sibling test.
-        std::thread::sleep(Duration::from_secs(9));
+        // Deliberately *not* polled with a probe request: a probe competes with the drip-feeders
+        // for the same `MAX_IN_FLIGHT` slots, and one that wins a slot at startup leaves the
+        // server permanently one short of saturation - the test then measures its own polling
+        // instead of the server. Wait on the drip-feeders' own signal instead, which perturbs
+        // nothing. The bound is absolute rather than derived from `REQUEST_DEADLINE`, and well
+        // inside the drippers' own ~25s lifetime, so reaching it at all means the handlers really
+        // did give up rather than the clients running out of patience - see the sibling test.
+        assert!(
+            test_support::wait_until(Duration::from_secs(15), || cut_off.load(Ordering::SeqCst)
+                == MAX_IN_FLIGHT),
+            "every handler must give up on its drip-feeder on its own, but only {} of {} did",
+            cut_off.load(Ordering::SeqCst),
+            MAX_IN_FLIGHT
+        );
+
+        // And the slots they held are genuinely free again, not merely accounted free.
         let good = post(
             port,
             listener.token(),
@@ -1179,7 +1198,8 @@ mod tests {
         );
         assert!(
             good.starts_with("HTTP/1.1 204"),
-            "a real hook must still be served while slow clients are connected, got {good:?}"
+            "a real hook must be served again once the deadline cuts the slow clients off, got \
+             {good:?}"
         );
         assert_eq!(listener.signal_for(99).fact, Some(HookFact::TurnEnded));
 

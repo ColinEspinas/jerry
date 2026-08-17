@@ -219,9 +219,9 @@ mod tests {
     fn a_real_busy_child_accumulates_real_cpu_time_at_a_real_rate() {
         use std::process::{Command, Stdio};
 
-        let mut child = Command::new("yes")
-            .stdout(Stdio::null())
-            .spawn()
+        // `ChildGuard`, not a manual `kill`/`wait`: `yes` pins a core, and either `expect` below
+        // firing left it doing so for the rest of the run.
+        let mut child = test_support::ChildGuard::spawn(Command::new("yes").stdout(Stdio::null()))
             .expect("spawn a real `yes` child process");
         let pid = child.id();
 
@@ -233,8 +233,7 @@ mod tests {
             .expect("still alive on the second read");
         let wall = wall_start.elapsed();
 
-        let _ = child.kill();
-        let _ = child.wait();
+        child.kill_and_wait().expect("reap the busy child");
 
         let delta = second.saturating_sub(first);
         // A quarter of wall time is a very loose floor for a process that genuinely pins a core -

@@ -36,41 +36,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::process::Command;
-    use tempfile::TempDir;
-
-    fn git(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn git_output(dir: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(output.status.success(), "git {args:?} failed in {dir:?}");
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
-    }
-
-    fn init_repo() -> TempDir {
-        let dir = TempDir::new().expect("tempdir");
-        git(dir.path(), &["init", "-b", "main"]);
-        git(dir.path(), &["config", "user.email", "test@example.com"]);
-        git(dir.path(), &["config", "user.name", "Test User"]);
-        dir
-    }
+    use test_support::{git, git_output, seed_empty_repo};
 
     fn commit(dir: &Path, file: &str, contents: &str, message: &str) -> String {
         fs::write(dir.join(file), contents).expect("write file");
@@ -81,7 +47,7 @@ mod tests {
 
     #[test]
     fn cherry_pick_really_applies_the_commits_change_on_top_of_head() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit(repo.path(), "a.txt", "base", "base");
         git(repo.path(), &["checkout", "-b", "feature"]);
         let feature_sha = commit(repo.path(), "b.txt", "feature content", "feature work");
@@ -100,7 +66,7 @@ mod tests {
 
     #[test]
     fn cherry_pick_a_real_conflict_surfaces_as_a_real_error_leaving_conflict_state_behind() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit(repo.path(), "a.txt", "base", "base");
         git(repo.path(), &["checkout", "-b", "feature"]);
         let feature_sha = commit(repo.path(), "a.txt", "feature change", "feature work");
@@ -132,7 +98,7 @@ mod tests {
 
     #[test]
     fn revert_really_creates_a_new_commit_undoing_the_targets_change() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit(repo.path(), "a.txt", "base", "base");
         let to_revert = commit(repo.path(), "a.txt", "changed", "the change to undo");
 
@@ -152,7 +118,7 @@ mod tests {
 
     #[test]
     fn revert_a_real_conflict_surfaces_as_a_real_error_leaving_conflict_state_behind() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit(repo.path(), "a.txt", "base", "base");
         let to_revert = commit(repo.path(), "a.txt", "changed", "the change to undo");
         commit(
@@ -191,7 +157,7 @@ mod tests {
 
     #[test]
     fn rebase_onto_really_replays_the_current_branchs_commits_on_top_of_the_target() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit(repo.path(), "a.txt", "base", "base");
         let base_sha = git_output(repo.path(), &["rev-parse", "HEAD"]);
 
@@ -218,7 +184,7 @@ mod tests {
 
     #[test]
     fn rebase_onto_a_real_conflict_surfaces_as_a_real_error_leaving_rebase_state_behind() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit(repo.path(), "a.txt", "base", "base");
         let base_sha = git_output(repo.path(), &["rev-parse", "HEAD"]);
 

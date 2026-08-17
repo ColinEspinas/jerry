@@ -562,40 +562,7 @@ mod tests {
     use super::*;
     use std::process::Command;
     use tempfile::TempDir;
-
-    fn git(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn git_output(dir: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(output.status.success(), "git {args:?} failed in {dir:?}");
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
-    }
-
-    fn init_repo() -> TempDir {
-        let dir = TempDir::new().expect("tempdir");
-        git(dir.path(), &["init", "-b", "main"]);
-        git(dir.path(), &["config", "user.email", "test@example.com"]);
-        git(dir.path(), &["config", "user.name", "Test User"]);
-        dir
-    }
+    use test_support::{git, git_output, seed_empty_repo};
 
     fn commit(dir: &Path, file: &str, contents: &str, message: &str) -> String {
         fs::write(dir.join(file), contents).expect("write file");
@@ -634,7 +601,7 @@ mod tests {
 
     #[test]
     fn commits_to_rebase_lists_commits_oldest_first_excluding_onto_itself() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         let base = commit(repo.path(), "base.txt", "base", "base");
         let c1 = commit(repo.path(), "a.txt", "1", "commit 1");
         let c2 = commit(repo.path(), "b.txt", "2", "commit 2");
@@ -646,7 +613,7 @@ mod tests {
 
     #[test]
     fn commits_to_rebase_is_empty_when_onto_is_head_itself() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit(repo.path(), "base.txt", "base", "base");
         let head = git_output(repo.path(), &["rev-parse", "HEAD"]);
 
@@ -658,7 +625,7 @@ mod tests {
 
     #[test]
     fn all_pick_plan_completes_cleanly_with_history_matching_the_plan() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         let base = commit(repo.path(), "base.txt", "base", "base");
         let c1 = commit(repo.path(), "a.txt", "1", "commit 1");
         let c2 = commit(repo.path(), "b.txt", "2", "commit 2");
@@ -690,7 +657,7 @@ mod tests {
 
     #[test]
     fn drop_removes_the_commit_from_history() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         let base = commit(repo.path(), "base.txt", "base", "base");
         let c1 = commit(repo.path(), "a.txt", "1", "commit 1");
         let c2 = commit(repo.path(), "b.txt", "2", "commit 2");
@@ -715,7 +682,7 @@ mod tests {
 
     #[test]
     fn squash_folds_into_the_previous_commit_keeping_both_original_messages() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         let base = commit(repo.path(), "base.txt", "base", "base");
         let c1 = commit(repo.path(), "a.txt", "1", "commit 1");
         let c2 = commit(repo.path(), "b.txt", "2", "commit 2");
@@ -748,7 +715,7 @@ mod tests {
 
     #[test]
     fn fixup_folds_into_the_previous_commit_discarding_its_own_message() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         let base = commit(repo.path(), "base.txt", "base", "base");
         let c1 = commit(repo.path(), "a.txt", "1", "commit 1");
         let c2 = commit(repo.path(), "b.txt", "2", "commit 2");
@@ -779,7 +746,7 @@ mod tests {
 
     #[test]
     fn reword_with_a_supplied_message_runs_straight_through_with_no_stop() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         let base = commit(repo.path(), "base.txt", "base", "base");
         let c1 = commit(repo.path(), "a.txt", "1", "original message");
 
@@ -799,7 +766,7 @@ mod tests {
 
     #[test]
     fn amend_head_message_replaces_the_real_committed_message() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit(repo.path(), "a.txt", "1", "original message");
         let head = git_output(repo.path(), &["rev-parse", "HEAD"]);
 
@@ -811,7 +778,7 @@ mod tests {
 
     #[test]
     fn amend_head_message_refuses_when_head_has_moved_since_expected() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit(repo.path(), "a.txt", "1", "original message");
         let stale_expected = "0000000000000000000000000000000000000000".to_string();
 
@@ -828,7 +795,7 @@ mod tests {
 
     #[test]
     fn amend_head_message_refuses_when_the_real_index_has_staged_changes() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit(repo.path(), "a.txt", "1", "original message");
         let head = git_output(repo.path(), &["rev-parse", "HEAD"]);
 
@@ -861,7 +828,7 @@ mod tests {
 
     #[test]
     fn reword_with_no_message_stops_and_reports_the_right_commit_and_reason() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         let base = commit(repo.path(), "base.txt", "base", "base");
         let c1 = commit(repo.path(), "a.txt", "1", "commit 1");
 
@@ -889,7 +856,7 @@ mod tests {
 
     #[test]
     fn edit_always_stops_even_with_no_special_handling_and_continue_completes_it() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         let base = commit(repo.path(), "base.txt", "base", "base");
         let c1 = commit(repo.path(), "a.txt", "1", "commit 1");
 
@@ -918,7 +885,7 @@ mod tests {
     /// Sets up a conflict: `base` sets `file.txt`, `v1` and `v2` change it differently, and the
     /// plan replays `v1` straight onto `base`.
     fn conflicting_repo() -> (TempDir, String, String, String) {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         let base = commit(repo.path(), "file.txt", "base", "base");
         commit(repo.path(), "file.txt", "v1", "commit v1");
         let v2 = commit(repo.path(), "file.txt", "v2", "commit v2");
@@ -1009,7 +976,7 @@ mod tests {
 
     #[test]
     fn a_plan_mixing_every_action_type_produces_the_exact_expected_history() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         let base = commit(repo.path(), "base.txt", "base", "base");
         let c1 = commit(repo.path(), "f1.txt", "1", "commit 1");
         let c2 = commit(repo.path(), "f2.txt", "2", "commit 2");
@@ -1081,7 +1048,7 @@ mod tests {
 
     #[test]
     fn cascading_conflicts_before_a_reword_do_not_misalign_the_message_queue() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         let base = commit(repo.path(), "file.txt", "base", "base");
         let c1 = commit(repo.path(), "file.txt", "v1", "commit v1");
         let c2 = commit(repo.path(), "file.txt", "v2", "commit v2");
@@ -1134,14 +1101,14 @@ mod tests {
 
     #[test]
     fn rebase_status_is_none_when_no_rebase_is_in_progress() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         commit(repo.path(), "a.txt", "1", "commit 1");
         assert_eq!(rebase_status(repo.path()).expect("rebase_status"), None);
     }
 
     #[test]
     fn rebase_status_reports_real_state_when_stopped_mid_flight() {
-        let repo = init_repo();
+        let repo = seed_empty_repo();
         let base = commit(repo.path(), "base.txt", "base", "base");
         let c1 = commit(repo.path(), "a.txt", "1", "commit 1");
         let c2 = commit(repo.path(), "b.txt", "2", "commit 2");

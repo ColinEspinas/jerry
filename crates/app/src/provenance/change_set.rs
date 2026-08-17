@@ -288,7 +288,7 @@ fn take_removal(ledger: &mut BTreeMap<usize, Vec<(Author, u32)>>, anchor: usize)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
+    use test_support::git;
 
     use wt_core::diff::{diff_against_base, DiffHunk, DiffLine};
 
@@ -796,21 +796,5 @@ impl UserApi {
         store.begin_agent_edit(worktree, &file);
         std::fs::write(&file, content).expect("write");
         store.record_agent_edit(worktree, &file, agent);
-    }
-
-    fn git(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
     }
 }

@@ -1,8 +1,36 @@
 name: CI
 
 on:
+  # Scoped to the default branch on purpose. An unscoped `push:` alongside `pull_request:` fires
+  # two complete, identical runs of this workflow for every push to a PR branch - verified on
+  # GitHub issue #426's own branch, where runs 31974623400 (push) and 31974624833 (pull_request)
+  # are the same commit. PR branches are covered by `pull_request` alone.
+  #
+  # This is not about money: the repository is public, so GitHub-hosted standard runners are free
+  # and the usual Linux/Windows/macOS billing multipliers do not apply to it at all. It is about
+  # the two things that are genuinely scarce here - concurrent runner slots, where the macOS
+  # allowance is much smaller than the overall one, and the 10 GB per-repository Actions cache the
+  # duplicate run was evicting entries from.
   push:
+    branches: [master]
   pull_request:
+  # The `external` job below is gated to these two events specifically, and never runs on `push`
+  # or `pull_request`. Everything else in this workflow runs on them too, which is deliberate: a
+  # nightly rebuild is the cheapest signal there is that a toolchain or transitive-dependency
+  # update broke the build without anyone pushing.
+  workflow_dispatch:
+  schedule:
+    # 04:00 UTC - outside working hours in every timezone this project is worked in, so a nightly
+    # run never competes with a PR for runner capacity.
+    - cron: "0 4 * * *"
+
+# A new push supersedes the run still in flight for the same branch or PR instead of racing it to
+# completion and holding runner slots nothing is waiting on. `github.event_name` is part of the key
+# as well as the ref, so that a push to the default branch cannot cancel a `schedule` run that
+# shares that ref - the nightly is the only execution the `external` tier ever gets.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -17,17 +45,65 @@ env:
   JERRY_DISABLE_PROVIDER_POLL: "1"
 
 jobs:
-  # Build + the workspace's own [workspace.lints]-backed clippy check + fmt on Linux.
-  # Deliberately NOT running `cargo test --workspace` here: a real run (PR #347) showed most
-  # of the GPUI-window-touching suite failing/timing out in a non-interactive environment -
-  # far broader than the one confirmed-flaky test (#320) or the missing-language-server gap
-  # (#348). Restoring the test step needs that investigated first, not a blind re-enable -
-  # see #348, which now tracks both. The `git config --global` step below stays: it's the
-  # real fix for a `wt-core` test's own submodule-commit failure ("Author identity unknown"
-  # on a fresh runner with no global git identity), independent of whether tests run in CI.
-  linux:
-    name: Linux (build, clippy, fmt)
+  # The platform-independent half of the gate, and the only job that is not tied to an OS.
+  # `cargo fmt`, the convention ratchet and the version check all read source text: their answer
+  # cannot differ between Linux, macOS and Windows, so running them three times would burn three
+  # runners to produce the same result. They run once, here, on the cheapest one.
+  #
+  # Deliberately compile-free - no system packages, no cargo cache, no `cargo build`. None of these
+  # three steps needs a compiled workspace, which is what makes this the fast "you got something
+  # obviously wrong" signal that lands in about a minute while the platform jobs are still linking.
+  #
+  # clippy is NOT here, and that is the one real asymmetry in this file: it is a *compiled* lint, so
+  # it only ever sees the `#[cfg(target_os = ...)]` code of the platform it runs on. Running it once
+  # on Linux would leave `status_bar::process_stats::{macos,windows}` - 14 `unsafe` FFI sites, the
+  # code this project's own standards are strictest about - linted by nobody. So each platform job
+  # below runs clippy over its own target instead.
+  lint:
+    name: Lint (fmt, conventions)
     runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt
+
+      # Deterministic ratchet, not a cargo lint: fails if the count of `use super::*` globs or
+      # of adapter calls in render.rs files rose vs .claude/conventions-baseline.json. See that
+      # script's own comments and docs/architecture/decisions.md (§3).
+      - name: Convention ratchet
+        run: .claude/hooks/check-conventions.sh
+
+      # Catches a crate manifest that regresses to a hardcoded version (issue #317).
+      - name: Crate version inheritance
+        run: .claude/hooks/check-release-version.sh
+
+      - name: cargo fmt --all -- --check
+        run: cargo fmt --all -- --check
+
+  # The three platform jobs below are deliberately the same shape: build, clippy, test. Whatever
+  # differs between them is a property of the platform, never of this file's own taste - the only
+  # intentional difference is Windows' test scope, which has its own comment.
+  #
+  # The test step is the `unit` and `ui` tiers of docs/testing.md, which is exactly what
+  # `cargo nextest run` executes by default - the `external` tier is `#[ignore]`d, and nextest skips
+  # ignored tests unless asked for them (`--run-ignored`, which only the `external` job passes).
+  #
+  # `nextest`, not `cargo test`: each test runs in its own process under `.config/nextest.toml`'s
+  # `slow-timeout`, so a test that blocks forever is a named, killed failure rather than a run that
+  # never ends.
+  linux:
+    name: Linux (build, clippy, test)
+    runs-on: ubuntu-latest
+    # A hard ceiling well above the ~10-minute target in issue #426, so a pathological hang still
+    # surfaces as a failed job rather than burning the six-hour default.
+    timeout-minutes: 45
     # System libraries GPUI's Linux backend (both the `wayland` and `x11`
     # gpui_platform features are compiled in, Revision R12 - see that file's own
     # Cargo.toml comment, and `crate::gpui_linux`'s real `guess_compositor()`-based
@@ -82,35 +158,60 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.95.0"
-          components: rustfmt, clippy
+          components: clippy
 
+      # Pinned to the version this change was actually written and validated against, per this
+      # project's "same version we verified against, not latest" convention (see
+      # `crates/app/Cargo.toml`'s `tree-sitter`/`alacritty_terminal` comments).
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.143
+
+      # `save-if` keeps the restore on every run but writes the cache only from the default branch.
+      # A repository gets 10 GB of Actions cache in total and GitHub evicts the least recently used
+      # entry once that fills; four jobs each saving a multi-gigabyte Rust target dir on every PR
+      # push churns that budget hard enough to evict the very entries the next run wants. Writing
+      # from master alone keeps one warm, stable entry per job instead.
       - name: Cache cargo/target
         uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      # A fresh runner has no global git identity, unlike every developer machine. `wt-core`'s
+      # `discard_worktree_refuses_when_stash_push_captures_nothing_and_an_unrelated_stash_already_exists`
+      # runs `git commit` inside a real submodule checkout, and `git submodule update --init`
+      # creates an independent git directory that does not inherit the parent fixture's *local*
+      # identity - so that commit fails with a real "Author identity unknown" (observed, not
+      # hypothetical: commit ac8e6cd). This is the fix.
+      - name: Configure git identity
+        run: |
+          git config --global user.email "ci@example.invalid"
+          git config --global user.name "CI"
 
       - name: cargo build --workspace
         run: cargo build --workspace
 
-      # Deterministic ratchet, not a cargo lint: fails if the count of `use super::*` globs or
-      # of adapter calls in render.rs files rose vs .claude/conventions-baseline.json. See that
-      # script's own comments and docs/architecture/decisions.md (§3).
-      - name: Convention ratchet
-        run: .claude/hooks/check-conventions.sh
-
-      # Catches a crate manifest that regresses to a hardcoded version (issue #317).
-      - name: Crate version inheritance
-        run: .claude/hooks/check-release-version.sh
-
-      - name: cargo fmt --all -- --check
-        run: cargo fmt --all -- --check
-
       - name: cargo clippy --workspace --all-targets -- -D warnings
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-  # Build-only signal on macOS and Windows, as two separate jobs (not a matrix) so all
-  # three platforms read as peers in the Actions UI, rather than Linux standing alone
-  # against one oddly-combined "the other two" job. Not every contributor can build and
-  # run the full test suite on both of these platforms locally, so these two jobs are the
-  # real verification that the workspace compiles there at all.
+      - name: cargo nextest run --workspace --profile ci
+        run: cargo nextest run --workspace --profile ci
+
+  # macOS and Windows are separate jobs rather than a matrix so all three platforms read as
+  # peers in the Actions UI. Not every contributor can build and run the suite on either of
+  # these platforms locally, so these two jobs are the only verification that the workspace
+  # works there at all.
+  #
+  # Same shape as the Linux job above - build, clippy, test - with one deliberate difference:
+  # Windows runs the narrow `status_bar::process_stats` filter it ran before issue #426 rather
+  # than the full suite. See the Windows job's own comment; that asymmetry is a recorded
+  # decision, not an oversight.
+  #
+  # macOS earned the full suite immediately: the bug that dominated this epic was a
+  # macOS-specific path canonicalization difference (`/var` is a symlink to `/private/var`,
+  # so a `PathBuf` comparison that holds on Linux does not hold there), and it went unseen
+  # precisely because no macOS runner ever executed the tests that would have caught it.
   #
   # `crates/app/Cargo.toml` has real per-target `[target.'cfg(target_os =
   # "...")'.dependencies]` sections for `gpui_platform` (Revision R11, extended in R12):
@@ -123,8 +224,9 @@ jobs:
   # needs no `--features` flag on either platform: per-target dependency/feature
   # selection is Cargo's job, resolved automatically from the actual build target.
   macos:
-    name: macOS (build + sampling tests)
+    name: macOS (build, clippy, test)
     runs-on: macos-latest
+    timeout-minutes: 45
     # A real, platform-specific build-script requirement found by reading
     # `vendor/zed/crates/gpui_macos/build.rs` directly (not assumed): it unconditionally
     # shells out to `xcrun -sdk macosx metal` to compile real Metal shaders - this needs
@@ -141,36 +243,65 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.95.0"
+          components: clippy
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.143
+
+      # Same `save-if` reasoning as the Linux job - see that job's own comment on the 10 GB
+      # per-repository Actions cache budget.
       - name: Cache cargo/target
         uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      # Same reason as the Linux job's identical step: `wt-core`'s submodule-commit test
+      # needs a global git identity a fresh runner does not have.
+      - name: Configure git identity
+        run: |
+          git config --global user.email "ci@example.invalid"
+          git config --global user.name "CI"
 
       - name: cargo build --workspace
         run: cargo build --workspace
 
-      # GitHub issue #283: the macOS per-process CPU/memory sampling backend
-      # (`crate::status_bar::process_stats::macos`) is real `proc_pid_rusage` FFI that nobody
-      # working on this repo can run locally - this project's dev environment is Linux/WSL2-only
-      # (see this file's own comments above). `cargo build` above does not help: it does not
-      # compile `#[cfg(test)]` modules at all, so without this step not one line of that
-      # backend's tests would ever execute on any macOS machine.
-      #
-      # This is deliberately a *narrow* filter, not the fuller `cargo test` this job's own
-      # comments explain is out of scope: `status_bar::process_stats` needs no language servers,
-      # no git fixtures and no filesystem watchers, so it is free of every environment gap that
-      # keeps the rest of the suite off these runners.
-      #
-      # It earns its keep concretely. `ri_user_time`/`ri_system_time` are mach *timebase* units,
-      # not nanoseconds, and reading them as nanoseconds under-reports CPU by ~41.7x on Apple
-      # Silicon while being exactly right on Intel - a defect this backend genuinely shipped with
-      # for one commit. `macos-latest` is Apple Silicon, and that backend's busy-child test
-      # asserts a real lower bound against wall-clock time, so this step is what would catch it.
-      - name: cargo test (per-process sampling backend)
-        run: cargo test -p app --lib status_bar::process_stats
+      # clippy runs per platform, not once on Linux, because it only ever lints the
+      # `#[cfg(target_os = ...)]` code of the target it runs against. This step is the only thing
+      # that lints `crate::status_bar::process_stats::macos` at all - 7 `unsafe` `proc_pid_rusage`
+      # FFI sites that a Linux-only clippy pass cannot even parse into its analysis.
+      - name: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # This job is what makes GitHub issue #283's macOS per-process CPU/memory sampling backend
+      # (`crate::status_bar::process_stats::macos`, real `proc_pid_rusage` FFI) actually get
+      # executed: `cargo build` above does not compile `#[cfg(test)]` modules at all, so without a
+      # test step not one line of that backend's tests would ever run on any macOS machine. It
+      # earns its keep concretely - `ri_user_time`/`ri_system_time` are mach *timebase* units, not
+      # nanoseconds, and reading them as nanoseconds under-reports CPU by ~41.7x on Apple Silicon
+      # while being exactly right on Intel, a defect this backend genuinely shipped with for one
+      # commit. `macos-latest` is Apple Silicon, and that backend's busy-child test asserts a real
+      # lower bound against wall-clock time.
+      - name: cargo nextest run --workspace --profile ci
+        run: cargo nextest run --workspace --profile ci
+
+  # DELIBERATELY NARROW - do not widen this to `--workspace` without reading issue #440 first.
+  #
+  # Issue #426 widened this job to the full suite for exactly one run, and that run is the whole
+  # argument: 3073 tests, 134 failed and 26 timed out, in 1407 seconds. Those failures are real
+  # and they are a large investigation of their own - paths formatted into strings, forward
+  # slashes baked into expected values, and 26 timeouts whose mechanism nobody has diagnosed yet.
+  # Issue #440 tracks that work. It was split out of epic #427 rather than done here because
+  # chasing it would hold a finished epic behind an unbounded piece of work.
+  #
+  # So Windows test coverage is deferred, not forgotten, and this job is back to the
+  # `status_bar::process_stats` filter it ran before #426. The full suite does not pass on
+  # Windows yet; re-widening it before #440 is done just turns this check permanently red.
   windows:
-    name: Windows (build + sampling tests)
+    name: Windows (build, clippy, sampling tests)
     runs-on: windows-latest
+    timeout-minutes: 45
     # A real, platform-specific build-script quirk found by reading
     # `vendor/zed/crates/gpui_windows/build.rs` directly (not assumed): its
     # `fxc.exe`-based HLSL shader compilation is gated behind
@@ -189,12 +320,26 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.95.0"
+          components: clippy
 
+      # Same `save-if` reasoning as the Linux job - see that job's own comment on the 10 GB
+      # per-repository Actions cache budget.
       - name: Cache cargo/target
         uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: cargo build --workspace
         run: cargo build --workspace
+
+      # The Windows twin of the macOS job's clippy step, and the only thing that lints
+      # `crate::status_bar::process_stats::windows` - 7 `unsafe` `GetProcessTimes`/PSAPI FFI sites
+      # written on a Linux machine and, until this step, never seen by clippy on any target where
+      # they actually compile. Note this lints the whole workspace for the Windows target even
+      # though the test step below is narrow: linting is cheap and has none of the 3073-test
+      # problems issue #440 tracks.
+      - name: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       # GitHub issue #283, the Windows twin of the macOS job's step above - same reasoning,
       # same narrow filter. `crate::status_bar::process_stats::windows` is real `GetProcessTimes`
@@ -204,3 +349,101 @@ jobs:
       # claim would be empty.
       - name: cargo test (per-process sampling backend)
         run: cargo test -p app --lib status_bar::process_stats
+
+  # The `external` tier (docs/testing.md): tests that spawn a real language server. Never on a PR,
+  # by the `if` below - these need binaries the repo does not vendor and a live npm registry, so
+  # they are slow, network-dependent and outside anything a contributor's PR controls. Nightly and
+  # on demand only.
+  #
+  # `--run-ignored all` runs the whole suite *including* the ignored tier, rather than
+  # `ignored-only`: an `external` test that passes while its `unit`/`ui` neighbours have regressed
+  # is not a useful signal, and the extra cost is one already-cached build away.
+  external:
+    name: External (real language servers)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      # Same list, same reasons, as the `linux` job above.
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            clang \
+            cmake \
+            pkg-config \
+            libfontconfig-dev \
+            libvulkan1 \
+            mesa-vulkan-drivers \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libx11-xcb-dev \
+            libasound2-dev
+
+      # `rust-analyzer` is a real rustup component, not a separate download, so requesting it here
+      # pins it to the same 1.95.0 toolchain the rest of the workflow uses - the strongest pin
+      # available for it, and free. Verified: `rustup component list` reports
+      # `rust-analyzer-<host>` and installing it puts a `rust-analyzer` proxy on PATH.
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+          components: rust-analyzer
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.143
+
+      # Pinned to the version verified against, not latest, per `crates/app/Cargo.toml`'s
+      # `tree-sitter`/`alacritty_terminal` convention. `@vue/language-server@3.3.8` is the version
+      # `crate::language`'s module docs were written against.
+      #
+      # `typescript-language-server` and `pyright` are deliberately unpinned: no version is
+      # recorded anywhere in the repo for the tests that use them, and a guessed pin looks
+      # authoritative while hiding drift. TODO(#426): the "Resolved server versions" step prints
+      # what npm resolved on each nightly run - bisect from a passing run, then pin.
+      #
+      # `gopls` is absent because no test spawns it: `crate::language` gives Go `lsp: None`, and
+      # the Settings page only detects it on PATH.
+      - name: Install language servers
+        run: |
+          npm install -g \
+            "@vue/language-server@3.3.8" \
+            typescript-language-server \
+            pyright
+
+      # The evidence-gathering half of the unpinned-version TODO above: every nightly run records
+      # exactly which versions it tested against, so pinning later is a lookup, not a re-guess.
+      # `|| true` because this step exists to record information, not to gate: `npm ls` exits
+      # non-zero on any pre-existing peer-dependency complaint in the runner image's own global
+      # tree, which has nothing to do with whether the servers installed.
+      - name: Resolved server versions
+        run: |
+          npm ls -g --depth=0 || true
+          rust-analyzer --version
+
+      # No `save-if` here, unlike the three platform jobs: this job only ever runs from
+      # `workflow_dispatch` or the nightly `schedule`, never on a PR, so it is not a source of
+      # cache churn and its own entry is worth keeping warm between nightlies.
+      - name: Cache cargo/target
+        uses: Swatinem/rust-cache@v2
+
+      # Same reason as the Linux job's identical step: `wt-core`'s submodule-commit test
+      # needs a global git identity a fresh runner does not have.
+      - name: Configure git identity
+        run: |
+          git config --global user.email "ci@example.invalid"
+          git config --global user.name "CI"
+
+      # `--profile external` inherits `ci` and raises `slow-timeout` - see `.config/nextest.toml`
+      # for why the tier gets its own profile rather than a filterset override.
+      - name: cargo nextest run --workspace --profile external --run-ignored all
+        run: cargo nextest run --workspace --profile external --run-ignored all

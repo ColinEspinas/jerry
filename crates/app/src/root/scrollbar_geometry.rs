@@ -65,105 +65,112 @@ pub fn offset_for_pointer(viewport: f32, max_offset: f32, track_start: f32, poin
 mod tests {
     use super::*;
 
+    /// The proportional relationship, its floor, and its cap, in one table: the thumb is the
+    /// visible fraction of the whole document, never shorter than [`MIN_THUMB_LENGTH`], and never
+    /// longer than the viewport it lives in.
     #[test]
-    fn thumb_fills_the_track_when_content_fits_without_scrolling() {
-        assert_eq!(thumb_length(400.0, 0.0), 400.0);
+    fn thumb_length_is_the_visible_fraction_floored_and_capped() {
+        for (viewport, max_offset, expected, why) in [
+            (
+                400.0,
+                0.0,
+                400.0,
+                "content that fits without scrolling fills the track",
+            ),
+            (
+                400.0,
+                1200.0,
+                100.0,
+                "400 visible of 1600 total is a quarter of the track",
+            ),
+            (
+                400.0,
+                100_000.0,
+                MIN_THUMB_LENGTH,
+                "an enormous document would compute a sub-pixel thumb without the floor",
+            ),
+            (
+                10.0,
+                5.0,
+                10.0,
+                "and the floor never pushes past the viewport itself",
+            ),
+        ] {
+            assert_eq!(thumb_length(viewport, max_offset), expected, "{why}");
+        }
     }
 
+    /// The thumb travels the whole track and stops at both ends - including for a stale or
+    /// overshot `scrolled` value (e.g. a frame where the content just shrank), the same real bug
+    /// class `list_example.rs`'s own `bug_detected` assertion exists to catch.
     #[test]
-    fn thumb_shrinks_proportionally_to_how_much_of_the_document_is_visible() {
-        // Viewport 400, document 1600 total (400 visible + 1200 more to scroll) -> the visible
-        // fraction is 1/4, so the thumb should be 1/4 of the 400px track (100px) - well above the
-        // floor, so the floor doesn't mask the proportional math here.
-        assert_eq!(thumb_length(400.0, 1200.0), 100.0);
+    fn thumb_position_spans_the_track_and_clamps_at_both_ends() {
+        let (viewport, max_offset) = (400.0, 1200.0);
+        let track = viewport - thumb_length(viewport, max_offset);
+
+        for (scrolled, expected, why) in [
+            (0.0, 0.0, "unscrolled sits at the track top"),
+            (max_offset, track, "fully scrolled sits at the track bottom"),
+            (
+                -50.0,
+                0.0,
+                "a negative offset must not send the thumb off-track",
+            ),
+            (5_000.0, track, "and neither must an overshot one"),
+        ] {
+            assert_eq!(
+                thumb_position(viewport, max_offset, scrolled),
+                expected,
+                "{why}"
+            );
+        }
+        assert_eq!(
+            thumb_position(400.0, 0.0, 0.0),
+            0.0,
+            "an unscrollable region has no meaningful thumb position"
+        );
     }
 
+    /// A click centers the thumb under the pointer and clamps to the track's own ends - measured
+    /// from a `track_start` that is deliberately not the window origin, so a dropped
+    /// `track_start` term cannot pass.
     #[test]
-    fn thumb_never_shrinks_below_the_documented_floor() {
-        // An enormous document (100,000px more to scroll) against a 400px viewport would compute
-        // a sub-pixel raw thumb length without the floor.
-        assert_eq!(thumb_length(400.0, 100_000.0), MIN_THUMB_LENGTH);
-    }
-
-    #[test]
-    fn thumb_never_exceeds_the_viewport_even_for_a_viewport_smaller_than_the_floor() {
-        assert_eq!(thumb_length(10.0, 5.0), 10.0);
-    }
-
-    #[test]
-    fn thumb_sits_at_the_track_top_when_unscrolled() {
-        assert_eq!(thumb_position(400.0, 1200.0, 0.0), 0.0);
-    }
-
-    #[test]
-    fn thumb_sits_at_the_track_bottom_when_scrolled_to_the_end() {
-        let viewport = 400.0;
-        let max_offset = 1200.0;
+    fn a_click_centers_the_thumb_under_the_pointer_and_clamps_to_the_track() {
+        let (viewport, max_offset, track_start) = (400.0, 1200.0, 50.0);
         let thumb = thumb_length(viewport, max_offset);
-        let expected_track = viewport - thumb;
+
+        for (pointer, expected, why) in [
+            (
+                track_start + thumb / 2.0,
+                0.0,
+                "the very top of the track jumps to the start",
+            ),
+            (
+                track_start + viewport - thumb / 2.0,
+                max_offset,
+                "the very bottom jumps to the end",
+            ),
+            (
+                -1_000.0,
+                0.0,
+                "a pointer above the track clamps rather than undershooting",
+            ),
+            (
+                10_000.0,
+                max_offset,
+                "and one below it clamps rather than overshooting",
+            ),
+        ] {
+            assert_eq!(
+                offset_for_pointer(viewport, max_offset, track_start, pointer),
+                expected,
+                "{why}"
+            );
+        }
         assert_eq!(
-            thumb_position(viewport, max_offset, max_offset),
-            expected_track
+            offset_for_pointer(400.0, 0.0, 0.0, 200.0),
+            0.0,
+            "an unscrollable region always jumps to zero"
         );
-    }
-
-    #[test]
-    fn thumb_position_is_never_negative_or_past_the_track_even_for_out_of_range_input() {
-        // A stale/overshot `scrolled` value (e.g. a frame where content just shrank) must not
-        // send the thumb off-track - the same real bug class `list_example.rs`'s own
-        // `bug_detected` assertion exists to catch, guarded against here instead by clamping.
-        assert_eq!(thumb_position(400.0, 1200.0, -50.0), 0.0);
-        let viewport = 400.0;
-        let max_offset = 1200.0;
-        let thumb = thumb_length(viewport, max_offset);
-        assert_eq!(
-            thumb_position(viewport, max_offset, 5_000.0),
-            viewport - thumb
-        );
-    }
-
-    #[test]
-    fn an_unscrollable_region_has_no_meaningful_thumb_position() {
-        assert_eq!(thumb_position(400.0, 0.0, 0.0), 0.0);
-    }
-
-    #[test]
-    fn clicking_the_very_top_of_the_track_jumps_to_the_start() {
-        let viewport = 400.0;
-        let max_offset = 1200.0;
-        let thumb = thumb_length(viewport, max_offset);
-        assert_eq!(
-            offset_for_pointer(viewport, max_offset, 0.0, thumb / 2.0),
-            0.0
-        );
-    }
-
-    #[test]
-    fn clicking_the_very_bottom_of_the_track_jumps_to_the_end() {
-        let viewport = 400.0;
-        let max_offset = 1200.0;
-        let thumb = thumb_length(viewport, max_offset);
-        let track_start = 50.0; // a viewport that doesn't start at window y=0
-        let pointer_at_bottom = track_start + viewport - thumb / 2.0;
-        assert_eq!(
-            offset_for_pointer(viewport, max_offset, track_start, pointer_at_bottom),
-            max_offset
-        );
-    }
-
-    #[test]
-    fn clicking_above_or_below_the_track_clamps_rather_than_over_or_under_shooting() {
-        let viewport = 400.0;
-        let max_offset = 1200.0;
-        assert_eq!(offset_for_pointer(viewport, max_offset, 0.0, -1_000.0), 0.0);
-        assert_eq!(
-            offset_for_pointer(viewport, max_offset, 0.0, 10_000.0),
-            max_offset
-        );
-    }
-
-    #[test]
-    fn an_unscrollable_region_always_jumps_to_zero() {
-        assert_eq!(offset_for_pointer(400.0, 0.0, 0.0, 200.0), 0.0);
     }
 }

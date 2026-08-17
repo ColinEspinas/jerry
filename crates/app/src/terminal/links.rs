@@ -128,38 +128,54 @@ pub fn resolve(cwd: &Path, path: &str) -> PathBuf {
 }
 
 #[cfg(test)]
-mod tests {
+mod link_detection_tests {
     use super::*;
 
+    /// Every real shape of file reference this app is expected to turn into a clickable link,
+    /// against the one thing that matters about each: which path, which line, which column.
+    /// A backtrace frame (`at src/main.rs:142:9`) needs no special-casing - it is structurally
+    /// just another `path:line:col` occurrence, which is why it sits in the same table.
     #[test]
-    fn detects_a_real_cargo_style_path_line_col_reference() {
-        let matches = find_links("src/main.rs:42:10");
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].path, "src/main.rs");
-        assert_eq!(matches[0].line, Some(42));
-        assert_eq!(matches[0].column, Some(10));
-        assert_eq!(matches[0].start, 0);
-        assert_eq!(matches[0].end, "src/main.rs:42:10".chars().count());
-    }
-
-    #[test]
-    fn detects_a_real_cargo_diagnostic_arrow_line_with_a_leading_prefix() {
-        let text = "  --> src/lib.rs:12:5";
-        let matches = find_links(text);
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].path, "src/lib.rs");
-        assert_eq!(matches[0].line, Some(12));
-        assert_eq!(matches[0].column, Some(5));
-        assert_eq!(matches[0].start, text.find("src/lib.rs").unwrap());
-    }
-
-    #[test]
-    fn a_line_number_with_no_column_is_a_real_partial_match_not_a_whole_line_style() {
-        let matches = find_links("thread panicked at tests/upload.rs:88");
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].path, "tests/upload.rs");
-        assert_eq!(matches[0].line, Some(88));
-        assert_eq!(matches[0].column, None);
+    fn every_real_shape_of_file_reference_resolves_to_its_own_path_line_and_column() {
+        for (text, path, line, column) in [
+            ("src/main.rs:42:10", "src/main.rs", Some(42), Some(10)),
+            ("  --> src/lib.rs:12:5", "src/lib.rs", Some(12), Some(5)),
+            (
+                "   3: my_crate::do_thing\n             at src/main.rs:142:9",
+                "src/main.rs",
+                Some(142),
+                Some(9),
+            ),
+            (
+                "thread panicked at tests/upload.rs:88",
+                "tests/upload.rs",
+                Some(88),
+                None,
+            ),
+            (" M Cargo.toml", "Cargo.toml", None, None),
+            (
+                " A src/db/query_builder.rs",
+                "src/db/query_builder.rs",
+                None,
+                None,
+            ),
+            // `:0` is a real, if unusual, shape terminal output can contain, and must never flow
+            // through as a real one-based line target.
+            ("foo.rs:0", "foo.rs", None, None),
+        ] {
+            let matches = find_links(text);
+            assert_eq!(matches.len(), 1, "expected exactly one link in {text:?}");
+            assert_eq!(matches[0].path, path, "path in {text:?}");
+            assert_eq!(matches[0].line, line, "line in {text:?}");
+            assert_eq!(matches[0].column, column, "column in {text:?}");
+            // The link starts where the real path begins, not at whatever prefix precedes it.
+            let start_char = text.char_indices().nth(matches[0].start).map(|(i, _)| i);
+            assert_eq!(
+                start_char,
+                text.find(path),
+                "the link span must begin at the path itself in {text:?}"
+            );
+        }
     }
 
     #[test]
@@ -178,40 +194,6 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_repo_root_filename_with_a_known_extension_is_a_real_link() {
-        let matches = find_links(" M Cargo.toml");
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].path, "Cargo.toml");
-        assert_eq!(matches[0].line, None);
-    }
-
-    #[test]
-    fn a_multi_segment_path_with_no_line_number_is_still_a_real_link() {
-        let matches = find_links(" A src/db/query_builder.rs");
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].path, "src/db/query_builder.rs");
-        assert_eq!(matches[0].line, None);
-    }
-
-    #[test]
-    fn ordinary_prose_with_dots_but_no_real_extension_is_never_linked() {
-        for line in [
-            "e.g. this failed",
-            "see v0.14.0 for details",
-            "p = 0.00 < 0.05",
-            "left: 5242880",
-            "scan/baseline           time:   [41.203 ms 41.878 ms 42.611 ms]",
-            "Compiling jerry-db v0.14.0 (~/.jerry/wt/index-scan)",
-        ] {
-            assert!(
-                find_links(line).is_empty(),
-                "expected no link in {line:?}, got {:?}",
-                find_links(line)
-            );
-        }
-    }
-
-    #[test]
     fn multiple_links_on_one_line_are_all_detected_left_to_right() {
         let matches = find_links("see src/a.rs:1 and src/b.rs:2 both");
         assert_eq!(matches.len(), 2);
@@ -222,64 +204,20 @@ mod tests {
         assert!(matches[0].end <= matches[1].start);
     }
 
-    #[test]
-    fn a_real_backtrace_frame_is_detected_like_any_other_path_line_col_reference() {
-        let matches = find_links("   3: my_crate::do_thing\n             at src/main.rs:142:9");
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].path, "src/main.rs");
-        assert_eq!(matches[0].line, Some(142));
-        assert_eq!(matches[0].column, Some(9));
-    }
-
-    #[test]
-    fn resolve_joins_a_relative_path_onto_the_given_cwd() {
-        let cwd = Path::new("/home/colin/wt/feature");
-        assert_eq!(
-            resolve(cwd, "src/main.rs"),
-            PathBuf::from("/home/colin/wt/feature/src/main.rs")
-        );
-    }
-
-    #[test]
-    fn resolve_leaves_an_absolute_path_untouched() {
-        let cwd = Path::new("/home/colin/wt/feature");
-        assert_eq!(resolve(cwd, "/etc/hosts"), PathBuf::from("/etc/hosts"));
-    }
-
-    #[test]
-    fn resolve_normalizes_dot_dot_segments_and_deliberately_allows_escaping_cwd() {
-        let cwd = Path::new("/home/colin/wt/feature");
-        assert_eq!(
-            resolve(cwd, "../../../etc/shadow.conf"),
-            PathBuf::from("/home/etc/shadow.conf"),
-            "`..` segments must be collapsed into a real path with no literal `..` left in it"
-        );
-    }
-
-    #[test]
-    fn resolve_normalizes_a_dot_dot_that_would_otherwise_go_above_the_root() {
-        let cwd = Path::new("/home");
-        assert_eq!(
-            resolve(cwd, "../../../etc/passwd"),
-            PathBuf::from("/etc/passwd"),
-            "a `..` with nowhere left to pop (already at the real filesystem root) must be \
-             dropped, not underflow into something nonsensical"
-        );
-    }
-
-    #[test]
-    fn a_url_in_real_cargo_output_is_never_detected_as_a_link() {
-        let text = "see https://doc.rust-lang.org/cargo/reference/manifest.html for more";
-        assert!(
-            find_links(text).is_empty(),
-            "expected no link in {text:?}, got {:?}",
-            find_links(text)
-        );
-    }
-
+    /// The false positives found by probing the production regex against realistic terminal
+    /// output. A URL is the sharpest of them: mod-clicking one used to resolve to a nonexistent
+    /// absolute path (`/doc.rust-lang.org/...`), because the old regex's leading `/?`
+    /// alternation latched onto the second slash of `://`.
     #[test]
     fn realistic_non_path_output_never_produces_a_false_link() {
         for line in [
+            "e.g. this failed",
+            "see v0.14.0 for details",
+            "p = 0.00 < 0.05",
+            "left: 5242880",
+            "scan/baseline           time:   [41.203 ms 41.878 ms 42.611 ms]",
+            "Compiling jerry-db v0.14.0 (~/.jerry/wt/index-scan)",
+            "see https://doc.rust-lang.org/cargo/reference/manifest.html for more",
             // An SSH-style git remote: before the fix, this matched a fake `github.c` (`"c"`
             // is a known bare extension) *and* a fake `foo/bar.git`.
             "$ git clone git@github.com:foo/bar.git",
@@ -287,8 +225,7 @@ mod tests {
             // *any* extension, so `12.5/100.0` looked exactly like `path/file.ext`.
             "12.5/100.0 MB downloaded",
             "the answer is 42/7.0 approx",
-            // A URL whose host:port looks path-shaped once the scheme/host prefix is ignored -
-            // covered by the same URL rejection as the `doc.rust-lang.org` case above.
+            // A URL whose host:port looks path-shaped once the scheme/host prefix is ignored.
             "curl http://127.0.0.1:8080/api/v1/health.json",
         ] {
             assert!(
@@ -300,13 +237,26 @@ mod tests {
     }
 
     #[test]
-    fn a_captured_line_number_of_zero_is_treated_as_no_line() {
-        let matches = find_links("foo.rs:0");
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].path, "foo.rs");
-        assert_eq!(
-            matches[0].line, None,
-            "a captured `:0` must never pass through as a real one-based line target"
-        );
+    fn resolve_produces_a_real_absolute_path_with_no_dot_dot_left_in_it() {
+        for (cwd, path, expected) in [
+            (
+                "/home/colin/wt/feature",
+                "src/main.rs",
+                "/home/colin/wt/feature/src/main.rs",
+            ),
+            ("/home/colin/wt/feature", "/etc/hosts", "/etc/hosts"),
+            (
+                "/home/colin/wt/feature",
+                "../../../etc/shadow.conf",
+                "/home/etc/shadow.conf",
+            ),
+            ("/home", "../../../etc/passwd", "/etc/passwd"),
+        ] {
+            assert_eq!(
+                resolve(Path::new(cwd), path),
+                PathBuf::from(expected),
+                "resolving {path:?} against {cwd:?}"
+            );
+        }
     }
 }

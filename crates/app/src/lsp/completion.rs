@@ -677,216 +677,181 @@ mod tests {
         chars.iter().map(|c| c.to_string()).collect()
     }
 
+    /// Every real shape of "the user typed something" the popup can be asked to open on: an
+    /// identifier byte invokes an ordinary completion, an advertised character opens a real
+    /// trigger-character one, and anything else opens nothing at all.
     #[test]
-    fn an_identifier_continuation_character_triggers_an_invoked_completion() {
-        let context = completion_trigger(Some('x'), &triggers(&["."])).expect("should trigger");
-        assert_eq!(
-            context.trigger_kind,
-            lsp_types::CompletionTriggerKind::INVOKED
-        );
-        assert_eq!(context.trigger_character, None);
+    fn every_typed_character_opens_exactly_the_completion_it_should() {
+        use lsp_types::CompletionTriggerKind as Kind;
+        let advertised = triggers(&[".", "::"]);
+        for (typed, advertised, expected) in [
+            (
+                Some('x'),
+                advertised.as_slice(),
+                Some((Kind::INVOKED, None)),
+            ),
+            (Some('9'), &[][..], Some((Kind::INVOKED, None))),
+            (Some('_'), &[][..], Some((Kind::INVOKED, None))),
+            (
+                Some('.'),
+                advertised.as_slice(),
+                Some((Kind::TRIGGER_CHARACTER, Some("."))),
+            ),
+            (Some(' '), advertised.as_slice(), None),
+            (Some(';'), advertised.as_slice(), None),
+            (Some(')'), &[][..], None),
+            // The very start of the buffer - no character behind the caret at all.
+            (None, advertised.as_slice(), None),
+        ] {
+            let context = completion_trigger(typed, advertised);
+            match expected {
+                None => assert_eq!(context, None, "{typed:?} must not open a completion"),
+                Some((kind, character)) => {
+                    let context =
+                        context.unwrap_or_else(|| panic!("{typed:?} must open a completion"));
+                    assert_eq!(context.trigger_kind, kind, "for {typed:?}");
+                    assert_eq!(
+                        context.trigger_character.as_deref(),
+                        character,
+                        "for {typed:?}"
+                    );
+                }
+            }
+        }
     }
 
-    #[test]
-    fn a_digit_or_underscore_also_triggers_an_invoked_completion() {
-        assert!(completion_trigger(Some('9'), &[]).is_some());
-        assert!(completion_trigger(Some('_'), &[]).is_some());
+    fn range(start_character: u32, end_character: u32) -> lsp_types::Range {
+        lsp_types::Range {
+            start: lsp_types::Position {
+                line: 0,
+                character: start_character,
+            },
+            end: lsp_types::Position {
+                line: 0,
+                character: end_character,
+            },
+        }
     }
 
+    /// The three real shapes a server can answer an edit in. The `InsertAndReplace` row is the
+    /// load-bearing one: taking the wider `replace` half would swallow text past the caret that
+    /// the user never asked to lose.
     #[test]
-    fn a_server_advertised_trigger_character_triggers_a_real_trigger_character_completion() {
-        let context = completion_trigger(Some('.'), &triggers(&[".", "::"])).expect("trigger");
-        assert_eq!(
-            context.trigger_kind,
-            lsp_types::CompletionTriggerKind::TRIGGER_CHARACTER
-        );
-        assert_eq!(context.trigger_character.as_deref(), Some("."));
-    }
-
-    #[test]
-    fn whitespace_and_punctuation_do_not_trigger_when_not_a_real_advertised_trigger_character() {
-        assert_eq!(completion_trigger(Some(' '), &triggers(&["."])), None);
-        assert_eq!(completion_trigger(Some(';'), &triggers(&["."])), None);
-        assert_eq!(completion_trigger(Some(')'), &[]), None);
-    }
-
-    #[test]
-    fn the_start_of_the_buffer_never_triggers() {
-        assert_eq!(completion_trigger(None, &triggers(&["."])), None);
-    }
-
-    #[test]
-    fn completion_text_edit_prefers_a_real_plain_edit() {
-        let item = lsp_types::CompletionItem {
-            label: "println!".to_string(),
-            text_edit: Some(lsp_types::CompletionTextEdit::Edit(lsp_types::TextEdit {
-                range: lsp_types::Range {
-                    start: lsp_types::Position {
-                        line: 0,
-                        character: 0,
-                    },
-                    end: lsp_types::Position {
-                        line: 0,
-                        character: 3,
-                    },
-                },
-                new_text: "println!".to_string(),
-            })),
-            ..Default::default()
-        };
-        let (range, text) = completion_text_edit(&item).expect("a real edit");
-        assert_eq!(range.start.character, 0);
-        assert_eq!(range.end.character, 3);
-        assert_eq!(text, "println!");
-    }
-
-    #[test]
-    fn completion_text_edit_reads_the_insert_half_of_a_real_insert_and_replace_edit() {
-        let item = lsp_types::CompletionItem {
-            label: "println!".to_string(),
-            text_edit: Some(lsp_types::CompletionTextEdit::InsertAndReplace(
-                lsp_types::InsertReplaceEdit {
+    fn completion_text_edit_reads_the_insert_half_of_every_real_edit_shape() {
+        for (name, text_edit, expected) in [
+            (
+                "a plain edit",
+                Some(lsp_types::CompletionTextEdit::Edit(lsp_types::TextEdit {
+                    range: range(0, 3),
                     new_text: "println!".to_string(),
-                    insert: lsp_types::Range {
-                        start: lsp_types::Position {
-                            line: 0,
-                            character: 0,
-                        },
-                        end: lsp_types::Position {
-                            line: 0,
-                            character: 3,
-                        },
+                })),
+                Some((0, 3)),
+            ),
+            (
+                "an insert-and-replace edit",
+                Some(lsp_types::CompletionTextEdit::InsertAndReplace(
+                    lsp_types::InsertReplaceEdit {
+                        new_text: "println!".to_string(),
+                        insert: range(0, 3),
+                        replace: range(0, 10),
                     },
-                    replace: lsp_types::Range {
-                        start: lsp_types::Position {
-                            line: 0,
-                            character: 0,
-                        },
-                        end: lsp_types::Position {
-                            line: 0,
-                            character: 10,
-                        },
-                    },
-                },
-            )),
-            ..Default::default()
-        };
-        let (range, _) = completion_text_edit(&item).expect("a real edit");
-        assert_eq!(
-            range.end.character, 3,
-            "the insert half (3), not the wider replace half (10), must be used"
-        );
+                )),
+                Some((0, 3)),
+            ),
+            ("no edit at all", None, None),
+        ] {
+            let item = lsp_types::CompletionItem {
+                label: "println!".to_string(),
+                text_edit,
+                ..Default::default()
+            };
+            match expected {
+                None => assert_eq!(completion_text_edit(&item), None, "{name}"),
+                Some((start, end)) => {
+                    let (edit_range, text) =
+                        completion_text_edit(&item).unwrap_or_else(|| panic!("{name}"));
+                    assert_eq!(edit_range.start.character, start, "{name}");
+                    assert_eq!(edit_range.end.character, end, "{name}");
+                    assert_eq!(text, "println!", "{name}");
+                }
+            }
+        }
     }
 
     #[test]
-    fn completion_text_edit_is_none_without_a_real_text_edit() {
-        let item = lsp_types::CompletionItem {
-            label: "foo".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(completion_text_edit(&item), None);
-    }
-
-    #[test]
-    fn completion_plain_insert_text_prefers_a_real_insert_text_over_the_label() {
-        let item = lsp_types::CompletionItem {
-            label: "foo (function)".to_string(),
-            insert_text: Some("foo".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(completion_plain_insert_text(&item), "foo");
-    }
-
-    #[test]
-    fn completion_plain_insert_text_falls_back_to_the_real_label_when_insert_text_is_absent() {
-        let item = lsp_types::CompletionItem {
-            label: "foo".to_string(),
-            insert_text: None,
-            ..Default::default()
-        };
-        assert_eq!(completion_plain_insert_text(&item), "foo");
+    fn completion_plain_insert_text_prefers_insert_text_and_falls_back_to_the_label() {
+        for (insert_text, expected) in [(Some("foo".to_string()), "foo"), (None, "foo (function)")]
+        {
+            let item = lsp_types::CompletionItem {
+                label: "foo (function)".to_string(),
+                insert_text: insert_text.clone(),
+                ..Default::default()
+            };
+            assert_eq!(completion_plain_insert_text(&item), expected);
+        }
     }
 
     #[test]
     fn identifier_prefix_start_walks_back_to_the_real_start_of_the_typed_word() {
-        assert_eq!(identifier_prefix_start("let x = pri", 11), 8);
-        assert_eq!(identifier_prefix_start("    foo_bar2", 12), 4);
+        for (line, cursor, expected) in [
+            ("let x = pri", 11, 8),
+            ("    foo_bar2", 12, 4),
+            // Stops at a real non-identifier byte rather than running through it.
+            ("foo.bar", 7, 4),
+            ("a.b", 3, 2),
+            // No prefix at all: the cursor is its own start.
+            ("foo.", 4, 4),
+            ("", 0, 0),
+        ] {
+            assert_eq!(
+                identifier_prefix_start(line, cursor),
+                expected,
+                "{line:?} at {cursor}"
+            );
+        }
     }
 
+    /// Every kind the popup gives a badge to, and the letter each badge paints - the glyphs the
+    /// design mockups specify. A kind with no badge slot, and an item with no kind at all, both
+    /// have to come back bare rather than pick an arbitrary bucket.
     #[test]
-    fn identifier_prefix_start_stops_at_a_real_non_identifier_byte() {
-        assert_eq!(identifier_prefix_start("foo.bar", 7), 4);
-        assert_eq!(identifier_prefix_start("a.b", 3), 2);
-    }
+    fn every_completion_kind_lands_in_its_documented_badge_bucket() {
+        use lsp_types::CompletionItemKind as ItemKind;
+        for (kind, expected) in [
+            (
+                Some(ItemKind::FUNCTION),
+                Some(CompletionKindBadge::Function),
+            ),
+            (Some(ItemKind::METHOD), Some(CompletionKindBadge::Function)),
+            (
+                Some(ItemKind::CONSTRUCTOR),
+                Some(CompletionKindBadge::Function),
+            ),
+            (
+                Some(ItemKind::VARIABLE),
+                Some(CompletionKindBadge::Variable),
+            ),
+            (Some(ItemKind::FIELD), Some(CompletionKindBadge::Variable)),
+            (
+                Some(ItemKind::CONSTANT),
+                Some(CompletionKindBadge::Variable),
+            ),
+            (Some(ItemKind::STRUCT), Some(CompletionKindBadge::Type)),
+            (Some(ItemKind::CLASS), Some(CompletionKindBadge::Type)),
+            (Some(ItemKind::ENUM), Some(CompletionKindBadge::Type)),
+            (Some(ItemKind::KEYWORD), None),
+            (None, None),
+        ] {
+            assert_eq!(completion_kind_badge(kind), expected, "for {kind:?}");
+        }
 
-    #[test]
-    fn identifier_prefix_start_is_the_cursor_itself_with_no_real_prefix() {
-        assert_eq!(identifier_prefix_start("foo.", 4), 4);
-        assert_eq!(identifier_prefix_start("", 0), 0);
-    }
-
-    #[test]
-    fn completion_kind_badge_groups_function_like_kinds() {
-        assert_eq!(
-            completion_kind_badge(Some(lsp_types::CompletionItemKind::FUNCTION)),
-            Some(CompletionKindBadge::Function)
-        );
-        assert_eq!(
-            completion_kind_badge(Some(lsp_types::CompletionItemKind::METHOD)),
-            Some(CompletionKindBadge::Function)
-        );
-        assert_eq!(
-            completion_kind_badge(Some(lsp_types::CompletionItemKind::CONSTRUCTOR)),
-            Some(CompletionKindBadge::Function)
-        );
-    }
-
-    #[test]
-    fn completion_kind_badge_groups_variable_like_kinds() {
-        assert_eq!(
-            completion_kind_badge(Some(lsp_types::CompletionItemKind::VARIABLE)),
-            Some(CompletionKindBadge::Variable)
-        );
-        assert_eq!(
-            completion_kind_badge(Some(lsp_types::CompletionItemKind::FIELD)),
-            Some(CompletionKindBadge::Variable)
-        );
-        assert_eq!(
-            completion_kind_badge(Some(lsp_types::CompletionItemKind::CONSTANT)),
-            Some(CompletionKindBadge::Variable)
-        );
-    }
-
-    #[test]
-    fn completion_kind_badge_groups_type_like_kinds() {
-        assert_eq!(
-            completion_kind_badge(Some(lsp_types::CompletionItemKind::STRUCT)),
-            Some(CompletionKindBadge::Type)
-        );
-        assert_eq!(
-            completion_kind_badge(Some(lsp_types::CompletionItemKind::CLASS)),
-            Some(CompletionKindBadge::Type)
-        );
-        assert_eq!(
-            completion_kind_badge(Some(lsp_types::CompletionItemKind::ENUM)),
-            Some(CompletionKindBadge::Type)
-        );
-    }
-
-    #[test]
-    fn completion_kind_badge_is_none_for_a_kind_with_no_real_badge_slot_or_no_kind_at_all() {
-        assert_eq!(
-            completion_kind_badge(Some(lsp_types::CompletionItemKind::KEYWORD)),
-            None
-        );
-        assert_eq!(completion_kind_badge(None), None);
-    }
-
-    #[test]
-    fn completion_kind_badge_letters_match_the_design_mockups_own_glyphs() {
-        assert_eq!(CompletionKindBadge::Function.letter(), "f");
-        assert_eq!(CompletionKindBadge::Variable.letter(), "v");
-        assert_eq!(CompletionKindBadge::Type.letter(), "t");
+        for (badge, letter) in [
+            (CompletionKindBadge::Function, "f"),
+            (CompletionKindBadge::Variable, "v"),
+            (CompletionKindBadge::Type, "t"),
+        ] {
+            assert_eq!(badge.letter(), letter, "for {badge:?}");
+        }
     }
 
     fn item(label: &str) -> lsp_types::CompletionItem {
@@ -964,24 +929,23 @@ mod tests {
         assert_eq!(rank_completion_items(&items, "new"), vec![0, 1]);
     }
 
+    /// The spec's own "when falsy the label is used" fallback - and falsy has to cover an empty
+    /// string, not just a missing field, or a server that sends `""` filters everything out.
     #[test]
-    fn completion_filter_text_prefers_a_real_server_supplied_filter_text() {
-        let mut with_filter = item("new(…)");
-        with_filter.filter_text = Some("new".to_string());
-        assert_eq!(completion_filter_text(&with_filter), "new");
-    }
-
-    #[test]
-    fn completion_filter_text_falls_back_to_the_label_when_absent_or_empty() {
-        assert_eq!(completion_filter_text(&item("version")), "version");
-        let mut blank = item("version");
-        blank.filter_text = Some(String::new());
-        assert_eq!(
-            completion_filter_text(&blank),
-            "version",
-            "the spec's own \"when falsy the label is used\" fallback must cover an empty string, \
-             not just a missing field"
-        );
+    fn completion_filter_text_prefers_the_servers_own_and_falls_back_to_the_label() {
+        for (filter_text, label, expected) in [
+            (Some("new"), "new(…)", "new"),
+            (None, "version", "version"),
+            (Some(""), "version", "version"),
+        ] {
+            let mut candidate = item(label);
+            candidate.filter_text = filter_text.map(str::to_string);
+            assert_eq!(
+                completion_filter_text(&candidate),
+                expected,
+                "for {label:?}"
+            );
+        }
     }
 
     #[test]
@@ -1077,28 +1041,15 @@ mod tests {
         assert_eq!(completion_match("ab", "abc"), None);
     }
 
+    /// The row's right-hand hint and the detail pane's signature line, over every real shape a
+    /// server sends. The `label_details` rows are the regression: `rust-analyzer`'s own
+    /// `label_details.detail` for a trait-provided method (`.into()`, `.try_into()`, …) is a
+    /// trait-source annotation (`"(as Into)"`), not a type - preferring it over the legacy
+    /// `detail` field broke the hint for some of the most common completions there are, so both
+    /// functions must ignore `label_details` entirely.
     #[test]
-    fn completion_item_display_trims_and_drops_a_real_blank_detail() {
-        let item = lsp_types::CompletionItem {
-            label: "foo".to_string(),
-            detail: Some("  fn() -> i32  ".to_string()),
-            ..Default::default()
-        };
-        let (label, detail) = completion_item_display(&item);
-        assert_eq!(label, "foo");
-        assert_eq!(detail.as_deref(), Some("fn() -> i32"));
-
-        let no_detail_item = lsp_types::CompletionItem {
-            label: "bar".to_string(),
-            detail: Some("   ".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(completion_item_display(&no_detail_item).1, None);
-    }
-
-    #[test]
-    fn completion_item_display_ignores_a_real_rust_analyzer_trait_source_label_details_detail() {
-        let item = lsp_types::CompletionItem {
+    fn the_row_hint_and_signature_line_read_the_legacy_detail_and_never_label_details() {
+        let trait_provided = lsp_types::CompletionItem {
             label: "into".to_string(),
             detail: Some("fn(self) -> T".to_string()),
             label_details: Some(lsp_types::CompletionItemLabelDetails {
@@ -1107,26 +1058,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert_eq!(
-            completion_item_display(&item).1.as_deref(),
-            Some("fn(self) -> T"),
-            "the row's own right-side hint must read the real legacy detail string, never the \
-             trait-source annotation rust-analyzer puts in label_details.detail"
-        );
-    }
-
-    #[test]
-    fn completion_item_display_falls_back_to_the_bare_label_with_no_real_detail_at_all() {
-        let item = lsp_types::CompletionItem {
-            label: "push_str".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(completion_item_display(&item).1, None);
-    }
-
-    #[test]
-    fn completion_signature_text_ignores_label_details_and_cleans_the_legacy_detail() {
-        let item = lsp_types::CompletionItem {
+        let typescript_method = lsp_types::CompletionItem {
             label: "pushStr".to_string(),
             detail: Some("(method) QueryBuilder.pushStr(s: string): void".to_string()),
             label_details: Some(lsp_types::CompletionItemLabelDetails {
@@ -1135,36 +1067,61 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert_eq!(
-            completion_signature_text(&item),
-            "pushStr(s: string): void",
-            "the pane's own signature line must clean the real legacy detail string, never read \
-             label_details at all"
-        );
-    }
-
-    #[test]
-    fn completion_signature_text_falls_back_to_the_legacy_detail_string() {
-        let item = lsp_types::CompletionItem {
+        let padded = lsp_types::CompletionItem {
+            label: "foo".to_string(),
+            detail: Some("  fn() -> i32  ".to_string()),
+            ..Default::default()
+        };
+        let blank = lsp_types::CompletionItem {
+            label: "bar".to_string(),
+            detail: Some("   ".to_string()),
+            ..Default::default()
+        };
+        let bare = lsp_types::CompletionItem {
+            label: "push_str".to_string(),
+            ..Default::default()
+        };
+        let rust_signature = lsp_types::CompletionItem {
             label: "push_str".to_string(),
             detail: Some("fn push_str(&mut self, string: &str)".to_string()),
             ..Default::default()
         };
-        assert_eq!(
-            completion_signature_text(&item),
-            "fn push_str(&mut self, string: &str)",
-            "rust-analyzer's own convention - a real, complete, standalone signature string \
-             with no kind/qualifier prefix to clean - must pass through unchanged"
-        );
-    }
 
-    #[test]
-    fn completion_signature_text_falls_back_to_the_bare_label_with_nothing_else_real() {
-        let item = lsp_types::CompletionItem {
-            label: "push_str".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(completion_signature_text(&item), "push_str");
+        for (name, candidate, hint, signature) in [
+            (
+                "a padded detail",
+                &padded,
+                Some("fn() -> i32"),
+                "fn() -> i32",
+            ),
+            ("a blank detail", &blank, None, "bar"),
+            ("no detail at all", &bare, None, "push_str"),
+            (
+                "a trait-provided method",
+                &trait_provided,
+                Some("fn(self) -> T"),
+                "fn(self) -> T",
+            ),
+            (
+                "a TypeScript method",
+                &typescript_method,
+                Some("pushStr(s: string): void"),
+                "pushStr(s: string): void",
+            ),
+            (
+                "a standalone rust-analyzer signature",
+                &rust_signature,
+                Some("fn push_str(&mut self, string: &str)"),
+                "fn push_str(&mut self, string: &str)",
+            ),
+        ] {
+            assert_eq!(
+                completion_item_display(candidate).1.as_deref(),
+                hint,
+                "{name}"
+            );
+            assert_eq!(completion_signature_text(candidate), signature, "{name}");
+        }
     }
 
     #[test]
@@ -1813,155 +1770,118 @@ mod tests {
         }
     }
 
+    /// Real, live-observed shapes from both servers this app supports - a real dump against a
+    /// genuinely spawned rust-analyzer/typescript-language-server, not synthetic guesses (see
+    /// `clean_completion_detail`'s own docs). The three "untouched" rows are the false-positive
+    /// guards: a genuine parenthesized parameter list or tuple type at the start of `detail` is
+    /// distinguished from a kind descriptor by the `:`/`,` inside its parens, and a label
+    /// reappearing deep in a return type is not a `Qualifier.` prefix.
     #[test]
-    fn clean_completion_detail_strips_a_real_typescript_method_kind_and_qualifier_prefix() {
-        assert_eq!(
-            clean_completion_detail("(method) QueryBuilder.pushStr(s: string): void", "pushStr"),
-            "pushStr(s: string): void"
-        );
+    fn clean_completion_detail_strips_only_a_real_kind_or_qualifier_prefix() {
+        for (detail, label, expected) in [
+            (
+                "(method) QueryBuilder.pushStr(s: string): void",
+                "pushStr",
+                "pushStr(s: string): void",
+            ),
+            ("(property) Foo.bar: string", "bar", "bar: string"),
+            ("fn(&mut self, &str)", "push_str", "fn(&mut self, &str)"),
+            ("fn(self) -> T", "into", "fn(self) -> T"),
+            ("(x: number) => void", "onClick", "(x: number) => void"),
+            ("(number, string)", "pair", "(number, string)"),
+            ("fn() -> Option<Table>", "Table", "fn() -> Option<Table>"),
+        ] {
+            assert_eq!(
+                clean_completion_detail(detail, label),
+                expected,
+                "for {detail:?}"
+            );
+        }
+    }
+
+    /// Every real shape a server can answer `documentation` in. Markdown is degraded to plain
+    /// text; plain text passes through untouched; nothing real means nothing shown.
+    #[test]
+    fn completion_documentation_text_reads_every_real_documentation_shape() {
+        for (name, documentation, expected) in [
+            (
+                "a plain string",
+                Some(lsp_types::Documentation::String(
+                    "Appends a given string slice.".to_string(),
+                )),
+                Some("Appends a given string slice."),
+            ),
+            (
+                "markdown markup",
+                Some(lsp_types::Documentation::MarkupContent(
+                    lsp_types::MarkupContent {
+                        kind: lsp_types::MarkupKind::Markdown,
+                        value: "Appends a **given** string slice.".to_string(),
+                    },
+                )),
+                Some("Appends a given string slice."),
+            ),
+            (
+                "plain-text markup",
+                Some(lsp_types::Documentation::MarkupContent(
+                    lsp_types::MarkupContent {
+                        kind: lsp_types::MarkupKind::PlainText,
+                        value: "`not markdown` stays as-is".to_string(),
+                    },
+                )),
+                Some("`not markdown` stays as-is"),
+            ),
+            ("nothing at all", None, None),
+            (
+                "a blank string",
+                Some(lsp_types::Documentation::String("   ".to_string())),
+                None,
+            ),
+        ] {
+            let candidate = lsp_types::CompletionItem {
+                label: "push_str".to_string(),
+                documentation,
+                ..Default::default()
+            };
+            assert_eq!(
+                completion_documentation_text(&candidate).as_deref(),
+                expected,
+                "{name}"
+            );
+        }
     }
 
     #[test]
-    fn clean_completion_detail_strips_a_real_typescript_property_kind_and_qualifier_prefix() {
-        assert_eq!(
-            clean_completion_detail("(property) Foo.bar: string", "bar"),
-            "bar: string"
-        );
-    }
-
-    #[test]
-    fn clean_completion_detail_leaves_a_real_rust_analyzer_signature_untouched() {
-        assert_eq!(
-            clean_completion_detail("fn(&mut self, &str)", "push_str"),
-            "fn(&mut self, &str)"
-        );
-        assert_eq!(
-            clean_completion_detail("fn(self) -> T", "into"),
-            "fn(self) -> T"
-        );
-    }
-
-    #[test]
-    fn clean_completion_detail_never_strips_a_real_parenthesized_type() {
-        assert_eq!(
-            clean_completion_detail("(x: number) => void", "onClick"),
-            "(x: number) => void"
-        );
-        assert_eq!(
-            clean_completion_detail("(number, string)", "pair"),
-            "(number, string)"
-        );
-    }
-
-    #[test]
-    fn clean_completion_detail_only_strips_a_real_bare_dotted_qualifier() {
-        // The label reappearing deep inside a return type, with no real `Qualifier.` immediately
-        // before it, must not be mistaken for one.
-        assert_eq!(
-            clean_completion_detail("fn() -> Option<Table>", "Table"),
-            "fn() -> Option<Table>"
-        );
-    }
-
-    #[test]
-    fn completion_documentation_text_reads_a_real_plain_string_shape() {
-        let item = lsp_types::CompletionItem {
-            label: "push_str".to_string(),
-            documentation: Some(lsp_types::Documentation::String(
-                "Appends a given string slice.".to_string(),
-            )),
-            ..Default::default()
-        };
-        assert_eq!(
-            completion_documentation_text(&item).as_deref(),
-            Some("Appends a given string slice.")
-        );
-    }
-
-    #[test]
-    fn completion_documentation_text_degrades_a_real_markdown_markup_content() {
-        let item = lsp_types::CompletionItem {
-            label: "push_str".to_string(),
-            documentation: Some(lsp_types::Documentation::MarkupContent(
-                lsp_types::MarkupContent {
-                    kind: lsp_types::MarkupKind::Markdown,
-                    value: "Appends a **given** string slice.".to_string(),
-                },
-            )),
-            ..Default::default()
-        };
-        assert_eq!(
-            completion_documentation_text(&item).as_deref(),
-            Some("Appends a given string slice.")
-        );
-    }
-
-    #[test]
-    fn completion_documentation_text_passes_a_real_plain_text_markup_content_through_unmodified() {
-        let item = lsp_types::CompletionItem {
-            label: "push_str".to_string(),
-            documentation: Some(lsp_types::Documentation::MarkupContent(
-                lsp_types::MarkupContent {
-                    kind: lsp_types::MarkupKind::PlainText,
-                    value: "`not markdown` stays as-is".to_string(),
-                },
-            )),
-            ..Default::default()
-        };
-        assert_eq!(
-            completion_documentation_text(&item).as_deref(),
-            Some("`not markdown` stays as-is")
-        );
-    }
-
-    #[test]
-    fn completion_documentation_text_is_none_for_a_real_absent_or_blank_documentation() {
-        let no_doc = lsp_types::CompletionItem {
-            label: "foo".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(completion_documentation_text(&no_doc), None);
-
-        let blank_doc = lsp_types::CompletionItem {
-            label: "foo".to_string(),
-            documentation: Some(lsp_types::Documentation::String("   ".to_string())),
-            ..Default::default()
-        };
-        assert_eq!(completion_documentation_text(&blank_doc), None);
-    }
-
-    #[test]
-    fn completion_module_path_reads_a_real_label_details_description() {
-        let item = lsp_types::CompletionItem {
-            label: "push_str".to_string(),
-            label_details: Some(lsp_types::CompletionItemLabelDetails {
-                detail: Some("(&mut self, &str)".to_string()),
-                description: Some("alloc::string::String".to_string()),
-            }),
-            ..Default::default()
-        };
-        assert_eq!(
-            completion_module_path(&item).as_deref(),
-            Some("alloc::string::String")
-        );
-    }
-
-    #[test]
-    fn completion_module_path_is_none_without_real_label_details_or_a_real_description() {
-        let no_label_details = lsp_types::CompletionItem {
-            label: "foo".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(completion_module_path(&no_label_details), None);
-
-        let no_description = lsp_types::CompletionItem {
-            label: "foo".to_string(),
-            label_details: Some(lsp_types::CompletionItemLabelDetails {
-                detail: Some("()".to_string()),
-                description: None,
-            }),
-            ..Default::default()
-        };
-        assert_eq!(completion_module_path(&no_description), None);
+    fn completion_module_path_reads_only_a_real_label_details_description() {
+        for (name, label_details, expected) in [
+            (
+                "a real description",
+                Some(lsp_types::CompletionItemLabelDetails {
+                    detail: Some("(&mut self, &str)".to_string()),
+                    description: Some("alloc::string::String".to_string()),
+                }),
+                Some("alloc::string::String"),
+            ),
+            ("no label details at all", None, None),
+            (
+                "label details with no description",
+                Some(lsp_types::CompletionItemLabelDetails {
+                    detail: Some("()".to_string()),
+                    description: None,
+                }),
+                None,
+            ),
+        ] {
+            let candidate = lsp_types::CompletionItem {
+                label: "push_str".to_string(),
+                label_details,
+                ..Default::default()
+            };
+            assert_eq!(
+                completion_module_path(&candidate).as_deref(),
+                expected,
+                "{name}"
+            );
+        }
     }
 }

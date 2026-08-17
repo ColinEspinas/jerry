@@ -55,6 +55,11 @@ pub mod sidebar;
 pub mod sound;
 pub mod status_bar;
 pub mod terminal;
+// The GPUI half of this workspace's shared fixtures; the gpui-free half is `crates/test-support`
+// (see that crate's docs and `docs/testing.md`). `cfg(test)`, so none of it is compiled into the
+// shipped binary.
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod text_history;
 pub mod theme;
 // `pub(crate)`, unlike every other feature folder above: this one exposes no public item at
@@ -969,6 +974,9 @@ mod open_ade_window_tests {
     #[gpui::test]
     fn reopen_shape_restores_the_remembered_repo(cx: &mut gpui::TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
+        // `AdeApp` canonicalizes the root it is opened with, so a bare `TempDir::path()` would be
+        // compared against its own `/private/var` resolution below and never match on macOS.
+        let repo_path = std::fs::canonicalize(repo.path()).expect("canonical tempdir");
         let settings_dir = tempfile::tempdir().expect("tempdir");
         let settings_path = settings_dir.path().join("settings.toml");
 
@@ -980,7 +988,7 @@ mod open_ade_window_tests {
         // window-less `update`, which `VisualTestContext` doesn't have the same shape of.
         let (_first, _first_window_cx) = cx.add_window_view(|window, cx| {
             AdeApp::new_with_settings(
-                Some(repo.path().to_path_buf()),
+                Some(repo_path.clone()),
                 true,
                 settings_store::Settings::default(),
                 Some(settings_path.clone()),
@@ -1008,7 +1016,7 @@ mod open_ade_window_tests {
         app.read_with(cx, |app, _| {
             assert_eq!(
                 app.focused_repo_path(),
-                repo.path(),
+                repo_path,
                 "a Dock reopen must restore the same repo a fresh relaunch would, not a bare \
                  empty window"
             );

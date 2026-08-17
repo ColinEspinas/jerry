@@ -522,7 +522,7 @@ pub fn relative_within(worktree: &Path, file: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use std::path::Path;
-    use std::process::Command;
+    use test_support::{git, git_output};
 
     /// The real shape of one agent tool call, end to end: the `PreToolUse` snapshot, the agent's
     /// actual write to the actual file, then the `PostToolUse` record. No step is simulated - the
@@ -996,7 +996,7 @@ mod tests {
             vec!["log", "--format=full", "--all"],
             vec!["cat-file", "-p", "HEAD"],
         ] {
-            let output = git_stdout(repo, &args);
+            let output = git_output(repo, &args);
             assert!(
                 !output.contains(marker) && !output.to_lowercase().contains("provenance"),
                 "`git {}` leaked attribution:\n{output}",
@@ -1004,44 +1004,19 @@ mod tests {
             );
         }
         assert_eq!(
-            git_stdout(repo, &["notes", "list"]).trim(),
+            git_output(repo, &["notes", "list"]),
             "",
             "attribution must not be smuggled out as a git note either"
         );
         assert_eq!(
-            git_stdout(repo, &["for-each-ref", "--format=%(refname)"]).trim(),
+            git_output(repo, &["for-each-ref", "--format=%(refname)"]),
             "refs/heads/main",
             "the store must not anchor anything with a ref of its own"
         );
         assert_eq!(
-            git_stdout(repo, &["status", "--porcelain"]).trim(),
+            git_output(repo, &["status", "--porcelain"]),
             "",
             "the store must not leave a single file behind in the worktree"
         );
-    }
-
-    fn git(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn git_stdout(dir: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        String::from_utf8_lossy(&output.stdout).into_owned()
     }
 }

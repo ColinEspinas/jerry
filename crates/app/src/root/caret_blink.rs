@@ -121,7 +121,6 @@ impl AdeApp {
 #[cfg(test)]
 mod caret_blink_focus_order_tests {
     use super::*;
-    use crate::root::focus::palette_focus_tests;
     use gpui::{Entity, TestAppContext, VisualTestContext};
 
     /// A real repo directory with a real file in it, opened in a real File view, so
@@ -130,11 +129,15 @@ mod caret_blink_focus_order_tests {
     /// `track_focus`'d (`crate::code_surface::render`).
     fn open_app_with_a_focusable_editor(
         cx: &mut TestAppContext,
-    ) -> (Entity<AdeApp>, &mut VisualTestContext, tempfile::TempDir) {
-        let repo = tempfile::tempdir().expect("tempdir");
+    ) -> (
+        Entity<AdeApp>,
+        &mut VisualTestContext,
+        crate::test_support::TempRoot,
+    ) {
+        let repo = crate::test_support::temp_root();
         let file_path = repo.path().join("notes.txt");
         std::fs::write(&file_path, "hello\n").expect("write notes.txt");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         // `on_focus`/`on_blur` only fire while GPUI considers the window itself active - a
         // freshly opened test window starts out inactive, so this is a real precondition, not
         // scaffolding (the same note every other caret-blink test in this codebase carries).

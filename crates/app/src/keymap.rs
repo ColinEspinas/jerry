@@ -253,13 +253,11 @@ mod tests {
 
     #[test]
     fn resolve_keystroke_renders_the_secondary_modifier_as_the_cross_platform_mod_glyph() {
-        // What `gpui::Keystroke::parse("secondary-n")` produces on a non-macOS build -
-        // `modifiers.control == true`, `modifiers.platform == false`.
+        // `Modifiers::secondary_key()`, not a hand-built `control: true`: `secondary()` reads
+        // `platform` on macOS and `control` elsewhere, so only the constructor gpui pairs with it
+        // produces a keystroke that really is secondary on the build actually running this test.
         let keystroke = gpui::Keystroke {
-            modifiers: gpui::Modifiers {
-                control: true,
-                ..Default::default()
-            },
+            modifiers: gpui::Modifiers::secondary_key(),
             key: "n".to_string(),
             key_char: None,
         };
@@ -290,12 +288,26 @@ mod tests {
         );
     }
 
-    // `resolve_keystroke`'s `else if modifiers.control` branch (a literal `ctrl` held *without*
-    // `secondary`) is only reachable on a real macOS build: on this Linux dev/test sandbox,
-    // `Modifiers::secondary()` *is* `modifiers.control`, so any keystroke with `control: true`
-    // already takes the `secondary` branch first. Not tested here for the same reason
-    // `WindowControlsStyle`'s own docs give for its `cfg!(target_os = "macos")`-gated behavior:
-    // real, compile-time-correct code this sandbox cannot compile-and-run the other branch of.
+    /// `resolve_keystroke`'s `else if modifiers.control` branch - a literal `ctrl` held *without*
+    /// `secondary`, as `crate::default_key_bindings`'s `"ctrl-shift-t"` really is - is only
+    /// reachable where `secondary()` reads `platform` rather than `control`, i.e. macOS.
+    /// Elsewhere `control: true` takes the `secondary` branch first and this asserts nothing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_literal_control_without_secondary_falls_back_to_the_physical_ctrl_glyph() {
+        let keystroke = gpui::Keystroke {
+            modifiers: gpui::Modifiers {
+                control: true,
+                ..Default::default()
+            },
+            key: "t".to_string(),
+            key_char: None,
+        };
+        assert_eq!(
+            resolve_keystroke(&keystroke, true),
+            vec!["\u{2303}".to_string(), "T".to_string()]
+        );
+    }
 
     #[test]
     fn labels_are_the_real_command_palette_display_strings() {
