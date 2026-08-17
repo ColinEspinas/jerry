@@ -26,6 +26,9 @@ use crate::terminal::grid::{
     CellPosition, CellSide, CellWidth, GridCell, ScrollAmount, TerminalGrid, TerminalPalette,
 };
 use crate::terminal::links::{self as terminal_links, LinkMatch};
+use crate::terminal::mouse::{
+    MouseAction, MouseCell, MouseModifiers, MouseProtocol, MouseReportButton,
+};
 use crate::terminal::osc::Progress;
 use crate::theme;
 
@@ -123,6 +126,12 @@ const APPROX_CELL_WIDTH_PX: f32 = 7.0;
 /// [`TerminalPane::handle_scroll_wheel`]'s line count back into wheel gestures for
 /// [`TerminalPane::forward_scroll_as_page_keys`] (GitHub issue #368).
 const WHEEL_LINES_PER_NOTCH: f32 = 3.0;
+
+/// Ceiling on how many wheel reports one scroll event may generate while a program has mouse
+/// tracking on (GitHub issue #437). A violent trackpad flick can accumulate hundreds of lines in a
+/// single event, and each one is a separate report the program has to parse; capping keeps one
+/// event's write bounded without changing what an ordinary wheel notch does.
+const MAX_WHEEL_REPORTS_PER_EVENT: usize = 16;
 
 /// The pane root's own padding, applied on every side via `.p(px(PANE_PADDING_PX))` in
 /// `render`. Named as its own constant rather than left as the equivalent `.p_2()` shorthand
@@ -532,6 +541,17 @@ pub struct TerminalPane {
     /// selection *itself* lives in `alacritty_terminal`'s own `Term::selection` (see
     /// `crate::terminal::grid`'s selection docs), not here.
     selecting: bool,
+    /// The grid cell the last motion report named (GitHub issue #437), so a pointer sliding within
+    /// one cell reports once rather than once per pixel. Cell only, deliberately not a whole
+    /// [`CellPosition`]: the protocol has no half-cell resolution, so including
+    /// [`CellSide`] would double the report rate for byte-identical reports.
+    last_reported_cell: Option<(usize, usize)>,
+    /// Which buttons a *press* report actually went out for, indexed by
+    /// [`MouseReportButton::index`]. A release is only reported for a press the program was told
+    /// about: Shift (or the secondary modifier) held at press time suppresses the press, and if the
+    /// human lets that modifier go mid-gesture, an unreported press would otherwise be followed by
+    /// a bare release - a malformed pair to whatever is parsing it.
+    reported_presses: [bool; 3],
     /// Test-only seam: the exact [`TerminalPalette`] the most recent real `Render::render` call
     /// painted with (GitHub issue #208). Written by `render` itself and by nothing else, so a test
     /// asserting on it is asserting on what the pane genuinely painted rather than re-deriving the
@@ -592,6 +612,8 @@ impl TerminalPane {
             _task: None,
             is_foreground: true,
             selecting: false,
+            last_reported_cell: None,
+            reported_presses: [false; 3],
             #[cfg(test)]
             last_painted_palette: None,
             scroll_handle: TerminalScrollHandle::new(),
@@ -918,10 +940,42 @@ impl TerminalPane {
         ))
     }
 
-    /// Anchors a fresh selection under the pointer and takes focus - a real left mouse-down
-    /// inside the grid. Anchoring on *every* left mouse-down (not only ones that turn into
-    /// drags) is what makes a plain click clear the previous selection, since an undragged
-    /// anchor is empty - see [`crate::terminal::grid::TerminalGrid::start_selection`]'s docs.
+    /// The mouse-reporting protocol in force for a gesture carrying `modifiers`, or
+    /// [`MouseProtocol::OFF`] whenever this pane's own local gestures must win instead (GitHub
+    /// issue #437).
+    ///
+    /// Shift is the standard xterm/alacritty escape hatch for selecting text out from under a
+    /// program that has taken the mouse. Scrolled back into history, a viewport row number would
+    /// name a line the program does not have on screen at all, so nothing is reported there
+    /// either - in practice a full-screen program never hits that, since the alt screen has no
+    /// scrollback.
+    fn mouse_protocol(&self, modifiers: Modifiers) -> MouseProtocol {
+        if modifiers.shift || self.grid.is_scrolled_back() {
+            return MouseProtocol::OFF;
+        }
+        self.grid.mouse_protocol()
+    }
+
+    /// Writes one already-encoded mouse report to the child, surfacing a failed write the same way
+    /// [`Self::handle_key_down`] does rather than swallowing it.
+    fn write_mouse_report(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let write_result = session.write_input(bytes);
+        if let Err(err) = write_result {
+            self.spawn_error = Some(format!("failed to write input: {err}"));
+            cx.notify();
+        }
+    }
+
+    /// Reports a press to the running program if one asked for the mouse, and otherwise anchors a
+    /// fresh selection under the pointer. Either way this takes focus, since the human's next
+    /// keystroke has to land in the pane they just clicked.
+    ///
+    /// Anchoring on *every* left mouse-down (not only ones that turn into drags) is what makes a
+    /// plain click clear the previous selection, since an undragged anchor is empty - see
+    /// [`crate::terminal::grid::TerminalGrid::start_selection`]'s docs.
     fn handle_mouse_down(
         &mut self,
         event: &gpui::MouseDownEvent,
@@ -932,6 +986,37 @@ impl TerminalPane {
         let Some(position) = self.cell_position_at(event.position, window) else {
             return;
         };
+        let protocol = self.mouse_protocol(event.modifiers);
+
+        // The secondary modifier stays reserved for the link spans' own Cmd/Ctrl+click
+        // (`render_link_span`), so one gesture can never both open a path and be acted on by the
+        // program underneath it.
+        if protocol.is_active() && !event.modifiers.secondary() {
+            self.last_reported_cell = Some((position.row, position.column));
+            let Some(button) = report_button(event.button) else {
+                return;
+            };
+            let Some(bytes) = protocol.encode(
+                MouseAction::Press(button),
+                report_cell(position),
+                report_modifiers(event.modifiers),
+            ) else {
+                return;
+            };
+            self.reported_presses[button.index()] = true;
+            // A reported click still clears whatever was selected - the "a plain click clears the
+            // previous selection" promise above holds in both modes.
+            self.grid.clear_selection();
+            self.write_mouse_report(&bytes, cx);
+            cx.notify();
+            return;
+        }
+
+        // Registered for all three buttons for the reporting half above; with reporting off, only
+        // the left button has ever had a local meaning here.
+        if event.button != gpui::MouseButton::Left {
+            return;
+        }
         self.grid.start_selection(position);
         self.selecting = true;
         cx.notify();
@@ -948,6 +1033,32 @@ impl TerminalPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let protocol = self.mouse_protocol(event.modifiers);
+        if protocol.is_active() {
+            // No bounds test needed: GPUI gates every `on_mouse_move` listener on its element's
+            // own hitbox being hovered, so a pointer outside this pane never reaches here.
+            let Some(position) = self.cell_position_at(event.position, window) else {
+                return;
+            };
+            let cell = (position.row, position.column);
+            if self.last_reported_cell == Some(cell) {
+                return;
+            }
+            // Latched before the encode, so a hover under drag tracking (which reports nothing)
+            // still costs at most one encode attempt per cell rather than one per pixel.
+            self.last_reported_cell = Some(cell);
+            let Some(bytes) = protocol.encode(
+                MouseAction::Motion(event.pressed_button.and_then(report_button)),
+                report_cell(position),
+                report_modifiers(event.modifiers),
+            ) else {
+                return;
+            };
+            // No `cx.notify()`: a motion report changes nothing this pane paints. Whatever the
+            // program draws in response arrives through the poll loop, which notifies itself.
+            self.write_mouse_report(&bytes, cx);
+            return;
+        }
         if !self.selecting {
             return;
         }
@@ -962,13 +1073,38 @@ impl TerminalPane {
         cx.notify();
     }
 
+    /// Ends a selection drag, and reports the release to the running program - but only for a press
+    /// it was actually told about, see [`Self::reported_presses`].
     fn handle_mouse_up(
         &mut self,
-        _event: &gpui::MouseUpEvent,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
+        event: &gpui::MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
         self.selecting = false;
+        self.last_reported_cell = None;
+        let Some(button) = report_button(event.button) else {
+            return;
+        };
+        if !std::mem::take(&mut self.reported_presses[button.index()]) {
+            return;
+        }
+        // The live protocol, deliberately *not* [`Self::mouse_protocol`]'s Shift/scrolled-back
+        // gating: the press was already reported, so this gesture belongs to the program, and a
+        // human who presses Shift or scrolls mid-drag must not strand it holding a button down.
+        // Only the program turning tracking off itself ends the gesture early, which `encode`
+        // handles on its own.
+        let Some(position) = self.cell_position_at(event.position, window) else {
+            return;
+        };
+        let Some(bytes) = self.grid.mouse_protocol().encode(
+            MouseAction::Release(button),
+            report_cell(position),
+            report_modifiers(event.modifiers),
+        ) else {
+            return;
+        };
+        self.write_mouse_report(&bytes, cx);
     }
 
     /// Mouse-wheel/trackpad scrollback (GitHub issue #331) - converts `event.delta` into whole
@@ -980,7 +1116,7 @@ impl TerminalPane {
     fn handle_scroll_wheel(
         &mut self,
         event: &ScrollWheelEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let row_height = self.line_height_px();
@@ -994,12 +1130,55 @@ impl TerminalPane {
             return;
         }
         self.pending_scroll_px -= lines * row_height;
-        if self.grid.alt_scroll_forwarding_active() {
+        let protocol = self.mouse_protocol(event.modifiers);
+        if protocol.is_active() {
+            self.report_scroll(protocol, event, lines as i32, window, cx);
+        } else if self.grid.alt_scroll_forwarding_active() {
             self.forward_scroll_as_page_keys(lines as i32);
         } else {
             self.grid.scroll_display(ScrollAmount::Lines(lines as i32));
         }
         cx.notify();
+    }
+
+    /// One wheel report per whole grid line the wheel moved (GitHub issue #437) - the same line
+    /// count [`crate::terminal::grid::TerminalGrid::scroll_display`] would have moved, so a notch
+    /// travels the same distance whether the program or this pane is doing the scrolling.
+    ///
+    /// Takes precedence over both [`crate::terminal::grid::TerminalGrid::alt_scroll_forwarding_active`]
+    /// and local scrollback: a program that asked for the mouse wants real wheel reports, not the
+    /// synthesised PageUp/PageDown presses [`Self::forward_scroll_as_page_keys`] sends on behalf of
+    /// one that didn't.
+    fn report_scroll(
+        &mut self,
+        protocol: MouseProtocol,
+        event: &ScrollWheelEvent,
+        lines: i32,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(position) = self.cell_position_at(event.position, window) else {
+            return;
+        };
+        let action = if lines > 0 {
+            MouseAction::WheelUp
+        } else {
+            MouseAction::WheelDown
+        };
+        let Some(report) = protocol.encode(
+            action,
+            report_cell(position),
+            report_modifiers(event.modifiers),
+        ) else {
+            return;
+        };
+        let count = (lines.unsigned_abs() as usize).min(MAX_WHEEL_REPORTS_PER_EVENT);
+        let mut bytes = Vec::with_capacity(report.len() * count);
+        for _ in 0..count {
+            bytes.extend_from_slice(&report);
+        }
+        // One write for the whole burst, so a violent flick can't interleave with anything else.
+        self.write_mouse_report(&bytes, cx);
     }
 
     /// Translates a mouse-wheel scroll delta into the same PageUp/PageDown byte sequence
@@ -1726,6 +1905,37 @@ impl Focusable for TerminalPane {
 
 impl EventEmitter<TerminalPaneEvent> for TerminalPane {}
 
+/// The reportable counterpart of a GPUI mouse button. `None` for `MouseButton::Navigate`: a
+/// back/forward button has no xterm report code, and inventing one would tell the program about a
+/// click it never received.
+fn report_button(button: gpui::MouseButton) -> Option<MouseReportButton> {
+    match button {
+        gpui::MouseButton::Left => Some(MouseReportButton::Left),
+        gpui::MouseButton::Middle => Some(MouseReportButton::Middle),
+        gpui::MouseButton::Right => Some(MouseReportButton::Right),
+        gpui::MouseButton::Navigate(_) => None,
+    }
+}
+
+/// The three modifiers a mouse report can carry. `Modifiers::platform` is deliberately dropped
+/// rather than mapped onto one of them, for the same reason [`keystroke_to_bytes`] refuses a
+/// platform-modified keystroke outright.
+fn report_modifiers(modifiers: Modifiers) -> MouseModifiers {
+    MouseModifiers {
+        shift: modifiers.shift,
+        alt: modifiers.alt,
+        control: modifiers.control,
+    }
+}
+
+/// A [`CellPosition`] without its [`CellSide`] - see [`TerminalPane::last_reported_cell`].
+fn report_cell(position: CellPosition) -> MouseCell {
+    MouseCell {
+        row: position.row,
+        column: position.column,
+    }
+}
+
 /// Converts a typed key into the bytes a real terminal would send for it. A deliberately small
 /// subset of `vendor/zed/crates/terminal/src/mappings/keys.rs`'s `to_esc_str` - see the module
 /// docs' "Input" section for why the full mapping isn't replicated here. Returns `None` for
@@ -2285,15 +2495,31 @@ impl Render for TerminalPane {
             .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
                 window.focus(&this.focus_handle, cx);
             }))
-            // Real mouse text selection (GitHub issue #158). Left-button only: a right-click
-            // has no selection meaning here, and a middle-click is the X11 primary-selection
-            // paste gesture this pane deliberately does not claim.
+            // Real mouse text selection (GitHub issue #158) and xterm mouse reporting (GitHub
+            // issue #437) share these handlers: each reports to the child whenever a program has
+            // asked for the mouse, and falls back to the local gesture when none has. Right and
+            // Middle are registered for the reporting half only - with reporting off they stay the
+            // no-ops they have always been here, and middle-click is still not claimed as the X11
+            // primary-selection paste.
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(Self::handle_mouse_down),
             )
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(Self::handle_mouse_down),
+            )
+            .on_mouse_down(
+                gpui::MouseButton::Middle,
+                cx.listener(Self::handle_mouse_down),
+            )
             .on_mouse_move(cx.listener(Self::handle_mouse_move))
             .on_mouse_up(gpui::MouseButton::Left, cx.listener(Self::handle_mouse_up))
+            .on_mouse_up(gpui::MouseButton::Right, cx.listener(Self::handle_mouse_up))
+            .on_mouse_up(
+                gpui::MouseButton::Middle,
+                cx.listener(Self::handle_mouse_up),
+            )
             // GitHub issue #331: real mouse-wheel/trackpad scrollback - see
             // `Self::handle_scroll_wheel`'s own docs for why this is a direct handler rather
             // than GPUI's built-in scrollable-div mechanism.
@@ -5143,5 +5369,498 @@ mod scrollback_pane_tests {
         handle.sync(bounds, px(20.0), 100, 100);
         handle.set_scroll_offset(gpui::point(px(0.0), px(-1900.0)));
         assert_eq!(handle.take_requested_display_offset(), Some(5));
+    }
+}
+
+/// Real xterm mouse reporting through a real pty (GitHub issue #437): a program that turns on mouse
+/// tracking must actually receive the clicks, hovers, and wheel notches the human aims at it.
+#[cfg(test)]
+mod mouse_reporting_tests {
+    use super::{
+        TerminalPane, TerminalSpec, PANE_PADDING_PX, POLL_INTERVAL, ROW_FONT_SIZE_PX,
+        WHEEL_LINES_PER_NOTCH,
+    };
+    use crate::terminal::grid::ScrollAmount;
+    use gpui::{
+        point, px, Bounds, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+        Pixels, ScrollDelta, ScrollWheelEvent, Size, TestAppContext, VisualTestContext,
+    };
+
+    /// A painted `cat -v`-backed pane with `mode_bytes` already applied to the grid. `cat -v`
+    /// visualises whatever escape bytes reach the child, so every assertion below is on real bytes
+    /// that crossed a real pty rather than on a mock. The DECSET bytes go in through
+    /// `inject_bytes_for_test`, which reaches `Term::mode()` without being echoed back.
+    fn reporting_pane<'a>(
+        cx: &'a mut TestAppContext,
+        mode_bytes: &[u8],
+    ) -> (
+        gpui::Entity<TerminalPane>,
+        &'a mut VisualTestContext,
+        Bounds<Pixels>,
+        Size<Pixels>,
+    ) {
+        let (pane, cx) = cx.add_window_view(|_window, cx| {
+            TerminalPane::new(
+                TerminalSpec::command("cat", vec!["-v".to_string()], std::env::temp_dir()),
+                ROW_FONT_SIZE_PX,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        cx.run_until_parked();
+
+        pane.update(cx, |pane, cx| {
+            pane.inject_bytes_for_test(mode_bytes, cx);
+        });
+        cx.run_until_parked();
+
+        let (bounds, cell_size) = pane.update_in(cx, |pane, window, _cx| {
+            (
+                pane.content_bounds_for_test(),
+                pane.cell_size_for_test(window),
+            )
+        });
+        let bounds = bounds.expect("the pane must have painted at least once");
+        (pane, cx, bounds, cell_size)
+    }
+
+    /// The centre of cell `(row, column)` in window space.
+    fn cell_centre(
+        bounds: Bounds<Pixels>,
+        cell_size: Size<Pixels>,
+        row: usize,
+        column: usize,
+    ) -> gpui::Point<Pixels> {
+        point(
+            bounds.origin.x + px(PANE_PADDING_PX) + cell_size.width * (column as f32 + 0.5),
+            bounds.origin.y + px(PANE_PADDING_PX) + cell_size.height * (row as f32 + 0.5),
+        )
+    }
+
+    fn down(
+        position: gpui::Point<Pixels>,
+        button: MouseButton,
+        modifiers: Modifiers,
+    ) -> MouseDownEvent {
+        MouseDownEvent {
+            button,
+            position,
+            modifiers,
+            click_count: 1,
+            first_mouse: false,
+        }
+    }
+
+    fn up(
+        position: gpui::Point<Pixels>,
+        button: MouseButton,
+        modifiers: Modifiers,
+    ) -> MouseUpEvent {
+        MouseUpEvent {
+            button,
+            position,
+            modifiers,
+            click_count: 1,
+        }
+    }
+
+    fn moved(
+        position: gpui::Point<Pixels>,
+        pressed_button: Option<MouseButton>,
+        modifiers: Modifiers,
+    ) -> MouseMoveEvent {
+        MouseMoveEvent {
+            position,
+            pressed_button,
+            modifiers,
+        }
+    }
+
+    fn shift() -> Modifiers {
+        Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        }
+    }
+
+    /// Pumps real poll ticks until `predicate` sees the round-trip land, or a generous cap is hit.
+    fn drain_until(
+        pane: &gpui::Entity<TerminalPane>,
+        cx: &mut VisualTestContext,
+        predicate: impl Fn(&str) -> bool,
+    ) -> String {
+        let mut joined = String::new();
+        for _ in 0..400 {
+            cx.background_executor.advance_clock(POLL_INTERVAL);
+            cx.run_until_parked();
+            joined = pane
+                .read_with(cx, |pane, _| pane.visible_text_lines())
+                .join("");
+            if predicate(&joined) {
+                break;
+            }
+        }
+        joined
+    }
+
+    #[gpui::test]
+    fn a_left_click_is_reported_to_the_child_as_a_real_sgr_press(cx: &mut TestAppContext) {
+        let (pane, cx, bounds, cell_size) = reporting_pane(cx, b"\x1b[?1000h\x1b[?1006h");
+        let position = cell_centre(bounds, cell_size, 1, 2);
+
+        pane.update_in(cx, |pane, window, cx| {
+            pane.handle_mouse_down(
+                &down(position, MouseButton::Left, Modifiers::default()),
+                window,
+                cx,
+            );
+        });
+
+        let echoed = drain_until(&pane, cx, |text| text.contains("^[[<0;3;2M"));
+        assert!(
+            echoed.contains("^[[<0;3;2M"),
+            "viewport row 1 / column 2 must reach the child 1-based as `<0;3;2M`, got {echoed:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn releasing_the_button_sends_the_matching_sgr_release(cx: &mut TestAppContext) {
+        let (pane, cx, bounds, cell_size) = reporting_pane(cx, b"\x1b[?1000h\x1b[?1006h");
+        let position = cell_centre(bounds, cell_size, 1, 2);
+
+        pane.update_in(cx, |pane, window, cx| {
+            pane.handle_mouse_down(
+                &down(position, MouseButton::Left, Modifiers::default()),
+                window,
+                cx,
+            );
+            pane.handle_mouse_up(
+                &up(position, MouseButton::Left, Modifiers::default()),
+                window,
+                cx,
+            );
+        });
+
+        let echoed = drain_until(&pane, cx, |text| text.contains("^[[<0;3;2m"));
+        assert!(
+            echoed.contains("^[[<0;3;2M"),
+            "the press must still be there, got {echoed:?}"
+        );
+        assert!(
+            echoed.contains("^[[<0;3;2m"),
+            "the release must arrive as the lowercase-terminated pair, got {echoed:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn a_right_click_is_reported_with_button_code_two(cx: &mut TestAppContext) {
+        let (pane, cx, bounds, cell_size) = reporting_pane(cx, b"\x1b[?1000h\x1b[?1006h");
+        let position = cell_centre(bounds, cell_size, 0, 0);
+
+        pane.update_in(cx, |pane, window, cx| {
+            pane.handle_mouse_down(
+                &down(position, MouseButton::Right, Modifiers::default()),
+                window,
+                cx,
+            );
+        });
+
+        let echoed = drain_until(&pane, cx, |text| text.contains("^[[<2;1;1M"));
+        assert!(
+            echoed.contains("^[[<2;1;1M"),
+            "a right-click must report button 2, got {echoed:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn a_shift_held_click_reports_nothing_and_selects_text_instead(cx: &mut TestAppContext) {
+        let (pane, cx, bounds, cell_size) = reporting_pane(cx, b"\x1b[?1000h\x1b[?1006h");
+        pane.update(cx, |pane, cx| {
+            pane.inject_bytes_for_test(b"hello world", cx);
+        });
+        cx.run_until_parked();
+
+        let start = point(
+            bounds.origin.x + px(PANE_PADDING_PX) + cell_size.width * 6.1,
+            cell_centre(bounds, cell_size, 0, 6).y,
+        );
+        let end = point(
+            bounds.origin.x + px(PANE_PADDING_PX) + cell_size.width * 10.9,
+            cell_centre(bounds, cell_size, 0, 10).y,
+        );
+        pane.update_in(cx, |pane, window, cx| {
+            pane.handle_mouse_down(&down(start, MouseButton::Left, shift()), window, cx);
+            pane.handle_mouse_move(&moved(end, Some(MouseButton::Left), shift()), window, cx);
+            pane.handle_mouse_up(&up(end, MouseButton::Left, shift()), window, cx);
+        });
+
+        assert_eq!(
+            pane.read_with(cx, |pane, _| pane.selected_text_for_test()),
+            Some("world".to_string()),
+            "Shift must still select text out from under a program holding the mouse"
+        );
+        let echoed = drain_until(&pane, cx, |text| text.contains("^[["));
+        assert!(
+            !echoed.contains("^[[<"),
+            "a Shift-held gesture must send the child nothing, got {echoed:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn a_release_is_not_reported_when_its_press_was_suppressed(cx: &mut TestAppContext) {
+        let (pane, cx, bounds, cell_size) = reporting_pane(cx, b"\x1b[?1000h\x1b[?1006h");
+        let position = cell_centre(bounds, cell_size, 0, 0);
+
+        // Shift held on the way down, let go before the button comes up.
+        pane.update_in(cx, |pane, window, cx| {
+            pane.handle_mouse_down(&down(position, MouseButton::Left, shift()), window, cx);
+            pane.handle_mouse_up(
+                &up(position, MouseButton::Left, Modifiers::default()),
+                window,
+                cx,
+            );
+        });
+
+        let echoed = drain_until(&pane, cx, |text| text.contains("^[[<"));
+        assert!(
+            !echoed.contains("^[[<"),
+            "an unreported press must never be followed by a bare release, got {echoed:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn a_reported_press_is_always_released_even_if_shift_goes_down_mid_gesture(
+        cx: &mut TestAppContext,
+    ) {
+        let (pane, cx, bounds, cell_size) = reporting_pane(cx, b"\x1b[?1000h\x1b[?1006h");
+        let position = cell_centre(bounds, cell_size, 0, 0);
+
+        pane.update_in(cx, |pane, window, cx| {
+            pane.handle_mouse_down(
+                &down(position, MouseButton::Left, Modifiers::default()),
+                window,
+                cx,
+            );
+            pane.handle_mouse_up(&up(position, MouseButton::Left, shift()), window, cx);
+        });
+
+        // `<4` rather than `<0`: Shift is genuinely held at release time, and a report carries the
+        // modifiers of its own moment - button 0 plus shift's 4.
+        let echoed = drain_until(&pane, cx, |text| text.contains("^[[<4;1;1m"));
+        assert!(
+            echoed.contains("^[[<4;1;1m"),
+            "a program told about the press must be told about the release, or it is left \
+             believing the button is still held, got {echoed:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn hover_motion_is_reported_once_per_cell_not_once_per_pixel(cx: &mut TestAppContext) {
+        let (pane, cx, bounds, cell_size) = reporting_pane(cx, b"\x1b[?1003h\x1b[?1006h");
+
+        let within_first_cell = [0.1_f32, 0.4, 0.8].map(|fraction| {
+            point(
+                bounds.origin.x + px(PANE_PADDING_PX) + cell_size.width * fraction,
+                cell_centre(bounds, cell_size, 0, 0).y,
+            )
+        });
+        pane.update_in(cx, |pane, window, cx| {
+            for position in within_first_cell {
+                pane.handle_mouse_move(&moved(position, None, Modifiers::default()), window, cx);
+            }
+            pane.handle_mouse_move(
+                &moved(
+                    cell_centre(bounds, cell_size, 0, 1),
+                    None,
+                    Modifiers::default(),
+                ),
+                window,
+                cx,
+            );
+        });
+
+        let echoed = drain_until(&pane, cx, |text| text.contains("^[[<35;2;1M"));
+        assert_eq!(
+            echoed.matches("^[[<35;").count(),
+            2,
+            "three moves inside one cell plus one into the next must report exactly twice, got {echoed:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn drag_tracking_ignores_button_less_hover(cx: &mut TestAppContext) {
+        let (pane, cx, bounds, cell_size) = reporting_pane(cx, b"\x1b[?1002h\x1b[?1006h");
+
+        pane.update_in(cx, |pane, window, cx| {
+            for column in 0..3 {
+                pane.handle_mouse_move(
+                    &moved(
+                        cell_centre(bounds, cell_size, 0, column),
+                        None,
+                        Modifiers::default(),
+                    ),
+                    window,
+                    cx,
+                );
+            }
+        });
+        let hovered = drain_until(&pane, cx, |text| text.contains("^[[<"));
+        assert!(
+            !hovered.contains("^[[<"),
+            "drag tracking asked about motion only while a button is held, got {hovered:?}"
+        );
+
+        pane.update_in(cx, |pane, window, cx| {
+            pane.handle_mouse_move(
+                &moved(
+                    cell_centre(bounds, cell_size, 0, 5),
+                    Some(MouseButton::Left),
+                    Modifiers::default(),
+                ),
+                window,
+                cx,
+            );
+        });
+        let dragged = drain_until(&pane, cx, |text| text.contains("^[[<32;"));
+        assert!(
+            dragged.contains("^[[<32;6;1M"),
+            "motion with the left button held must report code 32, got {dragged:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn the_wheel_is_reported_as_button_sixty_four_while_tracking_is_on(cx: &mut TestAppContext) {
+        let (pane, cx, _bounds, _cell_size) = reporting_pane(cx, b"\x1b[?1000h\x1b[?1006h");
+
+        pane.update_in(cx, |pane, window, cx| {
+            pane.handle_scroll_wheel(
+                &ScrollWheelEvent {
+                    position: point(px(0.0), px(0.0)),
+                    delta: ScrollDelta::Lines(point(0.0, WHEEL_LINES_PER_NOTCH)),
+                    modifiers: Modifiers::default(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                },
+                window,
+                cx,
+            );
+        });
+
+        let echoed = drain_until(&pane, cx, |text| text.contains("^[[<64;"));
+        assert_eq!(
+            echoed.matches("^[[<64;").count(),
+            WHEEL_LINES_PER_NOTCH as usize,
+            "one wheel report per whole grid line the wheel moved, got {echoed:?}"
+        );
+        assert_eq!(
+            pane.read_with(cx, |pane, _| pane.grid.scroll_offset()),
+            0,
+            "the wheel belongs to the program here - local scrollback must not have moved"
+        );
+    }
+
+    #[gpui::test]
+    fn mouse_reporting_beats_alternate_scroll_forwarding(cx: &mut TestAppContext) {
+        let (pane, cx, _bounds, _cell_size) =
+            reporting_pane(cx, b"\x1b[?1049h\x1b[?1007h\x1b[?1000h\x1b[?1006h");
+        assert!(
+            pane.read_with(cx, |pane, _| pane.grid.alt_scroll_forwarding_active()),
+            "the fixture must genuinely have alternate-scroll forwarding live, or this proves nothing"
+        );
+
+        pane.update_in(cx, |pane, window, cx| {
+            pane.handle_scroll_wheel(
+                &ScrollWheelEvent {
+                    position: point(px(0.0), px(0.0)),
+                    delta: ScrollDelta::Lines(point(0.0, WHEEL_LINES_PER_NOTCH)),
+                    modifiers: Modifiers::default(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                },
+                window,
+                cx,
+            );
+        });
+
+        let echoed = drain_until(&pane, cx, |text| text.contains("^[[<64;"));
+        assert!(
+            echoed.contains("^[[<64;"),
+            "a program that asked for the mouse must get real wheel reports, got {echoed:?}"
+        );
+        assert!(
+            !echoed.contains("^[[5~"),
+            "and must not also get the synthesised PageUp presses (GitHub issue #368), got {echoed:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn nothing_is_reported_while_scrolled_back_into_history(cx: &mut TestAppContext) {
+        let (pane, cx, bounds, cell_size) = reporting_pane(cx, b"\x1b[?1000h\x1b[?1006h");
+        let rows = pane.read_with(cx, |pane, _| pane.grid_dimensions().1 as usize);
+        pane.update(cx, |pane, cx| {
+            for i in 0..rows * 3 {
+                pane.inject_bytes_for_test(format!("line {i}\r\n").as_bytes(), cx);
+            }
+        });
+        cx.run_until_parked();
+        pane.update(cx, |pane, _cx| {
+            pane.grid.scroll_display(ScrollAmount::PageUp);
+        });
+        assert!(
+            pane.read_with(cx, |pane, _| pane.grid.is_scrolled_back()),
+            "the fixture must genuinely be scrolled back, or this proves nothing"
+        );
+
+        pane.update_in(cx, |pane, window, cx| {
+            pane.handle_mouse_down(
+                &down(
+                    cell_centre(bounds, cell_size, 1, 2),
+                    MouseButton::Left,
+                    Modifiers::default(),
+                ),
+                window,
+                cx,
+            );
+        });
+
+        let echoed = drain_until(&pane, cx, |text| text.contains("^[[<"));
+        assert!(
+            !echoed.contains("^[[<"),
+            "a viewport row while scrolled back would name a line the program does not have, got {echoed:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn a_reported_click_clears_a_previous_selection(cx: &mut TestAppContext) {
+        let (pane, cx, bounds, cell_size) = reporting_pane(cx, b"\x1b[?1000h\x1b[?1006h");
+        pane.update(cx, |pane, cx| {
+            pane.inject_bytes_for_test(b"hello world", cx);
+        });
+        cx.run_until_parked();
+
+        pane.update(cx, |pane, _cx| {
+            pane.select_cells_for_test(0, 6..11);
+        });
+        assert_eq!(
+            pane.read_with(cx, |pane, _| pane.selected_text_for_test()),
+            Some("world".to_string()),
+            "the fixture must genuinely have a selection to clear"
+        );
+
+        pane.update_in(cx, |pane, window, cx| {
+            pane.handle_mouse_down(
+                &down(
+                    cell_centre(bounds, cell_size, 0, 0),
+                    MouseButton::Left,
+                    Modifiers::default(),
+                ),
+                window,
+                cx,
+            );
+        });
+
+        assert_eq!(
+            pane.read_with(cx, |pane, _| pane.selected_text_for_test()),
+            None,
+            "a plain click clears the previous selection in reporting mode too"
+        );
     }
 }
