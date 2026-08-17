@@ -1081,7 +1081,7 @@ impl AdeApp {
                         file_ops::copy_path(&path, &backup_path).map_err(|err| err.to_string())?;
                         match mechanism {
                             DeleteMechanism::Trash { program, args } => {
-                                match std::process::Command::new(program).args(&args).status() {
+                                match pty_core::new_std_command(program).args(&args).status() {
                                     Ok(status) if status.success() => Ok(()),
                                     Ok(status) => Err(format!(
                                         "{program} exited with {status} while trashing {label}"

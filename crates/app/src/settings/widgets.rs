@@ -52,7 +52,7 @@ impl AdeApp {
     ) {
         cx.background_executor()
             .spawn(async move {
-                match std::process::Command::new(program).args(&args).status() {
+                match pty_core::new_std_command(program).args(&args).status() {
                     Ok(status) if !status.success() => {
                         log::warn!("{program} exited with {status} while opening {target_label}");
                     }

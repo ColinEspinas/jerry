@@ -279,3 +279,32 @@ catch.
 checkable invariant, not a convention. A helper that "just needs a `TestAppContext`" is not added
 to `crates/test-support` under any flag — it goes in `crates/app` or it is restructured to take
 plain data. The policy those fixtures serve is [`docs/testing.md`](../testing.md).
+
+## 10. Every non-PTY child process is constructed through `pty_core::new_std_command`
+
+**Status:** Accepted.
+
+**Context:** The release binary is a GUI-subsystem process on Windows (`windows_subsystem =
+"windows"` in `crates/app/src/main.rs`, adopted from Zed in #451 so no console opens behind the
+window). On Windows, a console-subsystem child — `git.exe`, an npm `.cmd` shim, `cmd /c start` —
+spawned from a consoleless parent allocates its own *visible* console window unless the spawn
+passes `CREATE_NO_WINDOW`. Jerry spawns git continuously from launch (status poll, worktree
+watch, Changes refresh), so the missing flag showed up as an endless storm of console popups
+(#465). Zed pairs the same attribute with construction-time wrappers
+(`util::command`/`gpui_util::new_std_command` upstream) plus a clippy ban on bare constructors;
+#451 copied the attribute without the wrapper.
+
+**Decision:** One constructor, `pty_core::new_std_command`, sets `CREATE_NO_WINDOW` on Windows
+and is the identity elsewhere; every production `std::process::Command` in the workspace is built
+through it. It lives in `pty-core` because that crate already owns "how children are spawned on
+this OS" (`resolve_on_path`), and a one-function helper does not earn its own crate. `wt-core`
+takes a dependency on `pty-core` for it — the constructor must exist in exactly one place.
+Enforced by `clippy.toml`'s `disallowed-methods` on `std::process::Command::new`; test modules
+are exempt (each crate root's `cfg_attr(test, allow(clippy::disallowed_methods))`,
+`test-support`'s crate-level allow) because the test runner owns a console its children inherit.
+
+**Consequences:** PTY children are explicitly out of scope — `portable-pty`'s ConPTY spawn
+already attaches them to a headless pseudo console via `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`, and
+`CREATE_NO_WINDOW` is neither needed nor passable there. Anything that spawns without
+`std::process::Command` (direct `CreateProcessW` FFI, a future async runtime's command type)
+must apply the same flag at its own call site; none exists today.

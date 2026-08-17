@@ -241,7 +241,7 @@ mod session_restore_tests {
                 path.to_str().expect("utf8 path"),
             ],
         );
-        std::fs::canonicalize(&path).expect("canonicalize")
+        dunce::canonicalize(&path).expect("canonicalize")
     }
 
     /// One real launch: a fresh [`AdeApp`] against a real settings path. `repo_path: None` with

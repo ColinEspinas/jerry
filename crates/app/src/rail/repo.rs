@@ -116,7 +116,10 @@ pub fn repo_state_path_for(settings_path: &Path) -> PathBuf {
 /// the path exactly as given when it can't be resolved at all - a directory that doesn't exist
 /// yet, or a pure in-memory path in a unit test, which must still be usable rather than an error.
 pub fn canonical_repo_path(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    // `dunce`, not `std::fs`: std's Windows answer is the verbatim `\\?\C:\...` form, which git
+    // rejects ("Invalid argument") - and this path is handed to git by everything keyed off the
+    // opened repo (GitHub issue #467). Identical to `std::fs::canonicalize` on unix.
+    dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// The map key for one repo - its real path, canonicalized ([`canonical_repo_path`]) so the same
@@ -212,7 +215,7 @@ impl RepoState {
             return RepoState::default();
         };
         match toml::from_str::<RepoState>(&contents) {
-            Ok(state) => state,
+            Ok(state) => state.normalized(),
             Err(err) => {
                 log::warn!(
                     "{} failed to parse ({err}) - starting from an empty repo list",
@@ -220,6 +223,34 @@ impl RepoState {
                 );
                 RepoState::default()
             }
+        }
+    }
+
+    /// Re-spells every persisted key and path through today's [`repo_key`]/
+    /// [`canonical_repo_path`], so a file written by an earlier build survives a canonicalization
+    /// change. The real case (GitHub issue #467): pre-fix Windows builds keyed repos by
+    /// `std::fs::canonicalize`'s verbatim `\\?\C:\...` form, which every consumer of the loaded
+    /// state would hand straight to git — leaving the remembered repo permanently broken, and
+    /// `last_focused` (written in the new plain spelling) matching no key at all from the second
+    /// launch on. Applied inside [`Self::load_at`] so [`Self::save_merged_at`]'s own load-merge
+    /// pass rewrites the file in the current spelling on the first save. If two old spellings
+    /// collapse into one key, the first (plain, the one current builds write) wins — both name
+    /// the same repo.
+    fn normalized(self) -> RepoState {
+        let respell = |value: String| {
+            canonical_repo_path(Path::new(&value))
+                .to_str()
+                .map(str::to_owned)
+                .unwrap_or(value)
+        };
+        let mut repos: BTreeMap<String, RepoRecord> = BTreeMap::new();
+        for (key, mut record) in self.repos {
+            record.selected_worktree = record.selected_worktree.map(respell);
+            repos.entry(respell(key)).or_insert(record);
+        }
+        RepoState {
+            repos,
+            last_focused: self.last_focused.map(respell),
         }
     }
 

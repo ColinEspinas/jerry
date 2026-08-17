@@ -10,8 +10,11 @@
 
 // `.expect()`/`.unwrap()` are the documented, accepted pattern in test modules (see
 // `CLAUDE.md`'s Rust standards) - only production code is held to `clippy::unwrap_used`/
-// `expect_used`.
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+// `expect_used` and the bare-`Command::new` ban (`clippy.toml`, GitHub issue #465).
+#![cfg_attr(
+    test,
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)
+)]
 
 pub mod budget;
 pub mod code_surface;
@@ -1004,7 +1007,7 @@ mod open_ade_window_tests {
         let repo = tempfile::tempdir().expect("tempdir");
         // `AdeApp` canonicalizes the root it is opened with, so a bare `TempDir::path()` would be
         // compared against its own `/private/var` resolution below and never match on macOS.
-        let repo_path = std::fs::canonicalize(repo.path()).expect("canonical tempdir");
+        let repo_path = dunce::canonicalize(repo.path()).expect("canonical tempdir");
         let settings_dir = tempfile::tempdir().expect("tempdir");
         let settings_path = settings_dir.path().join("settings.toml");
 

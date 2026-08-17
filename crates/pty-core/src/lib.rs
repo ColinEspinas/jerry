@@ -9,8 +9,12 @@
 //! Only `#[cfg(unix)]` gets the self-pipe and the process-tree walk; `/proc` readers degrade to
 //! "found nothing" on a non-Linux unix, leaving process-group signals intact.
 
-// Only production code is held to `unwrap_used`/`expect_used`; see `CLAUDE.md`.
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+// Only production code is held to `unwrap_used`/`expect_used` and the bare-`Command::new`
+// ban (`clippy.toml`, GitHub issue #465); see `CLAUDE.md`.
+#![cfg_attr(
+    test,
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)
+)]
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 #[cfg(unix)]
@@ -37,6 +41,9 @@ use thiserror::Error;
 mod login_shell;
 #[cfg(unix)]
 pub use login_shell::resolve_login_shell_path;
+
+mod command;
+pub use command::new_std_command;
 
 pub use portable_pty::ExitStatus;
 

@@ -39,7 +39,7 @@ pub(in crate::sidebar) mod fixtures {
     /// against the resolved ones the app actually holds, and matches nothing.
     pub(in crate::sidebar) fn temp_root() -> (TempDir, PathBuf) {
         let dir = TempDir::new().expect("tempdir");
-        let root = std::fs::canonicalize(dir.path()).expect("canonicalize tempdir");
+        let root = dunce::canonicalize(dir.path()).expect("canonicalize tempdir");
         (dir, root)
     }
 }

@@ -1002,10 +1002,9 @@ mod merge_regression_tests {
     /// worktrees by exact `PathBuf`, and on macOS the temp directory is behind a symlink.
     fn add_worktree(repo_path: &std::path::Path, branch: &str, name: &str) -> PathBuf {
         let container = TempDir::new().expect("tempdir");
-        let root = container
-            .path()
-            .canonicalize()
-            .expect("canonicalize tempdir");
+        // `dunce`, matching `canonical_repo_path` - std's Windows `\\?\` spelling breaks git
+        // (GitHub issue #467).
+        let root = dunce::canonicalize(container.path()).expect("canonicalize tempdir");
         // `keep()`, not `drop()`: dropping the container deleted the directory and freed its
         // random name for reuse, so under the parallel suite another fixture could be handed the
         // same name and create `<name>` inside it first - `git worktree add` then failed with

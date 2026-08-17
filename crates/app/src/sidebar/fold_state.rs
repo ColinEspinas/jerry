@@ -27,7 +27,9 @@ pub fn fold_state_path_for(settings_path: &Path) -> PathBuf {
 /// Falls back to the path as given when it can't be canonicalized (it may not exist yet, or be
 /// a pure in-memory path in a unit test), which is still a stable key for that path.
 pub fn worktree_key(root: &Path) -> Option<String> {
-    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    // `dunce`, matching `crate::rail::repo::canonical_repo_path`, so stored keys carry the same
+    // spelling as every other canonical path in the app (GitHub issue #467).
+    let canonical = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     canonical.to_str().map(str::to_owned)
 }
 

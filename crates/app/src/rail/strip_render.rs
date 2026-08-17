@@ -37,8 +37,10 @@ impl AdeApp {
         // `path_to_uri` canonicalises on the way in - so a checkout reached through a symlink
         // (macOS' `/var` -> `/private/var`, or a worktree directory someone symlinked) yields
         // paths that `strip_prefix(&root)` can never match. Resolved once per pass, not per row,
-        // and falling back to `root` itself if the checkout has since gone away.
-        let canonical_root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+        // and falling back to `root` itself if the checkout has since gone away. `dunce`, because
+        // `lsp_core` canonicalises with `dunce` too - std's Windows verbatim `\\?\` spelling
+        // would never prefix-match the server's paths (GitHub issue #467).
+        let canonical_root = dunce::canonicalize(&root).unwrap_or_else(|_| root.clone());
         let mut problems: Vec<Problem> = Vec::new();
         for ((client_root, _server), state) in &self.lsp_clients {
             let LspClientState::Ready(client) = state else {

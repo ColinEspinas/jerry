@@ -31,7 +31,7 @@ impl TempRepo {
 
 pub(in crate::lsp) fn temp_repo() -> TempRepo {
     let dir = tempfile::tempdir().expect("tempdir");
-    let root = dir.path().canonicalize().expect("canonicalize tempdir");
+    let root = dunce::canonicalize(dir.path()).expect("canonicalize tempdir");
     TempRepo { _dir: dir, root }
 }
 

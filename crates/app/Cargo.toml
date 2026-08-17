@@ -160,6 +160,13 @@ tree-sitter-javascript = "0.23.1"
 # API wrapper with no GPUI/vendor/zed call site to verify against, the same "just a version pin"
 # treatment `regex`/`unicode-segmentation` already get above.
 notify = "8.2.0"
+# `std::fs::canonicalize` without Windows's verbatim `\\?\C:\...` spelling, which git rejects
+# ("Invalid argument") - the app keys every repo root by its canonical path, so the verbatim
+# form broke git interop at runtime on Windows (GitHub issue #467). Identical to
+# `std::fs::canonicalize` on unix. The exact crate/version `lsp-core` already resolves for the
+# same reason (`lsp_core::client`'s own `canonicalize`), and the same pin upstream
+# `zed-industries/zed` carries (`dunce = "1.0"`, used by its `fs` and `path` crates).
+dunce = "1.0"
 # Real GitHub-releases-backed self-update (GitHub issue #87, `crate::updater`) - version
 # check via `backends::github::ReleaseList`, download+extract+atomic self-replace via
 # `backends::github::Update`/`self-replace`. `default-features = false` because this

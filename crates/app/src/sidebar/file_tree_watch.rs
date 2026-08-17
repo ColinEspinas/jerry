@@ -25,9 +25,11 @@ pub fn spawn_file_tree_watcher(
     wt_core::git_common_dir(worktree_root).ok()?;
     // The OS reports every event path resolved (macOS `FSEvents` hands back `/private/var/...` for
     // a watch armed on `/var/...`), so a `.git` prefix built from an unresolved root would match
-    // nothing and every one of git's own internal writes would mark the tree dirty.
+    // nothing and every one of git's own internal writes would mark the tree dirty. `dunce`
+    // rather than `std::fs` so the prefix carries no Windows verbatim `\\?\` spelling — the same
+    // form `canonical_repo_path` keys the app by (GitHub issue #467).
     let resolved =
-        std::fs::canonicalize(worktree_root).unwrap_or_else(|_| worktree_root.to_path_buf());
+        dunce::canonicalize(worktree_root).unwrap_or_else(|_| worktree_root.to_path_buf());
     let git_dir: PathBuf = resolved.join(".git");
 
     let mut watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {

@@ -292,6 +292,7 @@ version = "0.1.2"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
+ "dunce",
  "env_logger",
  "gpui",
  "gpui_platform",
@@ -9911,6 +9912,7 @@ name = "wt-core"
 version = "0.1.2"
 dependencies = [
  "gix",
+ "pty-core",
  "sha2",
  "tempfile",
  "test-support",

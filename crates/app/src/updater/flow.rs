@@ -101,7 +101,7 @@ fn run_self_update(
 /// own "pure decision function + thin real-execution wrapper" precedent (that function's own
 /// docs name this exact convention).
 fn build_relaunch_command(exe: &Path, args: &[OsString]) -> std::process::Command {
-    let mut command = std::process::Command::new(exe);
+    let mut command = pty_core::new_std_command(exe);
     command.args(args);
     command
 }

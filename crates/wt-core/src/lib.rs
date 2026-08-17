@@ -10,8 +10,12 @@
 //! functions wait on a child process. A caller on a UI thread must offload to a background
 //! executor.
 
-// Only production code is held to `unwrap_used`/`expect_used`; see `CLAUDE.md`.
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+// Only production code is held to `unwrap_used`/`expect_used` and the bare-`Command::new`
+// ban (`clippy.toml`, GitHub issue #465); see `CLAUDE.md`.
+#![cfg_attr(
+    test,
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)
+)]
 
 pub mod blame;
 pub mod checkout;
@@ -406,10 +410,12 @@ const GIT_ENV_OVERRIDES: [&str; 5] = [
 ];
 
 /// Build a `git` [`Command`] running in `dir` with `args`: environment scrubbed of
-/// [`GIT_ENV_OVERRIDES`], and stdin closed so an interactive prompt (credentials, GPG,
-/// askpass) fails fast instead of hanging forever with no way to cancel it.
+/// [`GIT_ENV_OVERRIDES`], stdin closed so an interactive prompt (credentials, GPG,
+/// askpass) fails fast instead of hanging forever with no way to cancel it, and constructed
+/// through [`pty_core::new_std_command`] so no console window flashes per spawn on Windows
+/// (GitHub issue #465).
 fn git_command(dir: &Path, args: &[OsString]) -> Command {
-    let mut command = Command::new("git");
+    let mut command = pty_core::new_std_command("git");
     command.current_dir(dir).args(args).stdin(Stdio::null());
     for var in GIT_ENV_OVERRIDES {
         command.env_remove(var);

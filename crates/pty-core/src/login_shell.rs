@@ -11,7 +11,7 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -90,7 +90,7 @@ fn login_shell_probe_args(shell: &Path) -> Option<Vec<&'static str>> {
 /// prompt) and a hard timeout, returning its raw stdout. `None` on any failure to spawn or
 /// produce output before the timeout - genuinely unable to resolve, never a guessed result.
 fn run_login_shell_probe(shell: &Path, args: &[&str], timeout: Duration) -> Option<Vec<u8>> {
-    let mut child = Command::new(shell)
+    let mut child = crate::new_std_command(shell)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

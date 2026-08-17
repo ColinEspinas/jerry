@@ -658,7 +658,7 @@ impl UserApi {
         // (`crate::rail::repo::canonical_repo_path`) and then keys provenance by exact `PathBuf`.
         // On macOS `std::env::temp_dir()` is itself behind a `/var` -> `/private/var` symlink, so
         // recording against `TempDir::path()` verbatim writes keys the app can never look up.
-        let root = dir.path().canonicalize().expect("canonicalize tempdir");
+        let root = dunce::canonicalize(dir.path()).expect("canonicalize tempdir");
         let repo = root.as_path();
         git(repo, &["init", "-b", "main"]);
         git(repo, &["config", "user.email", "test@example.com"]);
@@ -758,7 +758,7 @@ impl UserApi {
         // (`crate::rail::repo::canonical_repo_path`) and then keys provenance by exact `PathBuf`.
         // On macOS `std::env::temp_dir()` is itself behind a `/var` -> `/private/var` symlink, so
         // recording against `TempDir::path()` verbatim writes keys the app can never look up.
-        let root = dir.path().canonicalize().expect("canonicalize tempdir");
+        let root = dunce::canonicalize(dir.path()).expect("canonicalize tempdir");
         let repo = root.as_path();
         git(repo, &["init", "-b", "main"]);
         git(repo, &["config", "user.email", "test@example.com"]);
