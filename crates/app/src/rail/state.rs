@@ -497,8 +497,7 @@ pub enum RailListItem {
         row_index: usize,
         agent_index: usize,
     },
-    /// The `\u{21ba} N earlier runs` line under a worktree row (GitHub issue #227,
-    /// `REVISION-2026-08-13.md` \u{a7}6).
+    /// The `\u{21ba} N earlier runs` line under a worktree row (GitHub issue #227).
     EarlierRunsLink {
         group_index: usize,
         row_index: usize,

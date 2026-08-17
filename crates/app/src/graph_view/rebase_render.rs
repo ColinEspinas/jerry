@@ -3073,8 +3073,8 @@ mod rebase_design_tests {
     use super::{rebase_action_style, RebaseWarningKind, REBASE_FOOTER_HINTS};
     use crate::theme::hex_rgba;
 
-    /// `revision 5/REVISION-2026-08-12.md` §1.4's action table, transcribed here as data so a
-    /// drift in either direction is a failing assertion rather than a review catch.
+    /// The rebase action table as data, so a drift in either direction is a failing assertion
+    /// rather than a review catch.
     fn spec_action_table() -> Vec<(RebaseActionKind, u32, u32, u32)> {
         vec![
             (RebaseActionKind::Pick, 0xa9b0b7, 0x1c2023, 0x2a2f34),

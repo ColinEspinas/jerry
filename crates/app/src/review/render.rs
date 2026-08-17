@@ -402,8 +402,8 @@ impl AdeApp {
             .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
                 this.open_review_file(path.clone(), cx);
             }))
-            // `STAGE-A-CHANGELOG.md` §4j's fixed column, ahead of the directory - this is a
-            // list of file rows like the Uncommitted section, so every filename in it starts on
+            // A fixed column, ahead of the directory - this is a list of file rows like the
+            // Uncommitted section, so every filename in it starts on
             // the same x. The `new`/`del` word pill this replaced sat at the far end of the row
             // and was absent from every modified file.
             .child(render_status_letter(

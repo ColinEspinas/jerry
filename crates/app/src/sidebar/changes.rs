@@ -456,10 +456,10 @@ mod status_letter_tests {
     use crate::theme;
     use wt_core::diff::FileChangeStatus;
 
-    /// `STAGE-A-CHANGELOG.md` §4j: every status maps to a letter, including the common case. The
-    /// word pills this replaced returned `None` for `Modified`, which is the exact defect §4j
-    /// names - "only the exceptions were marked". A rename is a modification as far as the letter
-    /// column is concerned; the row's own `moved` chip is what states the rename.
+    /// Every status maps to a letter, including the common case. The word pills this replaced
+    /// returned `None` for `Modified`, which is the exact defect: only the exceptions were
+    /// marked. A rename is a modification as far as the letter column is concerned; the row's
+    /// own `moved` chip is what states the rename.
     #[test]
     fn every_file_status_gets_a_letter_including_the_common_case() {
         for (status, letter) in [

@@ -918,7 +918,7 @@ impl AdeApp {
     }
 
     /// *General* - `Window controls` as a segmented `System | macOS | Windows/Linux` choice,
-    /// wired live (`CHANGELOG.md`'s change 3) - see `Self::window_controls_style`'s own docs for
+    /// wired live - see `Self::window_controls_style`'s own docs for
     /// how both this row and the command palette's three `Window controls: …` entries read/write
     /// the same persisted field. `Default environment` shows the real, live-detected
     /// `crate::env_info`/`crate::root::widgets::render_env_chip` environment chip (real WSL
@@ -1383,7 +1383,7 @@ impl AdeApp {
     }
 
     /// *Appearance & scaling* - every row here is persisted and round-trips through
-    /// [`Self::settings`] (`CHANGELOG.md`'s change 3). This page is itself a live consumer of
+    /// [`Self::settings`]. This page is itself a live consumer of
     /// `interface_scale_percent` (`Self::ui_text_size`, applied to its own labels, hints, *and*
     /// every row's control - stepper value, choice-segment labels, config banner/snippet block -
     /// see `crate::settings::widgets`'s module docs), so editing the choice control below

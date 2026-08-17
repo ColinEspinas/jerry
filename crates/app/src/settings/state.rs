@@ -130,8 +130,7 @@ impl SettingsPage {
     }
 }
 
-/// One of the Settings nav's four grouped sections (`CHANGELOG.md`'s change 3: "Nav regrouped:
-/// Workspace ... Interface ... Editor ... Other").
+/// One of the Settings nav's four grouped sections: Workspace, Interface, Editor, Other.
 pub struct NavGroup {
     pub label: &'static str,
     pub pages: Vec<SettingsPage>,
@@ -623,8 +622,8 @@ pub fn keybinding_rows(
         .collect()
 }
 
-/// The Keybindings page's filter row logic (`CHANGELOG.md`'s change 3: "filter row (`/ filter N
-/// bindings`, right-aligned count)") - a case-insensitive substring match against a row's
+/// The Keybindings page's filter row logic (`/ filter N bindings`, right-aligned count) - a
+/// case-insensitive substring match against a row's
 /// command name or context, matching `crate::rail::state::filter_agents`'s shape. An empty (or
 /// all-whitespace) query matches every row.
 pub fn filter_keybinding_rows<'a>(

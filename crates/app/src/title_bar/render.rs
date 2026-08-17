@@ -727,8 +727,8 @@ mod agent_state_chip_text_tests {
                 };
                 assert!(
                     !text.to_lowercase().contains("review ready"),
-                    "revision 6 renamed this status to 'Finished' - no title-bar chip may say \
-                     'review ready' again, got {text:?} for {status:?}"
+                    "this status is named 'Finished' - no title-bar chip may say 'review \
+                     ready' again, got {text:?} for {status:?}"
                 );
             }
         }

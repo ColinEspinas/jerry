@@ -1802,8 +1802,8 @@ impl AdeApp {
     /// The agent context bar: agent badge/name, a divider, branch, the worktree path (the one
     /// flexible, ellipsising child - every other child is `flex_none` and non-wrapping, so the
     /// bar never wraps when the centre narrows), and a status pill. **Identity and status only**
-    /// (GitHub issue #295, `STAGE-A-CHANGELOG.md` §4e): the `Merge` and `Archive` buttons that
-    /// used to close this bar are deleted, not hidden.
+    /// (GitHub issue #295): the `Merge` and `Archive` buttons that used to close this bar are
+    /// deleted, not hidden.
     pub(in crate::work_surface) fn render_agent_context_bar(
         &self,
         agent: &Agent,
@@ -2126,8 +2126,8 @@ impl AdeApp {
         )
     }
 
-    /// The **agent** pane's bottom strip - **a readout, not an action bar** (GitHub issue #295,
-    /// `STAGE-A-CHANGELOG.md` §4t).
+    /// The **agent** pane's bottom strip - **a readout, not an action bar** (GitHub issue
+    /// #295).
     pub(in crate::work_surface) fn render_pty_footer(
         &self,
         agent: &Agent,
@@ -2780,7 +2780,7 @@ pub(in crate::work_surface) fn render_tab_insertion_caret(insert_after: bool) ->
 }
 
 /// How long a dropped tab's own settle-in fade runs - short and non-blocking, matching the
-/// design handoff's own "animations are short (~120-180ms)" ask (GitHub issue #16 §5).
+/// "animations are short (~120-180ms)" rule (GitHub issue #16 §5).
 pub(in crate::work_surface) const TAB_SETTLE_ANIMATION_DURATION: Duration =
     Duration::from_millis(150);
 

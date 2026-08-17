@@ -48,10 +48,10 @@ impl SidebarView {
         }
     }
 
-    /// The view's glyph, from `REVISION-2026-08-14.md` §8's mapping table (GitHub issue #282):
-    /// "strip: worktrees / history / problems → `tree-structure` / `clock-counter-clockwise` /
-    /// `warning`". Drawn through [`crate::icons::IconRow`] at [`crate::icons::IconSize::Strip`],
-    /// which is what §7 rule 7's "one shared optical box, not one size per icon" means in code.
+    /// The view's glyph (GitHub issue #282): worktrees / history / problems map to
+    /// `tree-structure` / `clock-counter-clockwise` / `warning`. Drawn through
+    /// [`crate::icons::IconRow`] at [`crate::icons::IconSize::Strip`], which is what "one shared
+    /// optical box, not one size per icon" means in code.
     pub const fn icon(self) -> Icon {
         match self {
             SidebarView::Worktrees => Icon::TreeStructure,
@@ -79,8 +79,7 @@ impl SidebarView {
 }
 
 /// Which hue a cell's state marker takes. Both are the app's own existing status hues, not a
-/// one-off pair - `REVISION-2026-08-14.md` §6: "badges use the app's own hues (amber `#e2a336` for
-/// worktrees, red `#e0625c` for problems), not a one-off cream."
+/// one-off pair: amber for worktrees, red for problems, never a one-off cream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarkerTone {
     /// Amber: work that is waiting on a human.
@@ -214,7 +213,7 @@ pub struct ProblemTally {
 }
 
 impl ProblemTally {
-    /// `problems` counted into `REVISION-2026-08-13.md` §2's three buckets.
+    /// `problems` counted into three buckets.
     pub fn over(problems: &[Problem]) -> Self {
         let mut tally = ProblemTally::default();
         for problem in problems {

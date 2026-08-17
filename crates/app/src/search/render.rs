@@ -100,8 +100,7 @@ impl AdeApp {
                             "replace with\u{2026}",
                             cx,
                         ))
-                        // `REVISION-2026-08-14.md` §7 rule 2: a control that acts on results does
-                        // not exist when there are none.
+                        // A control that acts on results does not exist when there are none.
                         .children(
                             state
                                 .has_results()
@@ -265,9 +264,8 @@ impl AdeApp {
                     } else {
                         theme::text::FAINTER
                     })
-                    // `ab` is underlined, the way VS Code draws whole-word
-                    // (`STAGE-A-CHANGELOG.md` §4v) - the one thing that tells it apart from two
-                    // ordinary letters.
+                    // `ab` is underlined, the way VS Code draws whole-word - the one thing
+                    // that tells it apart from two ordinary letters.
                     .when(modifier == SearchModifier::WholeWord, |el| el.underline())
                     .child(modifier.label()),
             )
@@ -439,8 +437,8 @@ impl AdeApp {
             }))
     }
 
-    /// One toggle in the count row - `⇄` or the funnel, both drawn in the active pair
-    /// `REVISION-2026-08-14.md` §5 gives the modifier buttons. The button itself is the shared
+    /// One toggle in the count row - `⇄` or the funnel, both drawn in the modifier buttons'
+    /// own active pair. The button itself is the shared
     /// 17x17 hit box (`theme::band::ICON_BUTTON_HIT`); the glyph `icons` draws inside it is the
     /// smaller `icons::IconSize::Control` optical box (12px), centred by this row's own
     /// `items_center`/`justify_center` - see `IconSize::Control`'s doc comment for why those two
@@ -905,9 +903,8 @@ fn render_search_row_mark(mark: &'static str, text_size: gpui::Pixels) -> impl I
         .child(mark)
 }
 
-/// `▾` open / `▸` closed - the file tree's own caret glyphs, reused verbatim so the two trees in
-/// this window speak one language (`STAGE-A-CHANGELOG.md` §4w's fold-all note is explicit that
-/// this is "the same caret a file row uses").
+/// `▾` open / `▸` closed - the file tree's own caret glyphs, reused verbatim so the two trees
+/// in this window speak one language. Fold-all uses the same caret a file row does.
 fn render_search_caret(open: bool, text_size: gpui::Pixels) -> impl IntoElement {
     div()
         .font(font(theme::font::MONO))
@@ -1546,7 +1543,7 @@ mod panel_tests {
             assert_eq!(
                 app.search.query.as_str(),
                 "refreshed_token",
-                "a real editable field, not append/backspace-only - `REVISION-2026-08-14.md` §5"
+                "a real editable field, not append/backspace-only"
             );
         });
         assert!(

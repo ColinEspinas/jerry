@@ -225,8 +225,8 @@ impl AdeApp {
             )
     }
 
-    /// The snippet block (`CHANGELOG.md`'s change 3): "In settings.toml" (or "In settings.json"),
-    /// then `page`'s keys/values pulled from the currently-loaded [`Self::settings`] - see
+    /// The snippet block: "In settings.toml" (or "In settings.json"), then `page`'s
+    /// keys/values pulled from the currently-loaded [`Self::settings`] - see
     /// `crate::settings::store::snippet_lines`'s docs for why this can't drift from the file's
     /// own contents. Only ever called for the three pages `page` can name.
     pub(in crate::settings) fn render_snippet_block(&self, page: ConfigPage) -> impl IntoElement {
@@ -469,8 +469,8 @@ impl AdeApp {
             ))
     }
 
-    /// The segmented `choice` control (`CHANGELOG.md`'s change 3: "a segmented control matching
-    /// the Diff/File toggle") - the one shared implementation behind every segmented-control
+    /// The segmented `choice` control, matching the Diff/File toggle - the one shared
+    /// implementation behind every segmented-control
     /// widget in this app (`Self::render_diff_file_toggle`, `Self::render_right_sidebar_toggle`,
     /// `Self::render_palette_scope_control`, and this page's TOML/JSON toggle). `selected` is
     /// compared by value (`==`) against each [`ChoiceOption::label`].
@@ -490,10 +490,10 @@ impl AdeApp {
             .rounded(theme::radius::BUTTON)
             .bg(theme::surface::SEGMENT_TRACK);
 
-        // One `IconRow` for the whole control, not one per segment: that is `REVISION-2026-08-14.md`
-        // §7 rule 7 ("a row of icons needs one shared optical box, not one size per icon") made
-        // structural rather than left to each segment to get right - the exact defect §4w records
-        // fixing after the first cut drew "folder 12x8, magnifier 8x8, diff 7x7".
+        // One `IconRow` for the whole control, not one per segment: "a row of icons needs one
+        // shared optical box, not one size per icon", made structural rather than left to each
+        // segment to get right - the exact defect that follows from drawing folder 12x8,
+        // magnifier 8x8, diff 7x7.
         let icons =
             crate::icons::IconRow::new(&self.settings.icon_pack, crate::icons::IconSize::PanelTab);
         for (index, option) in options.iter().enumerate() {
@@ -589,9 +589,9 @@ pub(crate) struct ChoiceOption {
     pub(in crate::settings) label: &'static str,
     pub(in crate::settings) enabled: bool,
     pub(in crate::settings) hint: Option<&'static str>,
-    /// Drawn **instead of** the label. `STAGE-A-CHANGELOG.md` §4w: the right panel's `Files` /
-    /// `Search` / `Changes` tabs become "three 26x19 buttons in the same segmented shell ... all
-    /// three drawn inside one 11x10 optical box", with the labels moving to the tooltips below.
+    /// Drawn **instead of** the label: the right panel's `Files` / `Search` / `Changes` tabs
+    /// are three 26x19 buttons in one segmented shell, all drawn inside one 11x10 optical box,
+    /// with the labels moving to the tooltips below.
     pub(in crate::settings) icon: Option<crate::icons::Icon>,
     /// The full `"<label> - <hint>"` sentence a segment shows on hover. Mandatory in practice for
     /// an icon segment, which has no visible label left to read - §4w's own "labels move to

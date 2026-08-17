@@ -126,8 +126,8 @@ impl UrgencyCount {
 }
 
 impl AdeApp {
-    /// One of the repo header's two urgency dot+count pairs, or **nothing at all** at zero
-    /// (`REVISION-2026-08-14.md` §4: "Each hidden at zero").
+    /// One of the repo header's two urgency dot+count pairs, or **nothing at all** at zero -
+    /// each is hidden at zero.
     fn render_repo_urgency_count(
         &self,
         repo_id: repo::RepoId,
@@ -270,7 +270,7 @@ impl AdeApp {
                 // present (`crate::hooks::event::HOOK_SIGNAL_TTL`).
                 //
                 // Only the *activity* half is read here. The question half used to feed a rail
-                // question-preview card, which revision 6 removed outright (see
+                // question-preview card, which was removed outright (see
                 // `Self::render_worktree_row`'s own note, and the field this row no longer
                 // carries) - it is still recorded, from this same real source, by
                 // `crate::hooks::flow::AdeApp::record_agent_statuses`, which is what History and a
@@ -685,9 +685,8 @@ impl AdeApp {
         let has_worktrees = groups.iter().any(|group| !group.all_rows.is_empty());
         let view = self.effective_sidebar_view(has_worktrees);
         // Built once, for the same reason `groups` is: the Problems cell's marker and the
-        // Problems body are two answers about one set of diagnostics, and `REVISION-2026-08-13.md`
-        // §2's "tallied over their own data" is only structurally guaranteed if there is one
-        // `data` for both to be over.
+        // Problems body are two answers about one set of diagnostics, and "tallied over their
+        // own data" is only structurally guaranteed if there is one `data` for both to be over.
         let problems = self.worktree_problems();
         let cells = rail_strip::strip_view_cells(
             has_worktrees,
@@ -1378,9 +1377,9 @@ impl AdeApp {
                         // glyph cannot: this control toggles the group *without* selecting the
                         // worktree, which is what the `stop_propagation` below actually does.
                         .tooltip(text_tooltip("Collapse or expand without selecting"))
-                        // `STAGE-A-CHANGELOG.md` §4o/§4p: this used to be its own hand-drawn
-                        // glyph, which is exactly the drift §4p closed - "every disclosure caret
-                        // is one control". It is now the shared one
+                        // This used to be its own hand-drawn glyph, which is exactly the
+                        // drift that closed - every disclosure caret is one control. It is now
+                        // the shared one
                         // (`crate::root::widgets::render_disclosure_caret`), the same call the
                         // Changes panel's four section headers make, so the two cannot diverge
                         // again. The 13x27 hit box, the tooltip and the hover stay here: they are
@@ -1490,8 +1489,8 @@ impl AdeApp {
                 }
             }))
             // The worktree row's context menu (GitHub issue #290) - anchored to the pointer, not
-            // to the row (`STAGE-A-CHANGELOG.md` §4u: "Rows are 27px and the pointer is what the
-            // user aimed with"), and painted at the root, outside this scroller (§4).
+            // to the row (rows are 27px and the pointer is what the user aimed with), and
+            // painted at the root, outside this scroller.
             .on_mouse_down(
                 gpui::MouseButton::Right,
                 cx.listener({
@@ -4021,8 +4020,8 @@ mod status_wording_tests {
         for text in every_rendered_status_string() {
             assert!(
                 !text.to_lowercase().contains("review ready"),
-                "revision 6 renamed this status to 'Finished' - no rendered label, state word \
-                 or tooltip may say 'review ready' again, got {text:?}"
+                "this status is named 'Finished' - no rendered label, state word or tooltip \
+                 may say 'review ready' again, got {text:?}"
             );
         }
     }

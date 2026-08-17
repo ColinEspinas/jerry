@@ -52,8 +52,8 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let (dir, name) = changes::split_dir_name(relative_path);
-        // `STAGE-A-CHANGELOG.md` §4j applies this letter in "all three places that carried the
-        // badge", and this toolbar is one of them. Unlike the Changes rows, it keeps the slot the
+        // This letter appears in all three places that carried the badge, and this toolbar is
+        // one of them. Unlike the Changes rows, it keeps the slot the
         // word pill had - after the name rather than ahead of the directory - because a single
         // header line has no column of siblings to align with, which is exactly what the fixed
         // column exists for. That is the designed diff toolbar order too.

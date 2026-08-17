@@ -159,9 +159,9 @@ git_gutter = "#315742"  # 3px agent-touched marker
 
 # Git's own A/M/D status letters on a file row, and the file tree's own A/M change marks.
 [tag]
-status_added    = "#5b876e"  # A - a file git reports as added (STAGE-A-CHANGELOG.md §4j).
+status_added    = "#5b876e"  # A - a file git reports as added.
 status_modified = "#696e73"  # M - a file git reports as modified.
-status_deleted  = "#94625d"  # D
+status_deleted  = "#94625d"  # D - a file git reports as deleted.
 tree_added      = "#5b876e"  # "A" mark
 tree_modified   = "#8a7847"  # "M" mark
 
@@ -197,7 +197,7 @@ edge_against_main     = "#ab80a1"  # AGAINST MAIN's 2px left edge
 section_label         = "#878c91"  # Section header label - 9.5px/600 uppercase, .09em tracking.
 section_count         = "#45494e"  # Section header count
 section_caret         = "#7b7f83"  # The section header's own disclosure caret (▾/▸).
-run_meta_live         = "#766949"
+run_meta_live         = "#766949"  # A run row's meta line while the run is **still moving**.
 run_meta_ended        = "#55595e"  # A run row's meta line once the run has ended
 section_stat_add      = "#76aa8b"  # The right-aligned per-section diffstat's +N, 10px mono.
 section_stat_del      = "#a46963"  # The right-aligned per-section diffstat's −N, 10px mono.
@@ -223,8 +223,8 @@ critical = "#a46963"  # Below 15% remaining.
 track    = "#232528"  # The unfilled remainder of the meter
 stale    = "#606469"
 
-# Diff-line review notes (GitHub issue #288, STAGE-A-CHANGELOG.md §1's two §6.2 rows and the
-# audit's top-5 #2) - the notes bar above the hunks and the card pinned beneath a line.
+# Diff-line review notes (GitHub issue #288) - the notes bar above the hunks and the card pinned
+# beneath a line.
 [notes]
 edge             = "#5c86b0"
 card_bg          = "#181b1f"  # The pinned card's fill.
@@ -278,9 +278,7 @@ resume_bg_hover    = "#294839"
 resume_border      = "#395e4a"
 resume_fg          = "#8fbba2"
 
-# The right panel's Search tab (GitHub issue #162, REVISION-2026-08-14.md §5 /
-# STAGE-A-CHANGELOG.md §4v) - real hex values transcribed directly from those sections, not
-# paraphrased.
+# The right panel's Search tab (GitHub issue #162).
 [search]
 modifier_on_bg = "#212f3b"  # A modifier button's active fill
 modifier_on_fg = "#95b0c9"  # That button's glyph while it is on.

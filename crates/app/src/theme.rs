@@ -900,15 +900,13 @@ pub mod rail {
     pub const WORKTREE_ACTIVE_BG: ColorToken = token("rail.worktree_active_bg", 0x181c1f);
     /// Worktree row hover background (§2.2: "hover `#16191c`").
     pub const WORKTREE_HOVER_BG: ColorToken = token("rail.worktree_hover_bg", 0x16191c);
-    /// An agent row's title, one level below its parent worktree's branch name
-    /// (`STAGE-A-CHANGELOG.md` §4n: agent title `450 11.5px/16px` `#c2c7cc` -> `450 11px/15px`
-    /// **`#a3a9b0`**). Deliberately dimmer than [`super::text::STRONG`] (`#c2c7cc`), which the
-    /// branch above it uses: "Fix hierarchy by shrinking the child, never by growing the parent."
+    /// An agent row's title, one level below its parent worktree's branch name. Deliberately
+    /// dimmer than [`super::text::STRONG`], which the branch above it uses: fix hierarchy by
+    /// shrinking the child, never by growing the parent.
     /// A `crate::rail::Status::Idle` agent drops further still, to [`super::text::DIMMER`].
     pub const AGENT_TITLE: ColorToken = token("rail.agent_title", 0xa3a9b0);
     /// The repo header's amber urgency **count** - the number beside the [`super::status::ASK`]
-    /// dot (`REVISION-2026-08-14.md` §4: "`● 2` amber (`#e2a336` dot, `#c99b4e` text, needs
-    /// input)").
+    /// dot, as in `● 2` for needs input.
     pub const REPO_ASK_COUNT: ColorToken = token("rail.repo_ask_count", 0xc99b4e);
     /// The repo header's red urgency **count** - the number beside the [`super::status::FAIL`]
     /// dot (§4: "`● 1` red (`#e0625c` dot, `#c4726d` text, failed)"). Its own key, for the reason
@@ -1710,12 +1708,12 @@ pub mod toggle {
 pub mod tag {
     use super::{token, ColorToken};
 
-    /// `A` - a file git reports as added (`STAGE-A-CHANGELOG.md` §4j).
+    /// `A` - a file git reports as added.
     pub const STATUS_ADDED: ColorToken = token("tag.status_added", 0x5f9c78);
-    /// `M` - a file git reports as modified. Neutral on purpose: "the common case does not
-    /// shout" (`STAGE-A-CHANGELOG.md` §4j).
+    /// `M` - a file git reports as modified. Neutral on purpose: the common case does not
+    /// shout.
     pub const STATUS_MODIFIED: ColorToken = token("tag.status_modified", 0x767d84);
-    /// `D` - a file git reports as deleted (`STAGE-A-CHANGELOG.md` §4j).
+    /// `D` - a file git reports as deleted.
     pub const STATUS_DELETED: ColorToken = token("tag.status_deleted", 0xb06a66);
     pub const TREE_ADDED: ColorToken = token("tag.tree_added", 0x5f9c78); // "A" mark
     pub const TREE_MODIFIED: ColorToken = token("tag.tree_modified", 0xa3873f); // "M" mark
@@ -1894,7 +1892,7 @@ pub mod changes {
     /// The section header's own disclosure caret (`▾`/`▸`).
     pub const SECTION_CARET: ColorToken = token("changes.section_caret", 0x8b9197);
 
-    /// A run row's meta line while the run is **still moving** (`STAGE-A-CHANGELOG.md` §4l).
+    /// A run row's meta line while the run is **still moving**.
     pub const RUN_META_LIVE: ColorToken = token("changes.run_meta_live", 0x8a7548);
     /// A run row's meta line once the run has ended - the neutral half of [`RUN_META_LIVE`]'s
     /// pair. Same hex as [`super::text::FAINTER`], a distinct token for a distinct element (the
@@ -1920,13 +1918,12 @@ pub mod changes {
     pub const DISCARD_FG: ColorToken = token("changes.discard_fg", 0xe0847e);
 
     /// The `⚠` ring around a file row's author chips - *this path has lines from more than one
-    /// agent* (`REVISION-2026-08-14.md` §1), and the control that filters the open diff by author
-    /// (GitHub issue #287).
+    /// agent* - and the control that filters the open diff by author (GitHub issue #287).
     pub const SHARED_RING: ColorToken = token("changes.shared_ring", 0x8a6420);
 
-    /// The `you` gutter bar in the diff view - Orca's second rule, kept: *"your own hand edit
-    /// flips that line back to you"* (`REVISION-2026-08-14.md` §1), and `you` is deliberately
-    /// **not** an agent, so it is deliberately not an agent tint either.
+    /// The `you` gutter bar in the diff view - your own hand edit flips that line back to
+    /// you, and `you` is deliberately **not** an agent, so it is deliberately not an agent tint
+    /// either.
     pub const HAND_EDIT_GUTTER: ColorToken = token("changes.hand_edit_gutter", 0x4e545a);
     /// The `you` author chip's glyph, the neutral counterpart to an agent chip's own tint.
     pub const HAND_EDIT_CHIP_FG: ColorToken = token("changes.hand_edit_chip_fg", 0x8b9197);
@@ -1935,8 +1932,8 @@ pub mod changes {
     pub const HAND_EDIT_CHIP_BG: ColorToken = token("changes.hand_edit_chip_bg", 0x23272b);
 
     /// The `<agent> only ✕` indicator that appears in the file toolbar while a per-author filter
-    /// is active, and **only** while it is active (`STAGE-A-CHANGELOG.md` §4b - "Without this a
-    /// filtered diff would read as the whole diff").
+    /// is active, and **only** while it is active - without it a filtered diff would read as
+    /// the whole diff.
     pub const FILTER_BG: ColorToken = token("changes.filter_bg", 0x1d2226);
     /// [`FILTER_BG`]'s hover fill - the indicator is a real control (clicking it clears the
     /// filter), so it answers the pointer.
@@ -2027,8 +2024,8 @@ pub mod status_bar {
     ];
 }
 
-/// Diff-line review notes (GitHub issue #288, `STAGE-A-CHANGELOG.md` §1's two `§6.2` rows and
-/// the audit's top-5 #2) - the notes bar above the hunks and the card pinned beneath a line.
+/// Diff-line review notes (GitHub issue #288) - the notes bar above the hunks and the card
+/// pinned beneath a line.
 pub mod notes {
     use super::{token, ColorToken};
 
@@ -2156,9 +2153,8 @@ pub mod history {
     pub const TRANSCRIPT_DETAIL: ColorToken = token("history.transcript_detail", 0x6b7178);
     pub const TRANSCRIPT_LEAD: ColorToken = token("history.transcript_lead", 0xced4da);
 
-    /// The transcript body's opacity - `revision 5/tokens.rs`'s own
-    /// `TRANSCRIPT_OPACITY = 0.70`, and §3's "the transcript at **70% opacity** - the one signal
-    /// that this is a recording, not a live pane".
+    /// The transcript body's opacity - **70%**, the one signal that this is a recording, not
+    /// a live pane.
     pub const TRANSCRIPT_OPACITY: f32 = 0.70;
 
     /// The run-transcript footer's `Resume here` button - §3's own triple, verbatim: "**Resume
@@ -2202,9 +2198,7 @@ pub mod history {
     ];
 }
 
-/// The right panel's Search tab (GitHub issue #162, `REVISION-2026-08-14.md` §5 /
-/// `STAGE-A-CHANGELOG.md` §4v) - real hex values transcribed directly from those sections, not
-/// paraphrased.
+/// The right panel's Search tab (GitHub issue #162).
 pub mod search {
     use super::{token, ColorToken};
 
@@ -2317,9 +2311,9 @@ pub mod graph {
     /// "44px tall"). Sits where [`TOOLBAR`] normally would while the graph pane is in rebase
     /// mode - see `crate::graph_view::rebase_render`'s module docs.
     pub const REBASE_BANNER: Pixels = px(44.0);
-    /// An interactive-rebase plan row's height (`revision 5/REVISION-2026-08-12.md` §1.4: "Plan
-    /// rows - 28 high"). Deliberately **not** [`ROW`] (26, the ordinary commit list's): §1.4's
-    /// fold elbow is specified as `top:-1`/`bottom:13` inside this box, which only lands on the
+    /// An interactive-rebase plan row's height, 28. Deliberately **not** [`ROW`] (26, the
+    /// ordinary commit list's): the fold elbow is `top:-1`/`bottom:13` inside this box, which
+    /// only lands on the
     /// action chip's centreline (an 18-high chip centred in 28 has its centre at 14, and a
     /// bottom-inset-13 box's inside-painted 1px bottom border occupies exactly 14..15) at 28.
     /// §2.2's own rebase menu anchor formula (`44 + 22 + 3 + row × 28 + 30`) counts in 28s too.
@@ -2408,8 +2402,7 @@ pub mod graph {
     /// [`REBASE_REWORD_FG`], separate token for the same reason that family exists at all: this
     /// one means "informational, not urgent", not "this row will be reworded".
     pub const REBASE_WARNING_REMOTE: ColorToken = token("graph.rebase_warning_remote", 0x8fbde6);
-    /// The column header band's height (`revision 3/REVISION-2026-07-31.md` §6.1: "Column
-    /// header, 22 high"). Sits between [`TOOLBAR`] and the row list -
+    /// The column header band's height, 22. Sits between [`TOOLBAR`] and the row list -
     /// `crate::graph_view::render::AdeApp::render_graph_view` renders it as a real sibling band,
     /// not a literal folded into the row list's own top padding, so the row `⋯` menu's anchor
     /// (built from a row's own real captured bounds, never a `TOOLBAR`/`HEADER`/index formula -
@@ -2524,9 +2517,9 @@ pub mod radius {
     pub const BUTTON: Pixels = px(4.0);
     pub const CHIP: Pixels = px(3.0); // chips, keycaps, segments
     pub const MARK: Pixels = px(2.0); // stat bars, small squares
-    /// The 5px squares the interactive-rebase plan paints - its pause marks (`revision 5/
-    /// REVISION-2026-08-12.md` §1.5), its warning-stack severity dots (§1.7) and the stopped
-    /// strip's own (§1.8). All four are specified `border-radius:1px`, and at 5px across the
+    /// The 5px squares the interactive-rebase plan paints - its pause marks, its
+    /// warning-stack severity dots and the stopped strip's own. All four are
+    /// `border-radius:1px`, and at 5px across the
     /// difference from [`MARK`] is the difference between reading as a square and reading as a
     /// dot - which is load-bearing here, since this app already uses a real circle for "an agent's
     /// status" and these deliberately are not that.
@@ -2561,10 +2554,9 @@ pub mod band {
     pub const PALETTE_INPUT: Pixels = px(44.0);
     pub const PALETTE_ROW: Pixels = px(30.0);
     pub const CHANGE_ROW: Pixels = px(27.0);
-    /// One Changes-panel section header (`REVISION-2026-08-14.md` §1: "Section header: 24 high").
+    /// One Changes-panel section header, 24 high.
     pub const CHANGES_SECTION_HEADER: Pixels = px(24.0);
-    /// One Runs-section row - two lines, `padding: 7 10 8 8`, 3px between them
-    /// (`STAGE-A-CHANGELOG.md` §4l: "Row height 31 -> 48").
+    /// One Runs-section row - two lines, `padding: 7 10 8 8`, 3px between them.
     pub const RUN_ROW: Pixels = px(48.0);
     pub const TREE_ROW: Pixels = px(22.0);
     pub const KEYCAP: Pixels = px(15.0);
@@ -2593,9 +2585,9 @@ pub mod band {
     /// One match row under it - line number, then the line with its hit highlighted.
     pub const SEARCH_MATCH_ROW: Pixels = px(19.0);
     /// The square hit box every 17x17 icon-only control button uses - the search panel's count
-    /// row and find bar, and the rail footer's prune button (`STAGE-A-CHANGELOG.md` §4w: "Same
-    /// 17px hit box as the other icon buttons"). **Not** the icon's own optical size - that is
-    /// `crate::icons::IconSize::Control` (12px), a real measurement off the mock's actual glyph
+    /// row and find bar, and the rail footer's prune button - the same 17px hit box as the
+    /// other icon buttons. **Not** the icon's own optical size - that is
+    /// `crate::icons::IconSize::Control` (12px), a real measurement of the glyph's actual
     /// geometry, which sits inset and centred inside this box rather than filling it. The two
     /// were wrongly conflated when this constant was first named after `IconSize::Control`'s
     /// (then-incorrect) 17px value; GitHub issue filed 2026-08-16 for the "icons too big"
@@ -3002,7 +2994,7 @@ mod agent_tint_allocation_tests {
                 "agent tint `{name}` ({:?}) is only {separation:.1}° of OKLCH hue from the \
                  reserved {family} family - under the {MIN_SEPARATION_DEGREES}° floor, so this \
                  colour would read as that family's *meaning* rather than as an agent's identity. \
-                 This is the failure STAGE-A-CHANGELOG.md §4a exists to prevent (haiku-4.5's tint \
+                 This is the failure the allocation rule exists to prevent (haiku-4.5's tint \
                  was the branch violet exactly, and the two met on the same 2px left edge). Pick a \
                  hue outside all five families - see `theme::agent`'s own docs for the table.",
                 foreground.key

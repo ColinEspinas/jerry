@@ -134,7 +134,7 @@ impl AdeApp {
         if state.count == 0 {
             return None;
         }
-        // `STAGE-A-CHANGELOG.md` §1: send flips the bar to *"N notes sent — awaiting revision"*.
+        // Send flips the bar to *"N notes sent — awaiting revision"*.
         // It flips back the moment a sent note is edited - see `NoteStore::file_state`.
         let label = notes_bar_label(state);
         let target = self.review_note_target(path);

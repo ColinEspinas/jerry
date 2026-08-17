@@ -1855,10 +1855,9 @@ impl AdeApp {
     }
 
     /// One row: lane canvas 100 · ref chips · subject (flex) · author 88 · relative time 40
-    /// right · sha 62 right · `⋯` 22 (`revision 3/REVISION-2026-07-31.md` §6.2 - supersedes the
-    /// revision-2 entry's own column list, which also had a `note` column and a per-commit
-    /// session column between subject and author; both are gone. A commit belongs to a
-    /// worktree, which can hold several agents, so pinning one agent's live status to a past
+    /// right · sha 62 right · `⋯` 22. An earlier column list also had a `note` column and a
+    /// per-commit session column between subject and author; both are gone. A commit belongs to
+    /// a worktree, which can hold several agents, so pinning one agent's live status to a past
     /// commit was exactly the imprecision that revision set out to remove; the `note` column
     /// next to it was never in either revision's own column list and had no real data behind
     /// it either - see the removed `render_graph_session_column`'s own former doc comment, git
@@ -1975,8 +1974,8 @@ impl AdeApp {
             // and the author column. Read straight off the uncommitted change set, so it is the
             // same number the Uncommitted section's header states rather than a second count of
             // the same working tree. A commit row has no note: what a commit changed is its own
-            // diff, one click away, and repeating a figure per row is what
-            // `REVISION-2026-07-31.md` §4 removed from these columns in the first place.
+            // diff, one click away, and repeating a figure per row is what was removed from
+            // these columns in the first place.
             .children(is_working_tree.then(|| self.render_graph_working_tree_note()))
             .child(
                 div()
@@ -3493,8 +3492,8 @@ fn lane_segment_span(
     }
 }
 
-/// The column header band, sitting between the toolbar and the row list (`revision 3/
-/// REVISION-2026-07-31.md` §6.1). Column widths mirror `AdeApp::render_graph_row`'s own real
+/// The column header band, sitting between the toolbar and the row list. Column widths mirror
+/// `AdeApp::render_graph_row`'s own real
 /// cells exactly - `graph` matches [`theme::graph::LANE_CANVAS`] plus the row's own reserved
 /// 2px selection edge, `commit` is the single flex cell standing in for the row's ref-chip
 /// (variable-width) and subject (flex) cells combined, `author`/`age`/`sha` and the trailing
@@ -4175,8 +4174,8 @@ mod graph_row_menu_tests {
         );
     }
 
-    /// `revision 3/REVISION-2026-07-31.md` §6.1 added a real 22px column header band between
-    /// the toolbar and the row list. The `⋯` button's own anchor
+    /// A real 22px column header band sits between the toolbar and the row list. The `⋯`
+    /// button's own anchor
     /// (`AdeApp::toggle_graph_row_menu`) is built entirely from that row's own real captured
     /// `row_menu_bounds` - never `TOOLBAR`/`HEADER`/the row's index - so adding the header should
     /// shift it down for free, with zero code changes to the anchor formula itself. This proves

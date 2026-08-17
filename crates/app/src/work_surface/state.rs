@@ -452,8 +452,7 @@ pub struct FooterAction {
     pub implemented: bool,
 }
 
-/// The footer action strip for one [`Status`] - GitHub issue #295's final state
-/// (`STAGE-A-CHANGELOG.md` §4e/§4r/§4t).
+/// The footer action strip for one [`Status`] - GitHub issue #295's final state.
 pub fn footer_actions(status: Status) -> Vec<FooterAction> {
     match status {
         // §4r: "`review` now renders no bar, matching `ask`". `Keep all` was "a fiction borrowed

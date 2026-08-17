@@ -618,7 +618,7 @@ pub struct AdeApp {
     /// `crate::rail::menu::RailRowMenu`. Its origin is window-space and already clamped, and it
     /// is rendered from [`Render::render`] rather than from the rail, because the rail's row list
     /// is a real scroller and a menu inside it would be clipped by it and would scroll away from
-    /// the pointer it was anchored to (`REVISION-2026-08-14.md` §4).
+    /// the pointer it was anchored to.
     pub(crate) rail_row_menu: Option<crate::rail::menu::RailRowMenu>,
     /// The rail's open overflow menu (GitHub issue #290), `None` when closed. A separate surface
     /// from [`Self::rail_row_menu`] because it is anchored off the button's own rect rather than
@@ -742,7 +742,7 @@ pub struct AdeApp {
     /// slot.
     pub(crate) _stage_tasks: TaskPool,
     /// Which Uncommitted row's own 27px band the pointer is inside, if any - one half of what
-    /// reveals `STAGE-A-CHANGELOG.md` §4i's floating hover bar.
+    /// reveals the floating hover bar.
     pub(crate) change_row_hover: Option<PathBuf>,
     /// The other half of [`Self::change_row_hover`] - the floating bar's own hitbox, including
     /// the part of it that hangs above the row. See that field's docs.
@@ -3068,10 +3068,10 @@ impl Render for AdeApp {
                 |el| el.child(self.render_tree_context_menu(cx)),
             )
             // The rail's row menus and its `⋯` overflow (GitHub issue #290) - root-level
-            // siblings, never children of the rail. `REVISION-2026-08-14.md` §4, verbatim: "All
-            // menus render outside the scrolling list. Inside it they are clipped by the scroller
-            // and scroll away from their anchor." The rail list is a real `overflow_y_scroll`
-            // container, so both of those would happen; §4w's generalisation ("an overlay
+            // siblings, never children of the rail. All menus render outside the scrolling
+            // list: inside it they are clipped by the scroller and scroll away from their anchor.
+            // The rail list is a real `overflow_y_scroll` container, so both of those would
+            // happen; the generalisation ("an overlay
             // anchored in viewport coordinates must live at the root. If it is nested in a panel,
             // every property of that panel - its scroll, its clip, its mount condition - becomes
             // a bug in the overlay") is why they sit here beside every other popover instead.

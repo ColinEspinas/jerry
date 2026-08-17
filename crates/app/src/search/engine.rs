@@ -41,8 +41,7 @@ const BINARY_SNIFF_BYTES: usize = 8 * 1024;
 /// and "Cancelled" docs.
 const SEARCH_SCAN_BATCH: usize = 128;
 
-/// The three modifier buttons in the query row, as real state
-/// (`REVISION-2026-08-14.md` §5: "`Aa` / `ab` / `.*` modifier buttons").
+/// The three modifier buttons in the query row, as real state: `Aa` / `ab` / `.*`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SearchOptions {
     /// `Aa` - off means the search is case-insensitive.
@@ -241,8 +240,7 @@ pub struct SearchOutcome {
 /// it from five separate widgets and three of them are strings that would be transposable.
 #[derive(Debug, Clone)]
 pub struct SearchRequest {
-    /// The worktree being searched - `STAGE-A-CHANGELOG.md` §4u: "scoped to the active worktree
-    /// like the tree beside it".
+    /// The worktree being searched - scoped to the active worktree, like the tree beside it.
     pub root: PathBuf,
     pub matcher: Matcher,
     pub filter: PathFilter,
