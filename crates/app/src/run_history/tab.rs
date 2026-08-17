@@ -450,17 +450,14 @@ pub(crate) fn render_run_tab(app: &AdeApp, cx: &mut Context<AdeApp>) -> gpui::An
         cx,
     );
 
-    let content: Vec<gpui::AnyElement> = vec![
-        chip,
-        div()
-            .font(font(theme::font::MONO))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_size(app.ui_text_size(11.0))
-            .text_color(colors.label)
-            .child(label.clone())
-            .into_any_element(),
-        close_button.into_any_element(),
-    ];
+    let (label_element, label_tooltip) = app.render_tab_label(
+        label.clone(),
+        theme::font::MONO,
+        app.ui_text_size(11.0),
+        colors.label,
+        cx,
+    );
+    let content: Vec<gpui::AnyElement> = vec![chip, label_element, close_button.into_any_element()];
 
     app.render_tab_chrome(
         TabChromeArgs {
@@ -470,6 +467,7 @@ pub(crate) fn render_run_tab(app: &AdeApp, cx: &mut Context<AdeApp>) -> gpui::An
             drag_value: DraggedTab::Run { label },
             is_active,
             content,
+            label_tooltip,
             on_middle_click: Box::new(|this, window, cx| {
                 this.close_run_tab(window, cx);
             }),

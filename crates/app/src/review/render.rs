@@ -549,15 +549,16 @@ pub(crate) fn render_review_tab(
         },
         cx,
     );
+    let (label_element, label_tooltip) = app.render_tab_label(
+        label.clone(),
+        theme::font::MONO,
+        app.ui_text_size(11.0),
+        colors.label,
+        cx,
+    );
     let content: Vec<gpui::AnyElement> = vec![
         render_review_tab_chip().into_any_element(),
-        div()
-            .font(font(theme::font::MONO))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_size(app.ui_text_size(11.0))
-            .text_color(colors.label)
-            .child(label.clone())
-            .into_any_element(),
+        label_element,
         close_button.into_any_element(),
     ];
 
@@ -569,6 +570,7 @@ pub(crate) fn render_review_tab(
             drag_value: DraggedTab::Review { id, label },
             is_active,
             content,
+            label_tooltip,
             on_middle_click: Box::new(|this, window, cx| {
                 this.close_review_tab(window, cx);
             }),
