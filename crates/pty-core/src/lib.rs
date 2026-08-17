@@ -1196,6 +1196,12 @@ mod pty_session_tests {
     /// failure. Generous: it has to survive a full-suite run where other tests' own child
     /// processes are competing for the same cores. `test_support::wait_until` returns as soon as
     /// the condition holds, so an idle machine pays none of it.
+    ///
+    /// `#[cfg(unix)]` because every one of its use sites is: the process-tree teardown and
+    /// SIGSTOP/SIGCONT state assertions this bounds have no Windows twin (see this module's own
+    /// header). Without the gate it is dead code on Windows - which nothing caught until clippy
+    /// started running on that target.
+    #[cfg(unix)]
     const TEARDOWN_DEADLINE: Duration = Duration::from_secs(5);
 
     /// Reads from `session.output()` until `needle` appears in the accumulated (lossy

@@ -1747,6 +1747,9 @@ fn run_stderr_drain_loop(stderr: std::process::ChildStderr, server: &'static str
 mod tests {
     use super::*;
     use std::time::Instant;
+    // Only `IncomingHarness` uses this, and it is `#[cfg(unix)]` - the import has to carry the
+    // same gate or it is an unused import on Windows.
+    #[cfg(unix)]
     use test_support::ChildGuard;
 
     /// GitHub issue #46's own real, remaining Windows gotcha - `canonicalize`'s own docs. Not a
