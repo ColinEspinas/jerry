@@ -14,7 +14,7 @@ Every test belongs to exactly one tier, and the tier decides what it may do and 
 
 | Tier | Marker | May do | Must not | Budget |
 |---|---|---|---|---|
-| `unit` | plain `#[test]` | pure logic, tempdir filesystem | spawn a process, open a gpui window, sleep, assert on wall-clock | < 10 ms |
+| `unit` | plain `#[test]` | pure logic, tempdir filesystem, a short-lived process the toolchain already guarantees (`git`, `/bin/sh`) | open a gpui window, spawn a language server or an agent, sleep, put an upper bound on elapsed time | < 10 ms, or a few hundred once it shells out |
 | `ui` | `#[gpui::test]` + `TestAppContext` / `VisualTestContext` | real git fixtures, real key/action dispatch | external language servers, real agent processes, sleep | < 2 s |
 | `external` | `#[ignore = "external: <binary>; see docs/testing.md"]` | real `rust-analyzer` / `typescript-language-server` / `pyright` / `gopls`, real OS process-tree semantics | — | dedicated CI job only |
 
@@ -23,10 +23,12 @@ Tiers 1 and 2 are the PR gate. Tier 3 never is.
 Today that is 2,186 plain `#[test]` and 1,006 `#[gpui::test]` in `crates/app` alone — the split
 already roughly exists, it has just never been named or enforced.
 
-A `unit` test that shells out to `git` against a tempdir repository is still a `unit` test: the
-budget is what separates the tiers in practice, and a seeded fixture repo costs a few hundred
-milliseconds of `git` at most. What pushes a test into `ui` is needing a window; what pushes it
-into `external` is needing a binary the repo does not vendor or a real agent process.
+A `unit` test that shells out to `git` against a tempdir repository is still a `unit` test, and so
+is one that spawns `/bin/sh` to stand in for a real login shell: the budget is what separates the
+tiers in practice, and a seeded fixture repo costs a few hundred milliseconds of `git` at most.
+What pushes a test into `ui` is needing a window; what pushes it into `external` is needing a
+binary neither the OS nor this repo's own toolchain already guarantees — `rust-analyzer`,
+`pyright` — or a real agent process.
 
 ## What deserves a test
 
@@ -60,7 +62,18 @@ body:
   `from_secs(9)` this list used to name is gone: `hooks::server`'s
   `many_slow_clients_at_once_cannot_starve_a_real_hook` now waits on the drip-feeders' own
   cut-off signal instead of guessing a duration.
-- Any test that spawns a process owns its teardown, via an RAII guard from `test-support`.
+- **No upper bound on elapsed time as an assertion.** `assert!(elapsed < limit)` fails whenever CI
+  is busy, and any limit loose enough to survive that no longer distinguishes the behaviour it was
+  written for — this rule is a real Linux CI failure, not a hypothetical (GitHub PR #451). Assert
+  the observable effect instead: have the subject's command touch a marker file on completion, and
+  assert the marker's absence, optionally over a window with `test_support::stays_false`. A *lower*
+  bound (`elapsed >= its own timeout`) is fine and often necessary — no slowness can break one, and
+  it is what stops such a test from passing vacuously when the subject returns early for an
+  unrelated reason. Genuine hangs are the runner's job: `.config/nextest.toml`'s `slow-timeout`
+  kills the test, not the run.
+- Any test that spawns a process owns its teardown, via an RAII guard from `test-support`. A
+  grandchild the test never spawned itself — a shell's own backgrounded job — is outside what a
+  guard can reach; keep it short-lived rather than pretending otherwise.
 - Any test that opens a file watcher shuts it down. A leaked watcher thread fails the tier's budget.
 - Every `#[ignore]` carries a reason string naming exactly what is missing.
 - Existing conventions that stay, unchanged: fixtures live under a sibling `testdata/` directory,

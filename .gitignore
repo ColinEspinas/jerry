@@ -1,4 +1,7 @@
 target/
+# Bundle-script output (script/bundle-mac.sh, and its Linux/Windows counterparts) - built
+# artifacts, not source.
+dist/
 # A shared `CARGO_TARGET_DIR` some worktrees point at to avoid recompiling the whole workspace
 # per worktree - a real build directory exactly like `target/` above, just outside it. Missing
 # here is the same class of bug `wt_core::review::MAX_UNTRACKED_SNAPSHOT_BYTES` documents hitting

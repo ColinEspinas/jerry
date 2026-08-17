@@ -30,6 +30,14 @@ use std::time::Duration;
 use std::time::Instant;
 use thiserror::Error;
 
+// A GUI-launched process (Finder's `.app`, a `.desktop` entry) inherits a minimal PATH that
+// omits Homebrew/nvm/asdf shims; Windows processes don't have this problem, so the module is
+// unix-only rather than `#[cfg]`-gating every item inside it.
+#[cfg(unix)]
+mod login_shell;
+#[cfg(unix)]
+pub use login_shell::resolve_login_shell_path;
+
 pub use portable_pty::ExitStatus;
 
 /// How many chunks the output channel buffers before the reader thread blocks, bounding buffered

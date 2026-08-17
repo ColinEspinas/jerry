@@ -47,16 +47,13 @@ jobs:
         include:
           - os: ubuntu-latest
             name: linux
-            bin: app
-            archive_ext: tar.gz
+            artifact: jerry-linux.tar.gz
           - os: macos-latest
             name: macos
-            bin: app
-            archive_ext: tar.gz
+            artifact: Jerry-macos.dmg
           - os: windows-latest
             name: windows
-            bin: app.exe
-            archive_ext: zip
+            artifact: Jerry-windows.zip
     name: Build (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     steps:
@@ -94,40 +91,32 @@ jobs:
       - name: cargo build --release -p app
         run: cargo build --release -p app
 
-      # Renamed from "app"/"app.exe" (the workspace's `[[bin]] name`) to "jerry"/
-      # "jerry.exe" at package time - the crate's own internal bin name is a workspace
-      # detail, but the product this repo ships is "jerry" (see README.md's own
-      # `# ade ("Jerry")` heading), so that's the name a downloaded executable should
-      # carry.
-      - name: Stage binary
+      # Each script assembles the real launchable bundle for its OS - a `.app` + DMG on
+      # macOS, a tarball with a `.desktop` launcher entry on Linux, a zip carrying
+      # `Jerry.exe` on Windows - and reads the release version from the workspace
+      # `Cargo.toml` itself, so nothing here re-derives it. Invoked via `bash`/`pwsh`
+      # rather than executed directly so a script's executable bit surviving checkout
+      # isn't load-bearing.
+      - name: Bundle (macOS)
+        if: matrix.name == 'macos'
         shell: bash
-        run: |
-          mkdir -p dist
-          if [ "${{ matrix.name }}" = "windows" ]; then
-            cp "target/release/${{ matrix.bin }}" dist/jerry.exe
-          else
-            cp "target/release/${{ matrix.bin }}" dist/jerry
-          fi
+        run: bash script/bundle-mac.sh
 
-      - name: Package (tar.gz)
-        if: matrix.archive_ext == 'tar.gz'
-        working-directory: dist
-        run: tar -czf jerry-${{ matrix.name }}.tar.gz jerry
+      - name: Bundle (Linux)
+        if: matrix.name == 'linux'
+        shell: bash
+        run: bash script/bundle-linux.sh
 
-      # Windows runners don't ship a `zip` CLI on PATH (only Linux/macOS runners do) -
-      # `Compress-Archive` is a builtin PowerShell cmdlet present on every windows-latest
-      # image, so it needs no extra install step.
-      - name: Package (zip)
-        if: matrix.archive_ext == 'zip'
-        working-directory: dist
+      - name: Bundle (Windows)
+        if: matrix.name == 'windows'
         shell: pwsh
-        run: Compress-Archive -Path jerry.exe -DestinationPath jerry-${{ matrix.name }}.zip
+        run: script/bundle-windows.ps1
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: jerry-${{ matrix.name }}
-          path: dist/jerry-${{ matrix.name }}.${{ matrix.archive_ext }}
+          path: dist/${{ matrix.artifact }}
           if-no-files-found: error
 
   release:

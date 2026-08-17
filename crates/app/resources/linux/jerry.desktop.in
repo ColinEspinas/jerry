@@ -1,0 +1,23 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Jerry
+GenericName=AI Agent Supervisor
+Comment=Supervise several AI coding agents at once, each in its own real git worktree
+TryExec=$APP_CLI
+Exec=$APP_CLI %f
+Icon=jerry
+# GitHub issue #447 bullet 1 ("Terminal opens in background"): explicit rather than relying on
+# the spec's own `false` default, since this key existing at all is half the fix for that bullet
+# on Linux - the other half is this file simply existing so a bare Unix executable is launchable
+# from a menu/dock in the first place.
+Terminal=false
+Categories=Development;IDE;
+StartupWMClass=jerry
+StartupNotify=true
+# Deliberately no MimeType=inode/directory here: Zed's own zed.desktop.in carries the same
+# warning next to that field - on Arch, some desktop environments treat any app that claims
+# `inode/directory` as a candidate default file browser, silently hijacking "Open Folder With..."
+# for a plain text/code editor. Jerry's own optional repo-path argument (`crates/app/src/main.rs`,
+# `env::args_os().nth(1)`) still works from a terminal or a launcher's "open with" dialog that
+# passes a path positionally - it just isn't advertised as a file-manager integration point.
