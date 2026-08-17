@@ -729,8 +729,8 @@ impl AdeApp {
             .collect()
     }
 
-    /// The file tree - `design_handoff_jerry_ade/README.md`'s Zone 3 "Files (tree)" spec:
-    /// rect-composed folder/language-chip icons (see [`render_folder_icon`]/
+    /// The file tree (`docs/design/sidebar.md`): rect-composed folder/language-chip icons (see
+    /// [`render_folder_icon`]/
     /// [`render_lang_chip`], never emoji or an SVG pipeline), collapse/expand (see
     /// [`Self::toggle_dir_expanded`]/`crate::sidebar::file_tree::visible_entries`).
     pub(in crate::sidebar) fn render_file_tree(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -1558,9 +1558,8 @@ impl AdeApp {
         row.into_any_element()
     }
 
-    /// Zone 3's header band (36 high): the real `Files · Search · Changes` segmented control
-    /// (`design_handoff_jerry_ade/README.md`: "Header 36: segmented `Files | Changes`
-    /// (Files is first and default...)", with GitHub issue #162 adding Search in the middle) plus
+    /// Zone 3's header band (36 high): the real `Files · Search · Changes` segmented control -
+    /// Files first and default, with GitHub issue #162 having added Search in the middle - plus
     /// the real `+n`/`−n` totals across the currently loaded diff, summed from the same real
     /// per-file stats (`crate::sidebar::changes::diff_file_stats`) the Changes rows themselves
     /// show.
@@ -1629,10 +1628,9 @@ impl AdeApp {
             // `crate::root::scrollbar::CONTENT_CLEARANCE`'s own docs for the value.
             .pr(px(scrollbar::CONTENT_CLEARANCE))
             // The third of the window's three column headers, so the rule it draws is the same
-            // one the sidebar strip and the centre tab strip draw - GitHub issue #291 /
-            // `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4v: "all three borders
-            // are `#191c1f` ... [otherwise it] would have read as one rule changing shade
-            // mid-span". This was `theme::border::INNER` (`#1c2023`), a third shade on the same y.
+            // one the sidebar strip and the centre tab strip draw (GitHub issue #291). All three
+            // share one colour; otherwise it reads as one rule changing shade mid-span. This was
+            // `theme::border::INNER` (`#1c2023`), a third shade on the same y.
             .border_b_1()
             .border_color(theme::border::RAIL_INNER)
             .child(toggle)
@@ -1768,8 +1766,7 @@ impl AdeApp {
     }
 
     /// Zone 3's whole real body: the `Files | Changes` header, then either the scrollable file
-    /// tree, or the Changes list's own header/scrollable-rows/footer trio -
-    /// `design_handoff_jerry_ade/README.md`'s Changes spec ("Header 7/12 ... Footer 29"). Both
+    /// tree, or the Changes list's own header/scrollable-rows/footer trio. Both
     /// list arms wrap their list in a plain `flex_1().min_h_0()` column, so a long list scrolls
     /// under its own pinned header/footer instead of pushing them off-screen.
     pub(crate) fn render_right_sidebar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -1808,7 +1805,7 @@ impl AdeApp {
                     self.window_controls_style().is_macos(),
                     self.tree_inline_edit.is_none(),
                 )),
-            // GitHub issue #162 / `REVISION-2026-08-14.md` §5: the query row (with the replace
+            // GitHub issue #162: the query row (with the replace
             // and glob rows it reveals), the count row, then the body - which is the two-level
             // match tree, or one of the two message states, gated on one has-query flag. The whole
             // panel is `crate::search::render`'s; this arm only places it.
@@ -1816,10 +1813,10 @@ impl AdeApp {
             // GitHub issue #285: four collapsible sections, with the commit composer pinned
             // **above** them rather than at the panel's foot. The composer is a git control and
             // the sections are what it acts on, so it reads first; that ordering is
-            // `REVISION-2026-08-14.md` §1's own sketch. Of the four, only Runs is pinned to the
-            // panel's own *bottom*, in its own capped well below the other three's shared
-            // scroller (`Self::render_changes_runs_section`) - `Jerry.dc.html` line 1433's own
-            // separate `max-height:170px` wrapper, not a fourth entry in the shared one.
+            // the design's own ordering. Of the four, only Runs is pinned to the panel's own
+            // *bottom*, in its own capped well below the other three's shared scroller
+            // (`Self::render_changes_runs_section`) - a separate, capped wrapper, not a fourth
+            // entry in the shared one.
             RightSidebarView::Changes => container
                 .child(self.render_commit_composer(cx))
                 .children(self.render_changes_row_error(cx))
@@ -1973,10 +1970,9 @@ impl AdeApp {
                     return vec![quiet("computing uncommitted changes...")];
                 };
                 // Rows come from the **change set**, not the diff's own file list: the change set
-                // is keyed by path, so "a path appears once per worktree" (`REVISION-2026-08-14`
-                // §1's rule 1) is a property of the list this renders rather than a rule this
-                // loop has to remember. A diff that somehow named one path twice is already one
-                // row by the time it gets here.
+                // is keyed by path, so "a path appears once per worktree" is a property of
+                // the list this renders rather than a rule this loop has to remember. A diff
+                // that somehow named one path twice is already one row by the time it gets here.
                 let mut body: Vec<SectionRow> = (0..self.uncommitted_change_set.len())
                     .map(SectionRow::UncommittedFile)
                     .collect();
@@ -2047,18 +2043,16 @@ impl AdeApp {
                 let mut body: Vec<SectionRow> = Vec::new();
                 // The read-only context card, deliberately **not** a counted row - see
                 // `SectionRow::is_counted`. This section carries no action buttons at all: a
-                // product decision recorded on GitHub issue #285, overriding
-                // `REVISION-2026-08-14.md` §1's rule 3 and `STAGE-A-CHANGELOG.md` §4e. Merging a
+                // product decision recorded on GitHub issue #285. Merging a
                 // branch into its base is the git graph's job (issue #241) and removing a
                 // worktree already has its own entry point on the rail's worktree context menu,
                 // so putting either here would be a second home for an action that already has
                 // one - the exact defect §4e removed them from the agent header for.
                 //
                 // No per-file rows, though issue #285's own checklist says "diffstat, file list
-                // and commit context" - a deliberate deviation from that restated checklist back
-                // toward `Jerry.dc.html` itself: line 1422's `baseRows` is a synthetic one-entry
-                // array (`wtBaseDefs`'s `files` is a plain count, never an array of files), so a
-                // committed file was never meant to be its own row here. Requested directly:
+                // and commit context" - a deliberate deviation from that restated checklist: the
+                // design carries a plain file *count* here, never an array of files, so a
+                // committed file was never meant to be its own row. Requested directly:
                 // "commited files should not appear on the changes tab under against master."
                 let base = self.changes_base_branch().map(str::to_string);
                 if let Some(base) = base {
@@ -2131,8 +2125,8 @@ impl AdeApp {
     /// (Uncommitted, Commits, Against main) in a single `gpui::list`, with the same shared overlay
     /// scrollbar every other scrollable region in this app draws (`crate::root::scrollbar`). Runs
     /// is deliberately excluded - it renders in its own pinned-bottom well,
-    /// [`Self::render_changes_runs_section`], matching `Jerry.dc.html` line 1433's own separate
-    /// `max-height:170px;overflow-y:auto` wrapper rather than sharing this scroller.
+    /// [`Self::render_changes_runs_section`], with its own `max-height:170px` overflow rather
+    /// than sharing this scroller.
     pub(in crate::sidebar) fn render_changes_sections(
         &self,
         cx: &mut Context<Self>,
@@ -2193,8 +2187,7 @@ impl AdeApp {
     }
 
     /// The Runs section, pinned to the Changes panel's own bottom in its own capped,
-    /// independently-scrolled well - `Jerry.dc.html` line 1433's `flex:none;max-height:170px;
-    /// overflow-y:auto` wrapper, which sits *outside* the shared scroller the other three
+    /// independently-scrolled well, which sits *outside* the shared scroller the other three
     /// sections share rather than as a fourth entry inside it (the user: "run row should be
     /// pinned to the bottom and not to the top look at the design").
     pub(in crate::sidebar) fn render_changes_runs_section(
@@ -2267,7 +2260,7 @@ impl AdeApp {
     }
 
     /// One section header: caret, uppercase label, count, and a right-aligned split diffstat, in
-    /// the rev-6 `theme::changes` tokens (`REVISION-2026-08-14.md` §1). Clicking anywhere on it
+    /// the `theme::changes` tokens. Clicking anywhere on it
     /// opens or closes the section.
     fn render_section_header(
         &self,
@@ -2396,11 +2389,11 @@ impl AdeApp {
             )
     }
 
-    /// One Runs row (`STAGE-A-CHANGELOG.md` §4l): line 1 is the title alone at full width, line 2
+    /// One Runs row: line 1 is the title alone at full width, line 2
     /// is `<agent> · ended 2m` on the left with `12 files +285 −119` pushed right. Left edge is
     /// the run's own agent tint, and there is **no checkbox, ever** - a run is not a stageable
     /// thing, and one agent's share of a file the other agent also wrote is not separately
-    /// stageable at all (`REVISION-2026-08-14.md` §1's table and rule 1).
+    /// stageable at all.
     fn render_run_row(&self, run: &sections::RunRow, cx: &mut Context<Self>) -> impl IntoElement {
         let agent_id = run.agent_id;
         let selector = format!("changes-run-{}", run.agent_id);
@@ -2513,7 +2506,7 @@ impl AdeApp {
     }
 
     /// One Commits row: short sha, subject, and the commit's own diffstat. No checkbox and no left
-    /// edge - a commit is neutral scope (`REVISION-2026-08-14.md` §1's table), and there is
+    /// edge - a commit is neutral scope, and there is
     /// nothing about an already-written commit to stage.
     fn render_commit_row(&self, commit: &wt_core::diff::BranchCommit) -> impl IntoElement {
         let selector = format!("changes-commit-{}", commit.short_id);
@@ -2716,8 +2709,8 @@ impl AdeApp {
                     .top_0()
                     .bottom_0()
                     .w(px(2.0))
-                    // The section's own edge colour (`REVISION-2026-08-14.md` §1's table:
-                    // uncommitted blue, branch-scope violet) is what this channel now carries, and
+                    // The section's own edge colour (uncommitted blue, branch-scope violet)
+                    // is what this channel now carries, and
                     // selection is painted over it - so an unselected row in a scoped section
                     // still states which scope it is in, which is the whole point of the edge.
                     .bg(if selected {
@@ -2792,7 +2785,7 @@ impl AdeApp {
                         gpui::FontWeight::MEDIUM
                     })
                     .text_size(self.ui_text_size(11.5))
-                    // `STAGE-A-CHANGELOG.md` §4i: the filename itself carries **seen**, because
+                    // The filename itself carries **seen**, because
                     // "when a row already contains the thing a state is about, style that thing".
                     // Staged is the checkbox's job and only the checkbox's - do not reintroduce a
                     // colour for it here.
@@ -2818,9 +2811,9 @@ impl AdeApp {
                     name_cell
                 }
             })
-            // GitHub issue #287: who wrote this file, right after its name -
-            // `REVISION-2026-08-14.md` §1's "agent chip per row […] amber ring when it has two
-            // authors". `render_author_chips` owns the ring, the tooltips and both click
+            // GitHub issue #287: who wrote this file, right after its name - an agent chip
+            // per row, with an amber ring when it has two authors. `render_author_chips` owns
+            // the ring, the tooltips and both click
             // gestures; this row only says where the group goes and when it exists at all.
             //
             // `stageable` is the Uncommitted scope, which is exactly where the design puts these:
@@ -2830,7 +2823,7 @@ impl AdeApp {
             // and the ring's filter would open a diff against a base these chips were never
             // measured over.
             //
-            // The multi-agent gate (`REVISION-2026-07-31.md` §4) is repeated here rather than left
+            // The multi-agent gate is repeated here rather than left
             // to `render_author_chips` alone, so a single-agent worktree does not build one
             // throwaway author `Vec` per row per frame for a group that is then never rendered.
             .when(stageable && self.worktree_has_multiple_agents(), |el| {
@@ -2891,8 +2884,8 @@ impl AdeApp {
             format!("change-row-discard-{}", path.display())
         };
 
-        // One shared 22x22 optical box for both icons - `REVISION-2026-08-14.md` §7 rule 7 ("a
-        // row of icons needs one shared optical box, not one size per icon"). Only the hover
+        // One shared 22x22 optical box for both icons: a row of icons needs one shared
+        // optical box, not one size per icon. Only the hover
         // pair differs: neutral for `open`, red for `discard`, since the second one destroys
         // work.
         let icon_button = |id: String,
@@ -3100,8 +3093,8 @@ impl AdeApp {
         self._discard_tasks.push(task);
     }
 
-    /// `V`'s action handler ([`crate::root::ToggleChangeSeen`]) - `STAGE-A-CHANGELOG.md` §4i:
-    /// "opening a file marks it seen […] and `V` unmarks".
+    /// `V`'s action handler ([`crate::root::ToggleChangeSeen`]) - opening a file marks it
+    /// seen, and `V` unmarks.
     pub(crate) fn handle_toggle_change_seen_action(
         &mut self,
         _action: &crate::root::ToggleChangeSeen,
@@ -3143,8 +3136,8 @@ impl AdeApp {
         self.open_uncommitted_change().is_some()
     }
 
-    /// `space`'s action handler ([`crate::root::ToggleChangeStaged`]) - the binding behind
-    /// `Jerry.dc.html`'s `changesHints` first hint, `space stage` (line 4548).
+    /// `space`'s action handler ([`crate::root::ToggleChangeStaged`]) - the binding behind the
+    /// Changes footer's first hint, `space stage`.
     pub(crate) fn handle_toggle_change_staged_action(
         &mut self,
         _action: &crate::root::ToggleChangeStaged,
@@ -3848,11 +3841,9 @@ impl AdeApp {
     }
 }
 
-/// The Changes list's footer 29 - **three keycap hints and no prose at all**, exactly as
-/// `design_handoff_jerry_ade/revision 5/Jerry.dc.html` line 4548 declares it:
-/// `changesHints: this.mkHints([['space', 'stage'], ['V', 'mark seen'], ['⌥click', 'filter by
-/// author']])`, rendered through the same `diffHints` hint-row template (line 842) that is purely a
-/// loop over keycap+label pairs. `STAGE-A-CHANGELOG.md` §2's ride-along I10 lists the same strip.
+/// The Changes list's footer 29 - **three keycap hints and no prose at all**: `space stage`,
+/// `V mark seen`, `⌥click filter by author`, rendered through the same hint-row template as
+/// every other footer, which is purely a loop over keycap+label pairs.
 pub(in crate::sidebar) fn render_changes_footer(
     text_size: Pixels,
     stage_toggle_live: bool,
@@ -3909,7 +3900,7 @@ pub(in crate::sidebar) fn render_changes_footer(
                 "stage",
             ))
         })
-        // The mock's second hint, and `STAGE-A-CHANGELOG.md` §4i's own legend entry.
+        // The Changes footer's second hint.
         .when(seen_toggle_live, |el| {
             el.child(hint(
                 "changes-footer-seen-hint",
@@ -3920,7 +3911,7 @@ pub(in crate::sidebar) fn render_changes_footer(
         // The mock's third hint, `⌥click filter by author`, as real keycaps rather than the prose
         // `alt+click` (ride-along I10). Gated on the affordance genuinely being on screen:
         // `alt`+click filters by clicking an *author chip*, and chips only exist in a multi-agent
-        // worktree (`REVISION-2026-07-31.md` §4), so in a one-agent worktree this would advertise
+        // worktree, so in a one-agent worktree this would advertise
         // a gesture with nothing to perform it on.
         .when(author_filter_live, |el| {
             el.child(hint(
@@ -4123,8 +4114,8 @@ pub(in crate::sidebar) fn scrollable_sidebar_message(
 }
 
 /// The Changes row's `moved` tag for a real rename (`changes::is_real_rename`) - its own muted
-/// chip rather than a fourth [`changes::StatusLetter`], since `STAGE-A-CHANGELOG.md` §4j's table
-/// is exactly three letters with three colours and a rename is not a fourth thing git did to the
+/// chip rather than a fourth [`changes::StatusLetter`], since the letter set is exactly three
+/// letters with three colours and a rename is not a fourth thing git did to the
 /// file's *contents*. See `changes::status_letter`'s own docs for why `Renamed` maps to `M` and
 /// this chip carries the rename instead.
 pub(in crate::sidebar) fn render_moved_tag() -> impl IntoElement {
@@ -4140,8 +4131,7 @@ pub(in crate::sidebar) fn render_moved_tag() -> impl IntoElement {
         .child("moved")
 }
 
-/// The Changes row's real five-segment 3×8 stat bar (`design_handoff_jerry_ade/README.md`:
-/// "a five-segment 3×8 stat bar (`#4e8c68` / `#a35f5b` / `#22262a`)"), per
+/// The Changes row's real five-segment 3×8 stat bar, per
 /// `crate::sidebar::changes::stat_bar_segments`'s real, unit-tested proportional allocation.
 pub(in crate::sidebar) fn render_stat_bar(segments: [changes::StatSegment; 5]) -> impl IntoElement {
     div()
@@ -6708,8 +6698,7 @@ mod commit_composer_tests {
         );
         assert!(
             cx.debug_bounds("stage-checkbox-committed.txt").is_none(),
-            "and it offers no checkbox anywhere: `REVISION-2026-08-14.md` §9 box 1, checkboxes \
-             exist only in Uncommitted"
+            "and it offers no checkbox anywhere: checkboxes exist only in Uncommitted"
         );
     }
 
@@ -7098,7 +7087,6 @@ mod changes_sections_tests {
 
     #[gpui::test]
     fn checkboxes_exist_only_in_the_uncommitted_section(cx: &mut TestAppContext) {
-        // `REVISION-2026-08-14.md` §9, box 1.
         let (_repo_dir, repo) = four_scope_repo();
         let (app, cx) = open_changes_view(cx, &repo);
         open_every_section(&app, cx);
@@ -7169,15 +7157,13 @@ mod changes_sections_tests {
     fn the_against_main_section_renders_no_action_buttons_and_no_file_rows(
         cx: &mut TestAppContext,
     ) {
-        // The product decision recorded on GitHub issue #285, overriding
-        // `REVISION-2026-08-14.md` §1 rule 3 and `STAGE-A-CHANGELOG.md` §4e: merging is the git
+        // The product decision recorded on GitHub issue #285: merging is the git
         // graph's job and worktree removal already has its entry point on the rail, so this
         // section is read-only.
         //
         // And, separately: no row per committed file either, reported directly ("commited files
-        // should not appear on the changes tab under against master") and confirmed against
-        // `Jerry.dc.html` line 1422's own `baseRows` - a synthetic one-entry array, never a
-        // per-file loop. Against main's only real body row is its context card.
+        // should not appear on the changes tab under against master"). Against main's only real
+        // body row is its context card.
         let (_repo_dir, repo) = four_scope_repo();
         let (app, cx) = open_changes_view(cx, &repo);
         open_every_section(&app, cx);
@@ -7220,8 +7206,8 @@ mod changes_sections_tests {
     fn the_runs_header_matches_the_uncommitted_header_when_one_agent_wrote_everything(
         cx: &mut TestAppContext,
     ) {
-        // `STAGE-A-CHANGELOG.md` §3's own verification of the mock, as a live render: "Runs
-        // `+319 −145` and Uncommitted `+319 −145` agree exactly." The provenance is recorded
+        // Runs `+319 −145` and Uncommitted `+319 −145` agree exactly, as a live render. The
+        // provenance is recorded
         // through the store's real `PreToolUse`/write/`PostToolUse` door, exactly as the hook
         // layer drives it - no fabricated attribution.
         let (_repo_dir, repo) = fixtures::temp_root();
@@ -7476,7 +7462,7 @@ mod changes_sections_tests {
             live_row.meta_color(),
             ended_row.meta_color(),
             "warm while it is still moving, neutral once it has ended - that colour split is the \
-             only thing carrying the state on the row itself (STAGE-A-CHANGELOG.md §4l)"
+             only thing carrying the state on the row itself"
         );
         assert!(
             cx.debug_bounds("changes-section-runs-2-open").is_some(),
@@ -7486,8 +7472,8 @@ mod changes_sections_tests {
 }
 
 /// GitHub issue #286 - the change row's three rev-6 channels, each asserted against a real,
-/// painted row: git's own status letter (`STAGE-A-CHANGELOG.md` §4j), the filename's own
-/// seen-state (§4i), and the floating hover-action bar with its two-step discard (§4i).
+/// painted row: git's own status letter, the filename's own seen-state, and the floating
+/// hover-action bar with its two-step discard.
 #[cfg(test)]
 mod change_row_tests {
     use super::*;
@@ -7647,7 +7633,7 @@ mod change_row_tests {
             .is_some());
         assert!(
             app.read_with(cx, |app, _| app.staged_files.is_empty()),
-            "reviewing must never stage (REVISION-2026-08-14.md §1 rule 2)"
+            "reviewing must never stage"
         );
 
         let checkbox = cx
@@ -8008,7 +7994,7 @@ mod change_row_tests {
         );
         assert!(
             app.read_with(cx, |app, _| app.staged_files.is_empty()),
-            "premise: opening a file never stages it (REVISION-2026-08-14.md §1 rule 2)"
+            "premise: opening a file never stages it"
         );
 
         cx.simulate_keystrokes("space");
@@ -8017,7 +8003,7 @@ mod change_row_tests {
             app.read_with(cx, |app, _| app
                 .staged_files
                 .contains(&PathBuf::from("modified.txt"))),
-            "a real `space` keystroke stages the open row - `Jerry.dc.html`'s `space stage`"
+            "a real `space` keystroke stages the open row - the footer's `space stage` hint"
         );
         assert!(
             cx.debug_bounds("stage-checkbox-modified.txt").is_some(),
@@ -8117,9 +8103,9 @@ mod change_row_tests {
             let modifiers = keystroke.modifiers();
             assert!(
                 !modifiers.control && !modifiers.alt && !modifiers.platform && !modifiers.shift,
-                "{spec:?} is printed bare in `Jerry.dc.html`'s `changesHints`, so a binding that \
-                 silently gained a modifier would leave the keycap advertising a keystroke nobody \
-                 can trigger"
+                "{spec:?} is printed bare in the Changes footer, so a binding that silently \
+                 gained a modifier would leave the keycap advertising a keystroke nobody can \
+                 trigger"
             );
         }
 

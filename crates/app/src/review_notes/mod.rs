@@ -74,7 +74,7 @@ pub enum NoteMark {
 }
 
 impl NoteMark {
-    /// The card's own word, verbatim from `Jerry.dc.html`'s `noteMark`.
+    /// The card's own word, verbatim design copy.
     pub fn label(self) -> &'static str {
         match self {
             NoteMark::Draft => "draft",

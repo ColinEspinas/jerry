@@ -16,10 +16,10 @@ use crate::status_bar::render::StatusTier;
 use crate::status_bar::resources;
 use crate::work_surface::agents::ProcessKind;
 
-/// §4c: "Click opens a popover (292 wide, above the bar)".
+/// The design: "Click opens a popover (292 wide, above the bar)".
 const POPOVER_WIDTH: f32 = 292.0;
 
-/// The pane strip's meter: `Jerry.dc.html`'s own `30x3` track, one per window.
+/// The pane strip's meter: a 30x3 track, one per window.
 const METER_WIDTH: f32 = 30.0;
 const METER_HEIGHT: f32 = 3.0;
 

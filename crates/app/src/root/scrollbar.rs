@@ -13,8 +13,8 @@ use crate::root::scrollbar_geometry as geometry;
 /// visual width.
 const SCROLLBAR_SIZE: f32 = 10.0;
 
-/// How far clear of the track's edges the painted thumb floats - STAGE-A-CHANGELOG.md §4p's "2px
-/// transparent border". A plain `f32` mirror of [`theme::scrollbar::THUMB_INSET`], for the same
+/// How far clear of the track's edges the painted thumb floats - a 2px transparent border. A
+/// plain `f32` mirror of [`theme::scrollbar::THUMB_INSET`], for the same
 /// const-context reason [`SCROLLBAR_SIZE`] is, and pinned to it by the same test.
 const THUMB_INSET: f32 = 2.0;
 
@@ -202,9 +202,8 @@ pub(crate) fn render_vertical_scrollbar<T: 'static, H: ScrollableHandle>(
                     .id(format!("{id}-thumb"))
                     .absolute()
                     .top(px(thumb_top + THUMB_INSET))
-                    // STAGE-A-CHANGELOG.md §4p: the thumb carries "a 2px transparent border
-                    // and `background-clip:content-box` so it floats 2px clear of the edge".
-                    // Drawn directly rather than in CSS, that transparent border is simply an
+                    // The thumb carries a 2px transparent border so it floats 2px clear of
+                    // the edge. Drawn directly rather than in CSS, that border is simply an
                     // inset on every edge - so the thumb is `WIDTH - 2 * INSET` wide and sits
                     // `INSET` in from the track's own edges. The track keeps its full
                     // `SCROLLBAR_SIZE` width and its own click-to-jump handler, so the region

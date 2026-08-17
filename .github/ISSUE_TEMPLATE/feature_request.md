@@ -15,5 +15,5 @@ labels: enhancement
 
 ## Design
 
-<!-- If this touches layout/colors/interaction, check design_handoff_jerry_ade/revision/ first -
-     link the relevant section, or note that none exists yet (blocked-on-design). -->
+<!-- If this touches layout/colors/interaction, check docs/design/ first - link the page and
+     section it belongs to, or note that none exists yet (blocked-on-design). -->

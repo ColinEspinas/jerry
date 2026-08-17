@@ -62,8 +62,7 @@ impl ChangeSetEntry {
             .collect()
     }
 
-    /// The `⚠` ring's single meaning, verbatim from `REVISION-2026-08-14.md` §1: *"this path has
-    /// lines from more than one agent"*.
+    /// The `⚠` ring's single meaning: *this path has lines from more than one agent*.
     pub fn is_shared(&self) -> bool {
         self.agents().len() > 1
     }
@@ -295,9 +294,8 @@ mod tests {
     use crate::provenance::store::ProvenanceStore;
     use crate::sidebar::changes::diff_file_stats;
 
-    /// The base content of the mock's shared file, as committed - the `Review · uncommitted`
-    /// fixture from `design_handoff_jerry_ade/revision 5/Jerry.dc.html` (`changeSets.s3` →
-    /// `src/api/users.rs`), reduced to the lines its hunks actually show.
+    /// The base content of the design's shared file, as committed - its `Review · uncommitted`
+    /// example (`src/api/users.rs`), reduced to the lines its hunks actually show.
     const USERS_RS_BASE: &str = "\
 impl UserApi {
     pub async fn list(&self, page: Page) -> Result<Vec<User>> {
@@ -421,8 +419,8 @@ impl UserApi {
 
     #[test]
     fn a_path_three_authors_touched_is_one_row_carrying_all_three_and_a_combined_diffstat() {
-        // `REVISION-2026-08-14.md` §1, rule 1: "A path appears once per worktree, however many
-        // agents touched it - `by: ['s3','s10']` with a combined diffstat, never two rows."
+        // A path appears once per worktree, however many agents touched it - `by:
+        // ['s3','s10']` with a combined diffstat, never two rows.
         let fixture = Fixture::two_agent_worktree();
         let change_set = fixture.change_set();
 
@@ -501,8 +499,8 @@ impl UserApi {
 
     #[test]
     fn every_share_of_a_shared_path_sums_to_its_combined_diffstat() {
-        // `STAGE-A-CHANGELOG.md` §5's open question, answered by construction: "the run diff and
-        // the split are the same fact counted two ways".
+        // Answered by construction: the run diff and the split are the same fact counted two
+        // ways.
         let fixture = Fixture::two_agent_worktree();
         let change_set = fixture.change_set();
 
@@ -616,8 +614,8 @@ impl UserApi {
             "and the human's own hand edit flipped that line back to `you` (Orca's second rule)"
         );
 
-        // Context lines are nobody's. `Jerry.dc.html` gives its unchanged rows no author at all,
-        // and painting one would tint a line this diff does not change.
+        // Context lines are nobody's. The design gives its unchanged rows no author at all, and
+        // painting one would tint a line this diff does not change.
         for (hunk, hunk_authors) in file.hunks.iter().zip(&authors) {
             for (line, author) in hunk.lines.iter().zip(hunk_authors) {
                 if line.kind == DiffLineKind::Context {
@@ -679,8 +677,8 @@ impl UserApi {
 
     #[test]
     fn agent_file_counts_deliberately_do_not_sum_to_the_worktree_file_count() {
-        // `REVISION-2026-07-31.md` §4's honest arithmetic: a shared path is one row for the
-        // worktree and one file for *each* agent in it. Summing them is the bug, not the total.
+        // The honest arithmetic: a shared path is one row for the worktree and one file for
+        // *each* agent in it. Summing them is the bug, not the total.
         let fixture = Fixture::two_agent_worktree();
         let change_set = fixture.change_set();
 

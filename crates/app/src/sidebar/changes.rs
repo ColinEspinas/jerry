@@ -1,4 +1,4 @@
-//! Pure logic for Zone 3's "Changes" list (`design_handoff_jerry_ade/README.md`'s Zone 3 spec)
+//! Pure logic for Zone 3's "Changes" list (`docs/design/sidebar.md`)
 //! and the fold-marker treatment used when rendering a file's hunks.
 //!
 //! Deliberately GPUI-window-free, mirroring `crate::work_surface::state`/`crate::rail::status`'s split: only
@@ -34,8 +34,7 @@ pub fn diff_file_stats(file: &DiffFile) -> (u32, u32) {
     (add, del)
 }
 
-/// Git's own status letter for one file row - `A`, `M` or `D`
-/// (`design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4j).
+/// Git's own status letter for one file row - `A`, `M` or `D`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusLetter {
     Added,
@@ -190,8 +189,7 @@ impl StagedProgress {
     }
 }
 
-/// Splits a diff file path into the Changes row / diff toolbar's `dir` and `name` fields
-/// (`design_handoff_jerry_ade/README.md`: "`dir` 10.5px mono ... `name` 11.5px/450 mono").
+/// Splits a diff file path into the Changes row / diff toolbar's `dir` and `name` fields.
 /// `wt_core::diff` paths are repo-relative (stripped of the `a/`/`b/` prefixes `git diff`
 /// prints - see that module's `parse_diff_git_header`), so a root-level file's `dir` is empty,
 /// not `.`.
@@ -458,10 +456,10 @@ mod status_letter_tests {
     use crate::theme;
     use wt_core::diff::FileChangeStatus;
 
-    /// `STAGE-A-CHANGELOG.md` §4j: every status maps to a letter, including the common case. The
-    /// word pills this replaced returned `None` for `Modified`, which is the exact defect §4j
-    /// names - "only the exceptions were marked". A rename is a modification as far as the letter
-    /// column is concerned; the row's own `moved` chip is what states the rename.
+    /// Every status maps to a letter, including the common case. The word pills this replaced
+    /// returned `None` for `Modified`, which is the exact defect: only the exceptions were
+    /// marked. A rename is a modification as far as the letter column is concerned; the row's
+    /// own `moved` chip is what states the rename.
     #[test]
     fn every_file_status_gets_a_letter_including_the_common_case() {
         for (status, letter) in [

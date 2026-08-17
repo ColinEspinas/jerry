@@ -320,8 +320,7 @@ pub struct AdeApp {
     /// module docs). Zero-to-many: the app's *current* single-repo-per-window behaviour is just
     /// the common case of this list holding exactly one entry, not a separate code path - see
     /// [`Self::add_repo`]. Order is insertion order and carries no meaning of its own (a later
-    /// rail-rendering phase orders *groups* by urgency, not by this `Vec`'s order -
-    /// `design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §2.0).
+    /// rail-rendering phase orders *groups* by urgency, not by this `Vec`'s order).
     pub(crate) repos: Vec<Repo>,
     /// Which of [`Self::repos`] is "the" repo for every currently-single-repo-scoped piece of
     /// state this app still has (the file tree, the diff, a fresh agent's cwd, `worktrees`
@@ -619,7 +618,7 @@ pub struct AdeApp {
     /// `crate::rail::menu::RailRowMenu`. Its origin is window-space and already clamped, and it
     /// is rendered from [`Render::render`] rather than from the rail, because the rail's row list
     /// is a real scroller and a menu inside it would be clipped by it and would scroll away from
-    /// the pointer it was anchored to (`REVISION-2026-08-14.md` §4).
+    /// the pointer it was anchored to.
     pub(crate) rail_row_menu: Option<crate::rail::menu::RailRowMenu>,
     /// The rail's open overflow menu (GitHub issue #290), `None` when closed. A separate surface
     /// from [`Self::rail_row_menu`] because it is anchored off the button's own rect rather than
@@ -743,7 +742,7 @@ pub struct AdeApp {
     /// slot.
     pub(crate) _stage_tasks: TaskPool,
     /// Which Uncommitted row's own 27px band the pointer is inside, if any - one half of what
-    /// reveals `STAGE-A-CHANGELOG.md` §4i's floating hover bar.
+    /// reveals the floating hover bar.
     pub(crate) change_row_hover: Option<PathBuf>,
     /// The other half of [`Self::change_row_hover`] - the floating bar's own hitbox, including
     /// the part of it that hangs above the row. See that field's docs.
@@ -766,9 +765,9 @@ pub struct AdeApp {
     /// composer has really painted once.
     pub(crate) commit_composer_bounds: gpui::Bounds<Pixels>,
     /// Ordered list of currently-open file tabs, rendered after every agent's own tab by
-    /// `Self::render_tab_strip` - **per worktree**, keyed by [`Self::file_tree_root`]
-    /// (`design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §3: "Switching worktrees
-    /// swaps the whole strip. Each worktree remembers its own ... open files"). No duplicates
+    /// `Self::render_tab_strip` - **per worktree**, keyed by [`Self::file_tree_root`]:
+    /// switching worktrees swaps the whole strip, and each worktree remembers its own open
+    /// files. No duplicates
     /// within one worktree's list: opening an already-open file just activates its existing entry
     /// (`Self::push_open_file`). Removed only on explicit tab close (`Self::close_file_tab`) -
     /// **not** on a worktree switch: these are worktree-*relative* paths, which is exactly why a
@@ -913,7 +912,7 @@ pub struct AdeApp {
     /// [`Self::graph_focus`] for the identical role on the graph tab.
     pub(crate) review_focus: OverlayFocus,
     /// Which runs the sidebar's History view is showing - `all` or `this worktree`
-    /// (`design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §6, GitHub issue #227).
+    /// (GitHub issue #227).
     pub(crate) history_scope: crate::run_history::model::HistoryScope,
     /// Which History worktree groups the user has explicitly folded or unfolded, keyed by
     /// worktree path (`true` = folded). A worktree with no entry takes the default
@@ -1097,8 +1096,7 @@ pub struct AdeApp {
     /// Real, live per-tab text-editing state for the File view (Revision R8.5a) - keyed by
     /// **both** the owning worktree ([`Self::file_tree_root`] at the time the buffer was created)
     /// and the worktree-relative path, exactly like [`Self::open_files_by_worktree`]'s own outer
-    /// key, so an unsaved edit survives a worktree switch away and back
-    /// (`design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §1/§3) and two worktrees that
+    /// key, so an unsaved edit survives a worktree switch away and back, and two worktrees that
     /// happen to share a relative path can never merge or overwrite each other's in-memory
     /// content. Created lazily the first time a file is opened in File view (see
     /// [`crate::code_surface::file_view::AdeApp::render_file_view`]), seeded from the exact same
@@ -1274,9 +1272,8 @@ pub struct AdeApp {
     /// (GitHub issue #17 - see [`text_history::TextField`]); unlike the palette's, this widget
     /// lives for the whole agent, so its history does too.
     pub(crate) filter_query: text_history::TextField,
-    /// Explicit per-worktree expand/collapse overrides for the rail's worktree rows
-    /// (`design_handoff_jerry_ade/revision 3/REVISION-2026-07-31.md` §2.2: "caret state is
-    /// remembered per worktree"), keyed by worktree path. Absence means "use the default" -
+    /// Explicit per-worktree expand/collapse overrides for the rail's worktree rows - caret state
+    /// is remembered per worktree - keyed by worktree path. Absence means "use the default" -
     /// [`crate::rail::render::AdeApp::worktree_is_expanded`] is the one place that default is
     /// decided (collapsed for a worktree whose most urgent agent is idle, expanded otherwise) -
     /// so a worktree the user has never touched the caret on tracks that live default rather
@@ -2928,9 +2925,9 @@ impl Render for AdeApp {
                 |el| el.on_action(cx.listener(Self::handle_discard_worktree_menu_command)),
             )
             .child(self.render_title_bar(cx))
-            // The Settings surface (`design_handoff_jerry_ade/README.md`: "a separate surface,
-            // not a modal: it replaces the three zones while the title bar and status bar
-            // stay") swaps out only this one child - the title bar above and the status bar
+            // The Settings surface is a separate surface, not a modal: it replaces the three
+            // zones while the title bar and status bar stay. It
+            // swaps out only this one child - the title bar above and the status bar
             // below are unconditional siblings, rendered every frame regardless of
             // `settings_open`.
             .child(if self.settings_open {
@@ -3071,10 +3068,10 @@ impl Render for AdeApp {
                 |el| el.child(self.render_tree_context_menu(cx)),
             )
             // The rail's row menus and its `⋯` overflow (GitHub issue #290) - root-level
-            // siblings, never children of the rail. `REVISION-2026-08-14.md` §4, verbatim: "All
-            // menus render outside the scrolling list. Inside it they are clipped by the scroller
-            // and scroll away from their anchor." The rail list is a real `overflow_y_scroll`
-            // container, so both of those would happen; §4w's generalisation ("an overlay
+            // siblings, never children of the rail. All menus render outside the scrolling
+            // list: inside it they are clipped by the scroller and scroll away from their anchor.
+            // The rail list is a real `overflow_y_scroll` container, so both of those would
+            // happen; the generalisation ("an overlay
             // anchored in viewport coordinates must live at the root. If it is nested in a panel,
             // every property of that panel - its scroll, its clip, its mount condition - becomes
             // a bug in the overlay") is why they sit here beside every other popover instead.

@@ -10,7 +10,7 @@ use crate::root::plural;
 use crate::theme;
 use crate::work_surface::agents::AgentKind;
 
-/// How a run ended - `REVISION-2026-08-13.md` §5's four values.
+/// How a run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     /// Its last turn ended cleanly, and Jerry watched the run end.
@@ -64,7 +64,7 @@ impl Outcome {
         }
     }
 
-    /// How the synthesised closing line opens, per outcome - `Jerry.dc.html`'s own four strings.
+    /// How the synthesised closing line opens, per outcome - the design's own four strings.
     pub const fn closing_lead(self) -> &'static str {
         match self {
             Outcome::Done => "Finished.",
@@ -75,7 +75,7 @@ impl Outcome {
     }
 }
 
-/// How far the branch has moved since the run ended - `REVISION-2026-08-13.md` §4's three bands.
+/// How far the branch has moved since the run ended - three bands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriftBand {
     /// 0 commits since - `at the tip`.
@@ -136,8 +136,7 @@ pub fn drift_sentence(commits: usize) -> String {
     )
 }
 
-/// Which runs the History view is showing - `REVISION-2026-08-14.md` §6's `all` / `this worktree`
-/// toggle.
+/// Which runs the History view is showing - the `all` / `this worktree` toggle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HistoryScope {
     #[default]
@@ -189,7 +188,7 @@ pub fn filtered_away_note(hidden: usize) -> String {
 
 // ---------------------------------------------------------------------- one run's own wording
 
-/// A run's title - `REVISION-2026-08-13.md` §3's first line, "agent chip · title · duration".
+/// A run's title - the first line: `agent chip · title · duration`.
 pub fn run_title(run: &PastAgent) -> String {
     run.title
         .clone()
@@ -334,7 +333,7 @@ pub struct RunGroup {
     pub label: String,
     pub branch: Option<String>,
     /// Whether this is the window's currently selected worktree - it carries the selection edge
-    /// and opens by default (`REVISION-2026-08-14.md` §6).
+    /// and opens by default.
     pub is_active: bool,
     pub open: bool,
     pub runs: Vec<RunEntry>,
@@ -377,9 +376,8 @@ impl RunTree {
         self.total() == 0
     }
 
-    /// The view's own count line - `REVISION-2026-08-13.md` §1: "each view's body opens with its
-    /// own count line", and §2's rule for what one may say: "Both list headers ... are **tallied
-    /// over their own data**".
+    /// The view's own count line - each view's body opens with one, and both list headers are
+    /// **tallied over their own data**.
     pub fn count_line(&self) -> Option<String> {
         let total = self.total();
         if total == 0 {
@@ -393,7 +391,7 @@ impl RunTree {
     }
 }
 
-/// The rail's own `↺ 2 earlier runs` line under a worktree row - `REVISION-2026-08-13.md` §6.
+/// The rail's own `↺ 2 earlier runs` line under a worktree row.
 pub fn earlier_runs_label(count: usize) -> String {
     format!("{count} earlier {}", plural::form(count, "run", "runs"))
 }

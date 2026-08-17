@@ -1,6 +1,5 @@
 //! The Resources popover's data model: the `repo → worktree → agent` cost tree behind the status
-//! bar's `41% cpu · 3.4 GB` readout (GitHub issue #293,
-//! `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4d).
+//! bar's `41% cpu · 3.4 GB` readout (GitHub issue #293).
 
 use std::collections::HashMap;
 use std::time::Duration;

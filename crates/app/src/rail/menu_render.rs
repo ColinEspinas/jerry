@@ -649,7 +649,7 @@ mod rail_menu_tests {
         assert!(
             cx.debug_bounds("rail-row-menu-Delete run\u{2026}")
                 .is_none(),
-            "there is no red Delete run beside Archive (REVISION-2026-08-14.md §7 rule 3)"
+            "there is no red Delete run beside Archive"
         );
     }
 

@@ -15,8 +15,7 @@ use crate::work_surface;
 use crate::work_surface::agents::ProcessKind;
 
 /// How far a line that is **not** the filtered author's is dimmed while a per-author filter is
-/// active - `Jerry.dc.html`'s own `opacity: .32`, quoted as an acceptance criterion by GitHub
-/// issue #287 ("other authors' lines dim (the mock uses 0.32 opacity)").
+/// active - `0.32` opacity, an acceptance criterion of GitHub issue #287.
 pub const FILTER_DIM_OPACITY: f32 = 0.32;
 
 /// One author, as this app draws it: the tint its gutter bar and chip wear, the single glyph the
@@ -38,8 +37,7 @@ pub struct AuthorStyle {
 pub fn author_style(author: &Author) -> Option<AuthorStyle> {
     match author {
         Author::Agent(key) => agent_style(key),
-        // Orca's second rule, and `STAGE-A-CHANGELOG.md` §1's own wording for the tooltip,
-        // verbatim: *`'you'` renders neutral `#4e545a` and is labelled you — hand edit*.
+        // `'you'` renders neutral and is labelled `you — hand edit`.
         Author::You => Some(AuthorStyle {
             fg: theme::changes::HAND_EDIT_CHIP_FG.into(),
             bg: theme::changes::HAND_EDIT_CHIP_BG.into(),
@@ -98,16 +96,16 @@ pub fn line_is_dimmed(author: Option<&Author>, filter: Option<&Author>) -> bool 
     }
 }
 
-/// The `⚠` ring's tooltip, verbatim from `STAGE-A-CHANGELOG.md` §1's own `title=` attribute:
+/// The `⚠` ring's tooltip.
 pub const SHARED_RING_TOOLTIP: &str =
     "Two agents edited this file \u{2014} click to filter the diff by author";
 
-/// The filter indicator's tooltip, verbatim from `Jerry.dc.html`'s own `title=`.
+/// The filter indicator's tooltip, verbatim from the design.
 pub const FILTER_INDICATOR_TOOLTIP: &str =
     "Showing one author's lines \u{2014} click to show every author";
 
 /// The `crate::keymap::resolve_combo` spec for the chip's own filter gesture, and the one the
-/// Changes footer renders as keycaps (`STAGE-A-CHANGELOG.md` §2's `⌥click filter by author`).
+/// Changes footer renders as keycaps (`⌥click filter by author`).
 pub const AUTHOR_FILTER_SPEC: &str = "alt+click";
 
 /// Which path a per-author filter is pinned to, and to whom.
@@ -168,8 +166,8 @@ impl AdeApp {
         super::change_set::line_authors(file, Some(records))
     }
 
-    /// One file row's author chips, with the `⚠` ring around them when the file has more than one
-    /// agent in it - `REVISION-2026-08-14.md` §1 and `REVISION-2026-07-31.md` §4.
+    /// One file row's author chips, with the `⚠` ring around them when the file has more than
+    /// one agent in it.
     pub(crate) fn render_author_chips(
         &self,
         id: &'static str,
@@ -331,8 +329,7 @@ impl AdeApp {
             .into_any_element()
     }
 
-    /// The `<agent> only ✕` indicator, in the file toolbar, **only while a filter is active** -
-    /// `STAGE-A-CHANGELOG.md` §4b:
+    /// The `<agent> only ✕` indicator, in the file toolbar, **only while a filter is active**.
     pub(crate) fn render_author_filter_indicator(
         &self,
         cx: &mut Context<Self>,
@@ -340,7 +337,7 @@ impl AdeApp {
         let author = self.active_author_filter()?;
         let style = author_style(author)?;
         let dot = author_gutter_color(author)?;
-        // `your lines only` rather than `you only` - `Jerry.dc.html`'s own `attrFilterLabel`.
+        // `your lines only` rather than `you only` - the design's own wording.
         let label = match author {
             Author::You => "your lines".to_string(),
             _ => style.label.clone(),
@@ -842,12 +839,12 @@ impl UserApi {
         );
         let hint = cx
             .debug_bounds("changes-footer-author-filter-hint")
-            .expect("STAGE-A-CHANGELOG.md §2's `\u{2325}click filter by author`, as real keycaps");
+            .expect("`\u{2325}click filter by author`, as real keycaps");
         // And it really fits. This strip is a fixed-width band inside a ~315px panel, so a third
         // hint is exactly the kind of thing that ends up *past* the right edge and is never seen -
         // which is why the prose lead-in is now the only shrinkable thing in the row
-        // (`REVISION-2026-08-14.md` §4's rule for the rail's repo header: same shape of problem,
-        // same fix). Caught by a real screenshot of the running app, then pinned here.
+        // - the same shape of problem the rail's repo header has, and the same fix. Caught by
+        // a real screenshot of the running app, then pinned here.
         let footer = cx.debug_bounds("changes-footer").expect("the footer band");
         assert!(
             hint.origin.x + hint.size.width <= footer.origin.x + footer.size.width,
@@ -1010,7 +1007,7 @@ impl UserApi {
 
         assert!(
             cx.debug_bounds("diff-author-filter").is_none(),
-            "at rest there is no indicator at all - not a greyed-out one (STAGE-A-CHANGELOG §4b)"
+            "at rest there is no indicator at all - not a greyed-out one"
         );
 
         let ring = cx.debug_bounds(RING).expect("the ring");

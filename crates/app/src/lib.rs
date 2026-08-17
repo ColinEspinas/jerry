@@ -47,7 +47,7 @@ pub mod root;
 // *capture* of what a run was) or inside `rail` (which owns the live tree): this is a surface
 // with its own model, its own persistence and its own tab kind.
 pub mod run_history;
-// GitHub issue #162 / `REVISION-2026-08-14.md` §5: the right panel's Search tab - the matcher,
+// GitHub issue #162: the right panel's Search tab - the matcher,
 // the bounded worktree walk, the two-level result tree and the real in-place replace behind it.
 pub mod search;
 pub mod settings;
@@ -200,9 +200,9 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
             root::NextChangedFile,
             Some("diff && !file-editor && !text-input"),
         ),
-        // GitHub issue #286 / `STAGE-A-CHANGELOG.md` §4i: "opening a file marks it seen - that is
-        // what the word means - and `V` unmarks. The convention is stated in the name's own
-        // tooltip", with `V mark seen` in the Changes panel's own legend.
+        // GitHub issue #286: opening a file marks it seen - that is what the word means - and
+        // `V` unmarks. The convention is stated in the name's own tooltip, with `V mark seen` in
+        // the Changes panel's own legend.
         //
         // Scoped exactly like `"]"` immediately above, and for the same real reason: this is a
         // *plain letter*, so leaving it global would swallow a literal `v` in a focused terminal
@@ -221,10 +221,9 @@ pub fn default_key_bindings() -> Vec<gpui::KeyBinding> {
             root::ToggleChangeSeen,
             Some("diff && !file-editor && !text-input"),
         ),
-        // `design_handoff_jerry_ade/revision 5/Jerry.dc.html`'s own `changesHints` (line 4548):
-        // `[['space', 'stage'], ['V', 'mark seen'], ['⌥click', 'filter by author']]` - three
-        // keycap hints on the Changes panel's footer, of which `space stage` was the one with no
-        // binding behind it at all. `STAGE-A-CHANGELOG.md` §2's ride-along I10 lists the same
+        // The Changes panel's footer carries three keycap hints - `space stage`, `V mark seen`,
+        // `⌥click filter by author` - of which `space stage` was the one with no
+        // binding behind it at all. An audit item lists the same
         // strip.
         //
         // Scoped exactly like `v` above and `]` above that, and its subject is the same one

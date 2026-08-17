@@ -1767,8 +1767,8 @@ impl AdeApp {
         cx.notify();
     }
 
-    /// The current worktree's open file tabs (`design_handoff_jerry_ade/revision 3/
-    /// REVISION-2026-07-31.md` §3) - an empty slice for a worktree that has never opened one,
+    /// The current worktree's open file tabs - an empty slice for a worktree that has never
+    /// opened one,
     /// never a panic or a fabricated default. See [`Self::open_files_by_worktree`]'s own docs for
     /// why this is keyed by [`Self::file_tree_root`] rather than a flat, unscoped `Vec`.
     pub(crate) fn open_files(&self) -> &[PathBuf] {

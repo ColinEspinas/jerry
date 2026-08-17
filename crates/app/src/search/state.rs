@@ -37,7 +37,7 @@ impl SearchField {
 pub enum SearchModifier {
     /// `Aa`.
     MatchCase,
-    /// `ab`, drawn underlined the way VS Code draws it (`STAGE-A-CHANGELOG.md` §4v).
+    /// `ab`, drawn underlined the way VS Code draws it.
     WholeWord,
     /// `.*`.
     Regex,
@@ -50,7 +50,7 @@ impl SearchModifier {
         SearchModifier::Regex,
     ];
 
-    /// The glyph pair `REVISION-2026-08-14.md` §5 names.
+    /// The glyph pair this modifier is drawn as.
     pub fn label(self) -> &'static str {
         match self {
             SearchModifier::MatchCase => "Aa",
@@ -245,8 +245,7 @@ mod flatten_tests {
     }
 }
 
-/// What the panel's body is showing right now - `REVISION-2026-08-14.md` §5's table, plus the two
-/// states a static mock cannot have. See this module's own docs.
+/// What the panel's body is showing right now. See this module's own docs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BodyState {
     /// Nothing typed. Not the same fact as "searched, found nothing".
@@ -263,8 +262,8 @@ pub enum BodyState {
 }
 
 impl BodyState {
-    /// Whether the fold-all caret and `Replace all` exist at all - `REVISION-2026-08-14.md` §7
-    /// rule 2: "A control that acts on results does not exist when there are none."
+    /// Whether the fold-all caret and `Replace all` exist at all: a control that acts on
+    /// results does not exist when there are none.
     pub fn has_results(&self) -> bool {
         matches!(self, BodyState::Results)
     }
@@ -272,9 +271,8 @@ impl BodyState {
 
 /// The whole Search tab's state.
 pub struct SearchPanel {
-    /// The four real inputs. `REVISION-2026-08-14.md` §5: "Four real inputs: query, replace,
-    /// include, exclude. A fake field directly below a real one is a dead end the user will
-    /// click."
+    /// The four real inputs: query, replace, include, exclude. A fake field directly below a
+    /// real one is a dead end the user will click.
     pub query: TextField,
     pub replace: TextField,
     pub include: TextField,
@@ -382,10 +380,9 @@ impl SearchPanel {
             .find(|field| self.field_is_visible(*field))
     }
 
-    /// The query as the search would run it. `REVISION-2026-08-14.md` §5's own `hasQ` is
-    /// `findQ.trim().length > 0`, but this app does **not** trim: a whitespace query is a real
-    /// search here (see `crate::search::engine::Matcher::compile`), so the has-query flag is
-    /// simply "not empty".
+    /// The query as the search would run it. This app does **not** trim: a whitespace query
+    /// is a real search here (see `crate::search::engine::Matcher::compile`), so the has-query
+    /// flag is simply "not empty".
     pub fn has_query(&self) -> bool {
         !self.query.is_empty()
     }
@@ -489,8 +486,8 @@ impl SearchPanel {
     }
 
     /// Whether every file in the current results is collapsed - what the fold-all caret points
-    /// at, and what clicking it inverts. `REVISION-2026-08-14.md` §5: fold-all is "the same
-    /// `▾`/`▸` caret a file row uses, since it is the same action applied to all of them".
+    /// at, and what clicking it inverts. Fold-all is the same `▾`/`▸` caret a file row uses,
+    /// since it is the same action applied to all of them.
     pub fn all_collapsed(&self) -> bool {
         match self.results() {
             Some(outcome) => outcome

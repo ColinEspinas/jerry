@@ -1,5 +1,5 @@
-//! Config-file-backed settings (`CHANGELOG.md`'s 2026-07-29 entry, change 3: "Settings —
-//! narrower, config-file-first, five new pages"). Owns [`Settings`] - the struct loaded from,
+//! Config-file-backed settings - narrower, config-file-first. Owns [`Settings`] - the struct
+//! loaded from,
 //! and saved back to, `~/.config/jerry/settings.toml` - plus the TOML/JSON snippet rendering the
 //! config banner/snippet-block widgets (`crate::settings::widgets`) show. Deliberately
 //! separate from `crate::settings::state`, which stays about already-live in-memory app state rather
@@ -565,7 +565,7 @@ impl EditorSettings {
     }
 }
 
-/// The config banner's `TOML | JSON` segment state (`CHANGELOG.md`'s change 3) - a display-only
+/// The config banner's `TOML | JSON` segment state - a display-only
 /// choice, not a [`Settings`] field (switching it never touches the file) - see the module docs'
 /// "TOML is the real file; JSON is a read-only alternate view" section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -692,9 +692,9 @@ impl Settings {
 }
 
 /// Which settings page a [`snippet_lines`]/[`config_keys_line`] call is for - only the four
-/// pages `crate::settings::render` shows a config banner/snippet block on. Every other page
-/// `Jerry.dc.html`'s own `cfgKeys` fixture lists isn't backed by a [`Settings`] field, so a
-/// banner for it would describe a file section that doesn't exist.
+/// pages `crate::settings::render` shows a config banner/snippet block on. Every other designed
+/// page isn't backed by a [`Settings`] field, so a banner for it would describe a file section
+/// that doesn't exist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigPage {
     General,
@@ -704,9 +704,9 @@ pub enum ConfigPage {
     Notifications,
 }
 
-/// The config banner's dot-joined key list for `page` - rewritten from `Jerry.dc.html`'s own
-/// `cfgKeys` fixture to list only the [`Settings`] field paths this app actually persists (that
-/// fixture also names settings this app doesn't implement, e.g. `window.restore_sessions`).
+/// The config banner's dot-joined key list for `page` - narrowed from the design's own list to
+/// only the [`Settings`] field paths this app actually persists (the design also names settings
+/// this app doesn't implement, e.g. `window.restore_sessions`).
 pub fn config_keys_line(page: ConfigPage) -> &'static str {
     match page {
         ConfigPage::General => "window.controls \u{b7} terminal.shell",
@@ -732,9 +732,8 @@ pub fn config_keys_line(page: ConfigPage) -> &'static str {
     }
 }
 
-/// One line of a config snippet, tagged for the design's syntax tint (`CHANGELOG.md`'s change 3
-/// names three colours: section, key, comment) - `crate::settings::widgets::render_snippet_block`
-/// is the only consumer.
+/// One line of a config snippet, tagged for the design's syntax tint - three colours: section,
+/// key, comment. `crate::settings::widgets::render_snippet_block` is the only consumer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnippetLine {
     pub text: String,

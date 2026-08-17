@@ -41,8 +41,7 @@ const BINARY_SNIFF_BYTES: usize = 8 * 1024;
 /// and "Cancelled" docs.
 const SEARCH_SCAN_BATCH: usize = 128;
 
-/// The three modifier buttons in the query row, as real state
-/// (`REVISION-2026-08-14.md` §5: "`Aa` / `ab` / `.*` modifier buttons").
+/// The three modifier buttons in the query row, as real state: `Aa` / `ab` / `.*`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SearchOptions {
     /// `Aa` - off means the search is case-insensitive.
@@ -241,8 +240,7 @@ pub struct SearchOutcome {
 /// it from five separate widgets and three of them are strings that would be transposable.
 #[derive(Debug, Clone)]
 pub struct SearchRequest {
-    /// The worktree being searched - `STAGE-A-CHANGELOG.md` §4u: "scoped to the active worktree
-    /// like the tree beside it".
+    /// The worktree being searched - scoped to the active worktree, like the tree beside it.
     pub root: PathBuf,
     pub matcher: Matcher,
     pub filter: PathFilter,
@@ -490,10 +488,10 @@ pub fn replace_across(
 }
 
 /// How many characters of context sit before the hit on a match row before the prefix elides from
-/// the left. `Jerry.dc.html`'s own `trimPre`: `s.length > 16 ? '…' + s.slice(-15)`.
+/// the left.
 pub const ELIDE_PREFIX_MAX: usize = 16;
 
-/// The same for the tail. `Jerry.dc.html`'s own `trimPost`: `s.length > 26 ? s.slice(0, 25) + '…'`.
+/// The same for the tail.
 pub const ELIDE_SUFFIX_MAX: usize = 26;
 
 /// Splits `line` around `range` into the three spans a match row draws, with the design's own

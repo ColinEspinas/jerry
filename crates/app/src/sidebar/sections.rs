@@ -47,9 +47,8 @@ pub enum ChangesSection {
 }
 
 impl ChangesSection {
-    /// Top to bottom, exactly as `Jerry.dc.html` both paints them (`onSecUnc` at line 1314,
-    /// `onSecCommits` at 1370, `onSecBase` at 1390, `onSecRuns` last at 1434) and says so in its own
-    /// comment: "Four stacked sections, in this order: Uncommitted, Commits, Against main, Runs.
+    /// Top to bottom, exactly as the design paints them and states in as many words:
+    /// "Four stacked sections, in this order: Uncommitted, Commits, Against main, Runs.
     /// The first three are one ladder of git state, narrowing to widening. Runs is not on that
     /// ladder — it indexes the same changes by author — so it sits after it rather than inside it,
     /// which also keeps Uncommitted's top edge fixed however many agents have run."
@@ -87,8 +86,7 @@ impl ChangesSection {
         }
     }
 
-    /// `REVISION-2026-08-14.md` §1: "Runs and Uncommitted open by default; the two git-history
-    /// sections start collapsed."
+    /// Runs and Uncommitted open by default; the two git-history sections start collapsed.
     pub fn starts_open(self) -> bool {
         match self {
             ChangesSection::Runs | ChangesSection::Uncommitted => true,
@@ -96,7 +94,7 @@ impl ChangesSection {
         }
     }
 
-    /// The section's 2px left edge (`REVISION-2026-08-14.md` §1's table).
+    /// The section's 2px left edge.
     pub fn edge_color(self) -> Option<Rgba> {
         match self {
             ChangesSection::Runs => None,
@@ -155,7 +153,7 @@ pub struct RunSource {
     pub elapsed: Duration,
 }
 
-/// One rendered run row (`REVISION-2026-08-14.md` §1 + `STAGE-A-CHANGELOG.md` §4l).
+/// One rendered run row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunRow {
     pub agent_id: AgentId,
@@ -175,8 +173,8 @@ pub struct RunRow {
 }
 
 impl RunRow {
-    /// Line 2's left-hand colour - warm while the run is still moving, neutral once it has ended
-    /// (`STAGE-A-CHANGELOG.md` §4l).
+    /// Line 2's left-hand colour - warm while the run is still moving, neutral once it has
+    /// ended.
     pub fn meta_color(&self) -> Rgba {
         if self.live {
             theme::changes::RUN_META_LIVE.into()
@@ -230,8 +228,8 @@ pub fn run_title(paths: &[&Path]) -> String {
     }
 }
 
-/// Line 2's left-hand text: `<agent> · ended 2m`, or `<agent> · running · 40s` while it is still
-/// moving (`STAGE-A-CHANGELOG.md` §4l's exact shape).
+/// Line 2's left-hand text: `<agent> · ended 2m`, or `<agent> · running · 40s` while it is
+/// still moving.
 pub fn run_meta(agent_label: &str, live: bool, elapsed: Duration) -> String {
     let age = crate::rail::state::format_elapsed(elapsed);
     if live {
@@ -327,8 +325,8 @@ pub enum SectionRow {
     Commit(wt_core::diff::BranchCommit),
     /// The Against-main section's *only* body row (besides its own notes): what would land, and
     /// how far ahead or behind the branch is. Unlike the other three sections, Against main never
-    /// lists a row per file - `Jerry.dc.html` line 1422's own `baseRows` is a synthetic one-entry
-    /// array (`wtBaseDefs`'s `files` is a plain count, never an array of files), and the panel's
+    /// lists a row per file - the design carries a plain file *count* here, never an array of
+    /// files, and the panel's
     /// own header count reads that count directly (`Self::changes_section_rows`), not the number
     /// of rows this section renders - a deliberate exception to `SectionHeader::count`'s usual
     /// "derived from the body" rule, and a deliberate removal of this section's earlier per-file
@@ -357,7 +355,7 @@ impl SectionRow {
     /// Which of the four sections this row belongs to - what
     /// `Self::render_changes_sections`/`Self::render_changes_runs_section` (in `sidebar::render`)
     /// split the flattened `changes_section_rows` list on to give Runs its own pinned-bottom
-    /// scroller (`Jerry.dc.html` line 1433) instead of sharing the other three's.
+    /// scroller instead of sharing the other three's.
     pub fn section(&self) -> ChangesSection {
         match self {
             SectionRow::Header(header) => header.section,
@@ -503,9 +501,8 @@ mod changes_section_tests {
 
     #[test]
     fn runs_sum_to_the_uncommitted_total_when_every_line_is_an_agent_s() {
-        // `STAGE-A-CHANGELOG.md` §3's own verification of the mock: "Runs `+319 −145` and
-        // Uncommitted `+319 −145` agree exactly." Here, against a real git repo and a real
-        // provenance store rather than authored demo data.
+        // Runs `+319 −145` and Uncommitted `+319 −145` must agree exactly - here against a
+        // real git repo and a real provenance store rather than authored demo data.
         let fixture = Fixture::two_agents_wrote_everything();
         let change_set = fixture.change_set();
         let rows = run_rows(&fixture.sources(), &change_set);
@@ -568,9 +565,8 @@ mod changes_section_tests {
 
     #[test]
     fn a_file_two_agents_wrote_is_one_file_in_each_of_their_runs_and_one_row_in_uncommitted() {
-        // `REVISION-2026-08-14.md` §1 rule 1, seen from the Runs side: the per-run file counts
-        // deliberately over-sum the worktree's row count, and that is what "they are both working
-        // on this file" means.
+        // Seen from the Runs side: the per-run file counts deliberately over-sum the
+        // worktree's row count, and that is what "they are both working on this file" means.
         let fixture = Fixture::two_agents_wrote_everything();
         let change_set = fixture.change_set();
         let rows = run_rows(&fixture.sources(), &change_set);
@@ -765,8 +761,8 @@ mod changes_section_tests {
 
     #[test]
     fn marking_a_file_seen_is_recorded_nowhere_a_stager_reads() {
-        // `REVISION-2026-08-14.md` §1 rule 2: "Reviewing must never stage." Structurally true
-        // here - `SeenFiles` is its own map with its own type, and the staged set is a
+        // Reviewing must never stage. Structurally true here - `SeenFiles` is its own map
+        // with its own type, and the staged set is a
         // `HashSet<PathBuf>` this type has no access to - so what this pins is that marking seen
         // is a complete operation that touches nothing else. The live, rendered half of the same
         // rule is asserted in `crate::sidebar::render`'s own tests.

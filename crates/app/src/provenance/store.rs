@@ -603,8 +603,8 @@ mod tests {
 
     #[test]
     fn a_hand_edit_flips_exactly_that_line_back_to_you_and_nothing_else() {
-        // Orca's first hard-won rule, and the one this whole model is built on
-        // (`REVISION-2026-08-14.md` §1): "your own hand edit flips that line back to you".
+        // The first hard-won rule, and the one this whole model is built on: your own hand
+        // edit flips that line back to you.
         let dir = tempfile::tempdir().expect("tempdir");
         let mut store = ProvenanceStore::default();
         std::fs::write(dir.path().join("a.txt"), FIVE_LINES).expect("seed");
@@ -957,9 +957,8 @@ mod tests {
 
     #[test]
     fn nothing_a_recording_store_does_ever_touches_the_worktree_or_a_commit_made_from_it() {
-        // `REVISION-2026-08-14.md` §1's second hard-won rule: "attribution is local, never
-        // committed". `STAGE-A-CHANGELOG.md` §1 records it as true "by construction"; this is what
-        // makes that claim checkable rather than a promise.
+        // The second hard-won rule: attribution is local, never committed. That is true by
+        // construction; this is what makes the claim checkable rather than a promise.
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = dir.path();
         git(repo, &["init", "-b", "main"]);

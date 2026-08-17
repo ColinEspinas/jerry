@@ -268,8 +268,8 @@ impl AdeApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // GitHub issue #285 / `REVISION-2026-08-14.md` §1 rule 2: opening a file marks it **seen**
-        // and does not, cannot, stage it - `seen_files` and `staged_files` are separate fields of
+        // GitHub issue #285: opening a file marks it **seen** and does not, cannot, stage it
+        // - `seen_files` and `staged_files` are separate fields of
         // separate types, and this is the only writer of the first. The mark records the diffstat
         // the file has right now, so an agent that writes to it again puts it straight back to
         // unseen (see `crate::sidebar::sections::SeenFiles`' own docs).

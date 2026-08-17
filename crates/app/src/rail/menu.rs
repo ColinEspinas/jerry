@@ -76,9 +76,8 @@ pub enum RailMenuAction {
 pub const REMOVE_WORKTREE_HINT: &str = "Removes the checkout. Uncommitted and untracked work is \
                                         stashed first; gitignored files are not preserved.";
 
-/// `Archive run`'s hint, quoted verbatim from `REVISION-2026-08-14.md` §6 - the single row that
-/// replaced an `Archive run` + red `Delete run…` pair, because "if two menu items need their
-/// hints read to be told apart, they are one item" (§7 rule 3).
+/// `Archive run`'s hint - the single row that replaced an `Archive run` + red `Delete run…`
+/// pair, because if two menu items need their hints read to be told apart, they are one item.
 pub const ARCHIVE_RUN_HINT: &str = "Ends the run. It stays in History with its transcript, \
                                     diffstat and notes; the files it wrote are untouched.";
 

@@ -1,6 +1,6 @@
 //! The app's shipped icon set: real [Phosphor Icons](https://phosphoricons.com) SVGs (MIT),
 //! vendored under `assets/icons/`, plus the one render helper every consuming surface draws them
-//! through (GitHub issue #282, `design_handoff_jerry_ade/revision 5/REVISION-2026-08-14.md` §8).
+//! through (GitHub issue #282).
 
 use std::borrow::Cow;
 use std::path::PathBuf;
@@ -67,10 +67,9 @@ pub const ICON_FILES: &[(&str, &[u8])] = &[
     ),
 ];
 
-/// One shipped Phosphor glyph. `REVISION-2026-08-14.md` §8's mapping table, plus the overflow
-/// menu's Settings glyph §4u names (GitHub issue #290) - and no speculative extras: an icon
-/// nothing draws is an affordance with no behaviour behind it, which §7 rule 1 rules out ("Ship
-/// the affordance with the behaviour, or ship neither").
+/// One shipped Phosphor glyph, plus the overflow menu's Settings glyph (GitHub issue #290) -
+/// and no speculative extras: an icon nothing draws is an affordance with no behaviour behind
+/// it. Ship the affordance with the behaviour, or ship neither.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Icon {
     /// Search panel's count row: replace.
@@ -87,9 +86,9 @@ pub enum Icon {
     GitBranch,
     /// Right-panel tab: Search.
     MagnifyingGlass,
-    /// The `⋯` overflow menu: Settings (GitHub issue #290). `STAGE-A-CHANGELOG.md` §4u:
-    /// History and Settings keep "the glyphs they had in the strip (clock, sliders) so the move
-    /// out of the strip does not cost their recognisability".
+    /// The `⋯` overflow menu: Settings (GitHub issue #290). History and Settings keep the
+    /// glyphs they had in the strip (clock, sliders), so the move out of the strip does not cost
+    /// their recognisability.
     SlidersHorizontal,
     /// Work-surface tab strip: terminal.
     TerminalWindow,
@@ -118,9 +117,8 @@ impl Icon {
         Icon::Warning,
     ];
 
-    /// This icon's stable name - Phosphor's own name for the glyph, which is also the name
-    /// `REVISION-2026-08-14.md` §8's table uses and the name a user icon pack overrides it by
-    /// (`crate::icon_pack::resolve_icon` looks for `<name>.svg`).
+    /// This icon's stable name - Phosphor's own name for the glyph, and the name a user icon
+    /// pack overrides it by (`crate::icon_pack::resolve_icon` looks for `<name>.svg`).
     pub const fn name(self) -> &'static str {
         match self {
             Icon::ArrowsLeftRight => "arrows-left-right",
@@ -159,31 +157,30 @@ impl Icon {
 }
 
 /// A named optical box: the one square every icon in a given row is drawn inside. Each variant is
-/// a real measurement off the reviewed mock (`design_handoff_jerry_ade/revision 5/Jerry.dc.html`),
-/// not a round number picked here - the surfaces these serve are being rebuilt against that file.
+/// a real measurement off the surface it serves, not a round number picked here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IconSize {
-    /// 11px - the right panel's segmented Files/Search/Changes tabs. `STAGE-A-CHANGELOG.md` §4w:
-    /// "All three are drawn inside one 11x10 optical box at x 7-18, y 4-14 inside the 26x19
-    /// button", after "the first cut drew each at whatever size suited it - folder 12x8,
-    /// magnifier 8x8, diff 7x7 - so three icons on one row had three weights". The mock's own
-    /// shapes actually span y 3.5-14.5, i.e. 11x11; 11 is the box both readings agree on.
+    /// 11px - the right panel's segmented Files/Search/Changes tabs. All three are drawn
+    /// inside one 11x10 optical box at x 7-18, y 4-14 inside the 26x19 button. Drawing each at
+    /// whatever size suited it - folder 12x8, magnifier 8x8, diff 7x7 - gave three icons on one
+    /// row three weights. The shapes span y 3.5-14.5, i.e. 11x11; 11 is the box both readings
+    /// agree on.
     PanelTab,
-    /// 13px - a row of the app's shared menu (`crate::menu`). `Jerry.dc.html`'s own context-menu
-    /// row draws its leading glyph in a `width:13px;height:13px` box.
+    /// 13px - a row of the app's shared menu (`crate::menu`), whose leading glyph sits in a
+    /// 13x13 box.
     MenuRow,
-    /// 14px - the work-surface tab strip's per-tab chip (`Jerry.dc.html`:
-    /// `width:14px;height:14px`), shared by every tab kind on that strip, terminal included.
+    /// 14px - the work-surface tab strip's per-tab chip, shared by every tab kind on that strip,
+    /// terminal included.
     TabChip,
-    /// 15px - the sidebar strip's buttons (`Jerry.dc.html`: each strip glyph sits in a
-    /// `position:relative;width:15px;height:15px` wrapper inside a 38px-wide cell).
+    /// 15px - the sidebar strip's buttons: each strip glyph sits in a 15x15 wrapper inside a
+    /// 38px-wide cell.
     Strip,
     /// 12px - the icon buttons: the search panel's count row (replace / filter) and the rail
-    /// footer's prune button. `Jerry.dc.html`'s `width:17px;height:17px` on these controls is the
+    /// footer's prune button. The designed 17px on these controls is the
     /// **hit box** (`theme::band::ICON_BUTTON_HIT`), not the glyph's own optical size - a
     /// distinction this size got wrong the first time round (GitHub issue filed 2026-08-16,
-    /// screenshot-reported: "icons in buttons are too big"). The hand-drawn stand-ins actually
-    /// painted well inside that box:
+    /// screenshot-reported: "icons in buttons are too big"). The glyph sits inset and centred
+    /// inside that box rather than filling it.
     Control,
 }
 
@@ -224,12 +221,11 @@ pub enum IconWeight {
 /// upstream release and commit the files came from.
 pub const VENDORED_WEIGHT: IconWeight = IconWeight::Bold;
 
-/// The smallest box `regular` is allowed at, per `REVISION-2026-08-14.md` §8 ("`regular` only at
-/// 20px+").
+/// The smallest box `regular` is allowed at - `regular` only at 20px+.
 const REGULAR_WEIGHT_MIN_BOX: Pixels = px(20.0);
 
-/// `REVISION-2026-08-14.md` §8's weight rule as real code: "`bold` at 15-17px (`regular`'s 1.5px
-/// stroke reads thin against `#5e646a`); `regular` only at 20px+".
+/// The weight rule as real code: `bold` at 15-17px (`regular`'s 1.5px stroke reads thin
+/// against `#5e646a`); `regular` only at 20px+.
 pub fn weight_for_size(box_size: Pixels) -> IconWeight {
     if box_size >= REGULAR_WEIGHT_MIN_BOX {
         IconWeight::Regular
@@ -331,7 +327,7 @@ mod tests {
         IconPackSettings { directory: None }
     }
 
-    /// `REVISION-2026-08-14.md` §8's mapping table, transcribed: `(slot, icon, Phosphor name)`.
+    /// The icon mapping table: `(slot, icon, Phosphor name)`.
     /// Every other test in this module reads the glyph choice off this table rather than
     /// restating it, so the table is the single place the design is written down in code.
     const MAPPING: &[(&str, Icon, &str)] = &[
@@ -366,13 +362,12 @@ mod tests {
     ];
 
     #[test]
-    fn every_mapped_slot_from_the_design_handoff_has_its_phosphor_glyph() {
+    fn every_mapped_icon_slot_has_its_phosphor_glyph() {
         assert_eq!(
             MAPPING.len(),
             Icon::ALL.len(),
-            "REVISION-2026-08-14.md §8's table has {} rows - `Icon` must be exactly those slots, \
-             no speculative extras (§7 rule 1: ship the affordance with the behaviour, or ship \
-             neither)",
+            "the mapping table has {} rows - `Icon` must be exactly those slots, no \
+             speculative extras: ship the affordance with the behaviour, or ship neither",
             MAPPING.len()
         );
         for (slot, icon, expected_name) in MAPPING {
@@ -510,7 +505,7 @@ mod tests {
         assert_eq!(IconSize::PanelTab.box_size(), px(11.0));
         assert_eq!(IconSize::TabChip.box_size(), px(14.0));
         assert_eq!(IconSize::Strip.box_size(), px(15.0));
-        // 12, not 17 - `Jerry.dc.html`'s 17px on these controls is the surrounding hit box
+        // 12, not 17 - the designed 17px on these controls is the surrounding hit box
         // (`theme::band::ICON_BUTTON_HIT`); the funnel/trash hand-drawn glyphs inside it only
         // really occupy up to 11x7 and 9x12 respectively. See `IconSize::Control`'s doc comment.
         assert_eq!(IconSize::Control.box_size(), px(12.0));
@@ -522,8 +517,8 @@ mod tests {
             assert_eq!(
                 weight_for_size(size.box_size()),
                 VENDORED_WEIGHT,
-                "{size:?} ({}) wants a Phosphor weight that is not vendored - REVISION-2026-08-14 \
-                 §8: `bold` at 15-17px, `regular` only at 20px+",
+                "{size:?} ({}) wants a Phosphor weight that is not vendored - `bold` at \
+                 15-17px, `regular` only at 20px+",
                 size.box_size()
             );
         }
@@ -608,8 +603,7 @@ mod tests {
                 assert!(
                     covered * 20 >= total,
                     "{path} covers only {covered}/{total} pixels at {size:?} - at this size the \
-                     glyph would read as nothing (REVISION-2026-08-14 §8's own complaint about \
-                     the hand-drawn marks)"
+                     glyph would read as nothing"
                 );
             }
         }

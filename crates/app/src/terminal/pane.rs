@@ -106,8 +106,8 @@ fn eof_poll_decision(
     }
 }
 
-/// The terminal body's default/fallback font size and line height -
-/// `design_handoff_jerry_ade/README.md`'s Surface A/B body spec, "lines at 12px/19 mono". Set
+/// The terminal body's default/fallback font size and line height - the designed 12px/19 mono.
+/// Set
 /// explicitly (`.text_size()`/`.line_height()`) on the pane root by [`TerminalPane`]'s
 /// `Render` impl, not per-row - rows inherit both from the root. Explicit rather than the
 /// GPUI-default `.text_xs()` (no `.line_height()`, so GPUI's own default `phi()` - the golden

@@ -455,13 +455,11 @@ impl AdeApp {
 /// their own popovers (see either constant's own docs): it gives the real "is there room below
 /// the offending row" measurement a concrete number to compare real available space against, and
 /// stops a genuinely enormous multi-paragraph `rustc` message from painting past the window.
-/// Not from the design mockup, whose own diagnostic card (`design_handoff_jerry_ade/revision 3/
-/// Jerry.dc.html`) is exactly as tall as its two real lines of text - just a practical ceiling
-/// comfortably above a real message plus note plus footer.
+/// Not a designed value - the designed diagnostic card is exactly as tall as its two real lines
+/// of text. Just a practical ceiling comfortably above a real message plus note plus footer.
 const DIAGNOSTIC_CARD_MAX_HEIGHT: gpui::Pixels = px(190.0);
 
-/// 470px - the design mockup's own diagnostic card width (`design_handoff_jerry_ade/revision 3/
-/// Jerry.dc.html`: `width:470px` on the card itself).
+/// 470px - the designed diagnostic card width.
 const DIAGNOSTIC_CARD_WIDTH: gpui::Pixels = px(470.0);
 
 /// How long the Diagnostic card's `copy` button reads `copied` after a real click before flipping
@@ -866,17 +864,14 @@ pub(in crate::code_surface) fn diagnostic_card_message_color(
 /// [`AdeApp::render_hover_card`]'s own real "is there room below the hovered row" measurement
 /// (mirroring [`AdeApp::render_completions_popover`]'s identical `POPOVER_MAX_HEIGHT` judgment -
 /// see that constant's own docs) has a concrete number to compare real available space against,
-/// and so a real, unusually long doc string can't paint past the window. Not derived from the
-/// design mockup (`design_handoff_jerry_ade/revision/Jerry.dc.html`'s own hover card has no
-/// fixed height - it's exactly as tall as its own real content), just a practical, generous
-/// ceiling comfortably above what a real signature + doc + footer normally needs.
+/// and so a real, unusually long doc string can't paint past the window. Not a designed value -
+/// the designed hover card has no fixed height, being exactly as tall as its own content. Just a
+/// practical, generous ceiling comfortably above what a real signature + doc + footer needs.
 const HOVER_CARD_MAX_HEIGHT: gpui::Pixels = px(220.0);
-/// 430px - the design mockup's own real hover card width
-/// (`design_handoff_jerry_ade/revision 3/Jerry.dc.html`: `width:430px` on the card).
+/// 430px - the designed hover card width.
 const HOVER_CARD_MAX_WIDTH: gpui::Pixels = px(430.0);
-/// 10px - the header/body/footer bands' own real shared horizontal padding
-/// (`Jerry.dc.html`: `padding:7px 10px 6px`/`padding:7px 10px`/`padding:6px 10px` - all three
-/// bands agree on `10px` left/right). Named so [`render_hover_signature`]'s own real max-width
+/// 10px - the header/body/footer bands' own real shared horizontal padding: all three bands
+/// agree on `10px` left/right. Named so [`render_hover_signature`]'s own real max-width
 /// (card width minus both sides' padding) can be computed from the same real numbers the bands
 /// themselves paint with, rather than a second, independently-guessed constant that could drift.
 const HOVER_CARD_HORIZONTAL_PADDING: gpui::Pixels = px(10.0);
@@ -1187,9 +1182,8 @@ impl AdeApp {
 }
 
 /// The Hover popover's own signature line, syntax-highlighted like real code rather than painted
-/// as flat text (`design_handoff_jerry_ade/revision 3/Jerry.dc.html`'s own hover card shows `pub
-/// trait Into<T>: Sized` with real per-token colors - keyword purple, type gold - not one flat
-/// heading color).
+/// as flat text: `pub trait Into<T>: Sized` gets real per-token colours - keyword purple, type
+/// gold - not one flat heading colour.
 fn render_hover_signature(signature: &str, extension: Option<&str>) -> gpui::AnyElement {
     let mut column = div()
         .flex()
@@ -1604,8 +1598,7 @@ pub(in crate::code_surface) fn diagnostic_inline_message_color(
     }
 }
 
-/// The File view row's real, dim end-of-line diagnostic message (`design_handoff_jerry_ade/
-/// revision 3/README.md`'s Diagnostic state: "dim inline message at end of line") - shared by both
+/// The File view row's real, dim end-of-line diagnostic message - shared by both
 /// row renderers, the read-only [`crate::code_surface::file_view::render_file_view_line`] and the
 /// live-buffer `crate::code_surface::editing::render_editable_file_view_line`, so the two can't
 /// drift apart on this.

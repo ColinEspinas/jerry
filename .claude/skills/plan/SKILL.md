@@ -34,8 +34,9 @@ before any code exists to be attached to the wrong fix.
    not — CLAUDE.md already answers that.
 
 4. **Check for a design source before inventing a UI shape.** If the issue touches layout, colors,
-   or interaction states, `design_handoff_jerry_ade/revision/` is the authoritative reference —
-   check it before proposing something that just looks reasonable.
+   or interaction states, read the relevant page in `docs/design/` before proposing something that
+   just looks reasonable — and say in the plan which page the change will have to update, since a
+   UI change updates its page in the same PR.
 
 5. **Write the approach**, scaled to the issue: a paragraph for a small bug, a short structured
    plan (what changes, which files, what the test coverage looks like) for anything touching more

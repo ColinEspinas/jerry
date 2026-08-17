@@ -15,8 +15,8 @@ the upstream project's own `assets/bold/` tree.
 
 ## Weight
 
-All twelve files are the **bold** weight. `design_handoff_jerry_ade/revision 5/`'s
-`REVISION-2026-08-14.md` §8 states the rule verbatim:
+All twelve files are the **bold** weight. The design states the rule verbatim
+(`docs/design/decisions.md` §8):
 
 > **Weight:** `bold` at 15–17px (`regular`'s 1.5px stroke reads thin against `#5e646a`);
 > `regular` only at 20px+.

@@ -35,10 +35,9 @@ impl SidebarView {
         }
     }
 
-    /// The view's hint - the second half of its tooltip, quoted from `Jerry.dc.html`'s own
-    /// `sideViews` table. §1 explains why every cell needs one: "With labels gone, [the] glyphs
-    /// are the only affordance identifying the views, so the hint has to live somewhere
-    /// reachable."
+    /// The view's hint - the second half of its tooltip. Every cell needs one: with labels gone,
+    /// the glyphs are the only affordance identifying the views, so the hint has to live
+    /// somewhere reachable.
     pub const fn hint(self) -> &'static str {
         match self {
             SidebarView::Worktrees => "repo \u{b7} worktree \u{b7} agent",
@@ -49,10 +48,10 @@ impl SidebarView {
         }
     }
 
-    /// The view's glyph, from `REVISION-2026-08-14.md` §8's mapping table (GitHub issue #282):
-    /// "strip: worktrees / history / problems → `tree-structure` / `clock-counter-clockwise` /
-    /// `warning`". Drawn through [`crate::icons::IconRow`] at [`crate::icons::IconSize::Strip`],
-    /// which is what §7 rule 7's "one shared optical box, not one size per icon" means in code.
+    /// The view's glyph (GitHub issue #282): worktrees / history / problems map to
+    /// `tree-structure` / `clock-counter-clockwise` / `warning`. Drawn through
+    /// [`crate::icons::IconRow`] at [`crate::icons::IconSize::Strip`], which is what "one shared
+    /// optical box, not one size per icon" means in code.
     pub const fn icon(self) -> Icon {
         match self {
             SidebarView::Worktrees => Icon::TreeStructure,
@@ -64,9 +63,8 @@ impl SidebarView {
         }
     }
 
-    /// The cell's `title="<view> — <hint>"` tooltip (§1), with the marker's real count appended in
-    /// parentheses when there is one - `Jerry.dc.html`'s own
-    /// `v.label + ' — ' + v.hint + (badge ? ' (' + badge + ')' : '')`.
+    /// The cell's `title="<view> — <hint>"` tooltip, with the marker's real count appended in
+    /// parentheses when there is one.
     pub fn tooltip(self, marker: Option<StripMarker>) -> String {
         match marker {
             Some(marker) => format!(
@@ -81,8 +79,7 @@ impl SidebarView {
 }
 
 /// Which hue a cell's state marker takes. Both are the app's own existing status hues, not a
-/// one-off pair - `REVISION-2026-08-14.md` §6: "badges use the app's own hues (amber `#e2a336` for
-/// worktrees, red `#e0625c` for problems), not a one-off cream."
+/// one-off pair: amber for worktrees, red for problems, never a one-off cream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarkerTone {
     /// Amber: work that is waiting on a human.
@@ -137,8 +134,7 @@ impl StripCell {
     }
 
     /// The colour this cell's glyph rests at: [`theme::text::SELECTED`] for the view you are in,
-    /// [`theme::text::FAINTER`] for one you are not (`Jerry.dc.html`'s own
-    /// `fg: on ? '#dde2e7' : '#5e646a'`).
+    /// [`theme::text::FAINTER`] for one you are not.
     pub const fn glyph_color(self) -> theme::ColorToken {
         if self.selected {
             theme::text::SELECTED
@@ -173,7 +169,7 @@ pub struct Problem {
 }
 
 impl Problem {
-    /// `line:column`, the way `Jerry.dc.html`'s own `p.line` prints it (`212:17`).
+    /// `line:column`, the way every compiler prints one (`212:17`).
     pub fn position(&self) -> String {
         format!("{}:{}", self.line, self.column)
     }
@@ -217,7 +213,7 @@ pub struct ProblemTally {
 }
 
 impl ProblemTally {
-    /// `problems` counted into `REVISION-2026-08-13.md` §2's three buckets.
+    /// `problems` counted into three buckets.
     pub fn over(problems: &[Problem]) -> Self {
         let mut tally = ProblemTally::default();
         for problem in problems {

@@ -1,5 +1,5 @@
-//! Agent-status derivation - the "who needs me" mechanism `design_handoff_jerry_ade/README.md`
-//! calls the whole point of the agent rail.
+//! Agent-status derivation - the "who needs me" mechanism that is the whole point of the agent
+//! rail (`docs/design/rail.md`).
 
 use std::time::Duration;
 
@@ -18,8 +18,8 @@ pub const RUN_RECENT_OUTPUT_WINDOW: Duration = Duration::from_secs(2);
 /// [`RUN_RECENT_OUTPUT_WINDOW`].
 pub const AGENT_ASK_IDLE_THRESHOLD: Duration = Duration::from_secs(15);
 
-/// The status vocabulary from `design_handoff_jerry_ade/README.md`'s "Status vocabulary" table,
-/// backed one-to-one by `crate::theme::status::*`.
+/// The app's whole status vocabulary (`docs/design/vocabulary.md`), backed one-to-one by
+/// `crate::theme::status::*`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Status {
     /// Needs input.
@@ -36,11 +36,9 @@ pub enum Status {
 }
 
 impl Status {
-    /// Rank used to sort the "by urgency" group order from
-    /// `design_handoff_jerry_ade/README.md`: `Needs input → Failed → Finished → Running →
-    /// Idle`. Lower sorts first. (The README spells that third group `Review ready`; revision 6
-    /// renamed the rendered word to `Finished` - see [`Self::label`] - without touching the
-    /// order itself.)
+    /// Rank used to sort by urgency: `Needs input → Failed → Finished → Running → Idle`. Lower
+    /// sorts first. (The third was originally worded `Review ready`; only the rendered word
+    /// changed - see [`Self::label`] - never the order.)
     pub fn urgency_rank(self) -> u8 {
         match self {
             Status::Ask => 0,
@@ -51,11 +49,10 @@ impl Status {
         }
     }
 
-    /// The label text from the README's status table, with revision 6's one rename applied:
-    /// [`Status::Review`] renders as `Finished`, never `Review ready`
-    /// (`design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4g, GitHub issue #280). The
+    /// The rendered label for each status, with one rename applied: [`Status::Review`] renders as
+    /// `Finished`, never `Review ready` (GitHub issue #280, `docs/design/decisions.md` §10). The
     /// old label "states a judgement the agent cannot make", collides with the user's own review
-    /// progress, and contradicts the file's own vocabulary; `Finished` states the fact, and the
+    /// progress, and contradicts the app's own vocabulary; `Finished` states the fact, and the
     /// file count rendered beside it (see `crate::rail::render`'s `agent_trailing_text`) carries
     /// what there is to look at. The *variant* deliberately keeps its `Review` name - the enum is
     /// an internal identifier, this is only about the rendered string.
@@ -80,8 +77,7 @@ impl Status {
         }
     }
 
-    /// The status pill's background colour (`design_handoff_jerry_ade/README.md`'s "Agent
-    /// context bar" spec) - `crate::theme::status::*_BG`, one per [`Status`].
+    /// The status pill's background colour - `crate::theme::status::*_BG`, one per [`Status`].
     pub fn pill_bg(self) -> gpui::Rgba {
         match self {
             Status::Ask => crate::theme::status::ASK_BG.into(),

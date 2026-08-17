@@ -15,8 +15,8 @@ impl AdeApp {
         self.load_run_drift(cx);
     }
 
-    /// A worktree row's own `↺ N earlier runs` line (`REVISION-2026-08-13.md` §6): selects that
-    /// checkout, switches the sidebar to History and narrows the scope to it.
+    /// A worktree row's own `↺ N earlier runs` line: selects that checkout, switches the
+    /// sidebar to History and narrows the scope to it.
     pub(crate) fn open_history_for_worktree(
         &mut self,
         path: PathBuf,
@@ -141,7 +141,7 @@ impl AdeApp {
         body.into_any_element()
     }
 
-    /// The `all` / `this worktree` toggle (`REVISION-2026-08-14.md` §6).
+    /// The `all` / `this worktree` toggle.
     fn render_history_scope_toggle(
         &self,
         branch: Option<&str>,

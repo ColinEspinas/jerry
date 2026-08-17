@@ -104,8 +104,8 @@ pub fn menu_rows<A>(groups: Vec<Vec<MenuEntry<A>>>) -> Vec<MenuRow<A>> {
     rows
 }
 
-/// The popover's fixed width, in px. `REVISION-2026-08-14.md` §4, verbatim: "206 wide, flip above
-/// when they would overflow the rail's bottom."
+/// The popover's fixed width, in px: 206 wide, flipping above when it would overflow the
+/// rail's bottom.
 pub const MENU_WIDTH: f32 = 206.0;
 
 /// One menu row's height, in px - §4t's "24px rows".
@@ -134,7 +134,7 @@ pub const MENU_EDGE_MARGIN: f32 = 4.0;
 pub const MENU_BORDER: f32 = 2.0;
 
 /// The gap the `⋯` overflow menu leaves between the button it hangs off and its own top edge, in
-/// px (`Jerry.dc.html`'s own `br.bottom + 4`).
+/// px.
 pub const MENU_ANCHOR_GAP: f32 = 4.0;
 
 /// The popover's real painted height for exactly the `rows` it is about to paint - action rows
@@ -189,8 +189,7 @@ pub struct AnchorRect {
 }
 
 /// Where a **button-anchored** menu's top-left corner goes: under the button it hangs off, with
-/// their right edges aligned (`STAGE-A-CHANGELOG.md` §4w: "the overflow menu off the ⋯ button's
-/// own rect with right edges aligned").
+/// their right edges aligned - the overflow menu hangs off the `⋯` button's own rect.
 pub fn anchor_menu_below_button(
     button: AnchorRect,
     width: f32,

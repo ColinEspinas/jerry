@@ -138,9 +138,8 @@ impl FindBar {
         format!("{} of {}", self.current + 1, self.hits.len())
     }
 
-    /// Next/prev exist only when there is something to step through -
-    /// `REVISION-2026-08-14.md` §7 rule 2, the same gate the panel's fold-all and `Replace all`
-    /// are behind.
+    /// Next/prev exist only when there is something to step through - the same gate the
+    /// panel's fold-all and `Replace all` are behind.
     pub fn has_results(&self) -> bool {
         self.has_query() && self.error.is_none() && !self.hits.is_empty()
     }

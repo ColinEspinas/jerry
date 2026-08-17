@@ -38,10 +38,11 @@ rather than looping on garbage images and drawing conclusions from them.
 
 4. **Look at it.** Read the PNG back directly — it renders as an image, not a file listing.
 
-5. **Compare against an oracle, not impression.** `design_handoff_jerry_ade/revision/` is the
-   authoritative source for exact values (zone heights, colors, interaction states) — its
-   `CHANGELOG.md` wins wherever the top-level copy and the revision disagree. If the task is a bug
-   fix rather than a new UI, the issue's acceptance criteria is the oracle instead. Either way, name
+5. **Compare against an oracle, not impression.** `docs/design/` carries the rules and invariants
+   for each surface, and `crates/app/src/theme.rs` carries the exact values behind the tokens those
+   pages name — a page says "the status pill's background is `theme::status::*_BG`", the token says
+   what that is. If the task is a bug fix rather than a new UI, the issue's acceptance criteria is
+   the oracle instead. Either way, name
    the specific mismatch ("the sidebar row height reads as 32px, the spec says 36px") rather than
    asserting it "looks right" or "looks off" — a vague impression isn't a finding anyone can act on.
 

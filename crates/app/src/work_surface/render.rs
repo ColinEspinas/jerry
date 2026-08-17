@@ -858,7 +858,7 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         // No `border_b` here, deliberately: the *children* own this column's bottom edge. GitHub
-        // issue #291 / `design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md` §4v, verbatim -
+        // issue #291 - the defect this fixes was that
         // "the centre column drew its bottom edge **twice** - once on the tab-strip container and
         // once on every tab - so under an inactive tab the rule was 1.6px of two shades stacked,
         // and the active tab's cut-out (its `border-bottom` set to its own background, so it joins
@@ -1802,8 +1802,8 @@ impl AdeApp {
     /// The agent context bar: agent badge/name, a divider, branch, the worktree path (the one
     /// flexible, ellipsising child - every other child is `flex_none` and non-wrapping, so the
     /// bar never wraps when the centre narrows), and a status pill. **Identity and status only**
-    /// (GitHub issue #295, `STAGE-A-CHANGELOG.md` §4e): the `Merge` and `Archive` buttons that
-    /// used to close this bar are deleted, not hidden.
+    /// (GitHub issue #295): the `Merge` and `Archive` buttons that used to close this bar are
+    /// deleted, not hidden.
     pub(in crate::work_surface) fn render_agent_context_bar(
         &self,
         agent: &Agent,
@@ -2126,8 +2126,8 @@ impl AdeApp {
         )
     }
 
-    /// The **agent** pane's bottom strip - **a readout, not an action bar** (GitHub issue #295,
-    /// `STAGE-A-CHANGELOG.md` §4t).
+    /// The **agent** pane's bottom strip - **a readout, not an action bar** (GitHub issue
+    /// #295).
     pub(in crate::work_surface) fn render_pty_footer(
         &self,
         agent: &Agent,
@@ -2428,11 +2428,10 @@ impl AdeApp {
                                 .overflow_hidden()
                                 .child(agent.pane.clone().into_any_element()),
                         )
-                        // One bottom bar per pane, picked by pane kind - never both stacked.
-                        // `Jerry.dc.html`'s two pane branches are mutually exclusive `sc-if`
-                        // siblings: `isTerminal` gets `pid │ 148×38 │ [wsl] … file:line
-                        // references open in a tab`, `isChat` gets the `hasBar` readout strip
-                        // (actions · cost · budget) and puts its pid in the header instead.
+                        // One bottom bar per pane, picked by pane kind - never both stacked. A
+                        // shell gets `pid │ 148×38 │ [wsl] … file:line references open in a tab`;
+                        // an agent gets the readout strip (actions · cost · budget) and puts its
+                        // pid in the header instead.
                         // Rendering both under every pane is the duplication reported live
                         // against the shipped build - see the two methods' own docs.
                         .child(match agent.kind {
@@ -2781,7 +2780,7 @@ pub(in crate::work_surface) fn render_tab_insertion_caret(insert_after: bool) ->
 }
 
 /// How long a dropped tab's own settle-in fade runs - short and non-blocking, matching the
-/// design handoff's own "animations are short (~120-180ms)" ask (GitHub issue #16 §5).
+/// "animations are short (~120-180ms)" rule (GitHub issue #16 §5).
 pub(in crate::work_surface) const TAB_SETTLE_ANIMATION_DURATION: Duration =
     Duration::from_millis(150);
 
@@ -4783,8 +4782,7 @@ mod select_agent_cross_repo_tests {
 }
 
 /// GitHub issue #295: the agent pane's context bar is identity-only, and its bottom strip is a
-/// readout rather than an action bar (`design_handoff_jerry_ade/revision 5/STAGE-A-CHANGELOG.md`
-/// §4e/§4r/§4t).
+/// readout rather than an action bar.
 #[cfg(test)]
 mod agent_pane_readout_tests {
     use super::*;
