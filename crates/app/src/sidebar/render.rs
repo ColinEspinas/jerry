@@ -1027,8 +1027,84 @@ impl AdeApp {
                 .absolute()
                 .size_full()
             })
+            .child(self.render_file_tree_root_row(cx))
             .child(body);
         shell.into_any_element()
+    }
+
+    /// The worktree root's own drop target row (GitHub issue #409).
+    ///
+    /// Deliberately outside [`Self::render_file_tree`]'s `uniform_list`, and in the shell rather
+    /// than any one of its three bodies: that list is `flex_1`, so a tree taller than the viewport
+    /// leaves no empty area for [`Self::file_tree_shell`]'s own root `on_drop` to catch, and "move
+    /// this to the top level" has to stay reachable at every tree height, scroll position, and
+    /// empty/unreadable-directory state.
+    fn render_file_tree_root_row(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let root = self.file_tree_root.clone();
+        div()
+            .id("file-tree-root-row")
+            .debug_selector(|| FILE_TREE_ROOT_ROW_SELECTOR.to_string())
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .w_full()
+            .h(theme::band::TREE_ROW)
+            .pl(px(file_tree::ROW_LEFT_PAD))
+            .pr(px(scrollbar::CONTENT_CLEARANCE))
+            .border_b_1()
+            .border_color(theme::border::INNER)
+            .font(font(theme::font::MONO))
+            .text_size(self.ui_text_size(11.5))
+            // The root is a real path and never appears as a row of its own, so it can share
+            // `Self::tree_drag_hover_target` with the folder rows without a sentinel value.
+            .when(
+                self.tree_drag_hover_target.as_deref() == Some(root.as_path()),
+                |el| el.bg(theme::status::ASK_BG),
+            )
+            .tooltip(text_tooltip(format!(
+                "The worktree root ({}). Drop files or folders here to move them to the top level.",
+                root.display()
+            )))
+            // Blank, but still the caret column's 8px, so this row's folder icon lines up with
+            // every top-level row's own.
+            .child(render_tree_caret(false, false, self.ui_text_size(9.0)))
+            .child(render_folder_icon(true))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .truncate()
+                    .text_color(theme::text::SECONDARY)
+                    .child(file_tree_root_label(&root)),
+            )
+            .on_drag_move(cx.listener(
+                move |this, event: &gpui::DragMoveEvent<TreeDragPayload>, _window, cx| {
+                    // Only touches state on a real change - `on_drag_move` fires on every mouse
+                    // move during the drag, and this row's own highlight is what it drives.
+                    let hovering = event.bounds.contains(&event.event.position);
+                    let lit = this.tree_drag_hover_target.as_deref() == Some(root.as_path());
+                    if hovering && !lit {
+                        this.tree_drag_hover_target = Some(root.clone());
+                        cx.notify();
+                    } else if !hovering && lit {
+                        this.tree_drag_hover_target = None;
+                        cx.notify();
+                    }
+                },
+            ))
+            .on_drop(
+                cx.listener(move |this, dragged: &TreeDragPayload, _window, cx| {
+                    // Without this the drop would also reach `Self::file_tree_shell`'s own root
+                    // handler and run the identical move a second time.
+                    cx.stop_propagation();
+                    this.tree_drag_hover_target = None;
+                    let root = this.file_tree_root.clone();
+                    this.move_paths_into_dir(&dragged.paths, &root, cx);
+                }),
+            )
+            .into_any_element()
     }
 
     /// The rows [`Self::render_file_tree`]'s `uniform_list` will build, and the indent depth the
@@ -4010,6 +4086,18 @@ impl gpui::Render for TreeDragPayload {
             .text_color(theme::text::BODY)
             .child(self.label.clone())
     }
+}
+
+/// `AdeApp::render_file_tree_root_row`'s `debug_bounds` selector, named once so its own tests
+/// assert against the real string rather than a plausible copy of it.
+pub(in crate::sidebar) const FILE_TREE_ROOT_ROW_SELECTOR: &str = "file-tree-root-row";
+
+/// What the worktree root's row is called: its directory name, falling back to the whole path for
+/// a root with no final component (a filesystem root), which would otherwise render blank.
+pub(in crate::sidebar) fn file_tree_root_label(root: &Path) -> String {
+    root.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| root.display().to_string())
 }
 
 /// The file tree row's `▾`/`▸` caret, signaling a directory row is clickable/expandable,
@@ -8150,5 +8238,194 @@ mod change_row_tests {
         assert!(letters.contains(&("added.txt".to_string(), StatusLetter::Added)));
         assert!(letters.contains(&("modified.txt".to_string(), StatusLetter::Modified)));
         assert!(letters.contains(&("deleted.txt".to_string(), StatusLetter::Deleted)));
+    }
+}
+
+/// GitHub issue #409: the worktree root's own row - the one drop target "move this to the root"
+/// has that does not depend on the tree being short enough to leave empty space below its last
+/// row. The gesture tests here drive real GPUI mouse input rather than calling
+/// `AdeApp::move_paths_into_dir` directly (which `crate::sidebar::tree_ops`'s own
+/// `tree_drag_move_tests` already covers): the bug this fixes was entirely in the mouse plumbing -
+/// the move primitive underneath was always correct, there was simply nowhere to release over.
+#[cfg(test)]
+mod file_tree_root_row_tests {
+    use crate::sidebar::render::FILE_TREE_ROOT_ROW_SELECTOR;
+    use crate::test_support::{open_test_app, temp_root};
+    use gpui::{px, Modifiers, MouseButton, TestAppContext};
+    use std::path::Path;
+
+    /// Down, a short move past GPUI's own 2px `DRAG_THRESHOLD` (`vendor/zed/crates/gpui/src/
+    /// elements/div.rs`'s `on_drag` arm, which only promotes a pending mouse-down to a real drag
+    /// once the pointer has genuinely travelled), the move onto the target, then up - the real
+    /// four-event gesture, not a synthesized drop.
+    fn drag_from_to(
+        cx: &mut gpui::VisualTestContext,
+        from: gpui::Point<gpui::Pixels>,
+        to: gpui::Point<gpui::Pixels>,
+    ) {
+        cx.simulate_mouse_down(from, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(
+            from + gpui::point(px(0.0), px(4.0)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_move(to, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::default());
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn dragging_a_nested_file_onto_the_root_row_moves_it_to_the_worktree_root(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = temp_root();
+        repo.write("src/util.rs", "fn util() {}\n");
+        let root = repo.to_path_buf();
+        let (app, cx) = open_test_app(cx, root.clone());
+        cx.run_until_parked();
+
+        app.update(cx, |app, cx| app.toggle_dir_expanded(root.join("src"), cx));
+        cx.run_until_parked();
+
+        let source = cx
+            .debug_bounds("file-tree-row-util.rs")
+            .expect("premise: the nested file's own row must paint before it can be dragged");
+        let target = cx
+            .debug_bounds(FILE_TREE_ROOT_ROW_SELECTOR)
+            .expect("the worktree root's row must paint");
+        drag_from_to(cx, source.center(), target.center());
+
+        assert!(
+            root.join("util.rs").exists(),
+            "dropping onto the root row must really move the file to the worktree root"
+        );
+        assert!(
+            !root.join("src/util.rs").exists(),
+            "the old path must be gone - a move, not a copy"
+        );
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.tree_op_error.is_none(),
+                "a legitimate move to the root must not report an error: {:?}",
+                app.tree_op_error
+            );
+            assert!(
+                app.tree_drag_hover_target.is_none(),
+                "the drop must clear its own hover highlight, or the root row stays lit after \
+                 the gesture ends"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn dragging_a_root_level_file_onto_the_root_row_is_a_real_no_op(cx: &mut TestAppContext) {
+        let repo = temp_root();
+        repo.write("a.txt", "a\n");
+        let root = repo.to_path_buf();
+        let (app, cx) = open_test_app(cx, root.clone());
+        cx.run_until_parked();
+
+        let source = cx
+            .debug_bounds("file-tree-row-a.txt")
+            .expect("premise: the root-level file's row must paint");
+        let target = cx
+            .debug_bounds(FILE_TREE_ROOT_ROW_SELECTOR)
+            .expect("the worktree root's row must paint");
+        let undo_len_before = app.read_with(cx, |app, _| app.tree_undo_stack.len());
+        drag_from_to(cx, source.center(), target.center());
+
+        assert!(
+            root.join("a.txt").exists(),
+            "a file already in the root must stay exactly where it is"
+        );
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.tree_undo_stack.len(),
+                undo_len_before,
+                "dropping a file back onto the folder it already lives in must not record a real \
+                 move - the same no-op `move_paths_into_dir` gives for any other same-folder drop"
+            );
+            assert!(app.tree_op_error.is_none());
+        });
+    }
+
+    /// The exact condition GitHub issue #409 was filed for: `Self::render_file_tree`'s
+    /// `uniform_list` is `flex_1`, so a tree with more rows than fit the viewport leaves *no* empty
+    /// area for `Self::file_tree_shell`'s own root drop to catch. The root row is outside that list
+    /// and must therefore still be there - both before and after scrolling to the very bottom.
+    #[gpui::test]
+    fn the_root_row_paints_with_a_tree_taller_than_the_viewport_and_stays_put_when_it_scrolls(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = temp_root();
+        for index in 0..300 {
+            repo.write(&format!("file-{index:03}.txt"), "x\n");
+        }
+        let (_app, cx) = open_test_app(cx, repo.to_path_buf());
+        cx.run_until_parked();
+
+        let before = cx
+            .debug_bounds(FILE_TREE_ROOT_ROW_SELECTOR)
+            .expect("the root row must paint even when the list overflows its viewport");
+        let first_row = cx
+            .debug_bounds("file-tree-row-file-000.txt")
+            .expect("premise: the list must really have rows");
+        assert!(
+            cx.debug_bounds("file-tree-row-file-299.txt").is_none(),
+            "premise: the tree must genuinely be taller than the viewport, or this test proves \
+             nothing about the case the issue was filed for"
+        );
+
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: first_row.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(-100_000.0))),
+            modifiers: Modifiers::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+
+        let after = cx
+            .debug_bounds(FILE_TREE_ROOT_ROW_SELECTOR)
+            .expect("the root row must survive scrolling - it is pinned, not the list's first row");
+        assert_eq!(
+            before, after,
+            "the root row must not move with the list it sits above"
+        );
+    }
+
+    #[gpui::test]
+    fn the_root_row_paints_for_an_empty_directory_too(cx: &mut TestAppContext) {
+        let repo = temp_root();
+        let (app, cx) = open_test_app(cx, repo.to_path_buf());
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.file_tree.is_empty() && app.file_tree_error.is_none(),
+                "premise: this must really be `Self::render_file_tree`'s empty-directory arm, \
+                 which returns through `Self::file_tree_shell` before building any list at all"
+            );
+        });
+        assert!(
+            cx.debug_bounds(FILE_TREE_ROOT_ROW_SELECTOR).is_some(),
+            "an empty directory is exactly when a root drop target matters most - there are no \
+             rows at all to drop onto"
+        );
+    }
+
+    #[test]
+    fn the_root_row_is_labelled_with_the_root_directory_name() {
+        assert_eq!(
+            super::file_tree_root_label(Path::new("/home/dev/jerry")),
+            "jerry"
+        );
+    }
+
+    /// A filesystem root has no final component; falling through to an empty label would leave the
+    /// row blank rather than merely terse.
+    #[test]
+    fn a_root_with_no_final_component_falls_back_to_its_full_path() {
+        let displayed = Path::new("/").display().to_string();
+        assert_eq!(super::file_tree_root_label(Path::new("/")), displayed);
     }
 }
