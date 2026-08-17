@@ -33,6 +33,14 @@ pub fn seed_empty_repo_at(dir: &Path) {
     // checkout and put `\r` into content, diff-hunk and blame assertions the fixture wrote with
     // `\n`. Pinned here so a fixture behaves identically on all three platforms (#440, finding 2).
     git(dir, &["config", "core.autocrlf", "false"]);
+    // Every `git commit` runs an auto-gc check, which can fork a real background repack. A fixture
+    // that seeds hundreds of commits and then hands the repository straight to `gix` can have its
+    // objects moved from loose to packed *while* that walk is opening them - which surfaces as a
+    // genuinely intermittent `An object with id <sha> could not be found`, observed twice on the
+    // Linux runner in `crate::graph_view::render::graph_virtualization_tests`. Fixtures are
+    // short-lived and thrown away, so they gain nothing from packing in the first place.
+    git(dir, &["config", "gc.auto", "0"]);
+    git(dir, &["config", "maintenance.auto", "false"]);
 }
 
 /// A git repository on branch `main` with one commit (`file.txt`) and a clean working tree.
@@ -82,6 +90,10 @@ pub fn seed_commits(dir: &Path, count: usize) {
 pub fn seed_bare_remote() -> TempDir {
     let dir = TempDir::new().expect("tempdir");
     git(dir.path(), &["init", "--bare", "-b", "main"]);
+    // Same reason as `seed_empty_repo_at`'s pair: a receiving repository runs its own auto-gc
+    // after a push, and a fixture never benefits from being packed.
+    git(dir.path(), &["config", "gc.auto", "0"]);
+    git(dir.path(), &["config", "maintenance.auto", "false"]);
     dir
 }
 
@@ -167,6 +179,23 @@ mod repo_seed_tests {
         seed_commits(dir.path(), 7);
 
         assert_eq!(commit_count(dir.path()), 7);
+    }
+
+    /// A seeded repository must never run a background repack. A fixture that seeds hundreds of
+    /// commits and hands the result straight to `gix` otherwise races git's auto-gc, which moves
+    /// objects from loose to packed mid-walk and produces an intermittent
+    /// `An object with id <sha> could not be found` - twice observed on the Linux runner. Pinned
+    /// as a real assertion because a silent config line is exactly the kind of thing a later
+    /// change drops without noticing.
+    #[test]
+    fn a_seeded_repo_never_runs_a_background_gc() {
+        let repo = seed_repo();
+
+        assert_eq!(git_output(repo.path(), &["config", "gc.auto"]), "0");
+        assert_eq!(
+            git_output(repo.path(), &["config", "maintenance.auto"]),
+            "false"
+        );
     }
 
     #[test]
