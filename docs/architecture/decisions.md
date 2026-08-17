@@ -254,3 +254,28 @@ and a ConPTY master is a named pipe, so the reader blocks until `master` itself 
 the child is reaped. Callers must therefore poll `try_wait` rather than wait for the output channel
 to disconnect. These paths are `#[cfg(windows)]`, never `#[cfg(not(unix))]`, so an unsupported
 non-unix target fails to compile instead of silently inheriting Windows semantics.
+
+## 9. `crates/test-support` is a real crate, not a feature-gated one
+
+**Status:** Accepted.
+
+**Context:** Test setup had no shared home, so it was copy-pasted instead: `fn git(dir, args)`
+appeared ~30 times across `wt-core` and `app`, alongside 1,223 separate tempdir setups and 303
+wall-clock waits. The obvious single crate to fix that has a trap in it — `crates/app`'s fixtures
+need `gpui` (a test window, `VisualTestContext`), and `wt-core`/`pty-core`/`lsp-core` must be able
+to dev-depend on the same crate without acquiring `gpui` (§1).
+
+A Cargo feature (`test-support = { features = ["gpui"] }` for `app` only) looks like it solves
+this and does not: features unify across a workspace build, so one crate enabling `gpui` enables it
+for every other crate resolving the same dependency. The core crates' dev graph would silently
+regain `gpui` — exactly the outcome §1 exists to prevent, and one no `Cargo.toml` review would
+catch.
+
+**Decision:** Two homes, split by dependency rather than by feature. `crates/test-support` is
+`gpui`-free and depends only on `tempfile`; anything needing `gpui` lives in
+`crates/app/src/test_support.rs`, inside the one crate already allowed to have it.
+
+**Consequences:** `cargo tree -e normal,dev,build -i gpui` reaching only `crates/app` is a
+checkable invariant, not a convention. A helper that "just needs a `TestAppContext`" is not added
+to `crates/test-support` under any flag — it goes in `crates/app` or it is restructured to take
+plain data. The policy those fixtures serve is [`docs/testing.md`](../testing.md).

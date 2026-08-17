@@ -3352,8 +3352,8 @@ mod settings_persist_tests {
     fn a_later_edit_queued_while_an_earlier_one_is_delayed_is_never_overwritten_by_it(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
+        let settings_dir = crate::test_support::temp_root();
         let settings_path = settings_dir.path().join("settings.toml");
 
         let (app, cx) = open_test_app_with_real_settings_path(
@@ -3415,8 +3415,8 @@ mod settings_persist_tests {
     fn a_burst_of_edits_with_decreasing_delays_converges_on_the_final_value(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
+        let settings_dir = crate::test_support::temp_root();
         let settings_path = settings_dir.path().join("settings.toml");
 
         let (app, cx) = open_test_app_with_real_settings_path(
@@ -3485,17 +3485,6 @@ mod repo_list_tests {
     /// in this module use) has no worktrees `wt_core::list_worktrees_porcelain` can report at
     /// all, which is fine for tests about agent persistence but not for one that needs a real
     /// main-worktree row to select.
-    fn init_repo() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().expect("tempdir");
-        git(dir.path(), &["init", "-b", "main"]);
-        git(dir.path(), &["config", "user.email", "test@example.com"]);
-        git(dir.path(), &["config", "user.name", "Test User"]);
-        std::fs::write(dir.path().join("README.md"), "hello\n").expect("write");
-        git(dir.path(), &["add", "README.md"]);
-        git(dir.path(), &["commit", "-m", "initial"]);
-        dir
-    }
-
     fn open_test_app_with_real_settings_path(
         cx: &mut TestAppContext,
         repo_path: PathBuf,
@@ -3515,8 +3504,8 @@ mod repo_list_tests {
 
     #[gpui::test]
     fn a_fresh_window_starts_with_exactly_one_focused_repo(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = focus::palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         app.read_with(cx, |app, _| {
             assert_eq!(app.repos.len(), 1);
@@ -3528,9 +3517,9 @@ mod repo_list_tests {
 
     #[gpui::test]
     fn add_repo_appends_a_new_entry_without_changing_focus(cx: &mut TestAppContext) {
-        let repo_a = tempfile::tempdir().expect("tempdir");
-        let repo_b = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = focus::palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        let repo_a = crate::test_support::temp_root();
+        let repo_b = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo_a.path().to_path_buf());
         let focused_before = app.read_with(cx, |app, _| app.focused_repo_path());
 
         app.update(cx, |app, cx| {
@@ -3550,8 +3539,8 @@ mod repo_list_tests {
 
     #[gpui::test]
     fn add_repo_is_idempotent_for_the_same_path(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = focus::palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         let (first_id, second_id) = app.update(cx, |app, cx| {
             let first = app.repos[0].id;
@@ -3574,9 +3563,9 @@ mod repo_list_tests {
 
     #[gpui::test]
     fn focus_repo_moves_focus_to_a_known_repo(cx: &mut TestAppContext) {
-        let repo_a = tempfile::tempdir().expect("tempdir");
-        let repo_b = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = focus::palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        let repo_a = crate::test_support::temp_root();
+        let repo_b = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo_a.path().to_path_buf());
 
         let repo_b_id = app.update(cx, |app, cx| app.add_repo(repo_b.path().to_path_buf(), cx));
         app.update(cx, |app, cx| app.focus_repo(repo_b_id, cx));
@@ -3588,8 +3577,8 @@ mod repo_list_tests {
 
     #[gpui::test]
     fn focus_repo_with_an_unknown_id_is_a_no_op(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = focus::palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         let focused_before = app.read_with(cx, |app, _| app.focused_repo_path());
 
         app.update(cx, |app, cx| app.focus_repo(RepoId(u64::MAX), cx));
@@ -3601,9 +3590,9 @@ mod repo_list_tests {
 
     #[gpui::test]
     fn adding_a_repo_persists_to_a_real_repos_toml(cx: &mut TestAppContext) {
-        let repo_a = tempfile::tempdir().expect("tempdir");
-        let repo_b = tempfile::tempdir().expect("tempdir");
-        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let repo_a = crate::test_support::temp_root();
+        let repo_b = crate::test_support::temp_root();
+        let settings_dir = crate::test_support::temp_root();
         let settings_path = settings_dir.path().join("settings.toml");
 
         let (app, cx) = open_test_app_with_real_settings_path(
@@ -3631,9 +3620,9 @@ mod repo_list_tests {
     fn opening_against_one_repo_does_not_erase_another_instances_already_persisted_repo(
         cx: &mut TestAppContext,
     ) {
-        let repo_a = tempfile::tempdir().expect("tempdir");
-        let repo_b = tempfile::tempdir().expect("tempdir");
-        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let repo_a = crate::test_support::temp_root();
+        let repo_b = crate::test_support::temp_root();
+        let settings_dir = crate::test_support::temp_root();
         let settings_path = settings_dir.path().join("settings.toml");
 
         let repo_state_path = repo::repo_state_path_for(&settings_path);
@@ -3671,7 +3660,7 @@ mod repo_list_tests {
 
     #[gpui::test]
     fn no_cli_arg_and_nothing_persisted_is_a_genuinely_empty_window(cx: &mut TestAppContext) {
-        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_dir = crate::test_support::temp_root();
         let settings_path = settings_dir.path().join("settings.toml");
 
         let (app, _cx) = cx.add_window_view(|window, cx| {
@@ -3700,8 +3689,8 @@ mod repo_list_tests {
     fn a_fresh_launch_with_no_cli_arg_reopens_the_remembered_last_focused_repo(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
+        let settings_dir = crate::test_support::temp_root();
         let settings_path = settings_dir.path().join("settings.toml");
 
         // "Launch 1": a real CLI-argument launch against `repo`, which focuses (and so persists)
@@ -3746,9 +3735,9 @@ mod repo_list_tests {
     fn a_remembered_repo_that_no_longer_exists_falls_back_to_a_genuinely_empty_window(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
         let repo_path = repo.path().to_path_buf();
-        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_dir = crate::test_support::temp_root();
         let settings_path = settings_dir.path().join("settings.toml");
 
         let (_first, cx) =
@@ -3784,8 +3773,8 @@ mod repo_list_tests {
     fn use_remembered_repo_false_stays_empty_even_with_a_real_remembered_repo(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
+        let settings_dir = crate::test_support::temp_root();
         let settings_path = settings_dir.path().join("settings.toml");
 
         let (_first, cx) = open_test_app_with_real_settings_path(
@@ -3821,9 +3810,9 @@ mod repo_list_tests {
     fn open_repo_in_current_window_focuses_and_reloads_a_real_repo_from_empty(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
         std::fs::write(repo.path().join("a.txt"), "hello\n").expect("write");
-        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let settings_dir = crate::test_support::temp_root();
         let settings_path = settings_dir.path().join("settings.toml");
 
         let (app, cx) = cx.add_window_view(|window, cx| {
@@ -3862,11 +3851,11 @@ mod repo_list_tests {
     fn open_repo_in_current_window_clears_stale_ui_state_from_the_previous_repo(
         cx: &mut TestAppContext,
     ) {
-        let repo_a = tempfile::tempdir().expect("tempdir");
-        let repo_b = tempfile::tempdir().expect("tempdir");
+        let repo_a = crate::test_support::temp_root();
+        let repo_b = crate::test_support::temp_root();
         std::fs::write(repo_b.path().join("y.txt"), "b\n").expect("write");
 
-        let (app, cx) = focus::palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo_a.path().to_path_buf());
         cx.run_until_parked();
 
         // Arm several pieces of real per-repo UI state against repo A - the same kinds of state
@@ -3905,23 +3894,23 @@ mod repo_list_tests {
     fn switching_away_from_a_zero_linked_worktree_repo_and_back_keeps_its_worktree_row(
         cx: &mut TestAppContext,
     ) {
-        let repo_a = tempfile::tempdir().expect("tempdir");
-        git(repo_a.path(), &["init", "-b", "main"]);
-        git(repo_a.path(), &["config", "user.email", "test@example.com"]);
-        git(repo_a.path(), &["config", "user.name", "Test User"]);
+        let repo_a = crate::test_support::temp_root();
+        test_support::git(repo_a.path(), &["init", "-b", "main"]);
+        test_support::git(repo_a.path(), &["config", "user.email", "test@example.com"]);
+        test_support::git(repo_a.path(), &["config", "user.name", "Test User"]);
         std::fs::write(repo_a.path().join("a.txt"), "hello\n").expect("write");
-        git(repo_a.path(), &["add", "a.txt"]);
-        git(repo_a.path(), &["commit", "-m", "init"]);
+        test_support::git(repo_a.path(), &["add", "a.txt"]);
+        test_support::git(repo_a.path(), &["commit", "-m", "init"]);
 
-        let repo_b = tempfile::tempdir().expect("tempdir");
-        git(repo_b.path(), &["init", "-b", "main"]);
-        git(repo_b.path(), &["config", "user.email", "test@example.com"]);
-        git(repo_b.path(), &["config", "user.name", "Test User"]);
+        let repo_b = crate::test_support::temp_root();
+        test_support::git(repo_b.path(), &["init", "-b", "main"]);
+        test_support::git(repo_b.path(), &["config", "user.email", "test@example.com"]);
+        test_support::git(repo_b.path(), &["config", "user.name", "Test User"]);
         std::fs::write(repo_b.path().join("b.txt"), "hello\n").expect("write");
-        git(repo_b.path(), &["add", "b.txt"]);
-        git(repo_b.path(), &["commit", "-m", "init"]);
+        test_support::git(repo_b.path(), &["add", "b.txt"]);
+        test_support::git(repo_b.path(), &["commit", "-m", "init"]);
 
-        let (app, cx) = focus::palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo_a.path().to_path_buf());
         cx.run_until_parked();
 
         app.read_with(cx, |app, _| {
@@ -3971,29 +3960,21 @@ mod repo_list_tests {
         });
     }
 
-    fn git(dir: &std::path::Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
+    /// Critical fix (independent audit): the original `open_repo_in_current_window` never
+    /// (re)started the real status-polling loop or the worktree filesystem watcher - a window
+    /// that starts empty and only later opens a folder never got either at all. `repo` is a real
+    /// `git init`-ed directory, not a bare `tempfile::tempdir()`: `spawn_worktree_watcher` returns
+    /// `None` for a path that isn't inside a real git repository at all
+    /// (`wt_core::git_common_dir` failing), so a bare tempdir would make this test pass "by
+    /// accident" - `_worktree_watcher` would read `None` regardless of whether the real fix ever
+    /// ran, proving nothing about the watcher half of the fix.
     #[gpui::test]
     fn open_repo_in_current_window_starts_status_polling_and_worktree_watch(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        git(repo.path(), &["init", "-b", "main"]);
-        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
+        test_support::git(repo.path(), &["init", "-b", "main"]);
+        let settings_dir = crate::test_support::temp_root();
         let settings_path = settings_dir.path().join("settings.toml");
 
         let (app, cx) = cx.add_window_view(|window, cx| {
@@ -4044,11 +4025,11 @@ mod repo_list_tests {
     fn open_repo_in_current_window_rebinds_the_worktree_watcher_to_the_new_repo(
         cx: &mut TestAppContext,
     ) {
-        let repo_a = tempfile::tempdir().expect("tempdir");
-        git(repo_a.path(), &["init", "-b", "main"]);
-        let repo_b = tempfile::tempdir().expect("tempdir");
+        let repo_a = crate::test_support::temp_root();
+        test_support::git(repo_a.path(), &["init", "-b", "main"]);
+        let repo_b = crate::test_support::temp_root();
 
-        let (app, cx) = focus::palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo_a.path().to_path_buf());
         cx.run_until_parked();
         app.read_with(cx, |app, _| {
             assert!(
@@ -4077,10 +4058,10 @@ mod repo_list_tests {
     fn open_repo_in_current_window_leaves_the_previous_repos_agents_running(
         cx: &mut TestAppContext,
     ) {
-        let repo_a = tempfile::tempdir().expect("tempdir");
-        let repo_b = tempfile::tempdir().expect("tempdir");
+        let repo_a = crate::test_support::temp_root();
+        let repo_b = crate::test_support::temp_root();
 
-        let (app, cx) = focus::palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo_a.path().to_path_buf());
         cx.run_until_parked();
         let repo_a_agent_id = app.read_with(cx, |app, _| {
             assert_eq!(
@@ -4160,12 +4141,26 @@ mod repo_list_tests {
         });
     }
 
+    /// The rail-native mirror of
+    /// [`open_repo_in_current_window_leaves_the_previous_repos_agents_running`] just above:
+    /// [`AdeApp::checkout_repo_from_rail`] shares the identical real cross-repo agent persistence
+    /// contract, not a partial or weaker version of it. Proves two real agents belonging to repo
+    /// A (its initial shell plus a spawned Claude session) are both still genuinely running -
+    /// still present in [`crate::work_surface::agents::Agents`]'s own list, real PTY processes
+    /// and all - after checking out repo B from the rail, the same "really alive, not leaked or
+    /// killed" guarantee the `open_repo_in_current_window` mirror test proves via the identical
+    /// technique (asserting against the live agent list and each one's own `TerminalPane::
+    /// is_running`).
+    // Asserts `TerminalPane::is_running` on a spawned `claude` CLI, so it needs that binary to
+    // exist: without it the PTY child exits at once and the persistence being proven here cannot
+    // be observed at all. The `external` tier.
+    #[ignore = "external: claude; see docs/testing.md"]
     #[gpui::test]
     fn checkout_repo_from_rail_leaves_the_previous_repos_agents_running(cx: &mut TestAppContext) {
-        let repo_a = tempfile::tempdir().expect("tempdir");
-        let repo_b = tempfile::tempdir().expect("tempdir");
+        let repo_a = crate::test_support::temp_root();
+        let repo_b = crate::test_support::temp_root();
 
-        let (app, cx) = focus::palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo_a.path().to_path_buf());
         cx.run_until_parked();
 
         let claude_agent_id = app.update_in(cx, |app, window, cx| {
@@ -4244,10 +4239,10 @@ mod repo_list_tests {
     fn checking_out_a_repo_from_the_rail_clears_the_centre_pane_instead_of_reactivating(
         cx: &mut TestAppContext,
     ) {
-        let repo_a = tempfile::tempdir().expect("tempdir");
-        let repo_b = tempfile::tempdir().expect("tempdir");
+        let repo_a = crate::test_support::temp_root();
+        let repo_b = crate::test_support::temp_root();
 
-        let (app, cx) = focus::palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo_a.path().to_path_buf());
         cx.run_until_parked();
 
         let repo_b_id = app.update(cx, |app, cx| app.add_repo(repo_b.path().to_path_buf(), cx));
@@ -4327,10 +4322,10 @@ mod repo_list_tests {
     fn checking_out_a_repo_from_the_rail_never_selects_a_worktree_on_its_own(
         cx: &mut TestAppContext,
     ) {
-        let repo_a = init_repo();
-        let repo_b = init_repo();
+        let repo_a = crate::test_support::temp_repo();
+        let repo_b = crate::test_support::temp_repo();
 
-        let (app, cx) = focus::palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo_a.path().to_path_buf());
         cx.run_until_parked();
 
         let repo_b_id = app.update(cx, |app, cx| app.add_repo(repo_b.path().to_path_buf(), cx));
@@ -4365,10 +4360,10 @@ mod repo_list_tests {
     fn checking_out_a_repo_from_the_rail_never_shows_the_previous_repos_worktrees_even_briefly(
         cx: &mut TestAppContext,
     ) {
-        let repo_a = init_repo();
-        let repo_b = init_repo();
+        let repo_a = crate::test_support::temp_repo();
+        let repo_b = crate::test_support::temp_repo();
 
-        let (app, cx) = focus::palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo_a.path().to_path_buf());
         cx.run_until_parked();
 
         let repo_b_id = app.update(cx, |app, cx| app.add_repo(repo_b.path().to_path_buf(), cx));
@@ -4398,8 +4393,8 @@ mod repo_list_tests {
     fn open_repo_in_current_window_forgets_a_dangling_empty_state_focus_target(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
+        let settings_dir = crate::test_support::temp_root();
         let settings_path = settings_dir.path().join("settings.toml");
 
         let (app, cx) = cx.add_window_view(|window, cx| {
@@ -4441,8 +4436,8 @@ mod repo_list_tests {
 
     #[gpui::test]
     fn new_agent_and_new_agent_pane_are_no_ops_with_no_focused_repo(cx: &mut TestAppContext) {
-        let other_repo = tempfile::tempdir().expect("tempdir");
-        let settings_dir = tempfile::tempdir().expect("tempdir");
+        let other_repo = crate::test_support::temp_root();
+        let settings_dir = crate::test_support::temp_root();
         let settings_path = settings_dir.path().join("settings.toml");
 
         // A real *other* repo is known to this process (persisted from a previous focus) - the

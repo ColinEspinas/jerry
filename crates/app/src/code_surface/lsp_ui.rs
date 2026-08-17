@@ -7,11 +7,13 @@ use super::*;
 // `AdeApp::lsp_connection_for_path`'s facade instead of raw client states (see
 // `crate::lsp::client::LspConnection`), so a non-test import here would be genuinely unused.
 #[cfg(test)]
-use crate::lsp::client::LspClientState;
+use crate::code_surface::fixtures::{temp_repo, wait_until_parked};
 #[cfg(test)]
-use crate::root::focus::palette_focus_tests;
+use crate::lsp::client::LspClientState;
 use crate::root::scrollbar;
 use crate::root::widgets::render_keycap;
+#[cfg(test)]
+use crate::test_support::open_test_app;
 use std::time::Duration;
 
 /// How long the pointer has to rest on one real token before a real `textDocument/hover` request
@@ -1698,15 +1700,13 @@ mod lsp_hover_wiring_tests {
     use gpui::{Entity, TestAppContext, VisualTestContext};
     use std::time::{Duration, Instant};
 
-    fn write_scratch_project(main_rs: &str) -> tempfile::TempDir {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        std::fs::write(
-            dir.path().join("Cargo.toml"),
+    fn write_scratch_project(main_rs: &str) -> crate::code_surface::fixtures::TempRepo {
+        let dir = temp_repo();
+        dir.write(
+            "Cargo.toml",
             "[package]\nname = \"app_hover_wiring_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-        )
-        .expect("write Cargo.toml");
-        std::fs::create_dir(dir.path().join("src")).expect("mkdir src");
-        std::fs::write(dir.path().join("src").join("main.rs"), main_rs).expect("write main.rs");
+        );
+        dir.write("src/main.rs", main_rs);
         dir
     }
 
@@ -1731,24 +1731,22 @@ mod lsp_hover_wiring_tests {
                     cx,
                 );
             });
-            loop {
+            // Each attempt waits for its *own* round trip to settle before the retry below
+            // sends another one, so a slow server is waited on rather than flooded.
+            let settled = wait_until_parked(cx, ONE_REQUEST_WINDOW, |cx| {
                 cx.run_until_parked();
-                let settled = app.read_with(cx, |app, _| {
+                app.read_with(cx, |app, _| {
                     matches!(
                         app.hover.as_ref().map(|entry| &entry.status),
                         Some(HoverStatus::Ready(_)) | Some(HoverStatus::Failed(_))
                     )
-                });
-                if settled {
-                    break;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "AdeApp::hover never left its real Loading state within the real deadline"
-                );
-                std::thread::sleep(Duration::from_millis(200));
-            }
-            let resolved = app.update(cx, |app, _| match &app.hover {
+                })
+            });
+            assert!(
+                settled || Instant::now() < deadline,
+                "AdeApp::hover never left its real Loading state within the real deadline"
+            );
+            let resolved = app.read_with(cx, |app, _| match &app.hover {
                 Some(HoverEntry {
                     status: HoverStatus::Ready(Some(model)),
                     ..
@@ -1764,9 +1762,42 @@ mod lsp_hover_wiring_tests {
                  call site within the real deadline - rust-analyzer kept answering with real \
                  \"nothing here\"/errors past its own indexing window"
             );
-            std::thread::sleep(Duration::from_millis(300));
         }
     }
+
+    /// How long one real request is given to settle before the enclosing retry loop sends
+    /// another. Its own bound, separate from the whole test's `deadline`.
+    const ONE_REQUEST_WINDOW: Duration = Duration::from_secs(5);
+
+    /// Drives real renders until `key`'s language server reports `Ready`, or the tier's real
+    /// deadline passes. Re-rendering (not just waiting) is load-bearing: `render_file_view` is
+    /// what spawns the client and, once it is Ready, what dispatches `didOpen` - and there is no
+    /// window compositor driving repaints in a headless test.
+    fn wait_for_ready_client(
+        app: &Entity<AdeApp>,
+        cx: &mut VisualTestContext,
+        root: &Path,
+        key: &str,
+    ) {
+        let ready = wait_until_parked(cx, CLIENT_HANDSHAKE_WINDOW, |cx| {
+            app.update(cx, |app, cx| {
+                app.render_center_pane(cx);
+            });
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| {
+                matches!(
+                    app.lsp_clients.get(&(root.to_path_buf(), key)),
+                    Some(LspClientState::Ready(_))
+                )
+            })
+        });
+        assert!(
+            ready,
+            "the real {key} client never became Ready within {CLIENT_HANDSHAKE_WINDOW:?}"
+        );
+    }
+
+    const CLIENT_HANDSHAKE_WINDOW: Duration = Duration::from_secs(120);
 
     /// Click position for `"    let result = add_one(41);"` (line index 8, 0-based), reused from
     /// `lsp_core::client::tests::rust_analyzer_returns_a_real_hover_for_a_documented_function`'s
@@ -1786,11 +1817,12 @@ mod lsp_hover_wiring_tests {
     };
 
     #[gpui::test]
+    #[ignore = "external: rust-analyzer; see docs/testing.md"]
     fn a_real_click_resolves_to_a_real_hover_render_model(cx: &mut TestAppContext) {
         let project = write_scratch_project(FIXTURE_SOURCE);
         let main_rs = project.path().join("src").join("main.rs");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, project.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, project.path().to_path_buf());
 
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(main_rs.clone(), window, cx);
@@ -1806,28 +1838,7 @@ mod lsp_hover_wiring_tests {
         // Keeps re-rendering (the trigger for `dispatch_did_open` once the client is Ready)
         // while waiting for the handshake - a single "wait, then render once" could leave
         // `didOpen` never sent for a client that only just became Ready.
-        let client_deadline = Instant::now() + Duration::from_secs(120);
-        loop {
-            app.update(cx, |app, cx| {
-                app.render_center_pane(cx);
-            });
-            cx.run_until_parked();
-            let ready = app.read_with(cx, |app, _| {
-                matches!(
-                    app.lsp_clients
-                        .get(&(project.path().to_path_buf(), "rust-analyzer")),
-                    Some(LspClientState::Ready(_))
-                )
-            });
-            if ready {
-                break;
-            }
-            assert!(
-                Instant::now() < client_deadline,
-                "the real rust-analyzer client never became Ready within 120s"
-            );
-            std::thread::sleep(Duration::from_millis(200));
-        }
+        wait_for_ready_client(&app, cx, project.path(), "rust-analyzer");
 
         let deadline = Instant::now() + Duration::from_secs(120);
         let model = request_hover_until_resolved(&app, cx, main_rs.clone(), deadline);
@@ -1855,8 +1866,8 @@ mod lsp_hover_wiring_tests {
 
     #[gpui::test]
     fn f12_action_reaches_the_real_handler_on_a_fresh_window(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = temp_repo();
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
         assert_eq!(
             app.read_with(cx, |app, _| app.hover.clone()),
@@ -1873,11 +1884,12 @@ mod lsp_hover_wiring_tests {
     }
 
     #[gpui::test]
+    #[ignore = "external: rust-analyzer; see docs/testing.md"]
     fn f12_action_navigates_to_the_real_definition_line(cx: &mut TestAppContext) {
         let project = write_scratch_project(FIXTURE_SOURCE);
         let main_rs = project.path().join("src").join("main.rs");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, project.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, project.path().to_path_buf());
 
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(main_rs.clone(), window, cx);
@@ -1886,28 +1898,7 @@ mod lsp_hover_wiring_tests {
 
         // See the hover test above's identical loop for why re-rendering, not just waiting,
         // matters.
-        let client_deadline = Instant::now() + Duration::from_secs(120);
-        loop {
-            app.update(cx, |app, cx| {
-                app.render_center_pane(cx);
-            });
-            cx.run_until_parked();
-            let ready = app.read_with(cx, |app, _| {
-                matches!(
-                    app.lsp_clients
-                        .get(&(project.path().to_path_buf(), "rust-analyzer")),
-                    Some(LspClientState::Ready(_))
-                )
-            });
-            if ready {
-                break;
-            }
-            assert!(
-                Instant::now() < client_deadline,
-                "the real rust-analyzer client never became Ready within 120s"
-            );
-            std::thread::sleep(Duration::from_millis(200));
-        }
+        wait_for_ready_client(&app, cx, project.path(), "rust-analyzer");
 
         // `trigger_goto_definition` reads `hover`'s path/position regardless of whether the
         // hover content itself has resolved - a `Loading` entry already carries a valid request
@@ -1923,69 +1914,50 @@ mod lsp_hover_wiring_tests {
         });
         cx.run_until_parked();
 
-        // Retried on a timer rather than called once: a `textDocument/definition` response can
-        // honestly be empty while rust-analyzer is still mid-index, and a real user would just
-        // press F12 again.
-        let definition_deadline = Instant::now() + Duration::from_secs(120);
-        loop {
+        // Retried rather than called once: a `textDocument/definition` response can honestly be
+        // empty while rust-analyzer is still mid-index, and a real user would just press F12
+        // again. The request itself runs on a background OS thread, so each attempt polls (which
+        // re-drains the executor between tries) rather than reading once.
+        let navigated = wait_until_parked(cx, DEFINITION_WINDOW, |cx| {
             app.update(cx, |app, cx| {
                 app.trigger_goto_definition(cx);
             });
-            cx.run_until_parked();
-            // The definition request runs on a background OS thread; GPUI's deterministic test
-            // executor's `run_until_parked` only drains its own scheduled queue, which is empty
-            // again the instant that background call is dispatched, so a wall-clock sleep is
-            // needed before a second `run_until_parked` can observe the completion callback.
-            std::thread::sleep(Duration::from_millis(300));
-            cx.run_until_parked();
-            // `fn add_one` is on line 4 (1-based), different from `CALL_SITE_LINE` (9), proving
-            // this is real navigation, not a no-op that left the cursor where it was.
-            let navigated = app.read_with(cx, |app, _| app.code_cursor == Some(4));
-            if navigated {
-                break;
-            }
-            assert!(
-                Instant::now() < definition_deadline,
-                "trigger_goto_definition never navigated AdeApp::code_cursor to the real \
-                 definition line within 120s - last observed code_cursor: {:?}",
-                app.read_with(cx, |app, _| app.code_cursor)
-            );
-        }
+            wait_until_parked(cx, ONE_REQUEST_WINDOW, |cx| {
+                cx.run_until_parked();
+                // `fn add_one` is on line 4 (1-based), different from `CALL_SITE_LINE` (9),
+                // proving this is real navigation, not a no-op that left the cursor where it was.
+                app.read_with(cx, |app, _| app.code_cursor == Some(4))
+            })
+        });
+        assert!(
+            navigated,
+            "trigger_goto_definition never navigated AdeApp::code_cursor to the real definition \
+             line within {DEFINITION_WINDOW:?} - last observed code_cursor: {:?}",
+            app.read_with(cx, |app, _| app.code_cursor)
+        );
     }
 
+    /// How long the whole retry sequence for one real `textDocument/definition` answer is given.
+    const DEFINITION_WINDOW: Duration = Duration::from_secs(120);
+
+    /// Real, end-to-end coverage for the Ctrl/Cmd+click go-to-definition affordance: a real
+    /// simulated mouse click, with a real secondary modifier held, on the real painted call-site
+    /// token, against a genuinely spawned rust-analyzer - not a call straight into
+    /// `trigger_goto_definition` the way [`f12_action_navigates_to_the_real_definition_line`]
+    /// tests the mechanism itself. This is what actually proves the click *routes* there.
     #[gpui::test]
+    #[ignore = "external: rust-analyzer; see docs/testing.md"]
     fn ctrl_click_on_a_real_token_navigates_to_its_real_definition(cx: &mut TestAppContext) {
         let project = write_scratch_project(FIXTURE_SOURCE);
         let main_rs = project.path().join("src").join("main.rs");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, project.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, project.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(main_rs.clone(), window, cx);
         });
         cx.run_until_parked();
 
-        let client_deadline = Instant::now() + Duration::from_secs(120);
-        loop {
-            app.update(cx, |app, cx| {
-                app.render_center_pane(cx);
-            });
-            cx.run_until_parked();
-            let ready = app.read_with(cx, |app, _| {
-                matches!(
-                    app.lsp_clients
-                        .get(&(project.path().to_path_buf(), "rust-analyzer")),
-                    Some(LspClientState::Ready(_))
-                )
-            });
-            if ready {
-                break;
-            }
-            assert!(
-                Instant::now() < client_deadline,
-                "the real rust-analyzer client never became Ready within 120s"
-            );
-            std::thread::sleep(Duration::from_millis(200));
-        }
+        wait_for_ready_client(&app, cx, project.path(), "rust-analyzer");
 
         let (row_bounds, shaped) = app
             .read_with(cx, |app, _| {
@@ -1996,46 +1968,39 @@ mod lsp_hover_wiring_tests {
             row_bounds.left() + shaped.x_for_index(CALL_SITE_BYTE_RANGE.start + 1),
             row_bounds.center().y,
         );
-        // `Modifiers::secondary()` reads `control` on every platform this test actually runs on
-        // (non-macOS - see that method's own docs) - a real, held Ctrl, not a stand-in for it.
-        let ctrl_click = gpui::Modifiers {
-            control: true,
-            ..Default::default()
-        };
+        // The real modifier the production click handler checks for (`Modifiers::secondary()`),
+        // which is Cmd on macOS and Ctrl elsewhere - held for real, not stood in for.
+        let ctrl_click = gpui::Modifiers::secondary_key();
 
         // Retried the same real way `f12_action_navigates_to_the_real_definition_line` retries
         // its own equivalent request: a real `textDocument/definition` response can honestly come
         // back empty while rust-analyzer is still mid-index, and a real user would just click
         // again. Re-clicking (not just re-waiting) is load-bearing here - a single stale response
         // means nothing will ever change without a fresh request.
-        let definition_deadline = Instant::now() + Duration::from_secs(120);
-        loop {
+        let navigated = wait_until_parked(cx, DEFINITION_WINDOW, |cx| {
             cx.simulate_click(click_point, ctrl_click);
-            cx.run_until_parked();
-            std::thread::sleep(Duration::from_millis(300));
-            cx.run_until_parked();
-            // `fn add_one` is on line 4 (1-based), different from `CALL_SITE_LINE` (9) - real
-            // navigation, not the click's own plain caret placement being mistaken for it.
-            let navigated = app.read_with(cx, |app, _| app.code_cursor == Some(4));
-            if navigated {
-                break;
-            }
-            assert!(
-                Instant::now() < definition_deadline,
-                "a real Ctrl+click on the real call-site token never navigated \
-                 AdeApp::code_cursor to the real definition line within 120s - last observed \
-                 code_cursor: {:?}",
-                app.read_with(cx, |app, _| app.code_cursor)
-            );
-        }
+            wait_until_parked(cx, ONE_REQUEST_WINDOW, |cx| {
+                cx.run_until_parked();
+                // `fn add_one` is on line 4 (1-based), different from `CALL_SITE_LINE` (9) - real
+                // navigation, not the click's own plain caret placement being mistaken for it.
+                app.read_with(cx, |app, _| app.code_cursor == Some(4))
+            })
+        });
+        assert!(
+            navigated,
+            "a real Ctrl+click on the real call-site token never navigated AdeApp::code_cursor \
+             to the real definition line within {DEFINITION_WINDOW:?} - last observed \
+             code_cursor: {:?}",
+            app.read_with(cx, |app, _| app.code_cursor)
+        );
     }
 
     #[gpui::test]
     fn a_plain_click_with_no_modifier_does_not_trigger_navigation(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = repo.path().join("sample.rs");
         std::fs::write(&file_path, "fn one() {}\nfn two() {}\n").expect("write sample.rs");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(file_path.clone(), window, cx);
         });
@@ -2139,10 +2104,10 @@ mod hover_popover_position_tests {
 
     #[gpui::test]
     fn a_genuinely_empty_hover_result_paints_no_popup_at_all(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = repo.path().join("sample.rs");
         std::fs::write(&file_path, "fn main() {}\n").expect("write sample.rs");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(file_path.clone(), window, cx);
         });
@@ -2205,10 +2170,10 @@ mod hover_popover_position_tests {
     fn a_real_long_signature_wraps_inside_the_card_instead_of_being_clipped(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = repo.path().join("sample.rs");
         std::fs::write(&file_path, "fn main() {}\n").expect("write sample.rs");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(file_path.clone(), window, cx);
         });
@@ -2274,13 +2239,13 @@ mod hover_popover_position_tests {
     fn a_card_with_no_room_below_sits_against_its_row_not_a_card_height_above_it(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = repo.path().join("sample.txt");
         // Long enough that its later rows are genuinely near the bottom of the painted body -
         // the only way to make a card flip for real rather than by faking bounds.
         let source: String = (1..=200).map(|index| format!("line {index}\n")).collect();
         std::fs::write(&file_path, &source).expect("write sample.txt");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(file_path.clone(), window, cx);
         });
@@ -2336,10 +2301,10 @@ mod hover_popover_position_tests {
 
     #[gpui::test]
     fn the_real_painted_hover_card_moves_with_the_real_hovered_row(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = repo.path().join("sample.txt");
         std::fs::write(&file_path, "one\ntwo\nthree\nfour\nfive\n").expect("write sample.txt");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(file_path.clone(), window, cx);
         });
@@ -2403,10 +2368,10 @@ mod hover_popover_position_tests {
     fn the_real_painted_hover_card_moves_horizontally_with_the_real_hovered_column(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = repo.path().join("sample.txt");
         std::fs::write(&file_path, "aaaa bbbb cccc dddd\n").expect("write sample.txt");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(file_path.clone(), window, cx);
         });
@@ -2538,16 +2503,15 @@ mod vue_two_server_wiring_tests {
     /// `node_modules/typescript/lib/typescript.js` specifically, and refuses to spawn without it).
     /// A stubbed stand-in would be worse than useless here - the real `vue-language-server` really
     /// does load this file, and a fake one would produce a different, equally fake failure.
-    fn write_scratch_vue_project() -> tempfile::TempDir {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        std::fs::write(
-            dir.path().join("tsconfig.json"),
+    fn write_scratch_vue_project() -> crate::code_surface::fixtures::TempRepo {
+        let dir = temp_repo();
+        dir.write(
+            "tsconfig.json",
             "{\"compilerOptions\": {\"strict\": true, \"target\": \"ES2020\", \
              \"module\": \"ESNext\", \"moduleResolution\": \"Bundler\", \"jsx\": \"preserve\"}, \
              \"include\": [\"**/*.ts\", \"**/*.vue\"]}\n",
-        )
-        .expect("write tsconfig.json");
-        std::fs::write(dir.path().join("App.vue"), FIXTURE_VUE).expect("write App.vue");
+        );
+        dir.write("App.vue", FIXTURE_VUE);
         let status = std::process::Command::new("npm")
             .args([
                 "install",
@@ -2571,26 +2535,29 @@ mod vue_two_server_wiring_tests {
 
     /// Re-renders, advances the deterministic clock past one `LSP_DIAGNOSTICS_POLL_INTERVAL`, and
     /// drains, until `predicate` holds or `deadline` passes.
-    fn wait_until(
+    ///
+    /// Advancing the clock is load-bearing here and not in the single-server tests: this app's
+    /// relay dispatch lives in `AdeApp::ensure_lsp_poll_task`'s own `timer(..)`-driven loop, which
+    /// on GPUI's deterministic test executor only ticks when the clock is actually advanced - and
+    /// the real `vue-language-server` will not produce a single diagnostic until its relayed
+    /// `tsserver/request` has been answered.
+    fn wait_for(
         app: &Entity<AdeApp>,
         cx: &mut VisualTestContext,
-        deadline: Instant,
+        deadline: Duration,
         message: &str,
         predicate: impl Fn(&AdeApp) -> bool,
     ) {
-        loop {
+        let held = wait_until_parked(cx, deadline, |cx| {
             app.update(cx, |app, cx| {
                 app.render_center_pane(cx);
             });
             cx.background_executor
                 .advance_clock(LSP_DIAGNOSTICS_POLL_INTERVAL + Duration::from_millis(10));
             cx.run_until_parked();
-            if app.read_with(cx, |app, _| predicate(app)) {
-                return;
-            }
-            assert!(Instant::now() < deadline, "{message}");
-            std::thread::sleep(Duration::from_millis(200));
-        }
+            app.read_with(cx, |app, _| predicate(app))
+        });
+        assert!(held, "{message}");
     }
 
     fn diagnostic_messages(app: &AdeApp) -> Vec<String> {
@@ -2602,7 +2569,7 @@ mod vue_two_server_wiring_tests {
     }
 
     #[gpui::test]
-    #[ignore]
+    #[ignore = "external: vue-language-server, typescript-language-server, npm; see docs/testing.md"]
     fn a_real_vue_file_gets_real_diagnostics_from_both_servers_and_a_real_hover(
         cx: &mut TestAppContext,
     ) {
@@ -2613,7 +2580,7 @@ mod vue_two_server_wiring_tests {
         let _ = env_logger::builder().parse_default_env().try_init();
         let project = write_scratch_vue_project();
         let app_vue = project.path().join("App.vue");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, project.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, project.path().to_path_buf());
 
         let opened_at = Instant::now();
         app.update_in(cx, |app, window, cx| {
@@ -2626,10 +2593,10 @@ mod vue_two_server_wiring_tests {
         let companion_key = language::companion_for_extension(Some("vue"))
             .expect("vue has a real companion")
             .client_key;
-        wait_until(
+        wait_for(
             &app,
             cx,
-            Instant::now() + Duration::from_secs(180),
+            Duration::from_secs(180),
             "the real vue-language-server and its real typescript-language-server companion were \
              never both Ready - check that both are installed and that @vue/typescript-plugin \
              resolved",
@@ -2648,10 +2615,10 @@ mod vue_two_server_wiring_tests {
 
         // The companion's own contribution: a real TypeScript semantic error for `.vue` content,
         // which only exists because the real `@vue/typescript-plugin` is genuinely loaded.
-        wait_until(
+        wait_for(
             &app,
             cx,
-            Instant::now() + Duration::from_secs(180),
+            Duration::from_secs(180),
             "no real TypeScript diagnostic for the genuine `.vue` script type error ever reached \
              file_view_diagnostics",
             |app| {
@@ -2664,10 +2631,10 @@ mod vue_two_server_wiring_tests {
 
         // The primary's own contribution: a real Vue template compile error, which the companion
         // does not and cannot report.
-        wait_until(
+        wait_for(
             &app,
             cx,
-            Instant::now() + Duration::from_secs(120),
+            Duration::from_secs(120),
             "no real Vue template diagnostic ever reached file_view_diagnostics - without it, \
              only one of the two real servers is genuinely contributing",
             |app| {
@@ -2706,9 +2673,11 @@ mod vue_two_server_wiring_tests {
         // A real hover, through the facade's real companion fallback: the primary answers `null`
         // for every position in a `.vue` file (real, expected hybrid-mode behavior), so a
         // non-`None` result here can only have come from the companion via `LspConnection`.
-        let hover_deadline = Instant::now() + Duration::from_secs(120);
         let hover_started = Instant::now();
-        let model = loop {
+        let mut resolved = None;
+        // Each attempt waits out its own real round trip before the next one is sent, so a
+        // still-indexing server is waited on rather than flooded with fresh requests.
+        let answered = wait_until_parked(cx, Duration::from_secs(120), |cx| {
             app.update(cx, |app, cx| {
                 app.hover = None;
                 app.request_hover(
@@ -2719,41 +2688,31 @@ mod vue_two_server_wiring_tests {
                     cx,
                 );
             });
-            loop {
+            wait_until_parked(cx, Duration::from_secs(5), |cx| {
                 cx.run_until_parked();
-                let settled = app.read_with(cx, |app, _| {
+                app.read_with(cx, |app, _| {
                     matches!(
                         app.hover.as_ref().map(|entry| &entry.status),
                         Some(HoverStatus::Ready(_)) | Some(HoverStatus::Failed(_))
                     )
-                });
-                if settled {
-                    break;
-                }
-                assert!(
-                    Instant::now() < hover_deadline,
-                    "AdeApp::hover never left its real Loading state within the real deadline"
-                );
-                std::thread::sleep(Duration::from_millis(200));
-            }
-            let resolved = app.update(cx, |app, _| match &app.hover {
+                })
+            });
+            resolved = app.read_with(cx, |app, _| match &app.hover {
                 Some(HoverEntry {
                     status: HoverStatus::Ready(Some(model)),
                     ..
                 }) => Some(model.clone()),
                 _ => None,
             });
-            if let Some(model) = resolved {
-                break model;
-            }
-            assert!(
-                Instant::now() < hover_deadline,
-                "no real, non-empty hover ever came back for the genuine `bad` identifier in the \
-                 real .vue script block - the companion fallback in LspConnection::request is \
-                 what has to supply it, since the primary genuinely answers null there"
-            );
-            std::thread::sleep(Duration::from_millis(300));
-        };
+            resolved.is_some()
+        });
+        assert!(
+            answered,
+            "no real, non-empty hover ever came back for the genuine `bad` identifier in the \
+             real .vue script block - the companion fallback in LspConnection::request is \
+             what has to supply it, since the primary genuinely answers null there"
+        );
+        let model = resolved.expect("the wait above only succeeds with a real resolved hover");
         println!(
             "vue e2e: real hover resolved in {:?}: {model:?}",
             hover_started.elapsed()
@@ -2778,7 +2737,7 @@ mod vue_two_server_wiring_tests {
         let uri = lsp_core::LspClient::uri_for_path(&app_vue).expect("a real file:// uri");
 
         let definition = retry_until_some(
-            Instant::now() + Duration::from_secs(120),
+            Duration::from_secs(120),
             "no real go-to-definition ever came back for `shape` in the real .vue script block - \
              the real vue-language-server answers an empty array there, so only the companion \
              fallback in LspConnection::request can supply one",
@@ -2814,7 +2773,7 @@ mod vue_two_server_wiring_tests {
         println!("vue e2e: real go-to-definition answer: {definition:?}");
 
         let completions = retry_until_some(
-            Instant::now() + Duration::from_secs(120),
+            Duration::from_secs(120),
             "no real completions ever came back after `shape.` in the real .vue script block - \
              the real vue-language-server answers an empty items list there",
             || {
@@ -2854,14 +2813,18 @@ mod vue_two_server_wiring_tests {
     /// Calls `attempt` until it returns a real `Some` or `deadline` passes. Both real servers are
     /// still settling for a while after the first diagnostic lands, so a single shot would be a
     /// race; nothing is fabricated on timeout, the assertion just fails.
-    fn retry_until_some<T>(deadline: Instant, message: &str, attempt: impl Fn() -> Option<T>) -> T {
-        loop {
-            if let Some(value) = attempt() {
-                return value;
-            }
-            assert!(Instant::now() < deadline, "{message}");
-            std::thread::sleep(Duration::from_millis(300));
-        }
+    fn retry_until_some<T>(
+        deadline: Duration,
+        message: &str,
+        attempt: impl Fn() -> Option<T>,
+    ) -> T {
+        let mut resolved = None;
+        let answered = test_support::wait_until(deadline, || {
+            resolved = attempt();
+            resolved.is_some()
+        });
+        assert!(answered, "{message}");
+        resolved.expect("the wait above only succeeds with a real answer")
     }
 }
 
@@ -2881,15 +2844,15 @@ mod hover_pointer_tests {
         name: &str,
         source: &str,
     ) -> (
-        tempfile::TempDir,
+        crate::code_surface::fixtures::TempRepo,
         PathBuf,
         Entity<AdeApp>,
         &'a mut VisualTestContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = repo.path().join(name);
         std::fs::write(&file_path, source).expect("write fixture");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(file_path.clone(), window, cx);
         });
@@ -3136,11 +3099,11 @@ mod hover_pointer_tests {
 
     #[gpui::test]
     fn the_full_real_pipeline_also_survives_hovering_a_covered_token(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = repo.path().join("sample.rs");
         std::fs::write(&file_path, "fn alpha() {}\nfn beta() {}\n").expect("write sample.rs");
         let client = spawn_fake_server(repo.path(), "rust-analyzer", "hover");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update(cx, |app, _cx| {
             app.lsp_clients.insert(
                 (repo.path().to_path_buf(), "rust-analyzer"),
@@ -3291,13 +3254,13 @@ mod diagnostic_popover_tests {
 
     #[gpui::test]
     fn the_real_diagnostic_card_floats_over_the_code_without_reflowing_it(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = repo.path().join("sample.rs");
         std::fs::write(&file_path, SOURCE).expect("write sample.rs");
         // A real, minimal LSP server installed *before* the first render, so `ensure_lsp_client`
         // finds a Ready entry for this key and never spawns a real rust-analyzer for the fixture.
         let client = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update(cx, |app, _cx| {
             app.lsp_clients.insert(
                 (repo.path().to_path_buf(), "rust-analyzer"),
@@ -3372,11 +3335,11 @@ mod diagnostic_popover_tests {
     fn the_real_diagnostic_card_is_anchored_under_the_offending_span_not_the_row_edge(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = repo.path().join("sample.rs");
         std::fs::write(&file_path, SOURCE).expect("write sample.rs");
         let client = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update(cx, |app, _cx| {
             app.lsp_clients.insert(
                 (repo.path().to_path_buf(), "rust-analyzer"),
@@ -3423,11 +3386,11 @@ mod diagnostic_popover_tests {
     fn the_real_card_shows_the_caret_line_only_and_yields_to_the_other_lsp_popups(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = repo.path().join("sample.rs");
         std::fs::write(&file_path, SOURCE).expect("write sample.rs");
         let client = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update(cx, |app, _cx| {
             app.lsp_clients.insert(
                 (repo.path().to_path_buf(), "rust-analyzer"),
@@ -3501,11 +3464,11 @@ mod diagnostic_popover_tests {
 
     #[gpui::test]
     fn moving_the_real_pointer_onto_the_diagnostic_card_does_not_hide_it(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = repo.path().join("sample.rs");
         std::fs::write(&file_path, SOURCE).expect("write sample.rs");
         let client = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update(cx, |app, _cx| {
             app.lsp_clients.insert(
                 (repo.path().to_path_buf(), "rust-analyzer"),
@@ -3563,11 +3526,11 @@ mod diagnostic_popover_tests {
     fn hovering_directly_over_the_diagnostic_span_shows_the_diagnostic_not_an_empty_hover(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = repo.path().join("sample.rs");
         std::fs::write(&file_path, SOURCE).expect("write sample.rs");
         let client = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update(cx, |app, _cx| {
             app.lsp_clients.insert(
                 (repo.path().to_path_buf(), "rust-analyzer"),
@@ -3623,11 +3586,11 @@ mod diagnostic_popover_tests {
     fn hovering_directly_over_the_diagnostic_span_shows_the_diagnostic_over_real_hover_content_too(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = repo.path().join("sample.rs");
         std::fs::write(&file_path, SOURCE).expect("write sample.rs");
         let client = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update(cx, |app, _cx| {
             app.lsp_clients.insert(
                 (repo.path().to_path_buf(), "rust-analyzer"),
@@ -3680,11 +3643,11 @@ mod diagnostic_popover_tests {
     fn hovering_a_diagnostic_span_shows_the_card_even_while_the_caret_is_elsewhere(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = repo.path().join("sample.rs");
         std::fs::write(&file_path, SOURCE).expect("write sample.rs");
         let client = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update(cx, |app, _cx| {
             app.lsp_clients.insert(
                 (repo.path().to_path_buf(), "rust-analyzer"),
@@ -3741,15 +3704,15 @@ mod diagnostic_popover_tests {
     ) -> (
         Entity<AdeApp>,
         &'a mut VisualTestContext,
-        tempfile::TempDir,
+        crate::code_surface::fixtures::TempRepo,
         std::sync::Arc<lsp_core::LspClient>,
         String,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = repo.path().join("sample.rs");
         std::fs::write(&file_path, SOURCE).expect("write sample.rs");
         let client = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update(cx, |app, _cx| {
             app.lsp_clients.insert(
                 (repo.path().to_path_buf(), "rust-analyzer"),
@@ -3971,11 +3934,11 @@ mod inline_diagnostic_message_tests {
     fn a_real_long_inline_message_truncates_instead_of_overlapping_the_real_code_text(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = repo.path().join("sample.rs");
         std::fs::write(&file_path, "fn alpha() {}\nfn beta() {}\n").expect("write sample.rs");
         let client = spawn_fake_server(repo.path(), "rust-analyzer", "normal");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update(cx, |app, _cx| {
             app.lsp_clients.insert(
                 (repo.path().to_path_buf(), "rust-analyzer"),
@@ -4206,10 +4169,10 @@ mod hover_card_footer_layout_tests {
     fn the_module_path_and_definition_chip_sit_at_opposite_ends_of_the_real_footer(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = repo.path().join("sample.rs");
         std::fs::write(&file_path, "fn add_one(x: i32) -> i32 { x + 1 }\n").expect("write");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(file_path.clone(), window, cx);
         });
@@ -4259,10 +4222,10 @@ mod hover_card_footer_layout_tests {
     fn clicking_through_the_hover_card_never_also_reaches_the_file_view_row_behind_it(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = repo.path().join("sample.rs");
         std::fs::write(&file_path, "fn line_one() {}\nfn line_two() {}\n").expect("write");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(file_path.clone(), window, cx);
         });
@@ -4317,12 +4280,12 @@ mod hover_card_footer_layout_tests {
     ) -> (
         gpui::Entity<AdeApp>,
         &'a mut gpui::VisualTestContext,
-        tempfile::TempDir,
+        crate::code_surface::fixtures::TempRepo,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = repo.path().join("sample.rs");
         std::fs::write(&file_path, "fn add_one(x: i32) -> i32 { x + 1 }\n").expect("write");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(file_path.clone(), window, cx);
         });
@@ -4391,10 +4354,10 @@ mod hover_card_footer_layout_tests {
 
     #[gpui::test]
     fn a_real_jsdoc_tag_in_the_hover_doc_body_paints_its_own_tag_run(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = repo.path().join("sample.rs");
         std::fs::write(&file_path, "fn add_one(x: i32) -> i32 { x + 1 }\n").expect("write");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(file_path.clone(), window, cx);
         });
@@ -4435,10 +4398,10 @@ mod hover_card_footer_layout_tests {
     fn real_jsdoc_block_tags_in_the_hover_doc_body_paint_their_own_structured_sections(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = repo.path().join("sample.rs");
         std::fs::write(&file_path, "fn add_one(x: i32) -> i32 { x + 1 }\n").expect("write");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(file_path.clone(), window, cx);
         });
@@ -4484,10 +4447,10 @@ mod hover_card_footer_layout_tests {
     fn a_tall_signature_keeps_the_footer_pinned_and_shows_a_real_scrollbar(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = repo.path().join("sample.rs");
         std::fs::write(&file_path, "fn add_one(x: i32) -> i32 { x + 1 }\n").expect("write");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(file_path.clone(), window, cx);
         });
@@ -4556,10 +4519,10 @@ mod hover_card_footer_layout_tests {
 
     #[gpui::test]
     fn a_short_signature_paints_no_scrollbar(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         let file_path = repo.path().join("sample.rs");
         std::fs::write(&file_path, "fn add_one(x: i32) -> i32 { x + 1 }\n").expect("write");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(file_path.clone(), window, cx);
         });

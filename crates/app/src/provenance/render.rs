@@ -580,8 +580,8 @@ mod attribution_render_tests {
     use crate::sidebar::render::RightSidebarView;
     use crate::work_surface::agents::AgentKind;
     use gpui::TestAppContext;
-    use std::process::Command;
     use tempfile::TempDir;
+    use test_support::git;
 
     /// The mock's own `src/api/users.rs`, as committed.
     const BASE: &str = "\
@@ -650,24 +650,16 @@ impl UserApi {
     const CHIP_CODEX: &str = "change-row-author-src/api/users.rs-codex";
     const CHIP_YOU: &str = "change-row-author-src/api/users.rs-you";
 
-    fn git(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
     /// A real repo whose one shared file carries lines from two different agents *and* one hand
     /// edit, with the provenance really recorded for all three.
     fn shared_file_repo() -> (TempDir, super::super::store::ProvenanceStore) {
         let dir = TempDir::new().expect("tempdir");
-        let repo = dir.path();
+        // Canonicalized because `AdeApp` canonicalizes the root it is given
+        // (`crate::rail::repo::canonical_repo_path`) and then keys provenance by exact `PathBuf`.
+        // On macOS `std::env::temp_dir()` is itself behind a `/var` -> `/private/var` symlink, so
+        // recording against `TempDir::path()` verbatim writes keys the app can never look up.
+        let root = dir.path().canonicalize().expect("canonicalize tempdir");
+        let repo = root.as_path();
         git(repo, &["init", "-b", "main"]);
         git(repo, &["config", "user.email", "test@example.com"]);
         git(repo, &["config", "user.name", "Test User"]);
@@ -762,7 +754,12 @@ impl UserApi {
     #[gpui::test]
     fn a_file_only_one_agent_wrote_gets_chips_but_no_ring(cx: &mut TestAppContext) {
         let dir = TempDir::new().expect("tempdir");
-        let repo = dir.path();
+        // Canonicalized because `AdeApp` canonicalizes the root it is given
+        // (`crate::rail::repo::canonical_repo_path`) and then keys provenance by exact `PathBuf`.
+        // On macOS `std::env::temp_dir()` is itself behind a `/var` -> `/private/var` symlink, so
+        // recording against `TempDir::path()` verbatim writes keys the app can never look up.
+        let root = dir.path().canonicalize().expect("canonicalize tempdir");
+        let repo = root.as_path();
         git(repo, &["init", "-b", "main"]);
         git(repo, &["config", "user.email", "test@example.com"]);
         git(repo, &["config", "user.name", "Test User"]);

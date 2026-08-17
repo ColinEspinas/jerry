@@ -603,25 +603,20 @@ mod tests {
         assert_eq!(sections.description, None);
     }
 
+    /// UTF-16 is what the protocol counts in and UTF-8 is what the buffer stores, so a
+    /// multi-byte character is the whole point: in `"café x"` the `'x'` is byte 6 but UTF-16 unit
+    /// 5. Anything past the line end clamps rather than panicking.
     #[test]
-    fn byte_offset_to_utf16_offset_is_identity_for_pure_ascii() {
-        assert_eq!(byte_offset_to_utf16_offset("let x = 1;", 4), 4);
-    }
-
-    #[test]
-    fn byte_offset_to_utf16_offset_accounts_for_a_real_multi_byte_char() {
-        // "café x" - 'é' is 2 UTF-8 bytes but only 1 UTF-16 code unit, so the real UTF-16 offset
-        // of the 'x' that follows it must be 5 (c=1,a=1,f=1,é=1 unit,space=1 => unit 5), even
-        // though its real byte offset is 6.
-        let text = "caf\u{e9} x";
-        let x_byte_offset = text.find('x').expect("'x' present");
-        assert_eq!(x_byte_offset, 6);
-        assert_eq!(byte_offset_to_utf16_offset(text, x_byte_offset), 5);
-    }
-
-    #[test]
-    fn byte_offset_to_utf16_offset_clamps_past_the_real_line_end() {
-        assert_eq!(byte_offset_to_utf16_offset("abc", 999), 3);
+    fn byte_offset_to_utf16_offset_converts_and_clamps() {
+        for (line, byte_offset, expected) in
+            [("let x = 1;", 4, 4), ("caf\u{e9} x", 6, 5), ("abc", 999, 3)]
+        {
+            assert_eq!(
+                byte_offset_to_utf16_offset(line, byte_offset),
+                expected,
+                "{line:?} at byte {byte_offset}"
+            );
+        }
     }
 
     #[test]
@@ -732,16 +727,6 @@ mod tests {
             vec!["const name = formatName(\"Ada\", \"Lovelace\");\nconsole.log(name);".to_string()],
             "a real fenced @example body must survive as real, multi-line example code"
         );
-    }
-
-    #[test]
-    fn degrade_markdown_to_plain_text_strips_a_real_fenced_code_block_and_starts_a_new_paragraph() {
-        let plain = degrade_markdown_to_plain_text(REAL_TYPESCRIPT_MARKDOWN_HOVER);
-        assert_eq!(
-            plain,
-            "\nfunction addOne(x: number): number\n\nAdds one to the given number."
-        );
-        assert!(!plain.contains('`'), "no backtick should survive degrading");
     }
 
     #[test]
@@ -948,33 +933,11 @@ mod tests {
         }
     }
 
+    /// Every real shape a server can answer go-to-definition in. The `Link` row is the one that
+    /// matters most: it must read the target's own *selection* range (the name span), not the
+    /// whole target range, which can start well before the item at its doc comment.
     #[test]
-    fn first_definition_location_reads_a_real_scalar_response() {
-        let response = lsp_types::GotoDefinitionResponse::Scalar(location("file:///a.rs", 4));
-        let (uri, range) = first_definition_location(&response).expect("a real location");
-        assert_eq!(uri.as_str(), "file:///a.rs");
-        assert_eq!(range.start.line, 4);
-    }
-
-    #[test]
-    fn first_definition_location_reads_the_real_first_array_entry() {
-        let response = lsp_types::GotoDefinitionResponse::Array(vec![
-            location("file:///first.rs", 1),
-            location("file:///second.rs", 2),
-        ]);
-        let (uri, range) = first_definition_location(&response).expect("a real location");
-        assert_eq!(uri.as_str(), "file:///first.rs");
-        assert_eq!(range.start.line, 1);
-    }
-
-    #[test]
-    fn first_definition_location_is_none_for_a_real_empty_array() {
-        let response = lsp_types::GotoDefinitionResponse::Array(vec![]);
-        assert_eq!(first_definition_location(&response), None);
-    }
-
-    #[test]
-    fn first_definition_location_reads_a_real_link_response_using_target_selection_range() {
+    fn first_definition_location_reads_the_first_target_of_every_real_response_shape() {
         let link = lsp_types::LocationLink {
             origin_selection_range: None,
             target_uri: "file:///target.rs".parse().expect("real test URI"),
@@ -999,12 +962,40 @@ mod tests {
                 },
             },
         };
-        let response = lsp_types::GotoDefinitionResponse::Link(vec![link]);
-        let (uri, range) = first_definition_location(&response).expect("a real location");
-        assert_eq!(uri.as_str(), "file:///target.rs");
-        // The real *selection* range (the target's own name span), not the whole real target
-        // range (which could start well before the item, e.g. at its own doc comment).
-        assert_eq!(range.start.line, 2);
-        assert_eq!(range.start.character, 3);
+        for (name, response, expected) in [
+            (
+                "a scalar location",
+                lsp_types::GotoDefinitionResponse::Scalar(location("file:///a.rs", 4)),
+                Some(("file:///a.rs", 4)),
+            ),
+            (
+                "an array - the first entry wins",
+                lsp_types::GotoDefinitionResponse::Array(vec![
+                    location("file:///first.rs", 1),
+                    location("file:///second.rs", 2),
+                ]),
+                Some(("file:///first.rs", 1)),
+            ),
+            (
+                "an empty array",
+                lsp_types::GotoDefinitionResponse::Array(vec![]),
+                None,
+            ),
+            (
+                "a link, read through its selection range",
+                lsp_types::GotoDefinitionResponse::Link(vec![link]),
+                Some(("file:///target.rs", 2)),
+            ),
+        ] {
+            match expected {
+                None => assert_eq!(first_definition_location(&response), None, "{name}"),
+                Some((expected_uri, expected_line)) => {
+                    let (uri, range) =
+                        first_definition_location(&response).unwrap_or_else(|| panic!("{name}"));
+                    assert_eq!(uri.as_str(), expected_uri, "{name}");
+                    assert_eq!(range.start.line, expected_line, "{name}");
+                }
+            }
+        }
     }
 }

@@ -4,9 +4,11 @@
 
 use super::*;
 #[cfg(test)]
-use crate::root::focus::palette_focus_tests;
+use crate::code_surface::fixtures::temp_repo;
 use crate::root::widgets::render_status_letter;
 use crate::settings::widgets::ChoiceOption;
+#[cfg(test)]
+use crate::test_support::open_test_app;
 
 impl AdeApp {
     /// A themed explanatory message for every [`DiffLoadState`] that isn't a loaded diff, as its
@@ -433,37 +435,19 @@ mod choice_control_dispatch_tests {
     use super::*;
     use gpui::TestAppContext;
 
-    fn git_repo(dir: &std::path::Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
     #[gpui::test]
     fn clicking_a_segment_by_structural_position_selects_the_matching_real_value(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        git_repo(repo.path(), &["init", "-b", "main"]);
-        git_repo(repo.path(), &["config", "user.email", "test@example.com"]);
-        git_repo(repo.path(), &["config", "user.name", "Test User"]);
+        let repo = temp_repo();
+        test_support::seed_empty_repo_at(repo.path());
         std::fs::write(repo.path().join("a.txt"), "1\n").expect("write a.txt");
-        git_repo(repo.path(), &["add", "."]);
-        git_repo(repo.path(), &["commit", "-m", "initial"]);
-        git_repo(repo.path(), &["checkout", "-b", "feature"]);
+        test_support::git(repo.path(), &["add", "."]);
+        test_support::git(repo.path(), &["commit", "-m", "initial"]);
+        test_support::git(repo.path(), &["checkout", "-b", "feature"]);
         std::fs::write(repo.path().join("a.txt"), "1\nchanged\n").expect("rewrite a.txt");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         app.update_in(cx, |app, window, cx| {
@@ -514,10 +498,10 @@ mod markdown_preview_toggle_tests {
 
     #[gpui::test]
     fn the_toggle_only_appears_for_a_real_md_file(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         std::fs::write(repo.path().join("readme.md"), "# hi\n").expect("write readme.md");
         std::fs::write(repo.path().join("main.rs"), "fn main() {}\n").expect("write main.rs");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         app.update_in(cx, |app, window, cx| {
@@ -541,14 +525,14 @@ mod markdown_preview_toggle_tests {
 
     #[gpui::test]
     fn clicking_preview_renders_the_real_parsed_document_with_no_panic(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         std::fs::write(
             repo.path().join("readme.md"),
             "# Title\n\nSome **bold** text, a [link](https://example.com), and:\n\n- one\n- two\n\n\
              ```rust\nfn main() {}\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n",
         )
         .expect("write readme.md");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         app.update_in(cx, |app, window, cx| {
@@ -590,10 +574,10 @@ mod markdown_preview_toggle_tests {
 
     #[gpui::test]
     fn opening_a_different_markdown_file_resets_the_toggle_back_to_source(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         std::fs::write(repo.path().join("a.md"), "# a\n").expect("write a.md");
         std::fs::write(repo.path().join("b.md"), "# b\n").expect("write b.md");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         app.update_in(cx, |app, window, cx| {
@@ -629,11 +613,11 @@ mod markdown_preview_toggle_tests {
     ) -> (
         gpui::Entity<AdeApp>,
         &'a mut gpui::VisualTestContext,
-        tempfile::TempDir,
+        crate::code_surface::fixtures::TempRepo,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = temp_repo();
         std::fs::write(repo.path().join("readme.md"), contents).expect("write readme.md");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(repo.path().join("readme.md"), window, cx);

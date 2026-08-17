@@ -1329,16 +1329,7 @@ mod worktree_tests {
 #[cfg(test)]
 mod layered_exclude_tests {
     use super::*;
-    use std::process::Command;
-
-    fn git(dir: &Path, args: &[&str]) {
-        let status = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .status()
-            .expect("git runs");
-        assert!(status.success(), "git {args:?} failed");
-    }
+    use test_support::{git, seed_empty_repo_at};
 
     /// A real git worktree with:
     /// - `target/`, a real `.gitignore`d build directory sized enough that including it would
@@ -1352,9 +1343,7 @@ mod layered_exclude_tests {
     fn fixture() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("a temp worktree");
         let root = dir.path();
-        git(root, &["init", "-q"]);
-        git(root, &["config", "user.email", "t@example.com"]);
-        git(root, &["config", "user.name", "Test"]);
+        seed_empty_repo_at(root);
 
         let write = |relative: &str, content: &str| {
             let path = root.join(relative);
@@ -1484,9 +1473,7 @@ mod layered_exclude_tests {
     fn an_ungitignored_build_directory_is_excluded_in_both_toggle_states() {
         let dir = tempfile::tempdir().expect("a temp worktree");
         let root = dir.path();
-        git(root, &["init", "-q"]);
-        git(root, &["config", "user.email", "t@example.com"]);
-        git(root, &["config", "user.name", "Test"]);
+        seed_empty_repo_at(root);
         let write = |relative: &str, content: &str| {
             let path = root.join(relative);
             fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");

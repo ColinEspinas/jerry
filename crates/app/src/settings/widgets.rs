@@ -650,79 +650,42 @@ impl ChoiceOption {
 #[cfg(test)]
 mod open_command_tests {
     use super::open_command_for;
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
     use std::path::Path;
 
     fn os_strings(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
     }
 
+    /// Every platform's real command, for both target shapes this is genuinely reused for: a
+    /// local settings path, and the Language servers page's `https://` install URL
+    /// (`AdeApp::open_install_url`). An unrecognized OS falls back to `xdg-open` rather than
+    /// failing.
+    ///
+    /// Windows' empty-string argument is load-bearing, not incidental - see
+    /// [`open_command_for`]'s own docs: without it, `start` treats the target itself as its
+    /// window-title argument.
     #[test]
-    fn macos_uses_the_real_open_command() {
-        let (program, args) =
-            open_command_for("macos", Path::new("/home/x/settings.toml").as_os_str());
-        assert_eq!(program, "open");
-        assert_eq!(args, os_strings(&["/home/x/settings.toml"]));
-    }
-
-    #[test]
-    fn windows_uses_cmd_start_with_a_required_empty_title_argument() {
-        let (program, args) = open_command_for(
-            "windows",
+    fn every_platform_opens_every_real_target_with_its_own_command() {
+        const URL: &str = "https://rust-analyzer.github.io/book/rust_analyzer_binary.html";
+        for target in [
+            Path::new("/home/x/settings.toml").as_os_str(),
             Path::new(r"C:\Users\x\settings.toml").as_os_str(),
-        );
-        assert_eq!(program, "cmd");
-        // The empty string is load-bearing, not incidental - see `open_command_for`'s docs:
-        // without it, `start` would treat the path itself as its window-title argument.
-        assert_eq!(
-            args,
-            os_strings(&["/c", "start", "", r"C:\Users\x\settings.toml"])
-        );
-    }
-
-    #[test]
-    fn linux_uses_the_real_xdg_open_command() {
-        let (program, args) =
-            open_command_for("linux", Path::new("/home/x/settings.toml").as_os_str());
-        assert_eq!(program, "xdg-open");
-        assert_eq!(args, os_strings(&["/home/x/settings.toml"]));
-    }
-
-    #[test]
-    fn an_unrecognized_target_os_falls_back_to_xdg_open() {
-        let (program, _) = open_command_for("freebsd", Path::new("/x").as_os_str());
-        assert_eq!(program, "xdg-open");
-    }
-
-    #[test]
-    fn every_platform_command_works_unchanged_for_a_real_url_target() {
-        let url =
-            std::ffi::OsStr::new("https://rust-analyzer.github.io/book/rust_analyzer_binary.html");
-
-        let (program, args) = open_command_for("macos", url);
-        assert_eq!(program, "open");
-        assert_eq!(
-            args,
-            os_strings(&["https://rust-analyzer.github.io/book/rust_analyzer_binary.html"])
-        );
-
-        let (program, args) = open_command_for("windows", url);
-        assert_eq!(program, "cmd");
-        assert_eq!(
-            args,
-            os_strings(&[
-                "/c",
-                "start",
-                "",
-                "https://rust-analyzer.github.io/book/rust_analyzer_binary.html"
-            ])
-        );
-
-        let (program, args) = open_command_for("linux", url);
-        assert_eq!(program, "xdg-open");
-        assert_eq!(
-            args,
-            os_strings(&["https://rust-analyzer.github.io/book/rust_analyzer_binary.html"])
-        );
+            OsStr::new(URL),
+        ] {
+            let raw = target.to_string_lossy().into_owned();
+            for (os, program, args) in [
+                ("macos", "open", os_strings(&[&raw])),
+                ("windows", "cmd", os_strings(&["/c", "start", "", &raw])),
+                ("linux", "xdg-open", os_strings(&[&raw])),
+                ("freebsd", "xdg-open", os_strings(&[&raw])),
+            ] {
+                assert_eq!(
+                    open_command_for(os, target),
+                    (program, args),
+                    "{os} / {raw}"
+                );
+            }
+        }
     }
 }

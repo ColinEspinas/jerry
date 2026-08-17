@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 # PreToolUse:Bash hook. Runs CLAUDE.md's pre-commit gate - the structural ratchet
-# (check-conventions.sh), fmt --check, and clippy -D warnings - before a `git commit` command
-# executes, so a lint-failing or convention-regressing change never lands in history.
-# `cargo test --workspace` is intentionally not part of this gate (or `/check`'s) right now -
-# GitHub issue #348 tracks why and getting it back. Run tests relevant to your change manually.
+# (check-conventions.sh), fmt --check, clippy -D warnings, and the `unit`/`ui` test tiers - before
+# a `git commit` command executes, so a lint-failing, convention-regressing or test-breaking
+# change never lands in history.
+#
+# Tests run through `cargo nextest`, not `cargo test`: per-test processes plus
+# `.config/nextest.toml`'s `slow-timeout` mean one hung test is a named failure rather than a hook
+# that never returns. The `external` tier is `#[ignore]`d and skipped by default (docs/testing.md).
 #
 # Exit code contract, matching Claude Code's PreToolUse protocol: this hook must NEVER hard-fail
 # in a way that blocks work for a reason unrelated to the gate itself. Missing `jq`, missing
-# `cargo`, or a command that isn't a git commit all exit 0 (allow, unmodified) rather than error.
-# Only a genuine fmt/clippy failure produces a deny decision.
+# `cargo`, missing `cargo-nextest`, or a command that isn't a git commit all exit 0 (allow,
+# unmodified) rather than error. Only a genuine fmt/clippy/test failure produces a deny decision.
 
 set -u
 
@@ -36,10 +39,24 @@ fi
 if [ -z "$FAIL" ] && command -v cargo &>/dev/null; then
   cargo clippy --workspace --all-targets -- -D warnings >/tmp/jerry-precommit-clippy.log 2>&1 || FAIL="clippy"
 fi
+# `cargo-nextest` is a separate binary, not part of a rustup toolchain: a contributor who hasn't
+# run `/setup` yet skips this step rather than being blocked by it, per this file's exit contract.
+# The skip is announced, not silent - a gate that quietly drops its only behavioural check reads as
+# a passing gate.
+if [ -z "$FAIL" ] && command -v cargo &>/dev/null; then
+  if command -v cargo-nextest &>/dev/null; then
+    cargo nextest run --workspace >/tmp/jerry-precommit-nextest.log 2>&1 || FAIL="nextest"
+  else
+    echo "pre-commit-check: cargo-nextest missing - tests NOT run for this commit." >&2
+    echo "  cargo install cargo-nextest --locked   (or run /setup)" >&2
+  fi
+fi
 
 if [ -n "$FAIL" ]; then
   if [ "$FAIL" = "conventions" ]; then
     REASON="the convention ratchet failed - see /tmp/jerry-precommit-conventions.log."
+  elif [ "$FAIL" = "nextest" ]; then
+    REASON="cargo nextest run --workspace failed - see /tmp/jerry-precommit-nextest.log. Run /check before committing."
   else
     REASON="cargo $FAIL failed - see /tmp/jerry-precommit-$FAIL.log. Run /check before committing."
   fi

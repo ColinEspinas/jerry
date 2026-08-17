@@ -24,3 +24,22 @@ pub mod sections;
 
 pub(crate) mod render;
 pub(crate) mod tree_ops;
+
+/// Fixtures shared by this folder's own test modules.
+#[cfg(test)]
+pub(in crate::sidebar) mod fixtures {
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    /// A scratch directory, plus the path every assertion about it must be written against.
+    ///
+    /// `AdeApp` resolves each repository path it is handed (`crate::rail::repo::canonical_repo_path`),
+    /// so on macOS - where `TMPDIR` lives under `/var/folders`, a symlink to `/private/var/folders` -
+    /// a test that builds expectations out of `TempDir::path()` is comparing unresolved paths
+    /// against the resolved ones the app actually holds, and matches nothing.
+    pub(in crate::sidebar) fn temp_root() -> (TempDir, PathBuf) {
+        let dir = TempDir::new().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonicalize tempdir");
+        (dir, root)
+    }
+}

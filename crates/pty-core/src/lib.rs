@@ -701,9 +701,11 @@ impl Drop for PtySession {
     }
 }
 
-/// The direct children of `pid`, from Linux's `/proc`. Best-effort: an unreadable file - a gone
-/// process, a non-Linux unix - is an empty list rather than an error.
-#[cfg(unix)]
+/// Reads the current direct children of `pid` from Linux's `/proc/<pid>/task/<pid>/children`.
+/// Best-effort: returns an empty list if the file can't be read (process already gone,
+/// a unix without procfs, permissions, etc.) rather than erroring - this is used for cleanup,
+/// where "found nothing to additionally clean up" is an acceptable fallback.
+#[cfg(all(unix, not(target_os = "macos")))]
 fn child_pids_of(pid: u32) -> Vec<u32> {
     let path = PathBuf::from(format!("/proc/{pid}/task/{pid}/children"));
     std::fs::read_to_string(&path)
@@ -716,10 +718,57 @@ fn child_pids_of(pid: u32) -> Vec<u32> {
         .unwrap_or_default()
 }
 
-/// Breadth-first, depth-capped walk of `root_pid`'s descendants.
+/// Reads the current direct children of `pid` from macOS's `libproc`, which has no `/proc` for
+/// the branch above to read. Best-effort in exactly the same way: an empty list, never an
+/// error, when the process is already gone or cannot be queried.
 ///
-/// Must run *before* any signal: reading it once a process is dying races the kernel reparenting
-/// its children out from under the file.
+/// `proc_listchildpids` returns the number of pids it wrote and truncates *silently* when the
+/// buffer is too small - it reports the capacity it filled with no error of any kind - so a
+/// completely full buffer is retried at double the capacity rather than trusted to be complete.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn child_pids_of(pid: u32) -> Vec<u32> {
+    // A parent with more direct children than this is pathological, not a real agent process
+    // tree; the doubling below stops here rather than growing without bound.
+    const MAX_CAPACITY: usize = 4096;
+
+    let Ok(ppid) = libc::pid_t::try_from(pid) else {
+        return Vec::new();
+    };
+
+    let mut capacity = 64usize;
+    loop {
+        let mut buffer: Vec<libc::pid_t> = vec![0; capacity];
+        let buffer_bytes = capacity * std::mem::size_of::<libc::pid_t>();
+
+        // SAFETY: `proc_listchildpids` writes at most `buffersize` bytes through the buffer
+        // pointer, which addresses a live, uniquely borrowed `Vec` allocation of exactly
+        // `buffer_bytes` bytes for the whole call and is not retained by the callee. The cast
+        // is the one Apple's own header requires - the parameter is a bare `void *`. It reports
+        // how many pids it wrote, or 0 on failure, and never a negative count.
+        let written = unsafe {
+            libc::proc_listchildpids(
+                ppid,
+                buffer.as_mut_ptr().cast::<libc::c_void>(),
+                buffer_bytes as libc::c_int,
+            )
+        };
+
+        let written = usize::try_from(written).unwrap_or(0).min(capacity);
+        if written < capacity || capacity == MAX_CAPACITY {
+            buffer.truncate(written);
+            return buffer
+                .into_iter()
+                .filter_map(|child| u32::try_from(child).ok())
+                .collect();
+        }
+        capacity = (capacity * 2).min(MAX_CAPACITY);
+    }
+}
+
+/// Breadth-first, depth-capped walk of `root_pid`'s descendant tree via [`child_pids_of`]. Must
+/// be called *before* signaling anything: reading it after a process starts dying races
+/// against the kernel reparenting its children out from under it.
 #[cfg(unix)]
 fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
     let mut discovered = Vec::new();
@@ -745,9 +794,21 @@ fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
     discovered
 }
 
+/// Whether `pid` is still a live (or zombie-but-unreaped) process, via the portable POSIX
+/// `kill(pid, 0)` existence probe - no procfs, so this answers the same on every unix.
+///
+/// `EPERM` counts as "exists": the kernel only reports it for a process that is genuinely
+/// there but not signalable by this user, and treating that as gone would make
+/// [`terminate_process_tree`]'s grace loop declare victory over something still running.
 #[cfg(unix)]
 fn pid_exists(pid: u32) -> bool {
-    PathBuf::from(format!("/proc/{pid}")).exists()
+    let Ok(raw) = i32::try_from(pid) else {
+        return false;
+    };
+    match nix::sys::signal::kill(nix::unistd::Pid::from_raw(raw), None) {
+        Ok(()) => true,
+        Err(errno) => errno == nix::errno::Errno::EPERM,
+    }
 }
 
 /// Terminates `root_pid`'s process group *and* any descendants that escaped it: `SIGHUP`, up to
@@ -789,12 +850,27 @@ fn terminate_process_tree(root_pid: u32, grace: Duration) {
 }
 
 #[cfg(test)]
-mod tests {
+mod pty_session_tests {
     use super::*;
     use std::sync::mpsc::RecvTimeoutError;
     use std::time::{Duration, Instant};
 
-    /// Reads until `needle` appears or `timeout` elapses, returning what was collected either way.
+    /// How long a real child process is given to reach a state before a test calls it a
+    /// failure. Generous: it has to survive a full-suite run where other tests' own child
+    /// processes are competing for the same cores. `test_support::wait_until` returns as soon as
+    /// the condition holds, so an idle machine pays none of it.
+    ///
+    /// `#[cfg(unix)]` because every one of its use sites is: the process-tree teardown and
+    /// SIGSTOP/SIGCONT state assertions this bounds have no Windows twin (see this module's own
+    /// header). Without the gate it is dead code on Windows - which nothing caught until clippy
+    /// started running on that target.
+    #[cfg(unix)]
+    const TEARDOWN_DEADLINE: Duration = Duration::from_secs(5);
+
+    /// Reads from `session.output()` until `needle` appears in the accumulated (lossy
+    /// UTF-8) output or `timeout` elapses, returning whatever was collected either way.
+    /// Returns as soon as the needle is found rather than always waiting out the full
+    /// timeout, so tests aren't needlessly slow.
     fn drain_until_contains(session: &PtySession, needle: &str, timeout: Duration) -> Vec<u8> {
         let mut collected = Vec::new();
         let deadline = Instant::now() + timeout;
@@ -883,7 +959,7 @@ mod tests {
         }
 
         let text = String::from_utf8(collected).expect("`seq` output is plain ASCII");
-        let normalized = text.replace("\r\n", "\n");
+        let normalized = text.replace('\r', "");
         let lines: Vec<&str> = normalized.trim_end_matches('\n').split('\n').collect();
 
         assert_eq!(
@@ -905,6 +981,41 @@ mod tests {
         }
     }
 
+    /// The two answers [`pid_exists`] has to get right for every teardown assertion below to
+    /// mean anything: a process that is genuinely running, and one that has already been
+    /// reaped.
+    ///
+    /// unix-only: uses `pid_exists` directly, which is a `#[cfg(unix)]` helper function (see
+    /// the crate-level "Platform scope" docs).
+    #[cfg(unix)]
+    #[test]
+    fn pid_exists_separates_a_live_process_from_a_reaped_one() {
+        assert!(
+            pid_exists(std::process::id()),
+            "this very test process is unambiguously alive"
+        );
+
+        // `ChildGuard` even though this child is expected to exit on its own and is reaped
+        // explicitly below: if the assertion above ever fails, the unwind must still not leave a
+        // process behind (`docs/testing.md`'s teardown rule).
+        let mut command = std::process::Command::new("true");
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child =
+            test_support::ChildGuard::spawn(&mut command).expect("spawning `true` should succeed");
+        let pid = child.id();
+        child.wait().expect("reaping `true` should succeed");
+
+        assert!(
+            !pid_exists(pid),
+            "pid {pid} was reaped, so it should read as gone rather than alive"
+        );
+    }
+
+    // unix-only: uses pid_exists/is_executable directly, which are #[cfg(unix)]
+    // helper functions (see the crate-level "Platform scope" docs).
     #[cfg(unix)]
     #[test]
     fn drop_kills_child_and_it_does_not_become_an_orphan() {
@@ -922,15 +1033,11 @@ mod tests {
 
         drop(session);
 
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while pid_exists(pid) {
-            assert!(
-                Instant::now() < deadline,
-                "child pid {pid} was still alive {:?} after PtySession was dropped - orphaned process",
-                deadline.elapsed()
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        assert!(
+            test_support::wait_until(TEARDOWN_DEADLINE, || !pid_exists(pid)),
+            "child pid {pid} was still alive {TEARDOWN_DEADLINE:?} after PtySession was dropped \
+             - orphaned process"
+        );
     }
 
     #[cfg(unix)]
@@ -941,7 +1048,7 @@ mod tests {
         let session = spawn(
             SpawnOptions::new("sh")
                 .arg("-c")
-                .arg("setsid sleep 100 & echo GRANDCHILD:$!; exec sleep 300"),
+                .arg("set -m; sleep 100 & echo GRANDCHILD:$!; exec sleep 300"),
         )
         .expect("spawning the shell pipeline should succeed");
 
@@ -962,18 +1069,23 @@ mod tests {
             pid_exists(grandchild_pid),
             "detached grandchild {grandchild_pid} should be alive before drop"
         );
+        // `pid_exists` alone would also be satisfied by an unreaped zombie, which is what this
+        // test degraded into on macOS before; the walk only lists a pid the kernel still
+        // reports as a child, and it is the mechanism actually under test here.
+        assert!(
+            collect_descendant_pids(direct_pid).contains(&grandchild_pid),
+            "the descendant walk should discover the detached grandchild {grandchild_pid} \
+             under direct child {direct_pid} - without it, `Drop` has no way to reach it"
+        );
 
         drop(session);
 
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while pid_exists(direct_pid) || pid_exists(grandchild_pid) {
-            assert!(
-                Instant::now() < deadline,
-                "direct child ({direct_pid}) or its escaped grandchild ({grandchild_pid}) was \
-                 still alive after PtySession was dropped - orphaned process"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        assert!(
+            test_support::wait_until(TEARDOWN_DEADLINE, || !pid_exists(direct_pid)
+                && !pid_exists(grandchild_pid)),
+            "direct child ({direct_pid}) or its escaped grandchild ({grandchild_pid}) was still \
+             alive {TEARDOWN_DEADLINE:?} after PtySession was dropped - orphaned process"
+        );
     }
 
     #[cfg(unix)]
@@ -1012,44 +1124,34 @@ mod tests {
             .process_id()
             .expect("a spawned unix child should report a pid");
 
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !proc_state(pid).starts_with('S') && !proc_state(pid).starts_with('R') {
-            assert!(
-                Instant::now() < deadline,
-                "process never reached a steady state"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let steady = |pid| {
+            let state = proc_state(pid);
+            state.starts_with('S') || state.starts_with('R')
+        };
+
+        // Give the kernel a moment to settle the freshly spawned process into a steady
+        // running/sleeping state before asserting anything about it.
+        assert!(
+            test_support::wait_until(TEARDOWN_DEADLINE, || steady(pid)),
+            "process {pid} never reached a steady state - last observed state: {:?}",
+            proc_state(pid)
+        );
 
         session.pause().expect("pause should succeed");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let state = proc_state(pid);
-            if state.starts_with('T') {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "process {pid} never reached the real kernel-reported stopped state \
-                 (State: T) after pause() - last observed state: {state:?}"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        assert!(
+            test_support::wait_until(TEARDOWN_DEADLINE, || proc_state(pid).starts_with('T')),
+            "process {pid} never reached the real kernel-reported stopped state (State: T) after \
+             pause() - last observed state: {:?}",
+            proc_state(pid)
+        );
 
         session.resume().expect("resume should succeed");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let state = proc_state(pid);
-            if state.starts_with('S') || state.starts_with('R') {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "process {pid} never left the real kernel-reported stopped state after \
-                 resume() - last observed state: {state:?}"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        assert!(
+            test_support::wait_until(TEARDOWN_DEADLINE, || steady(pid)),
+            "process {pid} never left the real kernel-reported stopped state after resume() - \
+             last observed state: {:?}",
+            proc_state(pid)
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -1066,18 +1168,11 @@ mod tests {
         }
 
         fn wait_for_state(pid: u32, prefix: char, what: &str) {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                let state = proc_state(pid);
-                if state.starts_with(prefix) {
-                    return;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "process {pid} never reached {what} - last observed state: {state:?}"
-                );
-                std::thread::sleep(Duration::from_millis(20));
-            }
+            assert!(
+                test_support::wait_until(TEARDOWN_DEADLINE, || proc_state(pid).starts_with(prefix)),
+                "process {pid} never reached {what} - last observed state: {:?}",
+                proc_state(pid)
+            );
         }
 
         let session = spawn(
@@ -1119,15 +1214,13 @@ mod tests {
     #[test]
     fn pause_and_resume_are_a_harmless_no_op_once_the_child_has_already_exited() {
         let mut session = spawn(SpawnOptions::new("true")).expect("spawning `true`");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while session
-            .try_wait()
-            .expect("try_wait should not error")
-            .is_none()
-        {
-            assert!(Instant::now() < deadline, "`true` never exited");
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        assert!(
+            test_support::wait_until(TEARDOWN_DEADLINE, || session
+                .try_wait()
+                .expect("try_wait should not error")
+                .is_some()),
+            "`true` never exited"
+        );
         session
             .pause()
             .expect("pause on an already-exited child must be a harmless no-op");
@@ -1177,18 +1270,24 @@ mod tests {
         let _session = spawn(SpawnOptions::new("yes")).expect("spawning `yes` should succeed");
 
         let rss_before = read_self_rss_kb();
-        // Deliberately undrained while `yes` floods the pty. Unbounded, this measured ~3.4MB ->
-        // ~127MB of RSS in 3s; bounded, the reader blocks in `send`, which backpressures its
-        // `read`, fills the kernel buffer, and blocks `yes`'s `write`.
-        std::thread::sleep(Duration::from_millis(500));
-        let rss_after = read_self_rss_kb();
-
-        let growth_kb = rss_after.saturating_sub(rss_before);
+        // Deliberately don't drain `session.output()` while `yes` floods the pty as
+        // fast as it can. With an unbounded channel this measurably grows RSS (an
+        // earlier version of this crate measured ~3.4MB -> ~127MB in 3s against a
+        // comparable undrained producer); with the bounded `sync_channel`, the reader
+        // thread blocks in `send` once the channel fills, which backpressures its
+        // `read`, which fills the kernel pty buffer, which blocks `yes`'s `write` - so
+        // growth should stay small and bounded.
+        //
+        // `stays_false` rather than a bare sleep-then-measure: it holds the same 500ms window
+        // open while asserting the bound *continuously*, so a transient spike is caught too.
         assert!(
-            growth_kb < 20_000,
-            "RSS grew by {growth_kb} kB while an undrained `yes` pipe ran for 500ms - \
-             the output channel does not appear to be backpressuring (expected growth \
-             bounded by the channel capacity, well under 20MB)"
+            test_support::stays_false(Duration::from_millis(500), || {
+                read_self_rss_kb().saturating_sub(rss_before) >= 20_000
+            }),
+            "RSS grew by {} kB while an undrained `yes` pipe ran for 500ms - the output channel \
+             does not appear to be backpressuring (expected growth bounded by the channel \
+             capacity, well under 20MB)",
+            read_self_rss_kb().saturating_sub(rss_before)
         );
     }
 

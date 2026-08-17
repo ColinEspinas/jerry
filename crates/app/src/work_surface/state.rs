@@ -538,81 +538,53 @@ mod tests {
         assert!(same(colors.bg, theme::lang::RS.1.into()));
     }
 
+    /// Inactive is one neutral for every chip kind - agent, shell and file tab alike - so a
+    /// background tab never advertises its own identity colour.
     #[test]
-    fn an_inactive_file_tab_chip_is_dimmed_to_the_same_neutral_a_agent_tab_chip_uses() {
+    fn an_inactive_chip_is_always_the_same_neutral_whatever_kind_it_is() {
         let rs = LangChip {
             label: "rs",
             fg: theme::lang::RS.0.into(),
             bg: theme::lang::RS.1.into(),
         };
-        let file_colors = file_tab_chip_colors(rs, false);
-        let agent_colors = tab_chip_colors(ProcessKind::Shell, false);
-        assert!(same(file_colors.bg, agent_colors.bg));
-        assert!(same(file_colors.fg, agent_colors.fg));
-    }
-
-    #[test]
-    fn an_inactive_chip_is_always_dimmed_to_the_same_neutral_regardless_of_kind() {
-        let claude = tab_chip_colors(ProcessKind::claude(), false);
         let shell = tab_chip_colors(ProcessKind::Shell, false);
-        assert!(same(claude.bg, shell.bg));
-        assert!(same(claude.fg, shell.fg));
-        assert!(same(claude.bg, theme::border::ZONE.into()));
+        for other in [
+            tab_chip_colors(ProcessKind::claude(), false),
+            file_tab_chip_colors(rs, false),
+        ] {
+            assert!(same(other.bg, shell.bg));
+            assert!(same(other.fg, shell.fg));
+        }
+        assert!(same(shell.bg, theme::border::ZONE.into()));
     }
 
+    /// An active tab's underline matches its own background - that is how it visually merges
+    /// into the surface below it (`design_handoff_jerry_ade/README.md`) - while an inactive one
+    /// is transparent and carries a different underline entirely.
     #[test]
-    fn active_tab_background_and_underline_are_the_same_colour_so_it_merges_into_the_surface() {
+    fn an_active_tab_merges_into_the_surface_and_an_inactive_one_does_not() {
         let active = tab_colors(true);
-        assert!(
-            same(active.bg, active.underline),
-            "an active tab's underline must match its own background - that's how it visually \
-             merges into the surface below it, per design_handoff_jerry_ade/README.md"
-        );
-    }
-
-    #[test]
-    fn inactive_tab_background_is_transparent_not_the_active_colour() {
         let inactive = tab_colors(false);
+        assert!(same(active.bg, active.underline));
         assert!(same(inactive.bg, TRANSPARENT));
-        assert!(!same(inactive.underline, tab_colors(true).underline));
+        assert!(!same(inactive.underline, active.underline));
     }
 
+    /// Every state a pty footer can honestly report, in one table: never started, exited with
+    /// its real code, and the three attached states the status drives.
     #[test]
-    fn a_process_that_never_started_reports_not_started_not_a_false_exit() {
-        assert_eq!(pty_state_label(false, Status::Idle, None), "not started");
-    }
-
-    #[test]
-    fn an_exited_process_always_reports_its_real_exit_code() {
-        assert_eq!(
-            pty_state_label(false, Status::Fail, Some(101)),
-            "exited 101"
-        );
-        assert_eq!(pty_state_label(false, Status::Review, Some(0)), "exited 0");
-    }
-
-    #[test]
-    fn a_running_agent_past_the_ask_threshold_reports_waiting_on_stdin() {
-        assert_eq!(
-            pty_state_label(true, Status::Ask, None),
-            "attached \u{b7} waiting on stdin"
-        );
-    }
-
-    #[test]
-    fn a_running_and_recently_active_agent_reports_streaming() {
-        assert_eq!(
-            pty_state_label(true, Status::Run, None),
-            "attached \u{b7} streaming"
-        );
-    }
-
-    #[test]
-    fn a_running_idle_shell_reports_idle_not_streaming_or_exited() {
-        assert_eq!(
-            pty_state_label(true, Status::Idle, None),
-            "attached \u{b7} idle"
-        );
+    fn the_pty_state_label_names_each_real_state_it_can_be_in() {
+        let cases: &[(bool, Status, Option<u32>, &str)] = &[
+            (false, Status::Idle, None, "not started"),
+            (false, Status::Fail, Some(101), "exited 101"),
+            (false, Status::Review, Some(0), "exited 0"),
+            (true, Status::Ask, None, "attached \u{b7} waiting on stdin"),
+            (true, Status::Run, None, "attached \u{b7} streaming"),
+            (true, Status::Idle, None, "attached \u{b7} idle"),
+        ];
+        for (running, status, code, expected) in cases {
+            assert_eq!(pty_state_label(*running, *status, *code), *expected);
+        }
     }
 
     #[test]
@@ -629,19 +601,20 @@ mod tests {
         }
     }
 
+    /// §4r, verbatim: "a finished transcript is a record; its actions live where their object
+    /// lives" - `Review` keeps none of `Keep all`, `Review`, `Open in editor`, `Discard
+    /// worktree`. §4e: `Interrupt` on an agent that is *waiting for you* has nothing to
+    /// interrupt, and `Open terminal` opens a *different* terminal, which does not answer the
+    /// question the agent is asking. §4t: `⌃C` in the focused pty is the interrupt, so the
+    /// button duplicating it is deleted from `Run` too.
     #[test]
-    fn a_finished_agent_offers_no_footer_actions_at_all() {
-        assert!(footer_actions(Status::Review).is_empty());
-    }
-
-    #[test]
-    fn an_asking_agent_offers_no_footer_actions_at_all() {
-        assert!(footer_actions(Status::Ask).is_empty());
-    }
-
-    #[test]
-    fn a_running_agent_offers_no_footer_actions_at_all() {
-        assert!(footer_actions(Status::Run).is_empty());
+    fn a_finished_asking_or_running_agent_offers_no_footer_actions_at_all() {
+        for status in [Status::Review, Status::Ask, Status::Run] {
+            assert!(
+                footer_actions(status).is_empty(),
+                "{status:?} must offer no footer action at all"
+            );
+        }
     }
 
     #[test]
@@ -696,27 +669,21 @@ mod tests {
     }
 
     #[test]
-    fn a_live_title_is_the_whole_tab_label_with_nothing_appended() {
-        assert_eq!(
-            live_tab_label(Some("\u{2733} Claude Code"), "claude"),
-            "\u{2733} Claude Code"
-        );
-        assert_eq!(live_tab_label(Some("~/src/jerry"), "zsh"), "~/src/jerry");
-    }
-
-    #[test]
-    fn a_pane_whose_process_has_set_no_title_falls_back_to_its_program_name() {
-        assert_eq!(live_tab_label(None, "zsh"), "zsh");
-    }
-
-    #[test]
-    fn an_empty_or_whitespace_title_falls_back_rather_than_rendering_a_blank_tab() {
-        assert_eq!(live_tab_label(Some(""), "bash"), "bash");
-        assert_eq!(live_tab_label(Some("   "), "bash"), "bash");
-    }
-
-    #[test]
-    fn two_panes_reporting_the_same_title_get_the_same_label() {
+    fn a_tab_label_is_the_live_title_verbatim_or_the_program_name() {
+        let cases: &[(Option<&str>, &str, &str)] = &[
+            (
+                Some("\u{2733} Claude Code"),
+                "claude",
+                "\u{2733} Claude Code",
+            ),
+            (Some("~/src/jerry"), "zsh", "~/src/jerry"),
+            (None, "zsh", "zsh"),
+            (Some(""), "bash", "bash"),
+            (Some("   "), "bash", "bash"),
+        ];
+        for (title, program, expected) in cases {
+            assert_eq!(live_tab_label(*title, program), *expected);
+        }
         assert_eq!(
             live_tab_label(Some("nvim"), "zsh"),
             live_tab_label(Some("nvim"), "bash"),
@@ -727,17 +694,13 @@ mod tests {
     fn the_new_agent_menu_row_shows_the_real_branch_never_a_model_name() {
         assert_eq!(
             new_agent_menu_secondary_text(Some("feature/real-branch")),
-            "runs in feature/real-branch"
+            "runs in feature/real-branch",
         );
         assert_ne!(
             new_agent_menu_secondary_text(Some("feature/real-branch")),
             "Claude",
             "must never show a model/agent-kind label in place of the branch"
         );
-    }
-
-    #[test]
-    fn the_new_agent_menu_row_falls_back_to_detached_with_no_recorded_branch() {
         assert_eq!(new_agent_menu_secondary_text(None), "runs in (detached)");
     }
 
@@ -833,46 +796,38 @@ mod tests {
         );
     }
 
+    /// The three payload-free singleton tabs - the graph (GitHub issue #93), the review tab
+    /// (#225) and the run transcript (#227) - are ordinary members of the same order every other
+    /// kind is in: appended last when freshly opened rather than pinned to a hardcoded position,
+    /// kept wherever a real drag put them, and dropped when closed rather than left dangling for
+    /// `crate::root::AdeApp::render_tab_strip` to render a tab that no longer exists.
     #[test]
-    fn reconcile_appends_a_freshly_opened_graph_tab() {
-        let order = reconcile_tab_order(&[], &[1], &[], true, None, false);
-        assert_eq!(order, vec![TabRef::Agent(1), TabRef::Graph]);
-    }
+    fn reconcile_treats_every_singleton_tab_kind_like_any_other() {
+        let kinds: &[(TabRef, bool, Option<AgentId>, bool)] = &[
+            (TabRef::Graph, true, None, false),
+            (TabRef::Review(1), false, Some(1), false),
+            (TabRef::Run, false, None, true),
+        ];
+        for (tab, graph_open, review_open, run_open) in kinds {
+            assert_eq!(
+                reconcile_tab_order(&[], &[1], &[], *graph_open, *review_open, *run_open),
+                vec![TabRef::Agent(1), tab.clone()],
+                "a freshly opened {tab:?} lands last, like every other new tab"
+            );
 
-    #[test]
-    fn reconcile_preserves_a_stored_graph_tab_position() {
-        let stored = vec![TabRef::Graph, TabRef::Agent(1)];
-        let order = reconcile_tab_order(&stored, &[1], &[], true, None, false);
-        assert_eq!(order, stored);
-    }
+            let stored = vec![tab.clone(), TabRef::Agent(1)];
+            assert_eq!(
+                reconcile_tab_order(&stored, &[1], &[], *graph_open, *review_open, *run_open),
+                stored,
+                "and a dragged position for {tab:?} is honoured rather than re-appended"
+            );
 
-    #[test]
-    fn reconcile_drops_a_closed_graph_tab() {
-        let stored = vec![TabRef::Agent(1), TabRef::Graph];
-        let order = reconcile_tab_order(&stored, &[1], &[], false, None, false);
-        assert_eq!(order, vec![TabRef::Agent(1)]);
-    }
-
-    #[test]
-    fn reconcile_appends_a_freshly_opened_review_tab() {
-        let order = reconcile_tab_order(&[], &[1], &[], false, Some(1), false);
-        assert_eq!(order, vec![TabRef::Agent(1), TabRef::Review(1)]);
-    }
-
-    #[test]
-    fn reconcile_preserves_a_stored_review_tab_position() {
-        let stored = vec![TabRef::Review(1), TabRef::Agent(1)];
-        assert_eq!(
-            reconcile_tab_order(&stored, &[1], &[], false, Some(1), false),
-            stored
-        );
-    }
-
-    #[test]
-    fn reconcile_drops_a_closed_review_tab() {
-        let stored = vec![TabRef::Agent(1), TabRef::Review(1)];
-        let order = reconcile_tab_order(&stored, &[1], &[], false, None, false);
-        assert_eq!(order, vec![TabRef::Agent(1)]);
+            assert_eq!(
+                reconcile_tab_order(&stored, &[1], &[], false, None, false),
+                vec![TabRef::Agent(1)],
+                "a closed {tab:?} is dropped, not left dangling in the strip"
+            );
+        }
     }
 
     #[test]
@@ -1014,7 +969,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_slide_offsets_is_empty_when_the_drop_lands_on_the_tabs_own_already_adjacent_slot() {
+    fn tab_slide_offsets_is_empty_for_every_real_no_op() {
         let order = vec![
             TabRef::Agent(1),
             TabRef::Agent(2),
@@ -1023,27 +978,23 @@ mod tests {
         ];
         let width = px(25.0);
 
-        let slides = tab_slide_offsets(&order, &TabRef::Agent(1), &TabRef::Agent(2), false, width);
-
-        assert!(slides.is_empty());
-    }
-
-    #[test]
-    fn tab_slide_offsets_is_empty_for_every_move_tab_order_no_op() {
-        let order = vec![TabRef::Agent(1), TabRef::Agent(2)];
-        let width = px(40.0);
-
-        assert!(
-            tab_slide_offsets(&order, &TabRef::Agent(1), &TabRef::Agent(1), false, width)
-                .is_empty()
-        );
-        assert!(
-            tab_slide_offsets(&order, &TabRef::Agent(99), &TabRef::Agent(1), false, width)
-                .is_empty()
-        );
-        assert!(
-            tab_slide_offsets(&order, &TabRef::Agent(1), &TabRef::Agent(99), false, width)
-                .is_empty()
-        );
+        for (dragged, target, after, why) in [
+            (1, 2, false, "the tab's own already-adjacent slot"),
+            (1, 1, false, "a tab dropped onto itself"),
+            (99, 1, false, "an unknown dragged entry"),
+            (1, 99, false, "an unknown target"),
+        ] {
+            assert!(
+                tab_slide_offsets(
+                    &order,
+                    &TabRef::Agent(dragged),
+                    &TabRef::Agent(target),
+                    after,
+                    width
+                )
+                .is_empty(),
+                "{why} must slide nothing"
+            );
+        }
     }
 }

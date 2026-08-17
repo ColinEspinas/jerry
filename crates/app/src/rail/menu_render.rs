@@ -406,53 +406,15 @@ impl AdeApp {
 #[cfg(test)]
 mod rail_menu_tests {
     use super::*;
-    use crate::root::focus::palette_focus_tests;
     use gpui::TestAppContext;
     use std::fs;
     use std::path::Path;
-    use std::process::Command;
-    use tempfile::TempDir;
-
-    fn git(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn init_repo() -> TempDir {
-        let dir = TempDir::new().expect("tempdir");
-        git(dir.path(), &["init", "-b", "main"]);
-        git(dir.path(), &["config", "user.email", "test@example.com"]);
-        git(dir.path(), &["config", "user.name", "Test User"]);
-        fs::write(dir.path().join("base.txt"), "base\n").expect("write");
-        git(dir.path(), &["add", "base.txt"]);
-        git(dir.path(), &["commit", "-m", "initial"]);
-        dir
-    }
 
     fn add_worktree(repo_path: &Path, branch: &str, name: &str) -> PathBuf {
-        let container = TempDir::new().expect("tempdir");
+        let container = crate::test_support::temp_root();
         let path = container.path().join(name);
         drop(container);
-        git(
-            repo_path,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                branch,
-                path.to_str().expect("utf8 path"),
-            ],
-        );
+        test_support::add_worktree(repo_path, branch, &path);
         path
     }
 
@@ -583,9 +545,9 @@ mod rail_menu_tests {
     fn right_clicking_a_worktree_row_paints_the_row_set_the_revision_lists(
         cx: &mut TestAppContext,
     ) {
-        let repo = init_repo();
+        let repo = crate::test_support::temp_repo();
         let feature = add_worktree(repo.path(), "feature", "feature");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
         // A real agent session in the main worktree, so the Archive row has a real count to
         // report (a plain shell gets no rail row, and so is not something this row promises).
@@ -626,9 +588,9 @@ mod rail_menu_tests {
 
     #[gpui::test]
     fn new_agent_here_really_spawns_an_agent_into_that_worktree(cx: &mut TestAppContext) {
-        let repo = init_repo();
+        let repo = crate::test_support::temp_repo();
         let feature = add_worktree(repo.path(), "feature", "feature");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
         app.read_with(cx, |app, _| {
             assert_eq!(
@@ -662,8 +624,8 @@ mod rail_menu_tests {
     fn right_clicking_an_agent_row_paints_open_one_pause_or_resume_and_one_archive_run(
         cx: &mut TestAppContext,
     ) {
-        let repo = init_repo();
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_repo();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         let agent_id = spawn_agent(&app, cx);
@@ -693,7 +655,7 @@ mod rail_menu_tests {
 
     #[gpui::test]
     fn scrolling_the_rail_does_not_move_or_clip_an_open_menu(cx: &mut TestAppContext) {
-        let repo = init_repo();
+        let repo = crate::test_support::temp_repo();
         for index in 0..8 {
             add_worktree(
                 repo.path(),
@@ -701,7 +663,7 @@ mod rail_menu_tests {
                 &format!("wt{index}"),
             );
         }
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
         // Small enough that nine worktree rows genuinely overflow the rail's own viewport -
         // without a list that really scrolls, this test would pass against a menu nailed to a
@@ -765,8 +727,8 @@ mod rail_menu_tests {
     fn the_overflow_button_opens_history_and_settings_under_its_own_right_edge(
         cx: &mut TestAppContext,
     ) {
-        let repo = init_repo();
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_repo();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         let button = cx
@@ -805,8 +767,8 @@ mod rail_menu_tests {
 
     #[gpui::test]
     fn picking_settings_from_the_overflow_really_opens_settings(cx: &mut TestAppContext) {
-        let repo = init_repo();
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_repo();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         let button = cx.debug_bounds("rail-overflow").expect("button");
@@ -830,8 +792,8 @@ mod rail_menu_tests {
     fn archive_run_ends_the_run_and_leaves_the_worktree_and_its_files_alone(
         cx: &mut TestAppContext,
     ) {
-        let repo = init_repo();
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_repo();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
         let written = repo.path().join("agent-wrote-this.txt");
         fs::write(&written, "work\n").expect("write");
@@ -855,9 +817,9 @@ mod rail_menu_tests {
     fn remove_worktree_takes_two_clicks_and_then_really_removes_the_checkout(
         cx: &mut TestAppContext,
     ) {
-        let repo = init_repo();
+        let repo = crate::test_support::temp_repo();
         let feature = add_worktree(repo.path(), "feature", "feature");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         right_click_worktree_row(&app, cx, &feature);
@@ -894,9 +856,9 @@ mod rail_menu_tests {
 
     #[gpui::test]
     fn dismissing_the_menu_disarms_a_half_confirmed_removal(cx: &mut TestAppContext) {
-        let repo = init_repo();
+        let repo = crate::test_support::temp_repo();
         let feature = add_worktree(repo.path(), "feature", "feature");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         right_click_worktree_row(&app, cx, &feature);
@@ -929,8 +891,8 @@ mod rail_menu_tests {
 
     #[gpui::test]
     fn open_in_opens_its_second_level_in_the_same_menu(cx: &mut TestAppContext) {
-        let repo = init_repo();
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_repo();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         right_click_worktree_row(&app, cx, repo.path());
@@ -951,8 +913,8 @@ mod rail_menu_tests {
 
     #[gpui::test]
     fn a_menu_opened_at_the_windows_foot_flips_above_the_pointer(cx: &mut TestAppContext) {
-        let repo = init_repo();
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_repo();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         let viewport = cx.update(|window, _cx| window.bounds().size);

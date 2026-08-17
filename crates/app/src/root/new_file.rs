@@ -444,7 +444,6 @@ impl AdeApp {
 
 #[cfg(test)]
 mod tests {
-    use crate::root::focus::palette_focus_tests;
     use gpui::TestAppContext;
     use std::time::Instant;
 
@@ -452,9 +451,9 @@ mod tests {
     fn cancelling_new_file_while_a_file_tab_is_open_does_not_leave_focus_dangling(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
         std::fs::write(repo.path().join("a.txt"), "hello\n").expect("write a.txt");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
 
         app.update_in(cx, |app, window, cx| {
@@ -481,8 +480,8 @@ mod tests {
     fn cancelling_new_file_with_no_file_tab_and_no_active_agent_does_not_leave_focus_dangling(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
 
         let initial_id = app.read_with(cx, |app, _| {
@@ -520,8 +519,8 @@ mod tests {
     fn creating_a_new_file_writes_a_real_empty_file_with_no_false_conflict(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         app.update_in(cx, |app, window, cx| {
             app.start_new_file(repo.path().to_path_buf(), window, cx);
@@ -566,9 +565,9 @@ mod tests {
 
     #[gpui::test]
     fn creating_a_file_that_already_exists_is_refused_with_a_real_error(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
         std::fs::write(repo.path().join("existing.txt"), "already here").expect("seed file");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         app.update_in(cx, |app, window, cx| {
             app.start_new_file(repo.path().to_path_buf(), window, cx);
@@ -600,8 +599,8 @@ mod tests {
 
     #[gpui::test]
     fn escape_cancels_the_new_file_prompt_without_touching_disk(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         app.update_in(cx, |app, window, cx| {
             app.start_new_file(repo.path().to_path_buf(), window, cx);
@@ -629,15 +628,14 @@ mod tests {
 /// measured-bounds technique.
 #[cfg(test)]
 mod new_file_caret_tests {
-    use crate::root::focus::palette_focus_tests;
     use gpui::TestAppContext;
 
     #[gpui::test]
     fn caret_sits_before_the_placeholder_when_empty_and_after_the_text_once_typed(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         app.update_in(cx, |app, window, cx| {
             app.start_new_file(repo.path().to_path_buf(), window, cx);
@@ -698,8 +696,8 @@ mod new_file_caret_tests {
 
     #[gpui::test]
     fn blurring_the_new_file_prompt_stops_the_real_shared_blink_loop(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         // `on_focus`/`on_blur` listeners (`AdeApp::wire_caret_blink`'s own mechanism) only
         // fire while GPUI considers the window itself "active" - a real, freshly opened test
         // window starts out not active at all, so this is a real, necessary precondition, not

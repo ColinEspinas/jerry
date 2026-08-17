@@ -2019,16 +2019,15 @@ mod agent_trailing_text_count_tests {
         }
     }
 
+    /// The row's trailing text conjugates with its own count - and no count at all is an empty
+    /// string, not `"0 files"`: the absence of a measurement and a measured zero are different
+    /// facts, and only the latter is a conjugation case.
     #[test]
-    fn review_file_count_conjugates_at_zero_one_and_two() {
+    fn the_review_file_count_conjugates_and_an_unmeasured_row_says_nothing() {
         assert_eq!(agent_trailing_text(&review_row(Some(0))), "0 files");
         assert_eq!(agent_trailing_text(&review_row(Some(1))), "1 file");
         assert_eq!(agent_trailing_text(&review_row(Some(2))), "2 files");
         assert_eq!(agent_trailing_text(&review_row(Some(12))), "12 files");
-    }
-
-    #[test]
-    fn an_unmeasured_review_row_has_no_trailing_text() {
         assert_eq!(agent_trailing_text(&review_row(None)), "");
     }
 }
@@ -2036,57 +2035,17 @@ mod agent_trailing_text_count_tests {
 #[cfg(test)]
 mod prune_regression_tests {
     use super::*;
-    use crate::root::focus::palette_focus_tests;
     use gpui::TestAppContext;
-    use std::fs;
     use std::path::Path;
-    use std::process::Command;
-    use tempfile::TempDir;
-
-    fn git(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn init_repo() -> TempDir {
-        let dir = TempDir::new().expect("tempdir");
-        git(dir.path(), &["init", "-b", "main"]);
-        git(dir.path(), &["config", "user.email", "test@example.com"]);
-        git(dir.path(), &["config", "user.name", "Test User"]);
-        fs::write(dir.path().join("base.txt"), "base\n").expect("write");
-        git(dir.path(), &["add", "base.txt"]);
-        git(dir.path(), &["commit", "-m", "initial"]);
-        dir
-    }
 
     /// Same linked-worktree idiom `merge::flow`'s test module uses. Created with no new
     /// commits, so its branch tip trivially equals `main`'s - a genuinely-merged, clean
     /// worktree without needing a second real merge to produce one.
     fn add_worktree(repo_path: &Path, branch: &str, name: &str) -> PathBuf {
-        let container = TempDir::new().expect("tempdir");
+        let container = crate::test_support::temp_root();
         let path = container.path().join(name);
         drop(container);
-        git(
-            repo_path,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                branch,
-                path.to_str().expect("utf8 path"),
-            ],
-        );
+        test_support::add_worktree(repo_path, branch, &path);
         path
     }
 
@@ -2128,10 +2087,10 @@ mod prune_regression_tests {
     fn a_second_confirm_while_first_batch_is_in_flight_does_not_prune_a_worktree_seeded_after_it(
         cx: &mut TestAppContext,
     ) {
-        let repo = init_repo();
+        let repo = crate::test_support::temp_repo();
         let first = add_worktree(repo.path(), "first-feature", "first-feature-wt");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         app.update(cx, |app, _cx| {
             seed_one_prunable_worktree(app, first.clone(), "first-feature");
         });
@@ -2201,7 +2160,6 @@ mod rail_row_tests {
     use super::*;
     use crate::hooks::store::LiveRun;
     use crate::rail::worktrees::WorktreeItem;
-    use crate::root::focus::palette_focus_tests;
     use gpui::TestAppContext;
 
     fn worktree_item(path: PathBuf, label: &str) -> WorktreeItem {
@@ -2223,10 +2181,10 @@ mod rail_row_tests {
 
     #[gpui::test]
     fn worktree_is_expanded_defaults_to_the_real_idle_rooted_rule(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let wt = tempfile::tempdir().expect("tempdir wt");
-        let other_wt = tempfile::tempdir().expect("tempdir other wt");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let wt = crate::test_support::temp_root();
+        let other_wt = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         app.update(cx, |app, _cx| {
             app.worktrees = vec![
@@ -2292,8 +2250,8 @@ mod rail_row_tests {
 
     #[gpui::test]
     fn a_worktree_with_only_a_shell_open_produces_no_agent_row(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         app.update(cx, |app, _cx| {
             app.worktrees = vec![worktree_item(repo.path().to_path_buf(), "repo")];
         });
@@ -2353,9 +2311,9 @@ mod rail_row_tests {
 
     #[gpui::test]
     fn the_selected_worktree_never_idle_collapses_by_default(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let wt = tempfile::tempdir().expect("tempdir wt");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let wt = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         app.update(cx, |app, _cx| {
             app.worktrees = vec![worktree_item(wt.path().to_path_buf(), "wt")];
@@ -2409,9 +2367,9 @@ mod rail_row_tests {
 
     #[gpui::test]
     fn toggle_worktree_collapsed_flips_and_remembers_the_override(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let wt = tempfile::tempdir().expect("tempdir wt");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let wt = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         app.update(cx, |app, _cx| {
             app.worktrees = vec![worktree_item(wt.path().to_path_buf(), "wt")];
@@ -2464,10 +2422,10 @@ mod rail_row_tests {
 
     #[gpui::test]
     fn selecting_an_agent_selects_its_worktree_and_raises_its_tab(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let wt_a = tempfile::tempdir().expect("tempdir a");
-        let wt_b = tempfile::tempdir().expect("tempdir b");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let wt_a = crate::test_support::temp_root();
+        let wt_b = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         app.update(cx, |app, _cx| {
             app.worktrees = vec![
@@ -2525,10 +2483,10 @@ mod rail_row_tests {
     fn render_rail_list_does_not_panic_across_bare_and_multi_agent_worktrees(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let bare_wt = tempfile::tempdir().expect("tempdir bare");
-        let busy_wt = tempfile::tempdir().expect("tempdir busy");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let bare_wt = crate::test_support::temp_root();
+        let busy_wt = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         app.update(cx, |app, _cx| {
             app.worktrees = vec![
@@ -2568,10 +2526,10 @@ mod rail_row_tests {
     fn build_repo_groups_header_wt_count_is_unaffected_by_the_filter_query(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let wt_alpha = tempfile::tempdir().expect("tempdir alpha");
-        let wt_beta = tempfile::tempdir().expect("tempdir beta");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let wt_alpha = crate::test_support::temp_root();
+        let wt_beta = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         app.update(cx, |app, _cx| {
             app.worktrees = vec![
@@ -2618,9 +2576,9 @@ mod rail_row_tests {
     ) {
         use crate::work_surface::agents::AgentKind;
 
-        let repo = tempfile::tempdir().expect("tempdir");
-        let wt = tempfile::tempdir().expect("tempdir wt");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let wt = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         app.update(cx, |app, _cx| {
             app.worktrees = vec![worktree_item(wt.path().to_path_buf(), "wt")];
@@ -2704,9 +2662,9 @@ mod rail_row_tests {
     ) {
         use crate::work_surface::agents::AgentKind;
 
-        let repo = tempfile::tempdir().expect("tempdir");
-        let wt = tempfile::tempdir().expect("tempdir wt");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let wt = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         app.update(cx, |app, _cx| {
             app.worktrees = vec![worktree_item(wt.path().to_path_buf(), "wt")];
         });
@@ -2761,9 +2719,9 @@ mod rail_row_tests {
     ) {
         use crate::work_surface::agents::AgentKind;
 
-        let repo = tempfile::tempdir().expect("tempdir");
-        let wt = tempfile::tempdir().expect("tempdir wt");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let wt = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         app.update(cx, |app, _cx| {
             app.worktrees = vec![worktree_item(wt.path().to_path_buf(), "wt")];
         });
@@ -2798,14 +2756,10 @@ mod rail_row_tests {
              {:?}",
             spec.args
         );
-    }
 
-    #[gpui::test]
-    fn resume_past_agent_is_a_no_op_for_an_unknown_key(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        // A stale/unknown key (the record was pruned, or never existed) is a genuine no-op -
+        // nothing is spawned, and nothing else about the app's state changes.
         let count_before = app.read_with(cx, |app, _| app.agents.iter().count());
-
         let resumed = app.update_in(cx, |app, window, cx| {
             app.resume_past_agent("no-such-key", window, cx)
         });
@@ -2829,51 +2783,33 @@ mod rail_row_tests {
 /// (`crate::root::AdeApp::select_worktree_by_path`'s cross-repo fallback).
 #[cfg(test)]
 mod repo_checkout_tests {
-    use crate::root::focus::palette_focus_tests;
     use crate::work_surface::agents::ProcessKind;
     use crate::work_surface::state::TabRef;
     use gpui::TestAppContext;
     use std::path::Path;
-    use std::process::Command;
-    use tempfile::TempDir;
 
     /// A minimal, real `git init`-ed repo - mirrors `crate::root::state::
     /// load_worktrees_integration_tests`'s identical own helper, duplicated locally per this
     /// crate's own established per-test-module convention rather than shared.
-    fn git(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn init_repo() -> TempDir {
-        let dir = TempDir::new().expect("tempdir");
-        git(dir.path(), &["init", "-b", "main"]);
-        git(dir.path(), &["config", "user.email", "test@example.com"]);
-        git(dir.path(), &["config", "user.name", "Test User"]);
-        std::fs::write(dir.path().join("base.txt"), "base\n").expect("write");
-        git(dir.path(), &["add", "base.txt"]);
-        git(dir.path(), &["commit", "-m", "initial"]);
-        dir
-    }
-
+    /// The repo header is **not a click target** - per explicit user direction, after two
+    /// subtler header-click behaviors were both rejected in review (auto-selecting the repo's
+    /// main worktree; then a "pure navigation" focus switch that still re-rooted the sidebar):
+    /// clicking a repo header must do *nothing at all*. Only worktree rows and agent rows are
+    /// clickable in the rail, and repo switching happens exclusively through a worktree row
+    /// (see `clicking_a_non_focused_repos_worktree_row_switches_repo_and_selects_it` below).
+    ///
+    /// Driven through a real click on the header's own painted bounds - which must still paint
+    /// at all (GitHub issue #113's "the whole group vanished from the rail" half is unchanged) -
+    /// asserting the focused repo, file tree root, worktree selection, and the live agent set
+    /// are all exactly what they were before the click. That proves the header genuinely has no
+    /// `on_click`, not merely that it does something subtler than before.
     #[gpui::test]
     fn clicking_a_non_focused_repos_header_does_nothing_at_all(cx: &mut TestAppContext) {
-        let repo_a = tempfile::tempdir().expect("tempdir a");
-        let repo_b = tempfile::tempdir().expect("tempdir b");
+        let repo_a = crate::test_support::temp_root();
+        let repo_b = crate::test_support::temp_root();
         std::fs::write(repo_b.path().join("b.txt"), "b\n").expect("write");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo_a.path().to_path_buf());
         cx.run_until_parked();
 
         let repo_b_id = app.update(cx, |app, cx| app.add_repo(repo_b.path().to_path_buf(), cx));
@@ -2945,10 +2881,10 @@ mod repo_checkout_tests {
     fn build_repo_groups_marks_a_non_focused_repos_data_as_loaded_once_its_real_fetch_resolves(
         cx: &mut TestAppContext,
     ) {
-        let repo_a = tempfile::tempdir().expect("tempdir a");
-        let repo_b = init_repo();
+        let repo_a = crate::test_support::temp_root();
+        let repo_b = crate::test_support::temp_repo();
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo_a.path().to_path_buf());
         cx.run_until_parked();
 
         let repo_a_id = app.read_with(cx, |app, _| {
@@ -3011,14 +2947,26 @@ mod repo_checkout_tests {
         );
     }
 
+    /// Real cross-repo agent persistence (`crate::root::AdeApp::open_repo_in_current_window`'s
+    /// own "cross-repo agent persistence" docs): a real Claude agent spawned into repo B must
+    /// still show up in `Self::build_repo_groups`' output for repo B, with genuinely live status,
+    /// even after focus has moved away to repo A - the rail's own "see at a glance if a
+    /// background repo's agent needs me" promise. Also proves the inverse half of that same
+    /// promise: repo A's own tab strip (`crate::work_surface::render::AdeApp::
+    /// combined_tab_order`) must *not* show repo B's agent while B isn't the active worktree -
+    /// cross-repo visibility lives in the rail alone, never a new tab-strip affordance.
+    // Asserts the folded-in row carries `Status::Run`, which requires the spawned `claude` CLI to
+    // still be a live process. On a machine without that binary the PTY child exits immediately
+    // and the status is `Fail`, so this needs the real agent CLI - the `external` tier.
+    #[ignore = "external: claude; see docs/testing.md"]
     #[gpui::test]
     fn build_repo_groups_folds_a_non_focused_repos_real_agent_into_its_own_row(
         cx: &mut TestAppContext,
     ) {
-        let repo_a = tempfile::tempdir().expect("tempdir a");
-        let repo_b = init_repo();
+        let repo_a = crate::test_support::temp_root();
+        let repo_b = crate::test_support::temp_repo();
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo_a.path().to_path_buf());
         cx.run_until_parked();
 
         // Focus repo B long enough to spawn a real Claude agent into it, mirroring how a user
@@ -3099,8 +3047,8 @@ mod repo_checkout_tests {
 
     #[gpui::test]
     fn clicking_the_already_focused_repos_header_does_not_reset_it(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         let repo_id = app.read_with(cx, |app, _| {
@@ -3132,19 +3080,10 @@ mod repo_checkout_tests {
     /// Same linked-worktree idiom the sibling test modules use: created with no new commits of its
     /// own, which is all these tests need from it (a second, real, selectable worktree row).
     fn add_worktree(repo_path: &Path, branch: &str, name: &str) -> std::path::PathBuf {
-        let container = TempDir::new().expect("tempdir");
+        let container = crate::test_support::temp_root();
         let path = container.path().join(name);
         drop(container);
-        git(
-            repo_path,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                branch,
-                path.to_str().expect("utf8 path"),
-            ],
-        );
+        test_support::add_worktree(repo_path, branch, &path);
         path
     }
 
@@ -3152,11 +3091,11 @@ mod repo_checkout_tests {
     fn clicking_a_non_focused_repos_worktree_row_switches_repo_and_selects_it(
         cx: &mut TestAppContext,
     ) {
-        let repo_a = init_repo();
-        let repo_b = init_repo();
+        let repo_a = crate::test_support::temp_repo();
+        let repo_b = crate::test_support::temp_repo();
         let repo_b_feature = add_worktree(repo_b.path(), "feature", "b-feature");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo_a.path().to_path_buf());
         cx.run_until_parked();
 
         app.update(cx, |app, cx| {
@@ -3234,14 +3173,14 @@ mod repo_checkout_tests {
     fn a_cross_repo_worktree_selection_survives_the_repos_own_background_fetch(
         cx: &mut TestAppContext,
     ) {
-        let repo_a = init_repo();
-        let repo_b = init_repo();
+        let repo_a = crate::test_support::temp_repo();
+        let repo_b = crate::test_support::temp_repo();
         // Two linked worktrees, so the target is not at index 0 and a stale index would be
         // visible as a wrong selection rather than accidentally landing on the right row.
         let _first = add_worktree(repo_b.path(), "first", "b-first");
         let target = add_worktree(repo_b.path(), "second", "b-second");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo_a.path().to_path_buf());
         cx.run_until_parked();
         app.update(cx, |app, cx| {
             app.add_repo(repo_b.path().to_path_buf(), cx);
@@ -3287,10 +3226,10 @@ mod repo_checkout_tests {
 
     #[gpui::test]
     fn selecting_a_worktree_path_no_repo_knows_about_still_does_nothing(cx: &mut TestAppContext) {
-        let repo_a = init_repo();
-        let repo_b = init_repo();
+        let repo_a = crate::test_support::temp_repo();
+        let repo_b = crate::test_support::temp_repo();
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo_a.path().to_path_buf());
         cx.run_until_parked();
         app.update(cx, |app, cx| {
             app.add_repo(repo_b.path().to_path_buf(), cx);
@@ -3318,8 +3257,8 @@ mod repo_checkout_tests {
     fn an_agent_spawned_in_a_repo_opened_through_a_symlink_still_appears_in_the_rail(
         cx: &mut TestAppContext,
     ) {
-        let repo = init_repo();
-        let link_holder = TempDir::new().expect("tempdir");
+        let repo = crate::test_support::temp_repo();
+        let link_holder = crate::test_support::temp_root();
         let link = link_holder.path().join("repo-link");
         std::os::unix::fs::symlink(repo.path(), &link).expect("symlink");
         assert_ne!(
@@ -3328,7 +3267,7 @@ mod repo_checkout_tests {
             "sanity check: the symlink really is a different path from the real repo"
         );
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, link.clone());
+        let (app, cx) = crate::test_support::open_test_app(cx, link.clone());
         cx.run_until_parked();
 
         let agent_id = app.update_in(cx, |app, window, cx| {
@@ -3370,13 +3309,13 @@ mod repo_checkout_tests {
     #[cfg(unix)]
     #[gpui::test]
     fn opening_a_symlinked_folder_stores_the_resolved_repo_path(cx: &mut TestAppContext) {
-        let repo_a = init_repo();
-        let repo_b = init_repo();
-        let link_holder = TempDir::new().expect("tempdir");
+        let repo_a = crate::test_support::temp_repo();
+        let repo_b = crate::test_support::temp_repo();
+        let link_holder = crate::test_support::temp_root();
         let link = link_holder.path().join("repo-b-link");
         std::os::unix::fs::symlink(repo_b.path(), &link).expect("symlink");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo_a.path().to_path_buf());
         cx.run_until_parked();
 
         app.update_in(cx, |app, window, cx| {
@@ -3419,56 +3358,17 @@ mod repo_checkout_tests {
 /// family of bugs behind it:
 #[cfg(test)]
 mod worktree_tab_attribution_tests {
-    use crate::root::focus::palette_focus_tests;
     use crate::work_surface::state::TabRef;
     use gpui::TestAppContext;
     use std::path::{Path, PathBuf};
-    use std::process::Command;
-    use tempfile::TempDir;
-
-    fn git(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
 
     /// A real repository with a real commit - `wt_core::list_worktrees_porcelain` reports nothing
     /// at all for a bare `tempfile::tempdir()`, so these tests need a genuine main worktree row.
-    fn init_repo() -> TempDir {
-        let dir = TempDir::new().expect("tempdir");
-        git(dir.path(), &["init", "-b", "main"]);
-        git(dir.path(), &["config", "user.email", "test@example.com"]);
-        git(dir.path(), &["config", "user.name", "Test User"]);
-        std::fs::write(dir.path().join("base.txt"), "base\n").expect("write");
-        git(dir.path(), &["add", "base.txt"]);
-        git(dir.path(), &["commit", "-m", "initial"]);
-        dir
-    }
-
     fn add_worktree(repo_path: &Path, branch: &str, name: &str) -> PathBuf {
-        let container = TempDir::new().expect("tempdir");
+        let container = crate::test_support::temp_root();
         let path = container.path().join(name);
         drop(container);
-        git(
-            repo_path,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                branch,
-                path.to_str().expect("utf8 path"),
-            ],
-        );
+        test_support::add_worktree(repo_path, branch, &path);
         path
     }
 
@@ -3497,8 +3397,8 @@ mod worktree_tab_attribution_tests {
 
     #[gpui::test]
     fn a_fresh_launch_genuinely_selects_the_repos_own_main_worktree(cx: &mut TestAppContext) {
-        let repo = init_repo();
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_repo();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         app.read_with(cx, |app, _| {
@@ -3538,9 +3438,9 @@ mod worktree_tab_attribution_tests {
     fn the_startup_terminal_is_a_real_worktrees_tab_and_survives_switching_away_and_back(
         cx: &mut TestAppContext,
     ) {
-        let repo = init_repo();
+        let repo = crate::test_support::temp_repo();
         let feature = add_worktree(repo.path(), "feature", "feature");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         let startup_agent = app.read_with(cx, |app, _| {
@@ -3608,9 +3508,9 @@ mod worktree_tab_attribution_tests {
     fn launching_against_a_subdirectory_still_attributes_its_shell_to_a_real_worktree(
         cx: &mut TestAppContext,
     ) {
-        let repo = init_repo();
+        let repo = crate::test_support::temp_repo();
         std::fs::create_dir_all(repo.path().join("crates")).expect("mkdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().join("crates"));
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().join("crates"));
         cx.run_until_parked();
 
         let startup_agent = app.read_with(cx, |app, _| {
@@ -3655,9 +3555,9 @@ mod worktree_tab_attribution_tests {
 
     #[gpui::test]
     fn launching_inside_a_linked_worktree_selects_that_worktree_not_main(cx: &mut TestAppContext) {
-        let repo = init_repo();
+        let repo = crate::test_support::temp_repo();
         let feature = add_worktree(repo.path(), "feature", "feature");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, feature.clone());
+        let (app, cx) = crate::test_support::open_test_app(cx, feature.clone());
         cx.run_until_parked();
 
         app.read_with(cx, |app, _| {
@@ -3678,9 +3578,9 @@ mod worktree_tab_attribution_tests {
     fn opening_a_folder_lands_on_a_real_worktree_and_spawns_its_shell_there(
         cx: &mut TestAppContext,
     ) {
-        let repo_a = init_repo();
-        let repo_b = init_repo();
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        let repo_a = crate::test_support::temp_repo();
+        let repo_b = crate::test_support::temp_repo();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo_a.path().to_path_buf());
         cx.run_until_parked();
 
         app.update_in(cx, |app, window, cx| {
@@ -3717,11 +3617,11 @@ mod worktree_tab_attribution_tests {
     fn a_worktree_click_racing_the_open_fetch_still_gets_its_guaranteed_shell(
         cx: &mut TestAppContext,
     ) {
-        let repo_a = init_repo();
-        let repo_b = init_repo();
+        let repo_a = crate::test_support::temp_repo();
+        let repo_b = crate::test_support::temp_repo();
         let feature = add_worktree(repo_b.path(), "feature", "feature");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo_a.path().to_path_buf());
         cx.run_until_parked();
         // Repo B is already a known repo with a real, already-fetched worktree list - which is
         // what makes the racing click below able to resolve a row at all.
@@ -3761,9 +3661,9 @@ mod worktree_tab_attribution_tests {
 
     #[gpui::test]
     fn nothing_selected_means_nothing_shown_anywhere(cx: &mut TestAppContext) {
-        let repo_a = init_repo();
-        let repo_b = init_repo();
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        let repo_a = crate::test_support::temp_repo();
+        let repo_b = crate::test_support::temp_repo();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo_a.path().to_path_buf());
         cx.run_until_parked();
 
         // Repo B enters through the real "Open Folder…" gesture, so it genuinely has a live shell
@@ -3843,7 +3743,6 @@ mod worktree_tab_attribution_tests {
 /// measured-bounds technique rather than only reading the render code.
 #[cfg(test)]
 mod rail_filter_caret_tests {
-    use crate::root::focus::palette_focus_tests;
     use gpui::TestAppContext;
     use std::time::Duration;
 
@@ -3851,8 +3750,8 @@ mod rail_filter_caret_tests {
     fn caret_sits_before_the_placeholder_when_empty_and_after_the_text_once_typed(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         app.update_in(cx, |app, window, cx| {
             window.focus(&app.filter_focus_handle, cx);
@@ -3906,8 +3805,8 @@ mod rail_filter_caret_tests {
 
     #[gpui::test]
     fn focusing_the_rail_filter_starts_the_real_shared_blink_loop(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         // `on_focus`/`on_blur` (`AdeApp::wire_caret_blink`'s own mechanism) only fire while GPUI
         // considers the window itself "active" - a real, freshly opened test window starts out
         // not active at all.
@@ -3944,7 +3843,6 @@ mod rail_filter_caret_tests {
 #[cfg(test)]
 mod agent_chip_icon_pack_tests {
     use crate::rail::worktrees::WorktreeItem;
-    use crate::root::focus::palette_focus_tests;
     use crate::work_surface::agents::ProcessKind;
     use gpui::{px, TestAppContext};
 
@@ -3972,14 +3870,14 @@ mod agent_chip_icon_pack_tests {
     fn open_with_a_running_agent(
         cx: &mut TestAppContext,
     ) -> (
-        tempfile::TempDir,
-        tempfile::TempDir,
+        crate::test_support::TempRoot,
+        crate::test_support::TempRoot,
         gpui::Entity<crate::root::AdeApp>,
         &mut gpui::VisualTestContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let wt = tempfile::tempdir().expect("tempdir wt");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let wt = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         app.update(cx, |app, _cx| {
             app.worktrees = vec![worktree_item(wt.path().to_path_buf(), "wt")];
@@ -4018,7 +3916,7 @@ mod agent_chip_icon_pack_tests {
     fn the_rail_agent_row_switches_to_a_real_pack_icon_once_one_is_configured(
         cx: &mut TestAppContext,
     ) {
-        let pack_dir = tempfile::tempdir().expect("tempdir");
+        let pack_dir = crate::test_support::temp_root();
         // The seeded agent is a real `AgentKind::Claude` (`work_surface::agent_icon_name`'s own
         // mapping), so `claude.svg` is the real file this specific row's chip looks for.
         std::fs::write(pack_dir.path().join("claude.svg"), "<svg></svg>").expect("write");
@@ -4044,7 +3942,7 @@ mod agent_chip_icon_pack_tests {
 
     #[gpui::test]
     fn the_pack_icon_element_is_a_real_image_not_a_colour_dependent_svg(cx: &mut TestAppContext) {
-        let pack_dir = tempfile::tempdir().expect("tempdir");
+        let pack_dir = crate::test_support::temp_root();
         std::fs::write(pack_dir.path().join("claude.svg"), "<svg></svg>").expect("write");
 
         let (_repo, _wt, app, cx) = open_with_a_running_agent(cx);
@@ -4264,7 +4162,6 @@ mod rail_correction_tests {
 mod rail_rev6_render_tests {
     use super::*;
     use crate::rail::worktrees::WorktreeItem;
-    use crate::root::focus::palette_focus_tests;
     use gpui::TestAppContext;
 
     fn worktree_item(path: PathBuf, label: &str) -> WorktreeItem {
@@ -4301,14 +4198,14 @@ mod rail_rev6_render_tests {
     fn open_with_a_failed_agent(
         cx: &mut TestAppContext,
     ) -> (
-        tempfile::TempDir,
-        tempfile::TempDir,
+        crate::test_support::TempRoot,
+        crate::test_support::TempRoot,
         gpui::Entity<crate::root::AdeApp>,
         &mut gpui::VisualTestContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let wt = tempfile::tempdir().expect("tempdir wt");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let wt = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         app.update(cx, |app, _cx| {
             app.worktrees = vec![worktree_item(wt.path().to_path_buf(), "wt")];
@@ -4359,8 +4256,8 @@ mod rail_rev6_render_tests {
 
     #[gpui::test]
     fn each_urgency_pair_is_an_element_only_when_its_own_count_is_nonzero(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         app.update(cx, |app, _cx| {
             let repo_id = app.repos[0].id;
             for kind in [UrgencyCount::NeedsInput, UrgencyCount::Failed] {
@@ -4478,8 +4375,8 @@ mod rail_rev6_render_tests {
 
     #[gpui::test]
     fn the_prune_control_is_a_bin_icon_in_a_seventeen_pixel_box(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (_app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (_app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         let button = cx
@@ -4526,10 +4423,10 @@ mod rail_rev6_render_tests {
     fn the_repo_header_sits_closer_to_its_rows_than_the_rows_sit_to_each_other(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let alpha = tempfile::tempdir().expect("tempdir alpha");
-        let beta = tempfile::tempdir().expect("tempdir beta");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let alpha = crate::test_support::temp_root();
+        let beta = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         app.update(cx, |app, cx| {
             app.worktrees = vec![
                 worktree_item(alpha.path().to_path_buf(), "alpha"),
@@ -4608,10 +4505,8 @@ mod rail_rev6_render_tests {
 mod rail_virtualization_tests {
     use super::*;
     use crate::rail::worktrees::WorktreeItem;
-    use crate::root::focus::palette_focus_tests;
     use gpui::TestAppContext;
     use std::path::Path;
-    use tempfile::TempDir;
 
     /// Deliberately more rows than any plausible test viewport can show at 27px each, mirroring
     /// `crate::sidebar::render::virtualization_tests`' own 300-file tree fixture - "dozens to
@@ -4643,12 +4538,15 @@ mod rail_virtualization_tests {
     /// directly" - both paths converge on the exact same `WorktreeItem`/`WorktreeRow`/`RepoGroup`
     /// types this file's own `rail_row_tests`/`prune_regression_tests` already seed the same way
     /// for their own synthetic fixtures. Returns every seeded path in seed order; the caller owns
-    /// `keepalive` so the real `TempDir`s (and the directories they hold open) outlive the test.
-    fn seed_many_worktrees(app: &mut AdeApp, keepalive: &mut Vec<TempDir>) -> Vec<PathBuf> {
+    /// `keepalive` so the real temporary directories outlive the test.
+    fn seed_many_worktrees(
+        app: &mut AdeApp,
+        keepalive: &mut Vec<crate::test_support::TempRoot>,
+    ) -> Vec<PathBuf> {
         let mut paths = Vec::with_capacity(ROW_COUNT);
         let mut items = Vec::with_capacity(ROW_COUNT);
         for index in 0..ROW_COUNT {
-            let dir = TempDir::new().expect("tempdir");
+            let dir = crate::test_support::temp_root();
             let path = dir.path().to_path_buf();
             keepalive.push(dir);
             items.push(worktree_item(path.clone(), &format!("wt-{index:03}")));
@@ -4678,8 +4576,8 @@ mod rail_virtualization_tests {
 
     #[gpui::test]
     fn a_worktree_row_far_below_the_viewport_is_never_painted(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         let mut keepalive = Vec::new();
         let paths = app.update(cx, |app, _cx| seed_many_worktrees(app, &mut keepalive));
         app.update(cx, |_app, cx| cx.notify());
@@ -4708,8 +4606,8 @@ mod rail_virtualization_tests {
     fn scrolling_the_virtualized_rail_materializes_a_row_that_was_not_painted(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         let mut keepalive = Vec::new();
         let paths = app.update(cx, |app, _cx| seed_many_worktrees(app, &mut keepalive));
         app.update(cx, |_app, cx| cx.notify());
@@ -4776,8 +4674,8 @@ mod rail_virtualization_tests {
     fn hovering_a_visible_row_does_not_materialize_a_row_far_below_the_viewport(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         let mut keepalive = Vec::new();
         let paths = app.update(cx, |app, _cx| seed_many_worktrees(app, &mut keepalive));
         app.update(cx, |_app, cx| cx.notify());
@@ -4819,7 +4717,6 @@ mod rail_virtualization_tests {
 #[cfg(test)]
 mod rail_filter_selection_tests {
     use super::*;
-    use crate::root::focus::palette_focus_tests;
     use gpui::TestAppContext;
 
     fn secondary(key: &str) -> String {
@@ -4837,7 +4734,7 @@ mod rail_filter_selection_tests {
         repo: &std::path::Path,
         text: &str,
     ) -> (gpui::Entity<AdeApp>, &'a mut gpui::VisualTestContext) {
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.to_path_buf());
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.to_path_buf());
         cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
         app.update_in(cx, |app, window, cx| {
             window.focus(&app.filter_focus_handle, cx);
@@ -4886,7 +4783,7 @@ mod rail_filter_selection_tests {
     fn shift_arrow_extends_a_real_selection_and_a_plain_arrow_collapses_it(
         cx: &mut TestAppContext,
     ) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
         let (app, cx) = open_filter_with(cx, repo.path(), "origin");
 
         cx.simulate_keystrokes("home shift-right shift-right shift-right");
@@ -4910,7 +4807,7 @@ mod rail_filter_selection_tests {
 
     #[gpui::test]
     fn a_real_click_places_the_caret_and_a_drag_selects_the_range_between(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
         let (app, cx) = open_filter_with(cx, repo.path(), "origin/main");
 
         let start = point_at_offset(&app, cx, 0);
@@ -4956,7 +4853,7 @@ mod rail_filter_selection_tests {
 
     #[gpui::test]
     fn a_real_double_click_selects_the_word_under_the_pointer(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
         let (app, cx) = open_filter_with(cx, repo.path(), "origin/main");
         let inside_second_word = point_inside_glyph(&app, cx, 8);
         cx.simulate_event(gpui::MouseDownEvent {
@@ -4977,7 +4874,7 @@ mod rail_filter_selection_tests {
 
     #[gpui::test]
     fn a_shift_click_extends_from_the_existing_anchor(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
         let (app, cx) = open_filter_with(cx, repo.path(), "origin/main");
         let left_edge = point_at_offset(&app, cx, 0);
         cx.simulate_mouse_down(
@@ -5009,7 +4906,7 @@ mod rail_filter_selection_tests {
 
     #[gpui::test]
     fn select_all_then_copy_puts_the_real_text_on_the_real_clipboard(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
         let (app, cx) = open_filter_with(cx, repo.path(), "origin/main");
         // Seeded with something else first, so a green result cannot come from a clipboard that
         // simply already said the right thing.
@@ -5040,7 +4937,7 @@ mod rail_filter_selection_tests {
 
     #[gpui::test]
     fn cut_removes_the_selection_and_paste_puts_it_back_somewhere_else(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
         let (app, cx) = open_filter_with(cx, repo.path(), "origin/main");
 
         cx.simulate_keystrokes("home shift-right shift-right shift-right");
@@ -5086,9 +4983,12 @@ mod rail_filter_selection_tests {
         );
     }
 
+    /// Any edit made while a selection is live replaces that whole range rather than acting at
+    /// the caret: a paste substitutes its clipboard content for it, and one Backspace empties it
+    /// rather than removing a single character from its end.
     #[gpui::test]
-    fn paste_over_a_selection_replaces_it(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+    fn an_edit_over_a_live_selection_replaces_the_whole_range(cx: &mut TestAppContext) {
+        let repo = crate::test_support::temp_root();
         let (app, cx) = open_filter_with(cx, repo.path(), "origin/main");
         cx.update(|_window, cx| {
             cx.write_to_clipboard(gpui::ClipboardItem::new_string("upstream".into()))
@@ -5104,12 +5004,7 @@ mod rail_filter_selection_tests {
             "upstream/main",
             "a paste with a live selection replaces that whole range"
         );
-    }
 
-    #[gpui::test]
-    fn backspace_over_a_selection_deletes_the_whole_range(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
-        let (app, cx) = open_filter_with(cx, repo.path(), "origin/main");
         cx.simulate_keystrokes(&secondary("a"));
         cx.simulate_keystrokes("backspace");
         cx.run_until_parked();
@@ -5122,7 +5017,7 @@ mod rail_filter_selection_tests {
 
     #[gpui::test]
     fn the_selection_is_really_measured_from_the_row_that_painted_it(cx: &mut TestAppContext) {
-        let repo = tempfile::tempdir().expect("tempdir");
+        let repo = crate::test_support::temp_root();
         let (app, cx) = open_filter_with(cx, repo.path(), "origin/main");
         cx.simulate_keystrokes(&secondary("a"));
         cx.run_until_parked();

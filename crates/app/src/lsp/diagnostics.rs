@@ -337,25 +337,20 @@ mod tests {
         );
     }
 
+    /// UTF-16 is what the protocol counts in and UTF-8 is what the buffer stores, so a
+    /// multi-byte character is the whole point: in `"café x"` the `'x'` is UTF-16 unit 5 but
+    /// byte 6. Anything past the line end clamps rather than panicking.
     #[test]
-    fn utf16_offset_to_byte_offset_is_identity_for_pure_ascii() {
-        assert_eq!(utf16_offset_to_byte_offset("let x = 1;", 4), 4);
-    }
-
-    #[test]
-    fn utf16_offset_to_byte_offset_accounts_for_a_real_multi_byte_char() {
-        // "café x" - 'é' is 2 UTF-8 bytes but only 1 UTF-16 code unit, so the real byte offset
-        // of the 'x' that follows it must be 6 (c=1,a=1,f=1,é=2 bytes,space=1 => byte 6), even
-        // though its UTF-16 offset is only 5 (c=1,a=1,f=1,é=1 unit,space=1 => unit 5).
-        let text = "caf\u{e9} x"; // '\u{e9}' is 'é'
-        let x_byte_offset = text.find('x').expect("'x' present");
-        assert_eq!(x_byte_offset, 6);
-        assert_eq!(utf16_offset_to_byte_offset(text, 5), x_byte_offset);
-    }
-
-    #[test]
-    fn utf16_offset_to_byte_offset_clamps_past_the_real_line_end() {
-        assert_eq!(utf16_offset_to_byte_offset("abc", 999), 3);
+    fn utf16_offset_to_byte_offset_converts_and_clamps() {
+        for (line, utf16_offset, expected) in
+            [("let x = 1;", 4, 4), ("caf\u{e9} x", 5, 6), ("abc", 999, 3)]
+        {
+            assert_eq!(
+                utf16_offset_to_byte_offset(line, utf16_offset),
+                expected,
+                "{line:?} at UTF-16 offset {utf16_offset}"
+            );
+        }
     }
 
     #[test]
@@ -424,36 +419,39 @@ mod tests {
         assert_eq!(Severity::from_lsp(None), Severity::Error);
     }
 
+    /// The worst severity in a line's list, and the ranking behind "worst" - never "whichever
+    /// the `Vec` happens to hold first", which is what a header count would silently get wrong.
     #[test]
-    fn worst_severity_is_none_for_an_empty_slice() {
+    fn worst_severity_ranks_by_severity_not_by_vec_order() {
+        fn at(severity: Severity) -> LineDiagnostic {
+            let mut diagnostic = line_diag(0..1);
+            diagnostic.severity = severity;
+            diagnostic
+        }
         assert_eq!(Severity::worst(&[]), None);
-    }
-
-    #[test]
-    fn worst_severity_picks_error_over_hint_regardless_of_vec_order() {
-        let mut a = line_diag(0..1);
-        a.severity = Severity::Hint;
-        let mut b = line_diag(0..1);
-        b.severity = Severity::Error;
-        assert_eq!(
-            Severity::worst(&[a.clone(), b.clone()]),
-            Some(Severity::Error)
-        );
-        assert_eq!(Severity::worst(&[b, a]), Some(Severity::Error));
-    }
-
-    #[test]
-    fn worst_severity_ranks_warning_above_information_and_hint() {
-        let mut hint = line_diag(0..1);
-        hint.severity = Severity::Hint;
-        let mut info = line_diag(0..1);
-        info.severity = Severity::Information;
-        let mut warning = line_diag(0..1);
-        warning.severity = Severity::Warning;
-        assert_eq!(
-            Severity::worst(&[hint, info, warning]),
-            Some(Severity::Warning)
-        );
+        for (name, diagnostics, expected) in [
+            (
+                "error listed last",
+                vec![at(Severity::Hint), at(Severity::Error)],
+                Severity::Error,
+            ),
+            (
+                "error listed first",
+                vec![at(Severity::Error), at(Severity::Hint)],
+                Severity::Error,
+            ),
+            (
+                "warning outranks information and hint",
+                vec![
+                    at(Severity::Hint),
+                    at(Severity::Information),
+                    at(Severity::Warning),
+                ],
+                Severity::Warning,
+            ),
+        ] {
+            assert_eq!(Severity::worst(&diagnostics), Some(expected), "{name}");
+        }
     }
 
     #[test]

@@ -359,10 +359,12 @@ pub fn fold_gap_between(prev_header: &str, next_header: &str) -> Option<usize> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod diff_stat_tests {
+    use crate::sidebar::changes::{
+        diff_file_stats, staged_diff_stats, stat_bar_segments, StatSegment,
+    };
     use std::path::PathBuf;
-    use wt_core::diff::{DiffHunk, DiffLine};
+    use wt_core::diff::{DiffFile, DiffHunk, DiffLine, DiffLineKind, FileChangeStatus};
 
     fn line(kind: DiffLineKind, text: &str) -> DiffLine {
         DiffLine {
@@ -371,7 +373,14 @@ mod tests {
         }
     }
 
-    fn sample_file(status: FileChangeStatus, hunks: Vec<DiffHunk>) -> DiffFile {
+    fn hunk(lines: Vec<DiffLine>) -> DiffHunk {
+        DiffHunk {
+            header: "@@ -1,2 +1,3 @@".to_string(),
+            lines,
+        }
+    }
+
+    fn file_with(status: FileChangeStatus, hunks: Vec<DiffHunk>) -> DiffFile {
         DiffFile {
             path: PathBuf::from("src/main.rs"),
             old_path: None,
@@ -384,54 +393,85 @@ mod tests {
 
     #[test]
     fn diff_file_stats_counts_added_and_removed_lines_only() {
-        let file = sample_file(
+        let mixed = file_with(
             FileChangeStatus::Modified,
-            vec![DiffHunk {
-                header: "@@ -1,2 +1,3 @@".to_string(),
-                lines: vec![
-                    line(DiffLineKind::Context, "ctx"),
-                    line(DiffLineKind::Added, "a1"),
-                    line(DiffLineKind::Added, "a2"),
-                    line(DiffLineKind::Removed, "r1"),
-                ],
-            }],
+            vec![hunk(vec![
+                line(DiffLineKind::Context, "ctx"),
+                line(DiffLineKind::Added, "a1"),
+                line(DiffLineKind::Added, "a2"),
+                line(DiffLineKind::Removed, "r1"),
+            ])],
         );
-        assert_eq!(diff_file_stats(&file), (2, 1));
+        assert_eq!(diff_file_stats(&mixed), (2, 1));
+        assert_eq!(
+            diff_file_stats(&file_with(FileChangeStatus::Renamed, Vec::new())),
+            (0, 0),
+            "a file with no hunks at all contributes nothing"
+        );
+    }
+
+    /// The bar is always five segments, split in proportion, with the "bump a nonzero category up
+    /// to one segment" rule this function documents - so a single added line among 400 removed
+    /// still shows.
+    #[test]
+    fn the_stat_bar_is_five_segments_split_in_proportion() {
+        use StatSegment::{Add, Del, Empty};
+        for (add, del, expected) in [
+            (0, 0, [Empty, Empty, Empty, Empty, Empty]),
+            (40, 0, [Add, Add, Add, Add, Add]),
+            (0, 40, [Del, Del, Del, Del, Del]),
+            (1, 399, [Add, Del, Del, Del, Del]),
+        ] {
+            assert_eq!(stat_bar_segments(add, del), expected, "+{add} -{del}");
+        }
+        for (add, del) in [(1, 0), (0, 1), (1, 1), (3, 400), (400, 3), (7, 7)] {
+            assert_eq!(stat_bar_segments(add, del).len(), 5, "+{add} -{del}");
+        }
+    }
+
+    fn changed_file(path: &str, add_lines: u32, del_lines: u32) -> DiffFile {
+        let mut lines = Vec::new();
+        for _ in 0..add_lines {
+            lines.push(line(DiffLineKind::Added, "a"));
+        }
+        for _ in 0..del_lines {
+            lines.push(line(DiffLineKind::Removed, "d"));
+        }
+        let mut file = file_with(FileChangeStatus::Modified, vec![hunk(lines)]);
+        file.path = PathBuf::from(path);
+        file
     }
 
     #[test]
-    fn diff_file_stats_is_zero_for_a_file_with_no_hunks() {
-        let file = sample_file(FileChangeStatus::Renamed, Vec::new());
-        assert_eq!(diff_file_stats(&file), (0, 0));
+    fn staged_diff_stats_sums_only_the_staged_files() {
+        let a = changed_file("src/a.rs", 3, 1);
+        let b = changed_file("src/b.rs", 2, 5);
+        assert_eq!(staged_diff_stats(&[&a, &b]), (5, 6));
+        assert_eq!(staged_diff_stats(&[&a]), (3, 1));
+        assert_eq!(staged_diff_stats(&[]), (0, 0));
     }
+}
 
+#[cfg(test)]
+mod status_letter_tests {
+    use crate::sidebar::changes::{status_letter, StatusLetter};
+    use crate::theme;
+    use wt_core::diff::FileChangeStatus;
+
+    /// `STAGE-A-CHANGELOG.md` §4j: every status maps to a letter, including the common case. The
+    /// word pills this replaced returned `None` for `Modified`, which is the exact defect §4j
+    /// names - "only the exceptions were marked". A rename is a modification as far as the letter
+    /// column is concerned; the row's own `moved` chip is what states the rename.
     #[test]
     fn every_file_status_gets_a_letter_including_the_common_case() {
-        assert_eq!(status_letter(FileChangeStatus::Added), StatusLetter::Added);
-        assert_eq!(
-            status_letter(FileChangeStatus::Modified),
-            StatusLetter::Modified
-        );
-        assert_eq!(
-            status_letter(FileChangeStatus::Deleted),
-            StatusLetter::Deleted
-        );
-        // A rename is a modification as far as the letter column is concerned - the row's own
-        // `moved` chip is what states the rename. See `status_letter`'s own docs.
-        assert_eq!(
-            status_letter(FileChangeStatus::Renamed),
-            StatusLetter::Modified
-        );
-    }
-
-    #[test]
-    fn the_letters_are_gits_own_and_their_tooltips_spell_them_out() {
-        assert_eq!(StatusLetter::Added.glyph(), "A");
-        assert_eq!(StatusLetter::Modified.glyph(), "M");
-        assert_eq!(StatusLetter::Deleted.glyph(), "D");
-        assert_eq!(StatusLetter::Added.tooltip(), "Added");
-        assert_eq!(StatusLetter::Modified.tooltip(), "Modified");
-        assert_eq!(StatusLetter::Deleted.tooltip(), "Deleted");
+        for (status, letter) in [
+            (FileChangeStatus::Added, StatusLetter::Added),
+            (FileChangeStatus::Modified, StatusLetter::Modified),
+            (FileChangeStatus::Deleted, StatusLetter::Deleted),
+            (FileChangeStatus::Renamed, StatusLetter::Modified),
+        ] {
+            assert_eq!(status_letter(status), letter, "{status:?}");
+        }
     }
 
     #[test]
@@ -451,93 +491,76 @@ mod tests {
             StatusLetter::Deleted.color()
         );
     }
+}
 
-    #[test]
-    fn zero_changes_is_an_all_empty_bar() {
-        assert_eq!(stat_bar_segments(0, 0), [StatSegment::Empty; 5]);
+#[cfg(test)]
+mod staging_scope_tests {
+    use crate::sidebar::changes::{
+        commit_button_label, is_committed_clean, stageable_count, staged_subset, StagedProgress,
+    };
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+    use wt_core::diff::{DiffFile, DiffHunk, DiffLine, DiffLineKind, FileChangeStatus};
+
+    fn changed_file(path: &str, add_lines: u32, del_lines: u32) -> DiffFile {
+        let mut lines = Vec::new();
+        for _ in 0..add_lines {
+            lines.push(DiffLine {
+                kind: DiffLineKind::Added,
+                content: "a".to_string(),
+            });
+        }
+        for _ in 0..del_lines {
+            lines.push(DiffLine {
+                kind: DiffLineKind::Removed,
+                content: "d".to_string(),
+            });
+        }
+        DiffFile {
+            path: PathBuf::from(path),
+            old_path: None,
+            status: FileChangeStatus::Modified,
+            is_binary: false,
+            hunks: vec![DiffHunk {
+                header: "@@ -1,1 +1,1 @@".to_string(),
+                lines,
+            }],
+            truncated: false,
+        }
     }
 
+    /// `None` is "the `git status` answer hasn't landed", not "nothing is dirty" - claiming a file
+    /// is committed on the strength of an absent answer is exactly the mislabelling GitHub issue
+    /// #220 is about, in the other direction.
     #[test]
-    fn pure_additions_fill_the_entire_bar_with_add_segments() {
-        assert_eq!(
-            stat_bar_segments(40, 0),
-            [
-                StatSegment::Add,
-                StatSegment::Add,
-                StatSegment::Add,
-                StatSegment::Add,
-                StatSegment::Add
-            ]
-        );
-    }
-
-    #[test]
-    fn pure_deletions_fill_the_entire_bar_with_del_segments() {
-        assert_eq!(
-            stat_bar_segments(0, 40),
-            [
-                StatSegment::Del,
-                StatSegment::Del,
-                StatSegment::Del,
-                StatSegment::Del,
-                StatSegment::Del
-            ]
-        );
-    }
-
-    #[test]
-    fn every_stat_bar_is_exactly_five_segments() {
-        for (add, del) in [(0, 0), (1, 0), (0, 1), (1, 1), (3, 400), (400, 3), (7, 7)] {
-            assert_eq!(stat_bar_segments(add, del).len(), 5);
+    fn only_a_path_absent_from_a_known_dirty_set_is_committed_clean() {
+        let dirty: HashSet<PathBuf> = [PathBuf::from("src/edited.rs")].into_iter().collect();
+        for (path, known_dirty, expected) in [
+            ("src/committed.rs", Some(&dirty), true),
+            ("src/edited.rs", Some(&dirty), false),
+            ("src/anything.rs", None, false),
+        ] {
+            assert_eq!(
+                is_committed_clean(Path::new(path), known_dirty),
+                expected,
+                "{path} with dirty set {known_dirty:?}"
+            );
         }
     }
 
     #[test]
-    fn a_tiny_minority_category_still_gets_at_least_one_visible_segment() {
-        // 1 out of 400 lines added would floor to 0/5 segments without the "bump nonzero up
-        // to 1" rule this function documents - confirm the bump actually applies.
-        let segments = stat_bar_segments(1, 399);
-        assert!(segments.contains(&StatSegment::Add));
-    }
-
-    #[test]
-    fn a_path_missing_from_a_known_dirty_set_is_committed_clean() {
-        let dirty: HashSet<PathBuf> = [PathBuf::from("src/edited.rs")].into_iter().collect();
-        assert!(is_committed_clean(
-            Path::new("src/committed.rs"),
-            Some(&dirty)
-        ));
-        assert!(!is_committed_clean(
-            Path::new("src/edited.rs"),
-            Some(&dirty)
-        ));
-    }
-
-    #[test]
-    fn nothing_is_committed_clean_while_the_dirty_set_is_still_unknown() {
-        // `None` is "the `git status` answer hasn't landed", not "nothing is dirty" - claiming a
-        // file is committed on the strength of an absent answer is exactly the mislabelling
-        // GitHub issue #220 is about, in the other direction.
-        assert!(!is_committed_clean(Path::new("src/anything.rs"), None));
-    }
-
-    #[test]
-    fn stageable_count_excludes_committed_clean_files() {
+    fn stageable_count_excludes_committed_clean_files_and_falls_back_when_unknown() {
         let files = vec![
             changed_file("src/committed.rs", 4, 0),
             changed_file("src/edited.rs", 1, 1),
         ];
         let dirty: HashSet<PathBuf> = [PathBuf::from("src/edited.rs")].into_iter().collect();
         assert_eq!(stageable_count(&files, Some(&dirty)), 1);
-    }
-
-    #[test]
-    fn stageable_count_falls_back_to_every_file_when_the_dirty_set_is_unknown() {
-        let files = vec![
-            changed_file("src/a.rs", 1, 0),
-            changed_file("src/b.rs", 0, 1),
-        ];
-        assert_eq!(stageable_count(&files, None), 2);
+        assert_eq!(
+            stageable_count(&files, None),
+            2,
+            "with no `git status` answer yet, every changed file is still a candidate"
+        );
     }
 
     #[test]
@@ -560,71 +583,74 @@ mod tests {
     }
 
     #[test]
-    fn staged_progress_fraction_handles_zero_total_without_dividing_by_zero() {
-        let progress = StagedProgress {
-            staged: 0,
-            total: 0,
-        };
-        assert_eq!(progress.fraction(), 0.0);
+    fn staged_progress_is_staged_over_total_and_never_divides_by_zero() {
+        for (staged, total, fraction) in [(0usize, 0usize, 0.0f32), (3, 12, 0.25)] {
+            let progress = StagedProgress { staged, total };
+            assert!(
+                (progress.fraction() - fraction).abs() < f32::EPSILON,
+                "{staged} of {total}"
+            );
+        }
     }
 
     #[test]
-    fn staged_progress_fraction_is_staged_over_total() {
-        let progress = StagedProgress {
-            staged: 3,
-            total: 12,
-        };
-        assert!((progress.fraction() - 0.25).abs() < f32::EPSILON);
-    }
+    fn staged_subset_only_keeps_files_in_the_staged_set() {
+        let files = vec![
+            changed_file("src/a.rs", 1, 0),
+            changed_file("src/b.rs", 2, 0),
+            changed_file("src/c.rs", 0, 3),
+        ];
+        let mut staged = HashSet::new();
+        staged.insert(PathBuf::from("src/b.rs"));
 
-    #[test]
-    fn split_dir_name_separates_a_nested_path() {
-        let (dir, name) = split_dir_name(Path::new("src/db/query_builder.rs"));
-        assert_eq!(dir, "src/db");
-        assert_eq!(name, "query_builder.rs");
-    }
-
-    #[test]
-    fn split_dir_name_leaves_dir_empty_for_a_root_level_file() {
-        let (dir, name) = split_dir_name(Path::new("Cargo.toml"));
-        assert_eq!(dir, "");
-        assert_eq!(name, "Cargo.toml");
-    }
-
-    #[test]
-    fn parse_hunk_new_range_reads_an_explicit_count() {
-        assert_eq!(
-            parse_hunk_new_range("@@ -10,5 +14,9 @@ fn foo() {"),
-            Some((14, 9))
+        let subset = staged_subset(&files, &staged);
+        assert_eq!(subset.len(), 1);
+        assert_eq!(subset[0].path, PathBuf::from("src/b.rs"));
+        assert!(
+            staged_subset(&files, &HashSet::new()).is_empty(),
+            "and nothing staged is an empty subset, not the whole list"
         );
     }
 
     #[test]
-    fn parse_hunk_new_range_defaults_a_missing_count_to_one() {
-        assert_eq!(parse_hunk_new_range("@@ -1 +1 @@"), Some((1, 1)));
+    fn the_commit_button_names_the_real_staged_count() {
+        for (staged, label) in [
+            (0, "Commit"),
+            (1, "Commit 1 file"),
+            (2, "Commit 2 files"),
+            (3, "Commit 3 files"),
+        ] {
+            assert_eq!(commit_button_label(staged), label, "{staged} staged");
+        }
+    }
+}
+
+#[cfg(test)]
+mod hunk_header_tests {
+    use crate::sidebar::changes::{
+        fold_gap_between, hunk_line_numbers, parse_hunk_new_range, parse_hunk_old_range,
+    };
+    use wt_core::diff::{DiffHunk, DiffLine, DiffLineKind};
+
+    fn line(kind: DiffLineKind, text: &str) -> DiffLine {
+        DiffLine {
+            kind,
+            content: text.to_string(),
+        }
     }
 
+    /// Both sides of a hunk header, an explicit count and the `@@ -1 +1 @@` form that means one,
+    /// and a header that isn't one at all.
     #[test]
-    fn parse_hunk_new_range_rejects_a_malformed_header() {
-        assert_eq!(parse_hunk_new_range("not a hunk header"), None);
-    }
-
-    #[test]
-    fn parse_hunk_old_range_reads_an_explicit_count() {
-        assert_eq!(
-            parse_hunk_old_range("@@ -10,5 +14,9 @@ fn foo() {"),
-            Some((10, 5))
-        );
-    }
-
-    #[test]
-    fn parse_hunk_old_range_defaults_a_missing_count_to_one() {
-        assert_eq!(parse_hunk_old_range("@@ -1 +1 @@"), Some((1, 1)));
-    }
-
-    #[test]
-    fn parse_hunk_old_range_rejects_a_malformed_header() {
-        assert_eq!(parse_hunk_old_range("not a hunk header"), None);
+    fn a_hunk_header_yields_both_ranges_or_none_at_all() {
+        for (header, old, new) in [
+            ("@@ -10,5 +14,9 @@ fn foo() {", Some((10, 5)), Some((14, 9))),
+            ("@@ -1 +1 @@", Some((1, 1)), Some((1, 1))),
+            ("not a hunk header", None, None),
+        ] {
+            assert_eq!(parse_hunk_old_range(header), old, "old range of {header:?}");
+            assert_eq!(parse_hunk_new_range(header), new, "new range of {header:?}");
+        }
     }
 
     #[test]
@@ -662,59 +688,66 @@ mod tests {
         assert_eq!(hunk_line_numbers(&hunk), vec![(None, None)]);
     }
 
+    /// The fold marker's own number: the unchanged span between two hunks, and the two cases that
+    /// have no marker to show - back-to-back hunks, and a header that couldn't be read.
     #[test]
-    fn fold_gap_between_computes_the_real_unchanged_span() {
+    fn the_fold_gap_is_the_real_unchanged_span_between_two_hunks() {
         // First hunk covers new lines 10..=14 (start 10, count 5); the next starts at 40 -
         // 25 real unchanged lines sit between them.
-        assert_eq!(
-            fold_gap_between("@@ -10,5 +10,5 @@", "@@ -30,5 +40,5 @@"),
-            Some(25)
-        );
-    }
-
-    #[test]
-    fn fold_gap_between_is_none_for_back_to_back_hunks() {
-        assert_eq!(fold_gap_between("@@ -1,5 +1,5 @@", "@@ -6,5 +6,5 @@"), None);
-    }
-
-    #[test]
-    fn fold_gap_between_is_none_when_a_header_is_unparseable() {
-        assert_eq!(fold_gap_between("garbage", "@@ -6,5 +6,5 @@"), None);
-    }
-
-    fn renamed_file(old_path: Option<PathBuf>) -> DiffFile {
-        DiffFile {
-            path: PathBuf::from("src/new_name.rs"),
-            old_path,
-            status: FileChangeStatus::Renamed,
-            is_binary: false,
-            hunks: Vec::new(),
-            truncated: false,
+        for (prev, next, gap) in [
+            ("@@ -10,5 +10,5 @@", "@@ -30,5 +40,5 @@", Some(25)),
+            ("@@ -1,5 +1,5 @@", "@@ -6,5 +6,5 @@", None),
+            ("garbage", "@@ -6,5 +6,5 @@", None),
+        ] {
+            assert_eq!(fold_gap_between(prev, next), gap, "{prev:?} -> {next:?}");
         }
     }
+}
+
+#[cfg(test)]
+mod row_label_tests {
+    use crate::sidebar::changes::{
+        empty_hunks_message, is_real_rename, rename_label, split_dir_name,
+    };
+    use std::path::{Path, PathBuf};
+    use wt_core::diff::{DiffFile, FileChangeStatus};
 
     #[test]
-    fn a_rename_with_a_real_different_old_path_is_a_real_rename() {
-        let file = renamed_file(Some(PathBuf::from("src/old_name.rs")));
-        assert!(is_real_rename(&file));
+    fn split_dir_name_separates_a_nested_path_and_leaves_a_root_level_one_bare() {
         assert_eq!(
-            rename_label(&file),
-            Some("src/old_name.rs \u{2192} src/new_name.rs".to_string())
+            split_dir_name(Path::new("src/db/query_builder.rs")),
+            ("src/db".to_string(), "query_builder.rs".to_string())
+        );
+        assert_eq!(
+            split_dir_name(Path::new("Cargo.toml")),
+            (String::new(), "Cargo.toml".to_string())
         );
     }
 
+    /// A rename is only real when git reports an old path that genuinely differs - an absent one,
+    /// or one identical to the current path (defensive: `wt_core::diff` shouldn't produce it, but
+    /// never assume it away), is not a rename and gets no label.
     #[test]
-    fn no_old_path_is_not_a_real_rename() {
-        let file = renamed_file(None);
-        assert!(!is_real_rename(&file));
-        assert_eq!(rename_label(&file), None);
-    }
-
-    #[test]
-    fn an_old_path_identical_to_the_current_path_is_not_a_real_rename() {
-        let file = renamed_file(Some(PathBuf::from("src/new_name.rs")));
-        assert!(!is_real_rename(&file));
-        assert_eq!(rename_label(&file), None);
+    fn only_a_genuinely_different_old_path_is_a_rename() {
+        for (old_path, label) in [
+            (
+                Some("src/old_name.rs"),
+                Some("src/old_name.rs \u{2192} src/new_name.rs".to_string()),
+            ),
+            (None, None),
+            (Some("src/new_name.rs"), None),
+        ] {
+            let file = DiffFile {
+                path: PathBuf::from("src/new_name.rs"),
+                old_path: old_path.map(PathBuf::from),
+                status: FileChangeStatus::Renamed,
+                is_binary: false,
+                hunks: Vec::new(),
+                truncated: false,
+            };
+            assert_eq!(is_real_rename(&file), label.is_some(), "{old_path:?}");
+            assert_eq!(rename_label(&file), label, "{old_path:?}");
+        }
     }
 
     #[test]
@@ -723,89 +756,12 @@ mod tests {
             empty_hunks_message(FileChangeStatus::Renamed),
             "no line changes (rename only)"
         );
-    }
-
-    #[test]
-    fn empty_hunks_message_is_generic_for_a_non_renamed_file() {
-        assert_eq!(
-            empty_hunks_message(FileChangeStatus::Added),
-            "no line changes"
-        );
-        assert_eq!(
-            empty_hunks_message(FileChangeStatus::Modified),
-            "no line changes"
-        );
-        assert_eq!(
-            empty_hunks_message(FileChangeStatus::Deleted),
-            "no line changes"
-        );
-    }
-
-    fn changed_file(path: &str, add_lines: u32, del_lines: u32) -> DiffFile {
-        let mut lines = Vec::new();
-        for _ in 0..add_lines {
-            lines.push(line(DiffLineKind::Added, "a"));
+        for status in [
+            FileChangeStatus::Added,
+            FileChangeStatus::Modified,
+            FileChangeStatus::Deleted,
+        ] {
+            assert_eq!(empty_hunks_message(status), "no line changes", "{status:?}");
         }
-        for _ in 0..del_lines {
-            lines.push(line(DiffLineKind::Removed, "d"));
-        }
-        DiffFile {
-            path: PathBuf::from(path),
-            old_path: None,
-            status: FileChangeStatus::Modified,
-            is_binary: false,
-            hunks: vec![DiffHunk {
-                header: "@@ -1,1 +1,1 @@".to_string(),
-                lines,
-            }],
-            truncated: false,
-        }
-    }
-
-    #[test]
-    fn staged_subset_only_keeps_files_in_the_staged_set() {
-        let files = vec![
-            changed_file("src/a.rs", 1, 0),
-            changed_file("src/b.rs", 2, 0),
-            changed_file("src/c.rs", 0, 3),
-        ];
-        let mut staged = HashSet::new();
-        staged.insert(PathBuf::from("src/b.rs"));
-
-        let subset = staged_subset(&files, &staged);
-        assert_eq!(subset.len(), 1);
-        assert_eq!(subset[0].path, PathBuf::from("src/b.rs"));
-    }
-
-    #[test]
-    fn staged_subset_is_empty_when_nothing_is_staged() {
-        let files = vec![changed_file("src/a.rs", 1, 0)];
-        let subset = staged_subset(&files, &HashSet::new());
-        assert!(subset.is_empty());
-    }
-
-    #[test]
-    fn staged_diff_stats_sums_only_the_staged_files() {
-        let a = changed_file("src/a.rs", 3, 1);
-        let b = changed_file("src/b.rs", 2, 5);
-        assert_eq!(staged_diff_stats(&[&a, &b]), (5, 6));
-        assert_eq!(staged_diff_stats(&[&a]), (3, 1));
-        assert_eq!(staged_diff_stats(&[]), (0, 0));
-    }
-
-    #[test]
-    fn commit_button_label_is_a_bare_ghost_commit_with_nothing_staged() {
-        assert_eq!(commit_button_label(0), "Commit");
-    }
-
-    #[test]
-    fn commit_button_label_is_singular_for_exactly_one_staged_file() {
-        assert_eq!(commit_button_label(1), "Commit 1 file");
-    }
-
-    #[test]
-    fn commit_button_label_is_plural_for_more_than_one_staged_file() {
-        assert_eq!(commit_button_label(2), "Commit 2 files");
-        assert_eq!(commit_button_label(3), "Commit 3 files");
     }
 }

@@ -1442,8 +1442,11 @@ mod palette_language_server_step_tests {
     #[gpui::test]
     fn picking_a_row_restarts_exactly_that_server_and_closes_the_palette(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
-        let root = repo.path().to_path_buf();
         let (app, _server, cx) = app_with_two_servers(cx, repo.path());
+        // The key `app_with_two_servers` really inserted under - `AdeApp` canonicalizes the root it
+        // is opened with, which on macOS resolves the `/var -> /private/var` symlink `TempDir`
+        // hands out, so `repo.path()` would key an entry that does not exist.
+        let root = app.read_with(cx, |app, _| app.file_tree_root.clone());
 
         cx.dispatch_action(TogglePalette);
         cx.run_until_parked();

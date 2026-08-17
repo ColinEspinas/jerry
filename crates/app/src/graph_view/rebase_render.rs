@@ -1510,47 +1510,18 @@ fn render_rebase_pause_marker(planned: bool, actual: bool) -> gpui::AnyElement {
 #[cfg(test)]
 mod rebase_flow_tests {
     use super::rebase::RebasePhase;
-    use crate::root::focus::palette_focus_tests;
     use crate::root::AdeApp;
+    use crate::test_support::open_test_app;
+    use crate::theme;
     use crate::work_surface::agents::{AgentKind, ProcessKind};
-    use gpui::{Entity, TestAppContext};
+    use gpui::{px, Entity, TestAppContext};
     use std::path::Path;
+    use test_support::{commit, git_output, seed_empty_repo_at, seed_three_commits};
     use wt_core::rebase::RebaseOutcome;
 
-    fn git(dir: &Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn git_output(dir: &Path, args: &[&str]) -> String {
-        let output = std::process::Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(output.status.success(), "git {args:?} failed in {dir:?}");
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
-    }
-
-    fn commit(dir: &Path, file: &str, contents: &str, message: &str) {
-        std::fs::write(dir.join(file), contents).expect("write file");
-        git(dir, &["add", file]);
-        git(dir, &["commit", "-m", message]);
-    }
-
-    /// Three real commits on `main` (`base`, `second`, `third`), clean working tree - the graph
-    /// walks them newest first, so row 0 is `third`, row 1 is `second`, row 2 is `base`.
+    /// `test_support::seed_three_commits`: three real commits on `main` (`first`, `second`,
+    /// `third`) each rewriting `a.txt`, clean working tree - the graph walks them newest first, so
+    /// row 0 is `third`, row 1 is `second`, row 2 is `first`.
     fn open_seeded_graph(
         cx: &mut TestAppContext,
     ) -> (
@@ -1559,14 +1530,9 @@ mod rebase_flow_tests {
         &mut gpui::VisualTestContext,
     ) {
         let repo = tempfile::tempdir().expect("tempdir");
-        git(repo.path(), &["init", "-b", "main"]);
-        git(repo.path(), &["config", "user.email", "test@example.com"]);
-        git(repo.path(), &["config", "user.name", "Test User"]);
-        commit(repo.path(), "a.txt", "1", "base");
-        commit(repo.path(), "a.txt", "2", "second");
-        commit(repo.path(), "a.txt", "3", "third");
+        seed_three_commits(repo.path());
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_git_graph(window, cx);
         });
@@ -1619,7 +1585,7 @@ mod rebase_flow_tests {
             assert_eq!(
                 subjects,
                 vec!["second", "third"],
-                "the plan must be oldest-first, excluding the onto row (`base`) itself"
+                "the plan must be oldest-first, excluding the onto row (`first`) itself"
             );
         });
 
@@ -1750,14 +1716,12 @@ mod rebase_flow_tests {
         // Independent files, unlike `open_seeded_graph`'s single shared file - dropping `second`
         // must not conflict with `third`, which touches a different file entirely.
         let repo = tempfile::tempdir().expect("tempdir");
-        git(repo.path(), &["init", "-b", "main"]);
-        git(repo.path(), &["config", "user.email", "test@example.com"]);
-        git(repo.path(), &["config", "user.name", "Test User"]);
+        seed_empty_repo_at(repo.path());
         commit(repo.path(), "base.txt", "base", "base");
         commit(repo.path(), "a.txt", "1", "second");
         commit(repo.path(), "b.txt", "1", "third");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_git_graph(window, cx);
         });
@@ -1799,9 +1763,7 @@ mod rebase_flow_tests {
         // Independent files throughout: this test is comparing a derivation against real git
         // output, so a conflict getting in the way would only obscure what it is measuring.
         let repo = tempfile::tempdir().expect("tempdir");
-        git(repo.path(), &["init", "-b", "main"]);
-        git(repo.path(), &["config", "user.email", "test@example.com"]);
-        git(repo.path(), &["config", "user.name", "Test User"]);
+        seed_empty_repo_at(repo.path());
         commit(repo.path(), "base.txt", "base", "base");
         commit(repo.path(), "a.txt", "1", "one");
         commit(repo.path(), "b.txt", "1", "two");
@@ -1810,7 +1772,7 @@ mod rebase_flow_tests {
         commit(repo.path(), "e.txt", "1", "five");
         commit(repo.path(), "f.txt", "1", "six");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_git_graph(window, cx);
         });
@@ -1834,7 +1796,7 @@ mod rebase_flow_tests {
             assert_eq!(
                 subjects,
                 vec!["one", "two", "three", "four", "five", "six"],
-                "the plan must be oldest-first, excluding the onto row (`base`) itself"
+                "the plan must be oldest-first, excluding the onto row (`first`) itself"
             );
         });
 
@@ -2030,7 +1992,7 @@ mod rebase_flow_tests {
         });
         let subjects = git_output(repo.path(), &["log", "--format=%s", "--reverse"]);
         assert_eq!(
-            subjects, "base\nsecond\nthird supplied up front",
+            subjects, "first\nsecond\nthird supplied up front",
             "the real history must carry the message supplied up front, with no stop in between"
         );
     }
@@ -2144,14 +2106,12 @@ mod rebase_flow_tests {
         cx: &mut TestAppContext,
     ) {
         let repo = tempfile::tempdir().expect("tempdir");
-        git(repo.path(), &["init", "-b", "main"]);
-        git(repo.path(), &["config", "user.email", "test@example.com"]);
-        git(repo.path(), &["config", "user.name", "Test User"]);
+        seed_empty_repo_at(repo.path());
         commit(repo.path(), "file.txt", "base", "base");
         commit(repo.path(), "file.txt", "v1", "commit v1");
         commit(repo.path(), "file.txt", "v2", "commit v2");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_git_graph(window, cx);
         });
@@ -2224,18 +2184,16 @@ mod rebase_flow_tests {
     fn running_agent_warning_shows_and_pause_now_really_suspends_the_process_with_resume_on_leave(
         cx: &mut TestAppContext,
     ) {
-        let (repo, app, cx) = open_seeded_graph(cx);
+        let (_repo, app, cx) = open_seeded_graph(cx);
 
+        // Spawned into the app's own `diff_root`, the key `pause_rebase_agents` and the warning
+        // both resolve agents by: a `TempDir`'s own path is a symlink on macOS (`/var/...`) while
+        // the app stores the canonicalized one (`/private/var/...`), so an agent spawned under
+        // `repo.path()` is invisible to this worktree there and the warning never renders.
         let agent_id = app.update_in(cx, |app, window, cx| {
-            app.agents.spawn(
-                ProcessKind::Shell,
-                repo.path().to_path_buf(),
-                12.0,
-                None,
-                None,
-                window,
-                cx,
-            )
+            let cwd = app.diff_root.clone();
+            app.agents
+                .spawn(ProcessKind::Shell, cwd, 12.0, None, None, window, cx)
         });
         app.update(cx, |app, _cx| {
             app.agents
@@ -2317,9 +2275,7 @@ mod rebase_flow_tests {
         let (repo_a, app, cx) = open_seeded_graph(cx);
 
         let repo_b = tempfile::tempdir().expect("tempdir b");
-        git(repo_b.path(), &["init", "-b", "main"]);
-        git(repo_b.path(), &["config", "user.email", "test@example.com"]);
-        git(repo_b.path(), &["config", "user.name", "Test User"]);
+        seed_empty_repo_at(repo_b.path());
         commit(repo_b.path(), "b.txt", "1", "repo b base");
 
         app.update(cx, |app, _cx| {
@@ -2429,7 +2385,7 @@ mod rebase_flow_tests {
         });
         let subjects = git_output(repo.path(), &["log", "--format=%s", "--reverse"]);
         assert_eq!(
-            subjects, "base\nsecond\nthird",
+            subjects, "first\nsecond\nthird",
             "a raced, unguarded Skip would have really dropped `third` from history - the guard \
              must have refused it outright, leaving every real commit intact"
         );
@@ -2494,7 +2450,7 @@ mod rebase_flow_tests {
         });
         let subjects = git_output(repo.path(), &["log", "--format=%s", "--reverse"]);
         assert_eq!(
-            subjects, "base\nsecond\nthird",
+            subjects, "first\nsecond\nthird",
             "abort must have restored the exact pre-rebase history"
         );
     }
@@ -2578,35 +2534,22 @@ mod rebase_flow_tests {
 
     #[cfg(target_os = "linux")]
     fn wait_for_proc_state(pid: u32, prefix: &str) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let state = proc_state(pid);
-            if state.starts_with(prefix) {
-                return;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "process {pid} never reached the real kernel-reported state {prefix:?} - last \
-                 observed: {state:?}"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        assert!(
+            test_support::wait_until(std::time::Duration::from_secs(5), || proc_state(pid)
+                .starts_with(prefix)),
+            "process {pid} never reached the real kernel-reported state {prefix:?} - last \
+             observed: {:?}",
+            proc_state(pid)
+        );
     }
 
     #[cfg(target_os = "linux")]
     fn wait_for_proc_state_not(pid: u32, prefix: &str) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let state = proc_state(pid);
-            if !state.starts_with(prefix) {
-                return;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "process {pid} never left the real kernel-reported state {prefix:?}"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        assert!(
+            test_support::wait_until(std::time::Duration::from_secs(5), || !proc_state(pid)
+                .starts_with(prefix)),
+            "process {pid} never left the real kernel-reported state {prefix:?}"
+        );
     }
 
     // --- Design spec §1.3/§1.4/§1.5's real geometry (GitHub issues #303, #304) ---------------
@@ -2684,19 +2627,18 @@ mod rebase_flow_tests {
         cx: &mut TestAppContext,
     ) {
         let repo = tempfile::tempdir().expect("tempdir");
-        git(repo.path(), &["init", "-b", "main"]);
-        git(repo.path(), &["config", "user.email", "test@example.com"]);
-        git(repo.path(), &["config", "user.name", "Test User"]);
+        seed_empty_repo_at(repo.path());
+        // Far more rows than any test window is tall, so the list genuinely scrolls.
         for n in 0..40 {
             commit(
                 repo.path(),
-                &format!("f{n}.txt"),
+                format!("f{n}.txt"),
                 "x",
                 &format!("commit {n}"),
             );
         }
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_git_graph(window, cx);
         });
@@ -2786,7 +2728,9 @@ mod rebase_flow_tests {
     // --- The action menu (GitHub issue #302) ---------------------------------------------------
 
     #[gpui::test]
-    fn the_action_menu_is_274_wide_and_paints_all_six_actions(cx: &mut TestAppContext) {
+    fn the_action_menu_paints_all_six_actions_full_width_below_its_own_row(
+        cx: &mut TestAppContext,
+    ) {
         let (_repo, app, cx) = open_seeded_graph(cx);
         app.update_in(cx, |app, _window, cx| {
             app.enter_rebase_mode(2, cx);
@@ -2818,10 +2762,10 @@ mod rebase_flow_tests {
             .debug_bounds("rebase-action-menu-0")
             .expect("the open action menu must be painted");
         assert_eq!(
-            f32::from(menu.size.width),
-            274.0,
-            "§1.4: the action menu is 274 wide - it used to be 90, which could not fit a hint \
-             at all"
+            menu.size.width,
+            theme::graph::REBASE_MENU_WIDTH,
+            "§1.4: the menu must really paint at the width the theme authors it to - it used \
+             to be 90, which could not fit a hint at all"
         );
 
         let mut option_bounds = Vec::new();
@@ -2830,11 +2774,11 @@ mod rebase_flow_tests {
                 .debug_bounds(selector)
                 .unwrap_or_else(|| panic!("{selector} must be painted"));
             // Every option row spans the menu's own inner width - the popover's 1px border on
-            // each side, and nothing else, separates it from the menu's own 274.
+            // each side, and nothing else, separates it from the menu's own width.
             assert_eq!(
-                f32::from(bounds.size.width),
-                272.0,
-                "{selector}'s row must span the whole 274-wide menu less its 1px borders"
+                bounds.size.width,
+                menu.size.width - px(2.0),
+                "{selector}'s row must span the whole menu less its 1px border on each side"
             );
             option_bounds.push(bounds);
         }
@@ -3066,14 +3010,12 @@ mod rebase_flow_tests {
     #[gpui::test]
     fn the_stopped_strip_paints_the_amber_square_the_spec_asks_for(cx: &mut TestAppContext) {
         let repo = tempfile::tempdir().expect("tempdir");
-        git(repo.path(), &["init", "-b", "main"]);
-        git(repo.path(), &["config", "user.email", "test@example.com"]);
-        git(repo.path(), &["config", "user.name", "Test User"]);
+        seed_empty_repo_at(repo.path());
         commit(repo.path(), "file.txt", "base", "base");
         commit(repo.path(), "file.txt", "v1", "commit v1");
         commit(repo.path(), "file.txt", "v2", "commit v2");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_git_graph(window, cx);
         });

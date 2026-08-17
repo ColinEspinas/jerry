@@ -48,10 +48,10 @@ process that applies them.
    against `design_handoff_jerry_ade/revision/` or the issue's acceptance criteria. The only way
    UI-visible work gets checked against something real instead of "looks right."
 
-7. **Finish — `ship`.** Runs `/check` (the gate: conventions, fmt, clippy — not tests right now,
-   see [issue #348](https://github.com/ColinEspinas/jerry/issues/348)), commits, pushes, and
-   opens the PR from `.github/pull_request_template.md` with a real summary — not a generic one.
-   Works standalone for anything that didn't start from a scoped issue, too.
+7. **Finish — `ship`.** Runs `/check` (the gate: conventions, fmt, clippy, and the `unit`/`ui`
+   test tiers), commits, pushes, and opens the PR from `.github/pull_request_template.md` with a
+   real summary — not a generic one. Works standalone for anything that didn't start from a scoped
+   issue, too.
 
 8. **Get reviewed — `review`.** Checks a diff or PR against `CLAUDE.md`'s standards and posts real
    findings with `gh pr review`, not a line-by-line narration.

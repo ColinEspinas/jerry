@@ -81,7 +81,7 @@ diagnostic_card_footer = "#dfd5d7"  # The Diagnostic popover's own footer band's
 # The Files tree's own structural marks (GitHub issue #18 §3).
 [tree]
 indent_guide        = "#d3d8dc"
-indent_guide_active = "#90a9bf"  # The guide for a level in the selected file's ancestor chain
+indent_guide_active = "#90a9bf"
 
 # The overlay scrollbar (GitHub issue #30).
 [scrollbar]

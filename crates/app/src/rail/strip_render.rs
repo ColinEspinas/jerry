@@ -519,38 +519,7 @@ fn severity_color(severity: diagnostics_view::Severity) -> theme::ColorToken {
 #[cfg(test)]
 mod sidebar_strip_tests {
     use super::*;
-    use crate::root::focus::palette_focus_tests;
     use gpui::TestAppContext;
-    use std::fs;
-    use std::path::Path;
-    use std::process::Command;
-    use tempfile::TempDir;
-
-    fn git(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn init_repo() -> TempDir {
-        let dir = TempDir::new().expect("tempdir");
-        git(dir.path(), &["init", "-b", "main"]);
-        git(dir.path(), &["config", "user.email", "test@example.com"]);
-        git(dir.path(), &["config", "user.name", "Test User"]);
-        fs::write(dir.path().join("base.txt"), "base\n").expect("write");
-        git(dir.path(), &["add", "base.txt"]);
-        git(dir.path(), &["commit", "-m", "initial"]);
-        dir
-    }
 
     /// The four bounds every geometry assertion below reads: the two view cells, the `+` and the
     /// `⋯`, in the order the strip paints them.
@@ -584,8 +553,8 @@ mod sidebar_strip_tests {
 
     #[gpui::test]
     fn every_strip_cell_is_a_full_height_38px_slab_with_no_gap(cx: &mut TestAppContext) {
-        let repo = init_repo();
-        let (_app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_repo();
+        let (_app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         let band = cx
@@ -639,8 +608,8 @@ mod sidebar_strip_tests {
 
     #[gpui::test]
     fn all_three_column_headers_end_on_one_line(cx: &mut TestAppContext) {
-        let repo = init_repo();
-        let (_app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_repo();
+        let (_app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         let rail = cx
@@ -669,8 +638,8 @@ mod sidebar_strip_tests {
 
     #[gpui::test]
     fn the_centre_columns_bottom_edge_is_carried_all_the_way_across(cx: &mut TestAppContext) {
-        let repo = init_repo();
-        let (_app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_repo();
+        let (_app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         let centre = cx.debug_bounds("tab-strip").expect("the tab strip");
@@ -701,8 +670,8 @@ mod sidebar_strip_tests {
 
     #[gpui::test]
     fn clicking_a_cell_really_switches_the_panel_under_it(cx: &mut TestAppContext) {
-        let repo = init_repo();
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_repo();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         assert!(
@@ -744,8 +713,8 @@ mod sidebar_strip_tests {
 
     #[gpui::test]
     fn both_view_glyphs_are_phosphor_assets_in_one_shared_optical_box(cx: &mut TestAppContext) {
-        let repo = init_repo();
-        let (_app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_repo();
+        let (_app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         let box_size = f32::from(IconSize::Strip.box_size());
@@ -777,8 +746,8 @@ mod sidebar_strip_tests {
 
     #[gpui::test]
     fn a_window_with_nothing_waiting_paints_no_state_marker(cx: &mut TestAppContext) {
-        let repo = init_repo();
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_repo();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         assert!(
@@ -805,8 +774,8 @@ mod sidebar_strip_tests {
 
     #[gpui::test]
     fn an_empty_day_drops_the_view_cells_and_keeps_the_trailing_pair(cx: &mut TestAppContext) {
-        let repo = init_repo();
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_repo();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
         assert!(
             cx.debug_bounds("sidebar-strip-worktrees").is_some(),
@@ -841,8 +810,8 @@ mod sidebar_strip_tests {
 
     #[gpui::test]
     fn the_filter_rows_placeholder_follows_the_selected_view(cx: &mut TestAppContext) {
-        let repo = init_repo();
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_repo();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         assert!(
@@ -876,8 +845,8 @@ mod sidebar_strip_tests {
 
     #[gpui::test]
     fn the_plus_cell_still_spawns_a_real_agent(cx: &mut TestAppContext) {
-        let repo = init_repo();
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let repo = crate::test_support::temp_repo();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
 
         let before = app.read_with(cx, |app, _| app.agents.iter().count());
@@ -906,41 +875,14 @@ mod problems_view_tests {
         publish_full_and_wait, spawn_fake_server,
     };
     use crate::rail::worktrees::WorktreeItem;
-    use crate::root::focus::palette_focus_tests;
     use gpui::TestAppContext;
     use std::path::Path;
-    use std::process::Command;
     use std::sync::Arc;
-    use tempfile::TempDir;
 
     /// LSP severity numbers, as a real server sends them.
     const ERROR: u8 = 1;
     const WARNING: u8 = 2;
     const HINT: u8 = 4;
-
-    fn git(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed in {dir:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn init_repo() -> TempDir {
-        let dir = TempDir::new().expect("tempdir");
-        git(dir.path(), &["init", "-b", "main"]);
-        git(dir.path(), &["config", "user.email", "test@example.com"]);
-        git(dir.path(), &["config", "user.name", "Test User"]);
-        std::fs::write(dir.path().join("base.txt"), "base\n").expect("write");
-        git(dir.path(), &["add", "base.txt"]);
-        git(dir.path(), &["commit", "-m", "initial"]);
-        dir
-    }
 
     /// Writes a real file under `root` and hands back its absolute path and its `file://` uri -
     /// the two things a real publish and a real click each need.
@@ -992,15 +934,15 @@ mod problems_view_tests {
     fn a_diagnostic_from_another_checkout_never_renders_under_the_active_one(
         cx: &mut TestAppContext,
     ) {
-        let repo = init_repo();
-        let other = TempDir::new().expect("tempdir");
+        let repo = crate::test_support::temp_repo();
+        let other = crate::test_support::temp_root();
         let here = repo.path().to_path_buf();
         let there = other.path().to_path_buf();
 
         let (_, here_uri) = real_file(&here, "src/here.rs", "fn here() {}\n");
         let (_, there_uri) = real_file(&there, "src/there.rs", "fn there() {}\n");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, here.clone());
+        let (app, cx) = crate::test_support::open_test_app(cx, here.clone());
         cx.run_until_parked();
 
         let here_server = spawn_fake_server(&here, "rust-analyzer", "normal");
@@ -1089,12 +1031,12 @@ mod problems_view_tests {
     fn a_row_for_a_never_opened_file_really_opens_it_at_the_diagnostics_line(
         cx: &mut TestAppContext,
     ) {
-        let repo = init_repo();
+        let repo = crate::test_support::temp_repo();
         let root = repo.path().to_path_buf();
         let (buried, buried_uri) =
             real_file(&root, "src/db/orm/select.rs", &"// filler\n".repeat(60));
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, root.clone());
+        let (app, cx) = crate::test_support::open_test_app(cx, root.clone());
         cx.run_until_parked();
 
         let server = spawn_fake_server(&root, "rust-analyzer", "normal");
@@ -1163,13 +1105,13 @@ mod problems_view_tests {
 
     #[gpui::test]
     fn the_header_and_the_marker_are_tallied_over_the_real_published_list(cx: &mut TestAppContext) {
-        let repo = init_repo();
+        let repo = crate::test_support::temp_repo();
         let root = repo.path().to_path_buf();
         let (_, broken) = real_file(&root, "src/db/orm/select.rs", "fn a() {}\n");
         let (_, noisy) = real_file(&root, "src/db/query_builder.rs", "fn b() {}\n");
         let (_, chatty) = real_file(&root, "src/api/orders.rs", "fn c() {}\n");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, root.clone());
+        let (app, cx) = crate::test_support::open_test_app(cx, root.clone());
         cx.run_until_parked();
 
         let server = spawn_fake_server(&root, "rust-analyzer", "normal");
@@ -1257,8 +1199,8 @@ mod problems_view_tests {
     fn a_diagnostic_about_a_file_outside_the_checkout_is_the_only_one_dropped(
         cx: &mut TestAppContext,
     ) {
-        let repo = init_repo();
-        let registry = TempDir::new().expect("tempdir");
+        let repo = crate::test_support::temp_repo();
+        let registry = crate::test_support::temp_root();
         let root = repo.path().to_path_buf();
         let (_, dependency) = real_file(
             registry.path(),
@@ -1270,7 +1212,7 @@ mod problems_view_tests {
         // landed): the dependency row must be the only one dropped, not everything.
         let (_, mine) = real_file(&root, "src/lib.rs", "pub fn mine() {}\n");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, root.clone());
+        let (app, cx) = crate::test_support::open_test_app(cx, root.clone());
         cx.run_until_parked();
 
         let server = spawn_fake_server(&root, "rust-analyzer", "normal");
@@ -1317,11 +1259,11 @@ mod problems_view_tests {
 
     #[gpui::test]
     fn a_row_for_a_deleted_file_disappears_from_the_list_and_the_tally(cx: &mut TestAppContext) {
-        let repo = init_repo();
+        let repo = crate::test_support::temp_repo();
         let root = repo.path().to_path_buf();
         let (doomed, doomed_uri) = real_file(&root, "src/scratch.rs", "fn tmp() {}\n");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, root.clone());
+        let (app, cx) = crate::test_support::open_test_app(cx, root.clone());
         cx.run_until_parked();
 
         let server = spawn_fake_server(&root, "rust-analyzer", "normal");
@@ -1367,11 +1309,11 @@ mod problems_view_tests {
     fn restarting_the_language_server_empties_the_list_rather_than_stranding_it(
         cx: &mut TestAppContext,
     ) {
-        let repo = init_repo();
+        let repo = crate::test_support::temp_repo();
         let root = repo.path().to_path_buf();
         let (_, uri) = real_file(&root, "src/main.rs", "fn main() {}\n");
 
-        let (app, cx) = palette_focus_tests::open_test_app(cx, root.clone());
+        let (app, cx) = crate::test_support::open_test_app(cx, root.clone());
         cx.run_until_parked();
 
         let server = spawn_fake_server(&root, "rust-analyzer", "normal");

@@ -1676,23 +1676,23 @@ mod tree_ops_regression_tests {
     }
 
     /// `src/main.rs` + `src/util.rs` + a root-level `README.md`.
-    fn seed(repo: &TempDir) {
-        fs::create_dir_all(repo.path().join("src")).expect("mkdir");
-        fs::write(repo.path().join("src/main.rs"), "fn main() {}\n").expect("write");
-        fs::write(repo.path().join("src/util.rs"), "pub fn u() {}\n").expect("write");
-        fs::write(repo.path().join("README.md"), "hi\n").expect("write");
+    fn seed(repo: &Path) {
+        fs::create_dir_all(repo.join("src")).expect("mkdir");
+        fs::write(repo.join("src/main.rs"), "fn main() {}\n").expect("write");
+        fs::write(repo.join("src/util.rs"), "pub fn u() {}\n").expect("write");
+        fs::write(repo.join("README.md"), "hi\n").expect("write");
     }
 
     #[gpui::test]
     fn renaming_an_open_file_carries_its_tab_and_buffer_with_no_orphan_left_behind(
         cx: &mut TestAppContext,
     ) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
-        let old = repo.path().join("src/main.rs");
+        let old = repo.join("src/main.rs");
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(old.clone(), window, cx);
         });
@@ -1714,7 +1714,7 @@ mod tree_ops_regression_tests {
         cx.run_until_parked();
 
         assert!(!old.exists(), "the old path must be gone from disk");
-        assert!(repo.path().join("src/renamed.rs").exists());
+        assert!(repo.join("src/renamed.rs").exists());
 
         app.read_with(cx, |app, _| {
             assert_eq!(
@@ -1736,40 +1736,40 @@ mod tree_ops_regression_tests {
                 .expect("the buffer must be re-keyed, not dropped");
             assert_eq!(
                 buffer.path,
-                repo.path().join("src/renamed.rs"),
+                repo.join("src/renamed.rs"),
                 "the buffer's own absolute save path must move too - otherwise the next save \
                  would recreate the file under its old name"
             );
             assert_eq!(
                 app.selected_tree_path.as_deref(),
-                Some(repo.path().join("src/renamed.rs").as_path())
+                Some(repo.join("src/renamed.rs").as_path())
             );
         });
     }
 
     #[gpui::test]
     fn renaming_a_folder_carries_every_open_tab_underneath_it(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
         app.update_in(cx, |app, window, cx| {
-            app.open_file_view(repo.path().join("src/main.rs"), window, cx);
-            app.open_file_view(repo.path().join("src/util.rs"), window, cx);
-            app.set_dir_expanded(repo.path().join("src"), true, cx);
+            app.open_file_view(repo.join("src/main.rs"), window, cx);
+            app.open_file_view(repo.join("src/util.rs"), window, cx);
+            app.set_dir_expanded(repo.join("src"), true, cx);
         });
         cx.run_until_parked();
 
         app.update_in(cx, |app, window, cx| {
-            app.start_tree_rename(repo.path().join("src"), true, window, cx);
+            app.start_tree_rename(repo.join("src"), true, window, cx);
             app.tree_inline_edit.as_mut().expect("editor").name =
                 text_history::TextField::seeded("lib");
             app.commit_tree_inline_edit(window, cx);
         });
         cx.run_until_parked();
 
-        assert!(repo.path().join("lib/main.rs").exists());
+        assert!(repo.join("lib/main.rs").exists());
         app.read_with(cx, |app, _| {
             assert_eq!(
                 app.open_files().to_vec(),
@@ -1779,8 +1779,8 @@ mod tree_ops_regression_tests {
             assert!(app.edit_buffer_contains(Path::new("lib/util.rs")));
             assert!(!app.edit_buffer_contains(Path::new("src/util.rs")));
             assert!(
-                app.expanded_dirs.contains(&repo.path().join("lib"))
-                    && !app.expanded_dirs.contains(&repo.path().join("src")),
+                app.expanded_dirs.contains(&repo.join("lib"))
+                    && !app.expanded_dirs.contains(&repo.join("src")),
                 "the folder's own expanded state must move with it, or the renamed folder would \
                  silently snap shut"
             );
@@ -1791,12 +1791,12 @@ mod tree_ops_regression_tests {
     fn deleting_a_file_removes_it_immediately_and_records_a_real_undo_entry(
         cx: &mut TestAppContext,
     ) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
-        let victim = repo.path().join("src/util.rs");
+        let victim = repo.join("src/util.rs");
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(victim.clone(), window, cx);
             app.request_tree_delete_with_mechanism_for_test(
@@ -1843,12 +1843,12 @@ mod tree_ops_regression_tests {
 
     #[gpui::test]
     fn undoing_then_redoing_a_delete_restores_then_removes_the_file_again(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
-        let victim = repo.path().join("src/util.rs");
+        let victim = repo.join("src/util.rs");
         let original_content = fs::read_to_string(&victim).expect("read fixture");
         app.update(cx, |app, cx| {
             app.request_tree_delete_with_mechanism_for_test(
@@ -1890,14 +1890,14 @@ mod tree_ops_regression_tests {
     fn two_app_instances_deleting_a_same_named_file_never_collide_on_their_backup_paths(
         cx: &mut TestAppContext,
     ) {
-        let repo_a = TempDir::new().expect("tempdir a");
+        let (_repo_a_dir, repo_a) = crate::sidebar::fixtures::temp_root();
         seed(&repo_a);
-        let repo_b = TempDir::new().expect("tempdir b");
+        let (_repo_b_dir, repo_b) = crate::sidebar::fixtures::temp_root();
         seed(&repo_b);
 
-        let (app_a, cx) = palette_focus_tests::open_test_app(cx, repo_a.path().to_path_buf());
+        let (app_a, cx) = palette_focus_tests::open_test_app(cx, repo_a.clone());
         cx.run_until_parked();
-        let (app_b, cx) = palette_focus_tests::open_test_app(cx, repo_b.path().to_path_buf());
+        let (app_b, cx) = palette_focus_tests::open_test_app(cx, repo_b.clone());
         cx.run_until_parked();
 
         app_a.read_with(cx, |a, _| {
@@ -1909,8 +1909,8 @@ mod tree_ops_regression_tests {
             })
         });
 
-        let victim_a = repo_a.path().join("src/util.rs");
-        let victim_b = repo_b.path().join("src/util.rs");
+        let victim_a = repo_a.join("src/util.rs");
+        let victim_b = repo_b.join("src/util.rs");
         app_a.update(cx, |a, cx| {
             a.request_tree_delete_with_mechanism_for_test(
                 victim_a.clone(),
@@ -1938,12 +1938,12 @@ mod tree_ops_regression_tests {
 
     #[gpui::test]
     fn undoing_then_redoing_a_rename_restores_then_reapplies_it(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
-        let old = repo.path().join("src/main.rs");
+        let old = repo.join("src/main.rs");
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(old.clone(), window, cx);
             app.start_tree_rename(old.clone(), false, window, cx);
@@ -1952,7 +1952,7 @@ mod tree_ops_regression_tests {
             app.commit_tree_inline_edit(window, cx);
         });
         cx.run_until_parked();
-        let renamed = repo.path().join("src/renamed.rs");
+        let renamed = repo.join("src/renamed.rs");
         assert!(renamed.exists());
         assert!(!old.exists());
         app.read_with(cx, |app, _| {
@@ -1983,18 +1983,18 @@ mod tree_ops_regression_tests {
 
     #[gpui::test]
     fn undoing_a_cut_and_paste_move_restores_the_original_location(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
-        let original = repo.path().join("README.md");
+        let original = repo.join("README.md");
         app.update(cx, |app, cx| {
             app.set_tree_clipboard(original.clone(), ClipboardMode::Cut, cx);
-            app.paste_into_dir(&repo.path().join("src"), cx);
+            app.paste_into_dir(&repo.join("src"), cx);
         });
         cx.run_until_parked();
-        let moved = repo.path().join("src/README.md");
+        let moved = repo.join("src/README.md");
         assert!(moved.exists());
         assert!(!original.exists());
 
@@ -2011,12 +2011,12 @@ mod tree_ops_regression_tests {
 
     #[gpui::test]
     fn a_fresh_edit_after_an_undo_clears_the_redo_stack(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
-        let victim = repo.path().join("src/util.rs");
+        let victim = repo.join("src/util.rs");
         app.update(cx, |app, cx| {
             app.request_tree_delete_with_mechanism_for_test(
                 victim.clone(),
@@ -2039,7 +2039,7 @@ mod tree_ops_regression_tests {
         });
 
         app.update_in(cx, |app, window, cx| {
-            app.start_tree_rename(repo.path().join("README.md"), false, window, cx);
+            app.start_tree_rename(repo.join("README.md"), false, window, cx);
             app.tree_inline_edit.as_mut().expect("editor").name =
                 text_history::TextField::seeded("renamed.md");
             app.commit_tree_inline_edit(window, cx);
@@ -2061,10 +2061,10 @@ mod tree_ops_regression_tests {
 
     #[gpui::test]
     fn deleting_something_outside_the_worktree_is_refused_outright(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         let outside = TempDir::new().expect("tempdir");
         fs::write(outside.path().join("precious.txt"), "keep me").expect("write");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
         app.update(cx, |app, cx| {
@@ -2084,19 +2084,19 @@ mod tree_ops_regression_tests {
 
     #[gpui::test]
     fn pasting_into_the_source_folder_creates_a_real_suffixed_copy(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
-        let source = repo.path().join("src/main.rs");
+        let source = repo.join("src/main.rs");
         app.update(cx, |app, cx| {
             app.set_tree_clipboard(source.clone(), ClipboardMode::Copy, cx);
-            app.paste_into_dir(&repo.path().join("src"), cx);
+            app.paste_into_dir(&repo.join("src"), cx);
         });
         cx.run_until_parked();
 
-        let copy = repo.path().join("src/main copy.rs");
+        let copy = repo.join("src/main copy.rs");
         assert!(
             copy.exists(),
             "the paste must produce a real, suffixed file"
@@ -2121,30 +2121,30 @@ mod tree_ops_regression_tests {
         });
 
         app.update(cx, |app, cx| {
-            app.paste_into_dir(&repo.path().join("src"), cx);
+            app.paste_into_dir(&repo.join("src"), cx);
         });
         cx.run_until_parked();
-        assert!(repo.path().join("src/main copy 2.rs").exists());
+        assert!(repo.join("src/main copy 2.rs").exists());
     }
 
     #[gpui::test]
     fn cutting_and_pasting_moves_the_entry_and_its_open_tab(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed(&repo);
-        fs::create_dir(repo.path().join("dest")).expect("mkdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        fs::create_dir(repo.join("dest")).expect("mkdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
-        let source = repo.path().join("src/util.rs");
+        let source = repo.join("src/util.rs");
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(source.clone(), window, cx);
             app.set_tree_clipboard(source.clone(), ClipboardMode::Cut, cx);
-            app.paste_into_dir(&repo.path().join("dest"), cx);
+            app.paste_into_dir(&repo.join("dest"), cx);
         });
         cx.run_until_parked();
 
         assert!(!source.exists());
-        assert!(repo.path().join("dest/util.rs").exists());
+        assert!(repo.join("dest/util.rs").exists());
         app.read_with(cx, |app, _| {
             assert!(app.open_files().contains(&PathBuf::from("dest/util.rs")));
             assert!(!app.edit_buffer_contains(Path::new("src/util.rs")));
@@ -2158,14 +2158,14 @@ mod tree_ops_regression_tests {
 
     #[gpui::test]
     fn a_tree_reload_during_an_inline_rename_keeps_the_typed_text(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
         app.update_in(cx, |app, window, cx| {
-            app.set_dir_expanded(repo.path().join("src"), true, cx);
-            app.start_tree_rename(repo.path().join("src/main.rs"), false, window, cx);
+            app.set_dir_expanded(repo.join("src"), true, cx);
+            app.start_tree_rename(repo.join("src/main.rs"), false, window, cx);
             app.tree_inline_edit.as_mut().expect("editor").name =
                 text_history::TextField::seeded("half-typed");
         });
@@ -2175,7 +2175,8 @@ mod tree_ops_regression_tests {
             "premise: the editor must be a real painted row before the reload"
         );
 
-        fs::write(repo.path().join("src/agent-made.rs"), "// new\n").expect("write");
+        // An agent CLI creating a file mid-agent, followed by the real re-walk.
+        fs::write(repo.join("src/agent-made.rs"), "// new\n").expect("write");
         app.update(cx, |app, cx| {
             let root = app.file_tree_root.clone();
             app.load_file_tree(root, cx);
@@ -2203,14 +2204,14 @@ mod tree_ops_regression_tests {
 
     #[gpui::test]
     fn the_empty_area_collapse_all_clears_the_persisted_fold_state_too(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed(&repo);
         let state_dir = TempDir::new().expect("tempdir");
         let settings_path = state_dir.path().join("settings.toml");
         let fold_path = crate::sidebar::fold_state::fold_state_path_for(&settings_path);
         let (app, cx) = cx.add_window_view(|window, cx| {
             AdeApp::new_with_settings(
-                Some(repo.path().to_path_buf()),
+                Some(repo.clone()),
                 true,
                 settings_store::Settings::default(),
                 Some(settings_path),
@@ -2221,7 +2222,7 @@ mod tree_ops_regression_tests {
         cx.run_until_parked();
 
         app.update(cx, |app, cx| {
-            app.set_dir_expanded(repo.path().join("src"), true, cx);
+            app.set_dir_expanded(repo.join("src"), true, cx);
         });
         cx.run_until_parked();
         assert!(
@@ -2252,14 +2253,14 @@ mod tree_ops_regression_tests {
 
     #[gpui::test]
     fn ctrl_z_while_typing_a_name_in_the_tree_undoes_the_name(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
         cx.run_until_parked();
 
         app.update_in(cx, |app, window, cx| {
-            app.start_tree_new_entry(repo.path().to_path_buf(), false, window, cx);
+            app.start_tree_new_entry(repo.clone(), false, window, cx);
         });
         cx.run_until_parked();
 
@@ -2297,14 +2298,14 @@ mod tree_ops_regression_tests {
     fn the_first_ctrl_z_in_a_rename_editor_does_not_blank_the_prefilled_name(
         cx: &mut TestAppContext,
     ) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
         cx.run_until_parked();
 
         app.update_in(cx, |app, window, cx| {
-            app.start_tree_rename(repo.path().join("README.md"), false, window, cx);
+            app.start_tree_rename(repo.join("README.md"), false, window, cx);
         });
         cx.run_until_parked();
         app.read_with(cx, |app, _| {
@@ -2338,14 +2339,14 @@ mod tree_ops_regression_tests {
 
     #[gpui::test]
     fn redo_in_the_tree_inline_editor_restores_the_undone_name(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
         cx.run_until_parked();
 
         app.update_in(cx, |app, window, cx| {
-            app.start_tree_new_entry(repo.path().to_path_buf(), true, window, cx);
+            app.start_tree_new_entry(repo.clone(), true, window, cx);
         });
         cx.run_until_parked();
         cx.simulate_input("assets");
@@ -2389,13 +2390,13 @@ mod tree_ops_regression_tests {
 
     #[gpui::test]
     fn opening_the_context_menu_cancels_an_open_inline_editor(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
         app.update_in(cx, |app, window, cx| {
-            app.start_tree_rename(repo.path().join("README.md"), false, window, cx);
+            app.start_tree_rename(repo.join("README.md"), false, window, cx);
         });
         cx.run_until_parked();
         app.read_with(cx, |app, _| {
@@ -2404,7 +2405,7 @@ mod tree_ops_regression_tests {
 
         app.update_in(cx, |app, window, cx| {
             app.open_tree_context_menu(
-                ContextTarget::File(repo.path().join("README.md")),
+                ContextTarget::File(repo.join("README.md")),
                 10.0,
                 10.0,
                 window,
@@ -2423,16 +2424,16 @@ mod tree_ops_regression_tests {
 
     #[gpui::test]
     fn ctrl_c_with_a_focused_terminal_never_reaches_the_trees_clipboard(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
         cx.run_until_parked();
 
         app.update_in(cx, |app, window, cx| {
             // A real selection, so the tree binding would genuinely have something to copy if it
             // fired - otherwise this test could pass for the wrong reason.
-            app.selected_tree_path = Some(repo.path().join("README.md"));
+            app.selected_tree_path = Some(repo.join("README.md"));
             app.agents.focus_active(window, cx);
         });
         cx.run_until_parked();
@@ -2451,14 +2452,14 @@ mod tree_ops_regression_tests {
 
     #[gpui::test]
     fn ctrl_c_with_the_tree_focused_copies_the_selected_entry(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
         cx.run_until_parked();
 
         app.update_in(cx, |app, window, cx| {
-            app.selected_tree_path = Some(repo.path().join("README.md"));
+            app.selected_tree_path = Some(repo.join("README.md"));
             app.focus_file_tree(window, cx);
         });
         cx.run_until_parked();
@@ -2469,7 +2470,7 @@ mod tree_ops_regression_tests {
                 .tree_clipboard
                 .as_ref()
                 .expect("ctrl-c with the tree focused must copy the selection");
-            assert_eq!(entry.path, repo.path().join("README.md"));
+            assert_eq!(entry.path, repo.join("README.md"));
             assert_eq!(entry.mode, ClipboardMode::Copy);
         });
     }
@@ -2516,9 +2517,9 @@ mod tree_ops_regression_tests {
     fn right_clicking_a_folder_row_opens_the_folder_menu_at_a_clamped_origin(
         cx: &mut TestAppContext,
     ) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
         let row = cx
@@ -2541,7 +2542,7 @@ mod tree_ops_regression_tests {
                 .expect("a real right-click on a folder row must open a menu");
             assert_eq!(
                 menu.target,
-                ContextTarget::Folder(repo.path().join("src")),
+                ContextTarget::Folder(repo.join("src")),
                 "the row's own handler must win over the container's empty-area one"
             );
             let rows = context_menu::menu_rows(&menu.target, false);
@@ -2577,9 +2578,9 @@ mod tree_ops_regression_tests {
 
     #[gpui::test]
     fn escape_dismisses_the_context_menu(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
         cx.run_until_parked();
 
@@ -2593,14 +2594,14 @@ mod tree_ops_regression_tests {
 
     #[gpui::test]
     fn the_new_folder_editor_creates_a_real_directory(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
         app.update_in(cx, |app, window, cx| {
             app.open_tree_context_menu(
-                ContextTarget::Folder(repo.path().join("src")),
+                ContextTarget::Folder(repo.join("src")),
                 20.0,
                 20.0,
                 window,
@@ -2613,11 +2614,11 @@ mod tree_ops_regression_tests {
         });
         cx.run_until_parked();
 
-        assert!(repo.path().join("src/nested").is_dir());
+        assert!(repo.join("src/nested").is_dir());
         app.read_with(cx, |app, _| {
             assert!(app.tree_inline_edit.is_none(), "the editor must close");
             assert!(
-                app.expanded_dirs.contains(&repo.path().join("src")),
+                app.expanded_dirs.contains(&repo.join("src")),
                 "the parent must have been expanded so the editor was visible in the first place"
             );
         });
@@ -2627,14 +2628,14 @@ mod tree_ops_regression_tests {
     fn an_invalid_name_is_refused_with_a_real_hint_and_the_editor_stays_open(
         cx: &mut TestAppContext,
     ) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
         for bad in ["", "  ", "a/b", ".."] {
             app.update_in(cx, |app, window, cx| {
-                app.start_tree_new_entry(repo.path().to_path_buf(), true, window, cx);
+                app.start_tree_new_entry(repo.clone(), true, window, cx);
                 app.tree_inline_edit.as_mut().expect("editor").name =
                     text_history::TextField::seeded(bad);
                 app.commit_tree_inline_edit(window, cx);
@@ -2653,7 +2654,7 @@ mod tree_ops_regression_tests {
         }
 
         app.update_in(cx, |app, window, cx| {
-            app.start_tree_new_entry(repo.path().to_path_buf(), true, window, cx);
+            app.start_tree_new_entry(repo.clone(), true, window, cx);
             app.tree_inline_edit.as_mut().expect("editor").name =
                 text_history::TextField::seeded("src");
             app.commit_tree_inline_edit(window, cx);
@@ -2669,40 +2670,40 @@ mod tree_ops_regression_tests {
                 .is_some_and(|error| error.contains("already exists")));
         });
         assert!(
-            repo.path().join("src/main.rs").exists(),
+            repo.join("src/main.rs").exists(),
             "and the existing folder must be untouched"
         );
     }
 
     #[gpui::test]
     fn collapse_subtree_collapses_only_that_folders_own_descendants(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
-        fs::create_dir_all(repo.path().join("a/inner")).expect("mkdir");
-        fs::create_dir_all(repo.path().join("b")).expect("mkdir");
-        fs::write(repo.path().join("a/inner/x.rs"), "x").expect("write");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
+        fs::create_dir_all(repo.join("a/inner")).expect("mkdir");
+        fs::create_dir_all(repo.join("b")).expect("mkdir");
+        fs::write(repo.join("a/inner/x.rs"), "x").expect("write");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
         app.update(cx, |app, cx| {
-            app.set_dir_expanded(repo.path().join("a"), true, cx);
-            app.set_dir_expanded(repo.path().join("a/inner"), true, cx);
-            app.set_dir_expanded(repo.path().join("b"), true, cx);
+            app.set_dir_expanded(repo.join("a"), true, cx);
+            app.set_dir_expanded(repo.join("a/inner"), true, cx);
+            app.set_dir_expanded(repo.join("b"), true, cx);
         });
         cx.run_until_parked();
 
         app.update(cx, |app, cx| {
-            app.collapse_subtree(&repo.path().join("a"), cx);
+            app.collapse_subtree(&repo.join("a"), cx);
         });
         cx.run_until_parked();
 
         app.read_with(cx, |app, _| {
-            assert!(!app.expanded_dirs.contains(&repo.path().join("a")));
+            assert!(!app.expanded_dirs.contains(&repo.join("a")));
             assert!(
-                !app.expanded_dirs.contains(&repo.path().join("a/inner")),
+                !app.expanded_dirs.contains(&repo.join("a/inner")),
                 "a nested expansion left behind would reappear the moment the parent reopened"
             );
             assert!(
-                app.expanded_dirs.contains(&repo.path().join("b")),
+                app.expanded_dirs.contains(&repo.join("b")),
                 "a sibling subtree must be untouched"
             );
         });
@@ -2710,30 +2711,24 @@ mod tree_ops_regression_tests {
 
     #[gpui::test]
     fn copy_relative_path_writes_the_worktree_relative_path(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
         app.update(cx, |app, cx| {
-            app.copy_path_to_system_clipboard(&repo.path().join("src/main.rs"), true, cx);
+            app.copy_path_to_system_clipboard(&repo.join("src/main.rs"), true, cx);
         });
         let text = cx.update(|_window, cx| cx.read_from_clipboard().and_then(|item| item.text()));
         assert_eq!(text.as_deref(), Some("src/main.rs"));
 
         app.update(cx, |app, cx| {
-            app.copy_path_to_system_clipboard(&repo.path().join("src/main.rs"), false, cx);
+            app.copy_path_to_system_clipboard(&repo.join("src/main.rs"), false, cx);
         });
         let text = cx.update(|_window, cx| cx.read_from_clipboard().and_then(|item| item.text()));
         assert_eq!(
             text.as_deref(),
-            Some(
-                repo.path()
-                    .join("src/main.rs")
-                    .display()
-                    .to_string()
-                    .as_str()
-            )
+            Some(repo.join("src/main.rs").display().to_string().as_str())
         );
     }
 
@@ -2745,16 +2740,16 @@ mod tree_ops_regression_tests {
 
         #[gpui::test]
         fn a_rename_carries_the_files_staged_checkbox_with_it(cx: &mut TestAppContext) {
-            let repo = TempDir::new().expect("tempdir");
+            let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
             seed(&repo);
-            let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+            let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
             cx.run_until_parked();
 
             app.update(cx, |app, cx| {
                 app.toggle_staged(PathBuf::from("src/main.rs"), cx);
             });
             app.update_in(cx, |app, window, cx| {
-                app.start_tree_rename(repo.path().join("src/main.rs"), false, window, cx);
+                app.start_tree_rename(repo.join("src/main.rs"), false, window, cx);
                 app.tree_inline_edit.as_mut().expect("editor").name =
                     text_history::TextField::seeded("renamed.rs");
                 app.commit_tree_inline_edit(window, cx);
@@ -2775,12 +2770,12 @@ mod tree_ops_regression_tests {
         fn renaming_and_deleting_both_clear_the_lsp_per_document_bookkeeping(
             cx: &mut TestAppContext,
         ) {
-            let repo = TempDir::new().expect("tempdir");
+            let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
             seed(&repo);
-            let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+            let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
             cx.run_until_parked();
 
-            let absolute = repo.path().join("src/main.rs");
+            let absolute = repo.join("src/main.rs");
             let relative = PathBuf::from("src/main.rs");
             app.update(cx, |app, _cx| {
                 app.lsp_opened_files.insert(absolute.clone());
@@ -2809,7 +2804,8 @@ mod tree_ops_regression_tests {
                 assert!(!app.lsp_synced_version.contains_key(&relative));
             });
 
-            let renamed = repo.path().join("src/renamed.rs");
+            // And the delete half, on the renamed path.
+            let renamed = repo.join("src/renamed.rs");
             let renamed_relative = PathBuf::from("src/renamed.rs");
             app.update(cx, |app, _cx| {
                 app.lsp_opened_files.insert(renamed.clone());
@@ -2835,15 +2831,15 @@ mod tree_ops_regression_tests {
         fn cutting_and_pasting_into_the_source_folder_is_a_no_op_not_a_rename(
             cx: &mut TestAppContext,
         ) {
-            let repo = TempDir::new().expect("tempdir");
+            let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
             seed(&repo);
-            let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+            let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
             cx.run_until_parked();
 
-            let source = repo.path().join("src/util.rs");
+            let source = repo.join("src/util.rs");
             app.update(cx, |app, cx| {
                 app.set_tree_clipboard(source.clone(), ClipboardMode::Cut, cx);
-                app.paste_into_dir(&repo.path().join("src"), cx);
+                app.paste_into_dir(&repo.join("src"), cx);
             });
             cx.run_until_parked();
 
@@ -2852,7 +2848,7 @@ mod tree_ops_regression_tests {
                 "the file must still be exactly where it was"
             );
             assert!(
-                !repo.path().join("src/util copy.rs").exists(),
+                !repo.join("src/util copy.rs").exists(),
                 "a cut back into its own folder must never silently rename the file"
             );
             app.read_with(cx, |app, _| {
@@ -2865,15 +2861,15 @@ mod tree_ops_regression_tests {
         fn leaving_the_files_tab_does_not_leave_focus_dangling_on_the_tree(
             cx: &mut TestAppContext,
         ) {
-            let repo = TempDir::new().expect("tempdir");
+            let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
             seed(&repo);
-            let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+            let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
             cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
             cx.run_until_parked();
 
             app.update_in(cx, |app, window, cx| {
                 app.open_tree_context_menu(
-                    ContextTarget::File(repo.path().join("README.md")),
+                    ContextTarget::File(repo.join("README.md")),
                     30.0,
                     30.0,
                     window,
@@ -2906,11 +2902,11 @@ mod tree_ops_regression_tests {
 
     #[gpui::test]
     fn switching_worktrees_clears_every_tree_operation_in_flight(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed(&repo);
         let other = TempDir::new().expect("tempdir");
         fs::write(other.path().join("elsewhere.txt"), "x").expect("write");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
         // A directly-seeded `worktrees` list - the same pattern `crate::code_surface::zoom`'s own
@@ -2918,7 +2914,7 @@ mod tree_ops_regression_tests {
         app.update(cx, |app, _cx| {
             app.worktrees = vec![
                 crate::rail::worktrees::WorktreeItem {
-                    path: repo.path().to_path_buf(),
+                    path: repo.clone(),
                     label: "wt-a".to_string(),
                     branch: None,
                     is_main: true,
@@ -2949,25 +2945,25 @@ mod tree_ops_regression_tests {
         });
 
         app.update_in(cx, |app, window, cx| {
-            app.set_tree_clipboard(repo.path().join("README.md"), ClipboardMode::Cut, cx);
+            app.set_tree_clipboard(repo.join("README.md"), ClipboardMode::Cut, cx);
             // Order matters: `open_tree_context_menu` cancels an open inline editor, so opening
             // the menu *first* is the only way to have all four states live at once. An earlier
             // version of this test did it the other way round, which made the
             // `tree_inline_edit.is_none()` assertion below already true before `select_worktree`
             // ever ran - it would have passed against a reset that dropped that field entirely.
             app.open_tree_context_menu(ContextTarget::Empty, 10.0, 10.0, window, cx);
-            app.start_tree_rename(repo.path().join("README.md"), false, window, cx);
+            app.start_tree_rename(repo.join("README.md"), false, window, cx);
             // A recorded undo/redo entry - the fourth piece of in-flight tree state, replacing
             // the pre-issue-#105 armed delete confirmation. Seeded directly rather than through a
             // real delete/rename, since only the bookkeeping reset (not the real file op) is
             // under test here.
             app.tree_undo_stack.push(TreeUndoEntry::Relocate {
-                old_path: repo.path().join("a.txt"),
-                new_path: repo.path().join("b.txt"),
+                old_path: repo.join("a.txt"),
+                new_path: repo.join("b.txt"),
             });
             app.tree_redo_stack.push(TreeUndoEntry::Relocate {
-                old_path: repo.path().join("c.txt"),
-                new_path: repo.path().join("d.txt"),
+                old_path: repo.join("c.txt"),
+                new_path: repo.join("d.txt"),
             });
             assert!(
                 app.tree_clipboard.is_some()
@@ -2988,16 +2984,16 @@ mod tree_ops_regression_tests {
             assert!(app.tree_undo_stack.is_empty());
             assert!(app.tree_redo_stack.is_empty());
         });
-        assert!(repo.path().join("README.md").exists());
+        assert!(repo.join("README.md").exists());
     }
 
     #[gpui::test]
     fn a_click_on_a_tree_row_under_an_open_context_menu_does_not_reach_that_row(
         cx: &mut TestAppContext,
     ) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
         // Open the menu from the empty area, so the menu's own panel is nowhere near the row
@@ -3036,9 +3032,9 @@ mod tree_ops_regression_tests {
 
     #[gpui::test]
     fn a_real_right_click_in_the_file_tree_closes_an_open_plus_menu(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
         app.update(cx, |app, cx| {
@@ -3089,9 +3085,9 @@ mod tree_ops_regression_tests {
     fn clicking_the_tab_strip_plus_under_an_open_tree_context_menu_never_leaves_both_open(
         cx: &mut TestAppContext,
     ) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
         app.update_in(cx, |app, window, cx| {
@@ -3142,9 +3138,9 @@ mod tree_ops_regression_tests {
 
     #[gpui::test]
     fn the_same_click_with_no_menu_open_really_does_open_the_file(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
         let row = cx
@@ -3164,9 +3160,9 @@ mod tree_ops_regression_tests {
     fn clicking_a_file_row_keeps_the_tree_focused_so_the_next_shortcut_still_fires(
         cx: &mut TestAppContext,
     ) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
         cx.run_until_parked();
 
@@ -3201,9 +3197,9 @@ mod tree_ops_regression_tests {
 
     #[gpui::test]
     fn the_delete_key_reaches_the_real_delete_handler(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.update(|_window, cx| cx.bind_keys(crate::default_key_bindings()));
         cx.run_until_parked();
 
@@ -3225,14 +3221,14 @@ mod tree_ops_regression_tests {
 
     #[gpui::test]
     fn the_context_menu_paints_exactly_the_height_it_measures(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
         for target in [
-            ContextTarget::File(repo.path().join("README.md")),
-            ContextTarget::Folder(repo.path().join("src")),
+            ContextTarget::File(repo.join("README.md")),
+            ContextTarget::Folder(repo.join("src")),
             ContextTarget::Empty,
         ] {
             let expected =
@@ -3318,14 +3314,14 @@ mod tree_multiselect_tests {
     use crate::sidebar::context_menu::ContextTarget;
     use gpui::{Modifiers, TestAppContext};
     use std::fs;
-    use tempfile::TempDir;
+    use std::path::Path;
 
     /// Four plain root-level files, alphabetical - `visible_indices`' own display order for a
     /// worktree with no directories to expand, so a range-select test can reason about exactly
     /// which paths a Shift+click between two of them should span.
-    fn seed_flat(repo: &TempDir) {
+    fn seed_flat(repo: &Path) {
         for name in ["a.txt", "b.txt", "c.txt", "d.txt"] {
-            fs::write(repo.path().join(name), "x\n").expect("write");
+            fs::write(repo.join(name), "x\n").expect("write");
         }
     }
 
@@ -3352,13 +3348,13 @@ mod tree_multiselect_tests {
 
     #[gpui::test]
     fn secondary_click_toggles_a_row_into_and_back_out_of_the_selection(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed_flat(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
-        let a = repo.path().join("a.txt");
-        let b = repo.path().join("b.txt");
+        let a = repo.join("a.txt");
+        let b = repo.join("b.txt");
         app.update(cx, |app, _cx| {
             app.selected_tree_path = Some(a.clone());
         });
@@ -3385,13 +3381,13 @@ mod tree_multiselect_tests {
     fn secondary_click_toggling_the_anchor_off_promotes_another_selected_row(
         cx: &mut TestAppContext,
     ) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed_flat(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
-        let a = repo.path().join("a.txt");
-        let b = repo.path().join("b.txt");
+        let a = repo.join("a.txt");
+        let b = repo.join("b.txt");
         app.update(cx, |app, _cx| {
             app.selected_tree_path = Some(a.clone());
             app.tree_click_select(b.clone(), secondary_modifiers());
@@ -3411,13 +3407,13 @@ mod tree_multiselect_tests {
 
     #[gpui::test]
     fn shift_click_range_selects_between_the_anchor_and_the_clicked_row(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed_flat(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
-        let a = repo.path().join("a.txt");
-        let c = repo.path().join("c.txt");
+        let a = repo.join("a.txt");
+        let c = repo.join("c.txt");
         app.update(cx, |app, _cx| {
             app.selected_tree_path = Some(a.clone());
             app.tree_click_select(c.clone(), shift_modifiers());
@@ -3425,7 +3421,7 @@ mod tree_multiselect_tests {
         app.read_with(cx, |app, _| {
             let mut selected = app.tree_selected_paths();
             selected.sort();
-            let mut expected = vec![a.clone(), repo.path().join("b.txt"), c.clone()];
+            let mut expected = vec![a.clone(), repo.join("b.txt"), c.clone()];
             expected.sort();
             assert_eq!(
                 selected, expected,
@@ -3440,7 +3436,7 @@ mod tree_multiselect_tests {
 
         // A second Shift+click resizes the range from the same anchor - it does not extend from
         // wherever the first range left off.
-        let b = repo.path().join("b.txt");
+        let b = repo.join("b.txt");
         app.update(cx, |app, _cx| {
             app.tree_click_select(b.clone(), shift_modifiers());
         });
@@ -3455,14 +3451,14 @@ mod tree_multiselect_tests {
 
     #[gpui::test]
     fn a_plain_click_collapses_the_selection_to_just_that_row(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed_flat(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
-        let a = repo.path().join("a.txt");
-        let b = repo.path().join("b.txt");
-        let c = repo.path().join("c.txt");
+        let a = repo.join("a.txt");
+        let b = repo.join("b.txt");
+        let c = repo.join("c.txt");
         app.update(cx, |app, _cx| {
             app.selected_tree_path = Some(a.clone());
             app.tree_click_select(b.clone(), secondary_modifiers());
@@ -3481,14 +3477,14 @@ mod tree_multiselect_tests {
 
     #[gpui::test]
     fn the_delete_key_removes_every_selected_file_not_just_the_anchor(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed_flat(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
-        let a = repo.path().join("a.txt");
-        let b = repo.path().join("b.txt");
-        let c = repo.path().join("c.txt");
+        let a = repo.join("a.txt");
+        let b = repo.join("b.txt");
+        let c = repo.join("c.txt");
         app.update(cx, |app, _cx| {
             app.selected_tree_path = Some(a.clone());
             app.tree_click_select(b.clone(), secondary_modifiers());
@@ -3503,17 +3499,32 @@ mod tree_multiselect_tests {
         assert!(c.exists(), "an unselected row must be left alone");
     }
 
+    /// GitHub issue #145: F2 still opens the rename editor for a real single selection, and opens
+    /// nothing at all once more than one row is selected - there is no single name to rename a
+    /// multi-selection to.
     #[gpui::test]
-    fn rename_is_a_no_op_with_more_than_one_row_selected(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+    fn rename_opens_an_editor_for_one_selected_row_and_for_no_other_count(cx: &mut TestAppContext) {
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed_flat(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
-        let a = repo.path().join("a.txt");
-        let b = repo.path().join("b.txt");
+        let a = repo.join("a.txt");
+        let b = repo.join("b.txt");
         app.update_in(cx, |app, window, cx| {
             app.selected_tree_path = Some(a.clone());
+            app.start_tree_rename_for_selection(window, cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.tree_inline_edit.is_some(),
+                "a real single selection must still open the rename editor exactly as before \
+                 GitHub issue #145"
+            );
+        });
+
+        app.update_in(cx, |app, window, cx| {
+            app.cancel_tree_inline_edit(window, cx);
             app.tree_click_select(b.clone(), secondary_modifiers());
             app.start_tree_rename_for_selection(window, cx);
         });
@@ -3526,38 +3537,19 @@ mod tree_multiselect_tests {
         });
     }
 
+    /// A right-click inside the selection keeps it whole (the menu then targets every selected
+    /// row); a right-click outside it is a fresh single selection, exactly as a plain click is.
     #[gpui::test]
-    fn rename_still_works_normally_with_exactly_one_row_selected(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
-        seed_flat(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        cx.run_until_parked();
-
-        let a = repo.path().join("a.txt");
-        app.update_in(cx, |app, window, cx| {
-            app.selected_tree_path = Some(a.clone());
-            app.start_tree_rename_for_selection(window, cx);
-        });
-        app.read_with(cx, |app, _| {
-            assert!(
-                app.tree_inline_edit.is_some(),
-                "a real single selection must still open the rename editor exactly as before \
-                 GitHub issue #145"
-            );
-        });
-    }
-
-    #[gpui::test]
-    fn right_clicking_a_row_already_inside_a_multi_selection_preserves_the_whole_selection(
+    fn a_right_click_preserves_a_selection_it_lands_inside_and_replaces_one_it_lands_outside(
         cx: &mut TestAppContext,
     ) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed_flat(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
-        let a = repo.path().join("a.txt");
-        let b = repo.path().join("b.txt");
+        let a = repo.join("a.txt");
+        let b = repo.join("b.txt");
         app.update_in(cx, |app, window, cx| {
             app.selected_tree_path = Some(a.clone());
             app.tree_click_select(b.clone(), secondary_modifiers());
@@ -3584,23 +3576,10 @@ mod tree_multiselect_tests {
             );
             assert!(app.additional_tree_selection.contains(&b));
         });
-    }
 
-    #[gpui::test]
-    fn right_clicking_a_row_outside_the_selection_collapses_to_just_that_row(
-        cx: &mut TestAppContext,
-    ) {
-        let repo = TempDir::new().expect("tempdir");
-        seed_flat(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        cx.run_until_parked();
-
-        let a = repo.path().join("a.txt");
-        let b = repo.path().join("b.txt");
-        let c = repo.path().join("c.txt");
+        let c = repo.join("c.txt");
         app.update_in(cx, |app, window, cx| {
-            app.selected_tree_path = Some(a.clone());
-            app.tree_click_select(b.clone(), secondary_modifiers());
+            // Right-clicking `c` - outside the {a, b} selection - must collapse to just `c`.
             app.open_tree_context_menu(ContextTarget::File(c.clone()), 10.0, 10.0, window, cx);
         });
         app.read_with(cx, |app, _| {
@@ -3613,13 +3592,13 @@ mod tree_multiselect_tests {
 
     #[gpui::test]
     fn opening_a_file_from_the_tree_collapses_a_stray_multi_selection(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed_flat(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
-        let a = repo.path().join("a.txt");
-        let b = repo.path().join("b.txt");
+        let a = repo.join("a.txt");
+        let b = repo.join("b.txt");
         app.update(cx, |app, _cx| {
             app.selected_tree_path = Some(a.clone());
             app.additional_tree_selection.insert(b.clone());
@@ -3650,25 +3629,25 @@ mod tree_drag_move_tests {
     use crate::root::AdeApp;
     use gpui::TestAppContext;
     use std::fs;
-    use tempfile::TempDir;
+    use std::path::Path;
 
-    fn seed(repo: &TempDir) {
-        fs::create_dir_all(repo.path().join("dest")).expect("mkdir");
-        fs::write(repo.path().join("a.txt"), "a\n").expect("write");
-        fs::write(repo.path().join("b.txt"), "b\n").expect("write");
+    fn seed(repo: &Path) {
+        fs::create_dir_all(repo.join("dest")).expect("mkdir");
+        fs::write(repo.join("a.txt"), "a\n").expect("write");
+        fs::write(repo.join("b.txt"), "b\n").expect("write");
     }
 
     #[gpui::test]
     fn dropping_a_file_onto_a_folder_moves_it_there_with_a_real_undo_entry(
         cx: &mut TestAppContext,
     ) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
-        let a = repo.path().join("a.txt");
-        let dest = repo.path().join("dest");
+        let a = repo.join("a.txt");
+        let dest = repo.join("dest");
         let undo_len_before = app.read_with(cx, |app, _| app.tree_undo_stack.len());
         app.update(cx, |app, cx| {
             app.move_paths_into_dir(std::slice::from_ref(&a), &dest, cx);
@@ -3696,14 +3675,14 @@ mod tree_drag_move_tests {
 
     #[gpui::test]
     fn dropping_a_multi_selection_moves_every_selected_path(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
-        let a = repo.path().join("a.txt");
-        let b = repo.path().join("b.txt");
-        let dest = repo.path().join("dest");
+        let a = repo.join("a.txt");
+        let b = repo.join("b.txt");
+        let dest = repo.join("dest");
         app.update(cx, |app, cx| {
             app.move_paths_into_dir(&[a.clone(), b.clone()], &dest, cx);
         });
@@ -3719,14 +3698,14 @@ mod tree_drag_move_tests {
     fn dropping_a_folder_onto_its_own_descendant_is_refused_with_a_real_error(
         cx: &mut TestAppContext,
     ) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed(&repo);
-        fs::create_dir_all(repo.path().join("dest/inner")).expect("mkdir");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        fs::create_dir_all(repo.join("dest/inner")).expect("mkdir");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
-        let dest = repo.path().join("dest");
-        let inner = repo.path().join("dest/inner");
+        let dest = repo.join("dest");
+        let inner = repo.join("dest/inner");
         app.update(cx, |app, cx| {
             app.move_paths_into_dir(std::slice::from_ref(&dest), &inner, cx);
         });
@@ -3744,13 +3723,13 @@ mod tree_drag_move_tests {
 
     #[gpui::test]
     fn dropping_onto_its_own_current_parent_is_a_real_no_op(cx: &mut TestAppContext) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed(&repo);
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
-        let a = repo.path().join("a.txt");
-        let root = repo.path().to_path_buf();
+        let a = repo.join("a.txt");
+        let root = repo.clone();
         let undo_len_before = app.read_with(cx, |app, _| app.tree_undo_stack.len());
         app.update(cx, |app, cx| {
             app.move_paths_into_dir(std::slice::from_ref(&a), &root, cx);
@@ -3772,16 +3751,16 @@ mod tree_drag_move_tests {
     fn dropping_a_selection_back_onto_a_sibling_file_row_in_the_same_folder_is_a_real_no_op(
         cx: &mut TestAppContext,
     ) {
-        let repo = TempDir::new().expect("tempdir");
+        let (_repo_dir, repo) = crate::sidebar::fixtures::temp_root();
         seed(&repo);
-        fs::create_dir_all(repo.path().join("src")).expect("mkdir src");
-        fs::write(repo.path().join("src/util.rs"), "// util\n").expect("write util.rs");
-        fs::write(repo.path().join("src/lib.rs"), "// lib\n").expect("write lib.rs");
-        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        fs::create_dir_all(repo.join("src")).expect("mkdir src");
+        fs::write(repo.join("src/util.rs"), "// util\n").expect("write util.rs");
+        fs::write(repo.join("src/lib.rs"), "// lib\n").expect("write lib.rs");
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.clone());
         cx.run_until_parked();
 
-        let dragged = repo.path().join("src/util.rs");
-        let sibling_row = repo.path().join("src/lib.rs");
+        let dragged = repo.join("src/util.rs");
+        let sibling_row = repo.join("src/lib.rs");
         // What `render_file_tree_row`'s file-row `on_drop` closure really resolves the drop
         // target to when the pointer released over `sibling_row` - not `sibling_row` itself,
         // which is exactly the bug: before this fix, a file row had no drop target of its own at
@@ -3790,7 +3769,7 @@ mod tree_drag_move_tests {
             AdeApp::tree_drop_target_dir(&sibling_row, false).expect("a file always has a parent");
         assert_eq!(
             drop_target,
-            repo.path().join("src"),
+            repo.join("src"),
             "premise: dropping on a sibling file row must resolve to their shared parent, not \
              the sibling's own path"
         );
@@ -3820,36 +3799,26 @@ mod tree_drag_move_tests {
 mod tree_drop_target_dir_tests {
     use super::*;
 
+    /// A drop lands in a directory, so a directory row is its own target and a file row is its
+    /// parent - including at the root, where a file's parent is the worktree itself.
     #[test]
-    fn a_directory_entry_resolves_to_its_own_path() {
-        let dir = Path::new("/repo/src");
-        assert_eq!(
-            AdeApp::tree_drop_target_dir(dir, true),
-            Some(dir.to_path_buf())
-        );
-    }
-
-    #[test]
-    fn a_file_entry_resolves_to_its_parent_not_itself() {
-        let file = Path::new("/repo/src/main.rs");
-        assert_eq!(
-            AdeApp::tree_drop_target_dir(file, false),
-            Some(Path::new("/repo/src").to_path_buf())
-        );
-    }
-
-    #[test]
-    fn a_root_level_file_resolves_to_the_worktree_root() {
-        let file = Path::new("/repo/README.md");
-        assert_eq!(
-            AdeApp::tree_drop_target_dir(file, false),
-            Some(Path::new("/repo").to_path_buf())
-        );
+    fn a_row_resolves_to_the_directory_a_drop_would_land_in() {
+        for (entry, is_dir, target) in [
+            ("/repo/src", true, "/repo/src"),
+            ("/repo/src/main.rs", false, "/repo/src"),
+            ("/repo/README.md", false, "/repo"),
+        ] {
+            assert_eq!(
+                AdeApp::tree_drop_target_dir(Path::new(entry), is_dir),
+                Some(Path::new(target).to_path_buf()),
+                "{entry} (is_dir: {is_dir})"
+            );
+        }
     }
 }
 
 #[cfg(test)]
-mod tests {
+mod path_remap_tests {
     use super::*;
 
     #[test]

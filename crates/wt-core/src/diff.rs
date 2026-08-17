@@ -1169,37 +1169,11 @@ mod tests {
     use std::fs;
     use std::process::Command;
     use tempfile::TempDir;
-
-    fn git(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("failed to spawn git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {:?}:\nstdout: {}\nstderr: {}",
-            args,
-            dir,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn init_repo() -> TempDir {
-        let dir = TempDir::new().expect("tempdir");
-        git(dir.path(), &["init", "-b", "main"]);
-        git(dir.path(), &["config", "user.email", "test@example.com"]);
-        git(dir.path(), &["config", "user.name", "Test User"]);
-        fs::write(dir.path().join("file.txt"), "hello\n").expect("write file");
-        git(dir.path(), &["add", "file.txt"]);
-        git(dir.path(), &["commit", "-m", "initial commit"]);
-        dir
-    }
+    use test_support::{git, seed_repo};
 
     #[test]
     fn on_default_branch_with_nothing_uncommitted_yields_an_empty_diff() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let result = diff_against_base(repo.path()).expect("diff_against_base");
         let DiffBase::NoBase {
             branch,
@@ -1217,7 +1191,7 @@ mod tests {
 
     #[test]
     fn on_default_branch_with_real_uncommitted_changes_shows_them() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("file.txt"), "hello\nedited on main\n").expect("write");
         fs::write(repo.path().join("new.txt"), "brand new\n").expect("write");
 
@@ -1306,7 +1280,7 @@ mod tests {
 
     #[test]
     fn feature_branch_diffs_modified_added_and_deleted_files() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("keep.txt"), "keep\n").expect("write");
         git(repo.path(), &["add", "keep.txt"]);
         git(repo.path(), &["commit", "-m", "add keep.txt"]);
@@ -1359,7 +1333,7 @@ mod tests {
 
     #[test]
     fn committed_changes_since_branch_point_are_included() {
-        let repo = init_repo();
+        let repo = seed_repo();
         git(repo.path(), &["checkout", "-b", "feature"]);
         fs::write(repo.path().join("file.txt"), "hello\ncommitted change\n").expect("write");
         git(repo.path(), &["commit", "-am", "a real commit on feature"]);
@@ -1382,7 +1356,7 @@ mod tests {
 
     #[test]
     fn clean_feature_branch_has_no_changes() {
-        let repo = init_repo();
+        let repo = seed_repo();
         git(repo.path(), &["checkout", "-b", "feature"]);
         let result = diff_against_base(repo.path()).expect("diff_against_base");
         let DiffBase::Diff(diff) = result else {
@@ -1393,7 +1367,9 @@ mod tests {
 
     #[test]
     fn rename_is_detected() {
-        let repo = init_repo();
+        let repo = seed_repo();
+        // `-M`'s similarity threshold needs enough content to recognize a rename rather than
+        // a delete+add; a single short line is not always enough, so pad the file.
         let content = "line\n".repeat(50);
         fs::write(repo.path().join("file.txt"), &content).expect("write");
         git(repo.path(), &["commit", "-am", "pad file.txt"]);
@@ -1417,7 +1393,7 @@ mod tests {
 
     #[test]
     fn binary_file_is_flagged_without_hunks() {
-        let repo = init_repo();
+        let repo = seed_repo();
         git(repo.path(), &["checkout", "-b", "feature"]);
         fs::write(repo.path().join("data.bin"), [0u8, 159, 146, 0, 1, 2]).expect("write");
         git(repo.path(), &["add", "data.bin"]);
@@ -1438,7 +1414,7 @@ mod tests {
 
     #[test]
     fn detached_head_still_diffs_against_default_branch() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("file.txt"), "hello\nchanged\n").expect("write");
         git(repo.path(), &["commit", "-am", "a change"]);
         let head_sha = {
@@ -1457,9 +1433,11 @@ mod tests {
 
     #[test]
     fn deleted_sql_style_comment_line_is_not_misparsed_as_file_header() {
-        // A removed line starting `-- ` renders as `--- <text>`, identical to a `--- <path>`
-        // header line.
-        let repo = init_repo();
+        // A removed line whose own text starts with `-- ` renders in unified diff output as
+        // `--- <that text>` (marker `-` prepended to the real content) - textually identical
+        // to a `--- <path>` old-file header line. Before this fix, the parser matched that
+        // prefix unconditionally, truncating the rest of this hunk right after it.
+        let repo = seed_repo();
         let content = "line one\n-- a real sql comment\nline three\nline four\n";
         fs::write(repo.path().join("file.txt"), content).expect("write");
         git(
@@ -1502,9 +1480,12 @@ mod tests {
 
     #[test]
     fn added_line_looking_like_a_file_header_does_not_misattribute_the_file() {
-        // An added line starting `++ ` renders as `+++ <text>`, identical to a `+++ <path>`
-        // header line - which would misattribute the change to a path parsed out of content.
-        let repo = init_repo();
+        // An added line whose own text starts with `++ ` renders as `+++ <that text>` -
+        // textually identical to a `+++ <path>` new-file header line. Before this fix, the
+        // parser matched that prefix unconditionally, overwriting `new_path` with a bogus
+        // path parsed out of the line's *content* - misattributing the change to the wrong
+        // file, exactly the "worst case" scenario the checker flagged.
+        let repo = seed_repo();
         git(repo.path(), &["checkout", "-b", "feature"]);
         fs::write(
             repo.path().join("file.txt"),
@@ -1588,9 +1569,11 @@ mod tests {
 
     #[test]
     fn untracked_file_appears_in_diff_as_an_addition() {
-        // `git diff <merge-base>` alone never sees untracked files; the shadow index's
-        // `--intent-to-add` pass is what surfaces them.
-        let repo = init_repo();
+        // `git diff <merge-base>` alone never sees genuinely untracked (never `git add`ed)
+        // files, no matter what - the single most common thing an agent produces in a fresh
+        // worktree. `prepare_shadow_index`'s `--intent-to-add` trick is what makes this
+        // show up at all.
+        let repo = seed_repo();
         git(repo.path(), &["checkout", "-b", "feature"]);
         fs::write(repo.path().join("brand_new.txt"), "content nobody staged\n").expect("write");
 
@@ -1625,10 +1608,16 @@ mod tests {
 
     #[test]
     fn a_missing_or_unreadable_real_index_does_not_fail_the_whole_diff() {
-        // `GIT_INDEX_FILE` at a nonexistent path is a fresh empty index and `git add` succeeds;
-        // at an existing 0-byte file it fails with `index file smaller than expected`. Leaving
-        // the placeholder in place therefore breaks the whole Changes panel.
-        let repo = init_repo();
+        // Reproduces a real, confirmed bug: `prepare_shadow_index` used to fall back to an
+        // empty *existing* temp file when the real index couldn't be read, on the (wrong)
+        // assumption that this "mirrors git's own missing index == empty index behavior."
+        // Verified directly with real git commands that it does not: `GIT_INDEX_FILE`
+        // pointed at a genuinely nonexistent path is treated as a fresh empty index (real
+        // `git add` succeeds), but pointed at an existing 0-byte file it fails outright
+        // (`fatal: ... index file smaller than expected`, exit 128) - a completely
+        // different, fatal code path. `diff_against_base` surfaced that fatal to the whole
+        // Changes panel as "failed to compute diff: ...".
+        let repo = seed_repo();
         git(repo.path(), &["checkout", "-b", "feature"]);
         fs::write(repo.path().join("brand_new.txt"), "content nobody staged\n").expect("write");
 
@@ -1749,7 +1738,7 @@ mod tests {
 
     #[test]
     fn prepare_shadow_index_closes_its_own_file_handle_before_returning() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("untracked.txt"), "nobody staged this\n").expect("write");
 
         let shadow = prepare_shadow_index(repo.path(), ShadowIndexContent::IntentToAdd)
@@ -1777,7 +1766,7 @@ mod tests {
 
     #[test]
     fn the_shadow_index_lives_in_the_git_directory_not_the_os_temp_directory() {
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("untracked.txt"), "nobody staged this\n").expect("write");
 
         let shadow = prepare_shadow_index(repo.path(), ShadowIndexContent::IntentToAdd)
@@ -1815,7 +1804,7 @@ mod tests {
 
     #[test]
     fn a_linked_worktrees_shadow_index_lives_in_that_worktrees_own_git_directory() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let holder = TempDir::new().expect("tempdir");
         let wt_path = holder.path().join("linked");
         drop(holder);
@@ -1848,7 +1837,7 @@ mod tests {
 
     #[test]
     fn an_embedded_git_repository_in_the_worktree_does_not_fail_the_diff() {
-        let repo = init_repo();
+        let repo = seed_repo();
         git(repo.path(), &["checkout", "-b", "feature"]);
         fs::write(repo.path().join("brand_new.txt"), "content nobody staged\n").expect("write");
 
@@ -1892,7 +1881,7 @@ mod tests {
         // Combines all three kinds of change the diff is supposed to surface in one pass -
         // the exact workflow this feature exists for (check everything an agent did before
         // merge, in one view).
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("keep.txt"), "keep\n").expect("write");
         git(repo.path(), &["add", "keep.txt"]);
         git(repo.path(), &["commit", "-m", "add keep.txt"]);
@@ -1939,7 +1928,7 @@ mod tests {
         // diff's `a/`/`b/` prefixes to `i/`/`w/`/`c/`. `diff_against_base` must pin this
         // config explicitly (rather than relying on defaults) so path parsing is unaffected
         // by whatever the repo's own config happens to be.
-        let repo = init_repo();
+        let repo = seed_repo();
         git(repo.path(), &["config", "diff.mnemonicPrefix", "true"]);
         git(repo.path(), &["checkout", "-b", "feature"]);
         fs::write(repo.path().join("file.txt"), "hello\nchanged\n").expect("write");
@@ -2002,7 +1991,7 @@ mod tests {
         // `diff_against_base` surfaces as `DiffBase::NoBase` (GitHub issue #108: real
         // uncommitted changes are still worth showing, even with no comparable base branch)
         // rather than an `Err` or a fabricated `NoBaseFound`.
-        let repo = init_repo();
+        let repo = seed_repo();
         git(repo.path(), &["checkout", "--orphan", "unrelated"]);
         git(repo.path(), &["rm", "-rf", "--cached", "."]);
         fs::remove_file(repo.path().join("file.txt")).expect("remove");
@@ -2028,6 +2017,9 @@ mod tests {
         assert_eq!(uncommitted.files[0].path, Path::new("other.txt"));
     }
 
+    /// `#[cfg(unix)]`: the child is `sh -c` over `head`, `/dev/zero` and `tr`. The draining
+    /// behaviour it proves is platform-free, but reproducing the full-pipe deadlock needs them.
+    #[cfg(unix)]
     #[test]
     fn stdout_and_stderr_are_drained_concurrently_without_deadlocking() {
         // A child that writes well past a typical OS pipe buffer (64KB on Linux) to stderr
@@ -2086,7 +2078,7 @@ mod tests {
 
     #[test]
     fn linked_worktree_diffs_against_main_repo_default_branch() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let linked_dir = TempDir::new().expect("tempdir");
         let linked_path = linked_dir.path().join("linked-wt");
         drop(linked_dir);
@@ -2206,7 +2198,7 @@ index 0000000..fedcba9
 
     #[test]
     fn merge_status_reports_merged_true_for_a_worktree_fully_contained_in_base() {
-        let repo = init_repo();
+        let repo = seed_repo();
         git(repo.path(), &["checkout", "-b", "feature"]);
         git(repo.path(), &["checkout", "main"]);
 
@@ -2235,7 +2227,7 @@ index 0000000..fedcba9
 
     #[test]
     fn merge_status_reports_merged_false_for_a_worktree_with_unique_commits() {
-        let repo = init_repo();
+        let repo = seed_repo();
         git(repo.path(), &["checkout", "-b", "feature"]);
         fs::write(repo.path().join("feature.txt"), "feature work\n").expect("write");
         git(repo.path(), &["add", "feature.txt"]);
@@ -2274,7 +2266,7 @@ index 0000000..fedcba9
 
     #[test]
     fn merge_status_on_the_default_branch_itself_is_trivially_merged() {
-        let repo = init_repo();
+        let repo = seed_repo();
         let status = merge_status_against_base(repo.path())
             .expect("merge_status_against_base")
             .expect("main itself has a detectable base (itself)");
@@ -2282,19 +2274,27 @@ index 0000000..fedcba9
         assert!(status.merged);
     }
 
+    /// Both real "nothing has diverged" states: the default branch itself (whose base is
+    /// itself), and a branch just cut from it.
     #[test]
-    fn ahead_behind_on_default_branch_is_zero_and_zero() {
-        let repo = init_repo();
-        let result = ahead_behind_against_base(repo.path())
-            .expect("ahead_behind_against_base")
-            .expect("main itself has a detectable base (itself)");
-        assert_eq!(
-            result,
-            AheadBehind {
-                ahead: 0,
-                behind: 0
+    fn a_branch_that_has_not_diverged_is_zero_ahead_and_zero_behind() {
+        for branch in [None, Some("feature")] {
+            let repo = seed_repo();
+            if let Some(branch) = branch {
+                git(repo.path(), &["checkout", "-b", branch]);
             }
-        );
+            let result = ahead_behind_against_base(repo.path())
+                .expect("ahead_behind_against_base")
+                .unwrap_or_else(|| panic!("{branch:?} must have a detectable base"));
+            assert_eq!(
+                result,
+                AheadBehind {
+                    ahead: 0,
+                    behind: 0
+                },
+                "{branch:?} has no commits of its own and none it is missing"
+            );
+        }
     }
 
     #[test]
@@ -2307,7 +2307,7 @@ index 0000000..fedcba9
 
     #[test]
     fn ahead_behind_counts_real_diverged_commits_on_each_side() {
-        let repo = init_repo();
+        let repo = seed_repo();
         git(repo.path(), &["checkout", "-b", "feature"]);
         fs::write(repo.path().join("feature_one.txt"), "one\n").expect("write");
         git(repo.path(), &["add", "feature_one.txt"]);
@@ -2334,22 +2334,13 @@ index 0000000..fedcba9
         );
     }
 
-    #[test]
-    fn ahead_behind_with_no_divergence_at_all_is_zero_and_zero() {
-        let repo = init_repo();
-        git(repo.path(), &["checkout", "-b", "feature"]);
-        let result = ahead_behind_against_base(repo.path())
-            .expect("ahead_behind_against_base")
-            .expect("feature has a detectable base (main)");
-        assert_eq!(
-            result,
-            AheadBehind {
-                ahead: 0,
-                behind: 0
-            }
-        );
-    }
-
+    /// The audit's exact reproduction of the wrong-ref bug: the detected base comes from
+    /// `refs/remotes/origin/HEAD` (short name `main`), but a *local* `main` branch of the same
+    /// short name also exists and has gone stale relative to `origin/main`. Before this fix,
+    /// `ahead_behind_against_base` handed git the bare short name `main`, which git's own
+    /// disambiguation rules resolve against the stale local branch (`refs/heads/main`) rather
+    /// than the fresh remote-tracking commit that was actually detected as the real base -
+    /// silently reporting `↓0` (up to date) when the real, correct answer is `↓2`.
     #[test]
     fn ahead_behind_is_computed_against_the_detected_base_commit_not_a_stale_local_branch_of_the_same_name(
     ) {
@@ -2439,7 +2430,7 @@ index 0000000..fedcba9
     /// shape that makes the three Changes-panel scopes give three genuinely different answers
     /// (GitHub issue #285).
     fn repo_with_a_commit_and_a_dirty_file() -> TempDir {
-        let repo = init_repo();
+        let repo = seed_repo();
         git(repo.path(), &["checkout", "-b", "feature"]);
         fs::write(repo.path().join("committed.txt"), "one\ntwo\n").expect("write committed");
         git(repo.path(), &["add", "committed.txt"]);
@@ -2495,7 +2486,7 @@ index 0000000..fedcba9
     fn the_uncommitted_scope_includes_a_brand_new_untracked_file() {
         // Untracked files are exactly the kind of dirty an agent produces, and `git diff HEAD`
         // cannot see them without the `--intent-to-add` shadow index.
-        let repo = init_repo();
+        let repo = seed_repo();
         fs::write(repo.path().join("agent_wrote_this.rs"), "fn main() {}\n").expect("write");
 
         let uncommitted = diff_against_head(repo.path())
@@ -2513,7 +2504,7 @@ index 0000000..fedcba9
     fn the_uncommitted_scope_is_empty_not_absent_for_a_clean_worktree() {
         // `Ok(None)` means "HEAD is unborn", never "nothing changed" - a caller must be able to
         // tell a clean checkout from a repository with no commits at all.
-        let repo = init_repo();
+        let repo = seed_repo();
         let uncommitted = diff_against_head(repo.path())
             .expect("diff_against_head")
             .expect("a clean worktree still has a real, empty answer");
@@ -2534,7 +2525,7 @@ index 0000000..fedcba9
 
     #[test]
     fn the_commits_scope_lists_only_this_branch_s_own_commits_newest_first() {
-        let repo = init_repo();
+        let repo = seed_repo();
         git(repo.path(), &["checkout", "-b", "feature"]);
         fs::write(repo.path().join("first.txt"), "a\nb\n").expect("write");
         git(repo.path(), &["add", "first.txt"]);
@@ -2582,7 +2573,7 @@ index 0000000..fedcba9
     fn the_commits_scope_reports_the_net_range_diffstat_not_the_sum_of_its_commits() {
         // A line one commit adds and the next removes is in the per-commit sum twice and in the
         // net answer not at all. "What is written down" is the net answer.
-        let repo = init_repo();
+        let repo = seed_repo();
         git(repo.path(), &["checkout", "-b", "feature"]);
         fs::write(repo.path().join("churn.txt"), "one\ntwo\nthree\n").expect("write");
         git(repo.path(), &["add", "churn.txt"]);
@@ -2614,7 +2605,7 @@ index 0000000..fedcba9
     fn a_worktree_on_its_own_default_branch_has_an_empty_commits_scope_not_all_of_history() {
         // "The commits this branch added" has no answer without a point to have added them from,
         // and listing every commit in the repository would be a different, wrong answer.
-        let repo = init_repo();
+        let repo = seed_repo();
         let commits = commits_since_base(repo.path()).expect("commits_since_base");
         assert!(commits.commits.is_empty());
         assert_eq!(commits.base_branch, None);
@@ -2625,7 +2616,7 @@ index 0000000..fedcba9
     fn a_commit_subject_carrying_the_numstat_separator_is_still_parsed_as_one_commit() {
         // The record/field separators exist so a subject cannot be mistaken for a field boundary
         // or for the start of a numstat line.
-        let repo = init_repo();
+        let repo = seed_repo();
         git(repo.path(), &["checkout", "-b", "feature"]);
         fs::write(repo.path().join("tabbed.txt"), "x\n").expect("write");
         git(repo.path(), &["add", "tabbed.txt"]);
@@ -2649,7 +2640,7 @@ index 0000000..fedcba9
 
     #[test]
     fn a_merge_commit_contributes_no_line_counts_rather_than_invented_ones() {
-        let repo = init_repo();
+        let repo = seed_repo();
         git(repo.path(), &["checkout", "-b", "feature"]);
         fs::write(repo.path().join("feature.txt"), "f\n").expect("write");
         git(repo.path(), &["add", "feature.txt"]);

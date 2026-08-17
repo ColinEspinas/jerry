@@ -274,6 +274,11 @@ split, and the reasoning for each, are in [`docs/architecture/`](docs/architectu
 a change moves from issue to merged PR is in
 [`docs/development-workflow.md`](docs/development-workflow.md).
 
+Tests run under [`cargo-nextest`](https://nexte.st) rather than `cargo test`, for the per-test
+process isolation and timeout configured in `.config/nextest.toml`. CI runs the full suite on Linux
+and macOS; Windows builds and runs only its platform-specific sampling tests, because the rest does
+not pass there yet ([issue #440](https://github.com/ColinEspinas/jerry/issues/440)).
+
 ## License
 
 [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE).

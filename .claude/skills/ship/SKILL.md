@@ -10,12 +10,12 @@ changed and why from the diff alone.
 
 ## Steps
 
-1. **Run the gate.** `/check` (conventions + fmt + clippy `-D warnings`). Don't proceed past a
-   failure — a PR opened against a red gate just moves the failure to someone else's screen.
-   `cargo test --workspace` isn't part of this gate right now
-   ([issue #348](https://github.com/ColinEspinas/jerry/issues/348)) — run whatever tests are
-   relevant to the change manually (e.g. `cargo test -p wt-core`, or a scoped `cargo test -p app
-   --lib <module>::`) and note the result in the PR's Testing section instead of leaving it blank.
+1. **Run the gate.** `/check` (conventions + fmt + clippy `-D warnings` + `cargo nextest run
+   --workspace`). Don't proceed past a failure — a PR opened against a red gate just moves the
+   failure to someone else's screen. That covers the `unit` and `ui` tiers; if the change touches
+   the `external` tier (real language servers, `docs/testing.md`), run that yourself with
+   `cargo nextest run --workspace --profile external --run-ignored all` and note the result in the
+   PR's Testing section instead of leaving it blank.
 
 2. **Decide if this is UI-visible.** `git diff --name-only` against the target branch — did it
    touch a `render.rs`, `theme.rs`, or anything else that changes what the app looks like? If so,

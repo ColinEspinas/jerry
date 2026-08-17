@@ -16,19 +16,18 @@ the product description; this file only covers how to build it.
 cargo build --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
+cargo nextest run --workspace
 ```
 
-All three together are the pre-commit gate — run them as `/check` before considering anything
-done. `.claude/hooks/pre-commit-check.sh` runs the same three automatically before any
+All four together are the pre-commit gate — run them as `/check` before considering anything
+done. `.claude/hooks/pre-commit-check.sh` runs the same four automatically before any
 `git commit`, as a safety net. None are optional; a PR that needs `#[allow(...)]` to silence a
 lint either fixes the underlying issue or justifies the allow with a one-line comment.
 
-**`cargo test --workspace` is deliberately not part of this gate right now.** A real run
-surfaced most of the GPUI-window-touching suite failing/timing out outside an interactive
-session — investigated in [GitHub issue #348](https://github.com/ColinEspinas/jerry/issues/348),
-which also tracks getting it back into CI and this gate once resolved. Run tests relevant to what
-you're touching manually in the meantime (e.g. `cargo test -p wt-core`, or a scoped
-`cargo test -p app --lib <module>::`), and don't treat a clean `/check` as proof the suite passes.
+The test step covers the `unit` and `ui` tiers; the `external` tier is `#[ignore]`d and runs only
+in CI's nightly job (see "Testing" below). `cargo nextest`, not `cargo test`: `.config/nextest.toml`
+gives each test its own process and a real timeout, so a hung test fails that test instead of
+sitting on the whole run forever.
 
 Run the app with `cargo run --release -p app [repo-path]`. Use `--release` unless you're actively
 recompiling every few seconds: a debug-profile GPUI build is commonly 5–20× slower for the per-frame
@@ -125,10 +124,13 @@ what this rule would have flagged.
 
 ## Testing
 
-`#[gpui::test]` + `TestAppContext`/`VisualTestContext` for anything touching a `Render`/`Entity` —
-not a snapshot of stdout, which doesn't cover a retained-mode GPU UI. Name test modules by concern
-(`mod change_row_selection_tests`, not `mod tests`) — the existing 175-name convention is good,
-keep it. Fixtures live under a sibling `testdata/` directory, not inlined as string literals.
+Every test is one of three tiers: `unit` (plain `#[test]`, pure logic or a tempdir, < 10 ms), `ui`
+(`#[gpui::test]` + `TestAppContext`/`VisualTestContext` for anything touching a `Render`/`Entity`,
+< 2 s), or `external` (`#[ignore = "external: <binary>; …"]`, a real language server or agent
+process, its own CI job and never the PR gate). Shared fixtures — argv-only `git`, seeded
+repositories, `wait_until`, `ChildGuard` — come from `crates/test-support`, which stays `gpui`-free;
+GPUI ones from `crates/app/src/test_support.rs`. What deserves a test, what gets deleted and why,
+and the no-`thread::sleep` rule: [`docs/testing.md`](docs/testing.md).
 
 ## Workflow
 

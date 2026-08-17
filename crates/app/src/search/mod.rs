@@ -6,4 +6,6 @@ pub mod glob;
 pub mod in_file;
 pub mod state;
 
+#[cfg(test)]
+pub(crate) mod fixtures;
 pub(crate) mod render;
