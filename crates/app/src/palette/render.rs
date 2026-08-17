@@ -165,6 +165,10 @@ impl AdeApp {
                 secondary: format!("spawn codex {spawn_target}"),
             },
             palette::CommandCandidate {
+                command: palette::PaletteCommand::NewCursorAgent,
+                secondary: format!("spawn cursor-agent {spawn_target}"),
+            },
+            palette::CommandCandidate {
                 command: palette::PaletteCommand::CycleRightPanel,
                 secondary: format!("switch the right panel to {next_sidebar_view}"),
             },
@@ -401,6 +405,9 @@ impl AdeApp {
             }
             palette::PaletteCommand::NewCodexAgent => {
                 self.new_agent(ProcessKind::codex(), window, cx)
+            }
+            palette::PaletteCommand::NewCursorAgent => {
+                self.new_agent(ProcessKind::cursor(), window, cx)
             }
             palette::PaletteCommand::CycleRightPanel => {
                 // Any palette gesture must disarm a pending prune confirmation (see

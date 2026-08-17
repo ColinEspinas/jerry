@@ -167,7 +167,7 @@ actually done. Rebase interactively when you want to tidy up before merging.
 <p>
   <a href="https://claude.com/claude-code"><kbd><img src="https://www.google.com/s2/favicons?domain=claude.com&sz=64" alt="" width="16" valign="middle" /> Claude Code <img src="docs/images/dot-full.png" alt="Full support" width="9" valign="middle" /></kbd></a> &nbsp;
   <a href="https://github.com/openai/codex"><kbd><img src="https://www.google.com/s2/favicons?domain=openai.com&sz=64" alt="" width="16" valign="middle" /> Codex <img src="docs/images/dot-partial.png" alt="Partial support" width="9" valign="middle" /></kbd></a> &nbsp;
-  <a href="https://cursor.com/cli"><kbd><img src="https://www.google.com/s2/favicons?domain=cursor.com&sz=64" alt="" width="16" valign="middle" /> Cursor <img src="docs/images/dot-planned.png" alt="Planned" width="9" valign="middle" /></kbd></a>
+  <a href="https://cursor.com/cli"><kbd><img src="https://www.google.com/s2/favicons?domain=cursor.com&sz=64" alt="" width="16" valign="middle" /> Cursor <img src="docs/images/dot-partial.png" alt="Partial support" width="9" valign="middle" /></kbd></a>
 </p>
 
 <p>

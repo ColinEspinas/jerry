@@ -517,7 +517,10 @@ fn resume_command_line(run: &PastAgent, branch: Option<&str>) -> String {
     let command = match (run.kind, run.session_id.as_deref()) {
         (AgentKind::Claude, Some(session_id)) => format!("claude --resume {session_id}"),
         (AgentKind::Claude, None) => "claude".to_string(),
+        // Neither of these resumes: `Agents::spawn_resume` is Claude-only, so printing a
+        // `--resume` flag here would advertise something this app doesn't actually do for them.
         (AgentKind::Codex, _) => "codex".to_string(),
+        (AgentKind::Cursor, _) => "cursor-agent".to_string(),
     };
     match branch {
         Some(branch) => format!("\u{276f} {command} \u{b7} {branch}"),

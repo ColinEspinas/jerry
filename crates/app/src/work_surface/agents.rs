@@ -21,6 +21,9 @@ pub enum AgentKind {
     Claude,
     /// The `codex` CLI, spawned the same way as [`AgentKind::Claude`].
     Codex,
+    /// The Cursor agent CLI (GitHub issue #463), spawned the same way as [`AgentKind::Claude`].
+    /// Its binary is `cursor-agent`, not `cursor` - the latter is the editor.
+    Cursor,
 }
 
 impl AgentKind {
@@ -28,6 +31,7 @@ impl AgentKind {
         match self {
             AgentKind::Claude => "Claude",
             AgentKind::Codex => "Codex",
+            AgentKind::Cursor => "Cursor",
         }
     }
 
@@ -38,6 +42,7 @@ impl AgentKind {
         match label {
             "Claude" => Some(AgentKind::Claude),
             "Codex" => Some(AgentKind::Codex),
+            "Cursor" => Some(AgentKind::Cursor),
             _ => None,
         }
     }
@@ -50,6 +55,7 @@ impl AgentKind {
         match self {
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
+            AgentKind::Cursor => "cursor-agent",
         }
     }
 }
@@ -76,6 +82,12 @@ impl ProcessKind {
     /// [`Self::claude`].
     pub const fn codex() -> Self {
         ProcessKind::Agent(AgentKind::Codex)
+    }
+
+    /// Construction-only shorthand for `ProcessKind::Agent(AgentKind::Cursor)` - see
+    /// [`Self::claude`].
+    pub const fn cursor() -> Self {
+        ProcessKind::Agent(AgentKind::Cursor)
     }
 
     pub fn label(self) -> &'static str {
@@ -584,7 +596,7 @@ mod tests {
         // The whole point of the two-type split: `is_agent_session` can only ever be `false`
         // for the one variant that isn't an agent, and there is no `AgentKind` value at all
         // that could make it `false` - `ProcessKind::from` can't produce a shell.
-        for agent in [AgentKind::Claude, AgentKind::Codex] {
+        for agent in [AgentKind::Claude, AgentKind::Codex, AgentKind::Cursor] {
             assert!(
                 ProcessKind::from(agent).is_agent_session(),
                 "{agent:?} wrapped as a ProcessKind must be a real agent session"
@@ -602,8 +614,10 @@ mod tests {
         // the explicit construction, spawn sites would quietly disagree with match arms.
         assert_eq!(ProcessKind::claude(), ProcessKind::Agent(AgentKind::Claude));
         assert_eq!(ProcessKind::codex(), ProcessKind::Agent(AgentKind::Codex));
+        assert_eq!(ProcessKind::cursor(), ProcessKind::Agent(AgentKind::Cursor));
         assert_eq!(ProcessKind::claude(), AgentKind::Claude.into());
         assert_eq!(ProcessKind::codex(), AgentKind::Codex.into());
+        assert_eq!(ProcessKind::cursor(), AgentKind::Cursor.into());
     }
 
     #[test]
@@ -611,8 +625,10 @@ mod tests {
         assert_eq!(ProcessKind::Shell.label(), "Shell");
         assert_eq!(ProcessKind::claude().label(), AgentKind::Claude.label());
         assert_eq!(ProcessKind::codex().label(), AgentKind::Codex.label());
+        assert_eq!(ProcessKind::cursor().label(), AgentKind::Cursor.label());
         assert_eq!(AgentKind::Claude.label(), "Claude");
         assert_eq!(AgentKind::Codex.label(), "Codex");
+        assert_eq!(AgentKind::Cursor.label(), "Cursor");
     }
 
     #[test]
@@ -620,7 +636,7 @@ mod tests {
         // GitHub issue #227's history reader (`crate::hooks::history`) decodes a persisted
         // `PersistedAgentStatus::kind` string back into a real `AgentKind` through this - it must
         // agree with `label` exactly, or a real persisted record would silently fail to decode.
-        for kind in [AgentKind::Claude, AgentKind::Codex] {
+        for kind in [AgentKind::Claude, AgentKind::Codex, AgentKind::Cursor] {
             assert_eq!(AgentKind::from_label(kind.label()), Some(kind));
         }
         assert_eq!(
@@ -634,11 +650,19 @@ mod tests {
     fn each_agent_kind_spawns_its_own_distinct_path_binary() {
         assert_eq!(AgentKind::Claude.binary_name(), "claude");
         assert_eq!(AgentKind::Codex.binary_name(), "codex");
-        assert_ne!(
-            AgentKind::Claude.binary_name(),
-            AgentKind::Codex.binary_name(),
-            "a copy-pasted arm sharing one binary name would spawn the wrong CLI silently"
-        );
+        // `cursor-agent`, not `cursor`: the latter is the Cursor editor's own launcher, so a
+        // slip here would spawn a GUI editor where an agent session was asked for.
+        assert_eq!(AgentKind::Cursor.binary_name(), "cursor-agent");
+        let kinds = [AgentKind::Claude, AgentKind::Codex, AgentKind::Cursor];
+        for (index, kind) in kinds.iter().enumerate() {
+            for other in &kinds[index + 1..] {
+                assert_ne!(
+                    kind.binary_name(),
+                    other.binary_name(),
+                    "a copy-pasted arm sharing one binary name would spawn the wrong CLI silently"
+                );
+            }
+        }
     }
 
     #[test]
@@ -677,7 +701,7 @@ mod tests {
 
     #[test]
     fn the_settings_path_search_and_the_real_spawn_read_the_same_binary_name() {
-        for agent in [AgentKind::Claude, AgentKind::Codex] {
+        for agent in [AgentKind::Claude, AgentKind::Codex, AgentKind::Cursor] {
             let spec = ProcessKind::Agent(agent).spec(PathBuf::from("/tmp"), None, None);
             assert_eq!(
                 spec.program,

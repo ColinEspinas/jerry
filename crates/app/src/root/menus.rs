@@ -4,7 +4,7 @@
 
 use super::*;
 
-/// Every real floating menu/dropdown surface in the app - the thirteen built on
+/// Every real floating menu/dropdown surface in the app - the fourteen built on
 /// [`crate::root::widgets::menu_popover_chrome`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MenuSurface {
@@ -63,6 +63,13 @@ pub(crate) enum MenuSurface {
     /// [`crate::root::widgets::menu_popover_chrome`], so it belongs to the same one-at-a-time
     /// invariant.
     Budget,
+    /// The `Start an agent` split button's own agent picker (GitHub issue #463) -
+    /// [`AdeApp::agent_picker_open`]. A separate surface from [`Self::Plus`] rather than a second
+    /// shape of the same field for the reason [`Self::GraphBranch`] is separate from
+    /// [`Self::GraphRow`]: the two are anchored to different controls, and the `+` menu's own
+    /// `New agent` row opens this one, which means both being open at once is exactly the state
+    /// this invariant exists to prevent.
+    AgentPicker,
 }
 
 impl MenuSurface {
@@ -70,7 +77,7 @@ impl MenuSurface {
     /// [`AdeApp::close_menu_surface`] are exhaustive, so a new variant added here cannot compile
     /// until it is really wired to real state - that pairing is what stops a new menu from
     /// quietly opting out of the invariant.
-    pub(crate) const ALL: [MenuSurface; 13] = [
+    pub(crate) const ALL: [MenuSurface; 14] = [
         MenuSurface::Plus,
         MenuSurface::Title,
         MenuSurface::TreeContext,
@@ -84,6 +91,7 @@ impl MenuSurface {
         MenuSurface::RailOverflow,
         MenuSurface::Resources,
         MenuSurface::Budget,
+        MenuSurface::AgentPicker,
     ];
 }
 
@@ -105,6 +113,7 @@ impl AdeApp {
             MenuSurface::RailOverflow => self.rail_overflow_menu.is_some(),
             MenuSurface::Resources => self.resources_popover_open,
             MenuSurface::Budget => self.budget_popover_open,
+            MenuSurface::AgentPicker => self.agent_picker_open.is_some(),
         }
     }
 
@@ -141,6 +150,7 @@ impl AdeApp {
             MenuSurface::RailOverflow => self.rail_overflow_menu = None,
             MenuSurface::Resources => self.resources_popover_open = false,
             MenuSurface::Budget => self.budget_popover_open = false,
+            MenuSurface::AgentPicker => self.agent_picker_open = None,
         }
     }
 
@@ -219,6 +229,9 @@ mod menu_surface_tests {
         });
         app.resources_popover_open = true;
         app.budget_popover_open = true;
+        app.agent_picker_open = Some(crate::work_surface::state::AgentPickerAnchor::StartButton(
+            "context-bar-start-agent",
+        ));
     }
 
     #[gpui::test]

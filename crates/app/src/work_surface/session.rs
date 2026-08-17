@@ -302,8 +302,8 @@ mod session_restore_tests {
                     Some(match agent.kind {
                         ProcessKind::Shell => Slot::Shell,
                         ProcessKind::Agent(AgentKind::Claude) => Slot::Claude,
-                        ProcessKind::Agent(AgentKind::Codex) => {
-                            panic!("no test here spawns a Codex agent into a live strip")
+                        ProcessKind::Agent(AgentKind::Codex | AgentKind::Cursor) => {
+                            panic!("no test here spawns a Codex or Cursor agent into a live strip")
                         }
                     })
                 }
