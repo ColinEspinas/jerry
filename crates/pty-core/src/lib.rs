@@ -517,15 +517,15 @@ impl PtySession {
         Ok(())
     }
 
-    /// Terminates the direct child only.
-    ///
-    /// A known regression against the unix path, not a cosmetic gap: any grandchild the killed
-    /// child spawned survives as an orphan. Windows has no signal-based process group without job
-    /// objects, whose `unsafe` FFI this project rules out.
+    /// Terminates the child's whole process tree via [`windows_terminate_process_tree`], then
+    /// the direct child itself as the backstop.
     #[cfg(windows)]
     pub fn kill(&mut self) -> Result<(), PtyError> {
         if self.exited.is_some() {
             return Ok(());
+        }
+        if let Some(pid) = self.process_id() {
+            windows_terminate_process_tree(pid);
         }
         if let Some(child) = self.child.as_mut() {
             let _ = child.kill();
@@ -652,6 +652,9 @@ impl PtySession {
     #[cfg(windows)]
     pub fn shutdown(&mut self) -> Result<(), PtyError> {
         if self.exited.is_none() {
+            if let Some(pid) = self.process_id() {
+                windows_terminate_process_tree(pid);
+            }
             if let Some(child) = self.child.as_mut() {
                 let _ = child.kill();
                 let status = child.wait().map_err(PtyError::Wait)?;
@@ -675,6 +678,26 @@ impl PtySession {
     }
 }
 
+/// Terminates `pid` and every descendant, synchronously: `taskkill /T` walks the parent-pid
+/// chain, the closest Windows equivalent of the unix process-group signal plus descendant walk,
+/// without the job-object `unsafe` FFI this project rules out. Best-effort by nature (a
+/// descendant that re-parented is missed; one that exited already is fine) - but without it a
+/// bare `TerminateProcess` on the direct child orphans every grandchild, which is how an npm
+/// `.cmd`-shim agent's real `node.exe` survived kills (GitHub issue #468) and how a discarded
+/// worktree's directory stayed open-handled through its own deletion (GitHub issue #470).
+/// `taskkill` ships with every Windows since XP; a failure to run it is logged and the direct
+/// kill still proceeds.
+#[cfg(windows)]
+fn windows_terminate_process_tree(pid: u32) {
+    match crate::new_std_command("taskkill")
+        .args(["/T", "/F", "/PID", &pid.to_string()])
+        .output()
+    {
+        Ok(_) => {}
+        Err(err) => log::warn!("taskkill /T /F /PID {pid} could not run: {err}"),
+    }
+}
+
 impl Drop for PtySession {
     fn drop(&mut self) {
         if self.exited.is_none() {
@@ -683,10 +706,23 @@ impl Drop for PtySession {
                 // Zero grace: `Drop` must not block the caller.
                 terminate_process_tree(pid, Duration::ZERO);
             }
-            // Windows has no process tree, so `child.kill()` below leaves grandchildren orphaned.
+            // Fire-and-forget `taskkill /T` (spawned, never waited - `Drop` must not block),
+            // then the direct kill as the backstop; see `windows_terminate_process_tree`.
+            // Stdio nulled so the detached child can't hold inherited pipes open - under
+            // `cargo nextest` an inherited stdout is reported as the test leaking.
             #[cfg(windows)]
-            if let Some(child) = self.child.as_mut() {
-                let _ = child.kill();
+            {
+                if let Some(pid) = self.process_id() {
+                    let _ = crate::new_std_command("taskkill")
+                        .args(["/T", "/F", "/PID", &pid.to_string()])
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn();
+                }
+                if let Some(child) = self.child.as_mut() {
+                    let _ = child.kill();
+                }
             }
 
             let reaped_immediately = self

@@ -459,6 +459,11 @@ pub struct AdeApp {
     /// [`Self::current_diff`]'s docs for exactly which [`DiffLoadState`]/[`DiffBase`]
     /// combinations count).
     pub(crate) diff_totals: Option<(u32, u32)>,
+    /// Memoized [`Self::worktree_problems`] output, keyed by worktree root and each Ready LSP
+    /// client's diagnostics generation - recomputed only when one of those moves, where it used
+    /// to clone every diagnostic and `stat` every diagnosed file on **every frame**
+    /// (GitHub issue #471). `RefCell` because render paths hold `&self`.
+    pub(crate) problems_cache: std::cell::RefCell<crate::rail::strip_render::ProblemsCache>,
     /// Whether a `Self::spawn_diff_reload` task is running right now, so the watcher-driven
     /// refresh behind GitHub issue #415 can skip a tick instead of cancelling a reload that is
     /// still working - see [`Self::refresh_diff_if_idle`].
@@ -1378,6 +1383,11 @@ pub struct AdeApp {
     /// newer one" structurally impossible - there can never be a second one in flight to race
     /// with.
     pub(crate) worktree_history_op_in_flight: Option<worktree_history::WorktreeHistoryOpKind>,
+    /// The worktree an in-flight discard is deleting, if any. Spawn paths
+    /// (`new_agent`/`respawn_agent`) refuse to start a process whose cwd would be this
+    /// directory: a child spawned mid-delete holds the directory open on Windows and executes
+    /// in an unlinked cwd on unix - the exact half-failed removal GitHub issue #470 closes.
+    pub(crate) discarding_worktree: Option<PathBuf>,
     /// Feedback from the most recent "keep all changes"/"discard worktree" operation, shown in
     /// the status bar
     /// (`status_bar::render::AdeApp::render_status_worktree_history_notice`) until the next one -

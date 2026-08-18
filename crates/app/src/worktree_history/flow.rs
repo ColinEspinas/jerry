@@ -168,11 +168,55 @@ impl AdeApp {
         self.worktree_history_status = Some(format!("discarding {branch_display}\u{2026}"));
         cx.notify();
 
+        // GitHub issue #470: every process this app started inside the worktree must be dead
+        // *before* the directory is deleted - on Windows a live child's cwd holds an open handle
+        // that makes `git worktree remove` half-fail, and on unix a surviving process keeps
+        // executing (and recreating files) in an unlinked cwd. Agent PTY sessions and the
+        // worktree's language servers are both taken here and shut down inside the same
+        // background hop that then runs the discard, so the ordering holds by construction; the
+        // one spawn source left is the user starting something new mid-delete, which
+        // `Self::discarding_worktree` (set below) makes `new_agent`/`respawn_agent` refuse.
+        // The panes render as exited; the tabs themselves still close only in the success arm
+        // below (and deliberately stay, showing the dead pane, when the discard fails).
+        self.discarding_worktree = Some(worktree_path.clone());
+        let doomed_panes: Vec<gpui::Entity<crate::terminal::pane::TerminalPane>> = self
+            .agents
+            .iter_for_cwd(worktree_path.clone())
+            .map(|agent| agent.pane.clone())
+            .collect();
+        let mut doomed_sessions = Vec::with_capacity(doomed_panes.len());
+        for pane in doomed_panes {
+            if let Some(session) = pane.update(cx, |pane, cx| pane.take_session_for_teardown(cx)) {
+                doomed_sessions.push(session);
+            }
+        }
+        let doomed_lsp_clients = self.take_lsp_clients_for_root(&worktree_path);
+
         let discarded_path = worktree_path.clone();
         let task = cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { wt_core::undo::discard_worktree(&repo_path, &worktree_path) })
+                .spawn(async move {
+                    for mut session in doomed_sessions {
+                        if let Err(err) = session.shutdown() {
+                            log::warn!("failed to shut down a doomed agent session: {err}");
+                        }
+                    }
+                    for client in doomed_lsp_clients {
+                        // The same try_unwrap-then-shutdown-else-drop rule as
+                        // `AdeApp::shutdown_lsp_client_off_thread`, run here so the server's
+                        // process tree is down before the delete rather than on a detached task.
+                        match std::sync::Arc::try_unwrap(client) {
+                            Ok(mut client) => {
+                                if let Err(err) = client.shutdown() {
+                                    log::warn!("failed to shut down a doomed server: {err}");
+                                }
+                            }
+                            Err(client) => drop(client),
+                        }
+                    }
+                    wt_core::undo::discard_worktree(&repo_path, &worktree_path)
+                })
                 .await;
             // `update_in` (not plain `update`): a successful discard closes the now-cwd-less
             // agent tab, and `Self::close_agent` needs a real `Window` to move focus off it -
@@ -181,6 +225,7 @@ impl AdeApp {
             // relies on for the identical reason.
             let _ = this.update_in(cx, |this, window, cx| {
                 this.worktree_history_op_in_flight = None;
+                this.discarding_worktree = None;
                 match result {
                     Ok(snapshot) => {
                         // `wt_core::undo::DiscardSnapshot::had_ignored_content` is a real,

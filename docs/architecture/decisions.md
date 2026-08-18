@@ -246,10 +246,12 @@ this crate streams.
 - **Input goes through a writer thread.** A full pty write buffer would otherwise block whichever
   thread called `write_input`, plausibly a key handler on the main thread.
 
-**Windows is narrower, and untested on real hardware** (reasoned from `portable-pty` 0.9.0 and
-`filedescriptor` 0.8.3 sources plus `cargo check --target x86_64-pc-windows-gnu`). `kill()`
-terminates the direct child only — job objects are the only alternative and need `unsafe` FFI, so
-grandchildren can survive as orphans. There is no self-pipe either: `WSAPoll` accepts only sockets
+**Windows is narrower** (originally reasoned from `portable-pty` 0.9.0 and
+`filedescriptor` 0.8.3 sources plus `cargo check --target x86_64-pc-windows-gnu`; now exercised on
+real hardware — see issues #465–#468). `kill()`/`shutdown()` terminate the whole tree via
+`taskkill /T` — the no-`unsafe` alternative to job objects; best-effort against re-parented
+descendants, with the direct kill as backstop (an orphaned tree was how npm `.cmd`-shim agents'
+real `node.exe` survived, #468). There is no self-pipe either: `WSAPoll` accepts only sockets
 and a ConPTY master is a named pipe, so the reader blocks until `master` itself drops, *not* when
 the child is reaped. Callers must therefore poll `try_wait` rather than wait for the output channel
 to disconnect. These paths are `#[cfg(windows)]`, never `#[cfg(not(unix))]`, so an unsupported

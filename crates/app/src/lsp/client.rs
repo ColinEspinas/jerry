@@ -402,6 +402,39 @@ impl AdeApp {
         }
     }
 
+    /// Removes and returns every Ready client rooted exactly at `root`, pruning the same
+    /// per-root caches [`Self::evict_stale_lsp_clients`] prunes. For the worktree discard flow
+    /// (GitHub issue #470), which must shut these servers down *sequenced before* deleting the
+    /// directory - their cwd and open file handles are inside it - rather than on eviction's
+    /// detached teardown task. `Spawning`/`Failed` entries hold no process and are dropped;
+    /// an in-flight `Spawning` that later re-inserts is caught by the next eviction pass,
+    /// exactly as eviction's own docs describe.
+    pub(crate) fn take_lsp_clients_for_root(
+        &mut self,
+        root: &Path,
+    ) -> Vec<std::sync::Arc<lsp_core::LspClient>> {
+        let doomed_keys: Vec<LspClientKey> = self
+            .lsp_clients
+            .keys()
+            .filter(|(client_root, _)| client_root == root)
+            .cloned()
+            .collect();
+        if doomed_keys.is_empty() {
+            return Vec::new();
+        }
+        self.lsp_opened_files.retain(|path| !path.starts_with(root));
+        self.lsp_document_versions
+            .retain(|path, _| !path.starts_with(root));
+        self.lsp_uri_cache.retain(|path, _| !path.starts_with(root));
+        doomed_keys
+            .into_iter()
+            .filter_map(|key| match self.lsp_clients.remove(&key) {
+                Some(LspClientState::Ready(client)) => Some(client),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Tears one real server down without blocking the GPUI thread - the shared body behind both
     /// [`Self::evict_stale_lsp_clients`] and [`Self::restart_lsp_clients`], so the
     /// `try_unwrap`-then-`shutdown`-else-`drop` rule lives in exactly one place. See
