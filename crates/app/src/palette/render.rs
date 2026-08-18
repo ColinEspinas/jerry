@@ -376,6 +376,12 @@ impl AdeApp {
         }
         let next = (self.palette_selected as i32 + delta).clamp(0, total as i32 - 1);
         self.palette_selected = next as usize;
+        // Moving the highlight has to move the viewport with it, or the selection walks off the
+        // bottom and `⏎` runs a row the user cannot see (GitHub issue #413). Resolved on the next
+        // prepaint against real child bounds, and a no-op when the row is already fully visible.
+        if let Some(child) = palette::row_child_index(&groups, self.palette_selected) {
+            self.palette_results_scroll_handle.scroll_to_item(child);
+        }
         cx.notify();
     }
 
@@ -839,6 +845,9 @@ impl AdeApp {
 
         let mut container = div()
             .id("palette-groups")
+            // Test-only, as above: the results viewport's own painted box, so a test can assert a
+            // row is inside it rather than re-deriving the viewport from theme constants.
+            .debug_selector(|| "palette-results".to_string())
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
@@ -847,9 +856,20 @@ impl AdeApp {
             .flex_col()
             .py(px(4.0));
 
+        // Headers and rows are children of the scroller itself rather than of a per-group wrapper,
+        // so `palette_results_scroll_handle`'s child bounds line up with
+        // `palette::row_child_index` and a row can actually be scrolled to. Both carry `flex_none`
+        // for that to be safe: as direct children of a column flex container they would otherwise
+        // shrink below their themed heights the moment the list overflows, compacting the list
+        // rather than scrolling it (the per-group wrapper used to absorb that shrink).
         let mut flat_index = 0usize;
         for group in groups {
-            container = container.child(self.render_palette_group(group, &mut flat_index, cx));
+            container = container.child(self.render_palette_group_header(group));
+            for entry in &group.entries {
+                let index = flat_index;
+                flat_index += 1;
+                container = container.child(self.render_palette_row(entry, index, cx));
+            }
         }
 
         // See `crate::sidebar::render::AdeApp::render_file_tree`'s own docs on why the scrollbar
@@ -871,47 +891,38 @@ impl AdeApp {
             .into_any_element()
     }
 
-    pub(in crate::palette) fn render_palette_group(
+    /// One group's header band - its label and how many rows it contributes. The rows themselves
+    /// are siblings of this, not children; see [`Self::render_palette_groups`].
+    pub(in crate::palette) fn render_palette_group_header(
         &self,
         group: &palette::PaletteGroup,
-        flat_index: &mut usize,
-        cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let mut el = div()
+        div()
             .id(format!("palette-group-{}", group.label))
+            // Same reason as [`Self::render_palette_row`]'s own: a direct child of the scrolling
+            // column must not shrink when the list overflows.
+            .flex_none()
             .flex()
-            .flex_col()
+            .items_center()
+            .gap(px(7.0))
+            .px(px(12.0))
+            .pt(px(7.0))
+            .pb(px(4.0))
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap(px(7.0))
-                    .px(px(12.0))
-                    .pt(px(7.0))
-                    .pb(px(4.0))
-                    .child(
-                        div()
-                            .font(font(theme::font::SANS))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_size(self.ui_text_size(9.5))
-                            .text_color(theme::palette::GROUP_HEADER)
-                            .child(group.label.to_uppercase()),
-                    )
-                    .child(
-                        div()
-                            .font(font(theme::font::MONO))
-                            .text_size(self.ui_text_size(9.5))
-                            .text_color(theme::text::GHOSTER)
-                            .child(group.entries.len().to_string()),
-                    ),
-            );
-
-        for entry in &group.entries {
-            let index = *flat_index;
-            *flat_index += 1;
-            el = el.child(self.render_palette_row(entry, index, cx));
-        }
-        el
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_size(self.ui_text_size(9.5))
+                    .text_color(theme::palette::GROUP_HEADER)
+                    .child(group.label.to_uppercase()),
+            )
+            .child(
+                div()
+                    .font(font(theme::font::MONO))
+                    .text_size(self.ui_text_size(9.5))
+                    .text_color(theme::text::GHOSTER)
+                    .child(group.entries.len().to_string()),
+            )
     }
 
     /// One result row: a kind chip (command/agent-badge/language, per [`palette::EntryTarget`]),
@@ -958,7 +969,15 @@ impl AdeApp {
 
         let mut row = div()
             .id(("palette-row", index as u64))
+            // Test-only (a no-op outside test builds, like every other `debug_selector` in this
+            // codebase) - lets a real render test read a row's own painted bounds back with
+            // `VisualTestContext::debug_bounds` and prove the selected row really sits inside the
+            // results viewport, rather than trusting that scrolling "probably" happened.
+            .debug_selector(move || format!("palette-row-{index}"))
             .cursor_pointer()
+            // A row is a direct child of the scrolling column, so it has to opt out of flex
+            // shrinking or an overflowing list compacts its rows instead of scrolling them.
+            .flex_none()
             .flex()
             .items_center()
             .gap(px(9.0))
@@ -1565,5 +1584,244 @@ mod palette_language_server_step_tests {
                  when there are none - it would open an empty step and do nothing"
             );
         });
+    }
+}
+
+/// The results list is a real scrolling viewport, so moving the highlight with `↑`/`↓` has to
+/// bring the highlighted row with it (GitHub issue #413). Asserted against the row's and the
+/// viewport's genuinely painted boxes, since an index that moves while the viewport stays put is
+/// exactly the bug and reads as correct from the render code alone.
+#[cfg(test)]
+mod palette_scroll_tests {
+    use crate::palette::state as palette;
+    use crate::root::focus::palette_focus_tests;
+    use crate::root::scrollbar::ScrollableHandle;
+    use crate::root::{AdeApp, TogglePalette};
+    use gpui::{Bounds, Entity, Pixels, TestAppContext, VisualTestContext};
+
+    /// `VisualTestContext::debug_bounds` takes a `&'static str`, so a row's selector cannot be
+    /// interpolated from its index and has to be looked up here instead. Long enough to cover
+    /// every row the fixture below produces, which [`row_selector`] asserts rather than assumes.
+    const ROW_SELECTORS: [&str; 24] = [
+        "palette-row-0",
+        "palette-row-1",
+        "palette-row-2",
+        "palette-row-3",
+        "palette-row-4",
+        "palette-row-5",
+        "palette-row-6",
+        "palette-row-7",
+        "palette-row-8",
+        "palette-row-9",
+        "palette-row-10",
+        "palette-row-11",
+        "palette-row-12",
+        "palette-row-13",
+        "palette-row-14",
+        "palette-row-15",
+        "palette-row-16",
+        "palette-row-17",
+        "palette-row-18",
+        "palette-row-19",
+        "palette-row-20",
+        "palette-row-21",
+        "palette-row-22",
+        "palette-row-23",
+    ];
+
+    fn row_selector(index: usize) -> &'static str {
+        ROW_SELECTORS
+            .get(index)
+            .copied()
+            .expect("ROW_SELECTORS must cover every row this fixture builds")
+    }
+
+    /// An open palette whose results genuinely overflow, which is the only state issue #413 is
+    /// about: the commands the palette always offers fill ten rows, which fit, so a real "Recent
+    /// Files" group is added on top - `changed` is what puts a file in that group with an empty
+    /// query, the same way a repository with uncommitted additions does.
+    fn open_overflowing_palette<'a>(
+        cx: &'a mut TestAppContext,
+        root: &std::path::Path,
+    ) -> (Entity<AdeApp>, &'a mut VisualTestContext) {
+        let (app, cx) = palette_focus_tests::open_test_app(cx, root.to_path_buf());
+        cx.run_until_parked();
+
+        app.update(cx, |app, _| {
+            app.palette_file_candidates = (0..8)
+                .map(|i| palette::FileCandidate {
+                    path: root.join(format!("src/fixture{i}.rs")),
+                    name: format!("fixture{i}.rs"),
+                    dir: "src".to_string(),
+                    add: 1,
+                    del: 0,
+                    changed: Some(palette::FileChangeKind::Added),
+                })
+                .collect();
+        });
+
+        cx.dispatch_action(TogglePalette);
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.palette_open),
+            "sanity check: the palette should actually be open"
+        );
+        assert!(
+            max_scroll_offset(&app, cx) > gpui::px(0.0),
+            "premise: the seeded results must genuinely overflow the viewport - a zero \
+             `max_offset` would mean everything fits and there is nothing to scroll"
+        );
+        (app, cx)
+    }
+
+    fn row_count(app: &Entity<AdeApp>, cx: &mut VisualTestContext) -> usize {
+        app.read_with(cx, |app, cx| {
+            palette::flatten(&app.build_palette_groups(cx)).len()
+        })
+    }
+
+    fn selected(app: &Entity<AdeApp>, cx: &mut VisualTestContext) -> usize {
+        app.read_with(cx, |app, _| app.palette_selected)
+    }
+
+    fn scroll_offset(app: &Entity<AdeApp>, cx: &mut VisualTestContext) -> Pixels {
+        app.read_with(cx, |app, _| {
+            app.palette_results_scroll_handle.scroll_offset().y
+        })
+    }
+
+    fn max_scroll_offset(app: &Entity<AdeApp>, cx: &mut VisualTestContext) -> Pixels {
+        app.read_with(cx, |app, _| {
+            app.palette_results_scroll_handle.max_scroll_offset().y
+        })
+    }
+
+    /// Whether a row's real painted box sits entirely inside the results viewport's real painted
+    /// box - "visible to the user", not "exists in the element tree".
+    fn fully_inside(row: Bounds<Pixels>, viewport: Bounds<Pixels>) -> bool {
+        row.top() >= viewport.top() && row.bottom() <= viewport.bottom()
+    }
+
+    /// Asserts the invariant issue #413 is about, against the real painted frame: whichever row is
+    /// highlighted right now is entirely visible.
+    fn assert_selection_visible(app: &Entity<AdeApp>, cx: &mut VisualTestContext, step: &str) {
+        let index = selected(app, cx);
+        let viewport = cx
+            .debug_bounds("palette-results")
+            .expect("the results viewport should have really painted");
+        let row = cx
+            .debug_bounds(row_selector(index))
+            .unwrap_or_else(|| panic!("row {index} should have really painted after {step}"));
+        assert!(
+            fully_inside(row, viewport),
+            "after {step} the highlighted row {index} must sit entirely inside the results \
+             viewport - got row {row:?} against viewport {viewport:?}"
+        );
+    }
+
+    /// A scrolling list must scroll, not squash. Rows and headers are flex children of a column
+    /// container, so without `flex_none` they shrink below their themed height as soon as the
+    /// content overflows - the list quietly compacts instead of overflowing, which is both wrong
+    /// on its own and hides the very overflow the scrolling exists to handle.
+    #[gpui::test]
+    fn an_overflowing_list_keeps_every_row_at_its_full_themed_height(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = open_overflowing_palette(cx, repo.path());
+
+        let total = row_count(&app, cx);
+        for index in 0..total {
+            let row = cx
+                .debug_bounds(row_selector(index))
+                .unwrap_or_else(|| panic!("row {index} should have really painted"));
+            assert_eq!(
+                row.size.height,
+                crate::theme::band::PALETTE_ROW,
+                "row {index} of {total} must paint at its full themed height even though the list \
+                 overflows - a shorter row means flex shrank it, compacting the list instead of \
+                 scrolling it"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn arrowing_down_keeps_the_highlighted_row_inside_the_viewport(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = open_overflowing_palette(cx, repo.path());
+
+        let total = row_count(&app, cx);
+        assert_eq!(
+            scroll_offset(&app, cx),
+            gpui::px(0.0),
+            "a freshly opened palette must start at the top"
+        );
+
+        // The premise the whole issue rests on: the bottom of the list really is out of sight
+        // before any key is pressed, so walking down to it has to move the viewport.
+        let viewport = cx
+            .debug_bounds("palette-results")
+            .expect("the results viewport should have really painted");
+        let last = cx
+            .debug_bounds(row_selector(total - 1))
+            .expect("the last row should have really painted - the list is not virtualized");
+        assert!(
+            !fully_inside(last, viewport),
+            "premise: the last of {total} rows must start out past the viewport's bottom edge, \
+             otherwise arrowing to it would never need to scroll - got row {last:?} inside \
+             viewport {viewport:?}"
+        );
+
+        for step in 1..total {
+            cx.simulate_keystrokes("down");
+            cx.run_until_parked();
+            assert_eq!(
+                selected(&app, cx),
+                step,
+                "sanity check: {step} presses of `down` must land on row {step}"
+            );
+            assert_selection_visible(&app, cx, "pressing `down`");
+        }
+
+        assert!(
+            scroll_offset(&app, cx) < gpui::px(0.0),
+            "walking to the last row must have really scrolled the viewport (GPUI's own scroll \
+             offset goes negative as you scroll down), not merely moved an index - this is \
+             GitHub issue #413"
+        );
+    }
+
+    #[gpui::test]
+    fn arrowing_back_up_brings_the_viewport_back_with_it(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (app, cx) = open_overflowing_palette(cx, repo.path());
+
+        let total = row_count(&app, cx);
+        for _ in 1..total {
+            cx.simulate_keystrokes("down");
+        }
+        cx.run_until_parked();
+
+        let scrolled_down = scroll_offset(&app, cx);
+        assert!(
+            scrolled_down < gpui::px(0.0),
+            "premise: the list must really be scrolled down before `up` can be shown to undo it"
+        );
+
+        for step in (0..total - 1).rev() {
+            cx.simulate_keystrokes("up");
+            cx.run_until_parked();
+            assert_eq!(
+                selected(&app, cx),
+                step,
+                "sanity check: walking back up must pass through row {step}"
+            );
+            assert_selection_visible(&app, cx, "pressing `up`");
+        }
+
+        assert!(
+            scroll_offset(&app, cx) > scrolled_down,
+            "walking back up to the first row must have really scrolled the viewport back toward \
+             the top (the offset rises toward zero), not left the highlight stranded above the \
+             fold - still at {scrolled_down:?}"
+        );
     }
 }

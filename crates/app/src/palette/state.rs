@@ -391,32 +391,76 @@ pub fn flatten(groups: &[PaletteGroup]) -> Vec<&PaletteEntry> {
         .collect()
 }
 
-/// A position-preserving ASCII-fold of `text` (only ASCII letters are case-folded; every other
-/// `char` passes through unchanged), so a matched span's `(char_index, char_len)` always indexes
-/// back correctly into the *original* string. A full Unicode fold (`str::to_lowercase`) can
-/// change a string's char count (e.g. `'İ'` folds to two chars), which would misalign that
-/// mapping - not worth guarding against for this app's content, so the simpler, alignment-safe
-/// ASCII fold is used instead.
-fn ascii_fold(text: &str) -> Vec<char> {
-    text.chars().map(|c| c.to_ascii_lowercase()).collect()
+/// Maps a [`flatten`] row index onto that row's position among the *children* of the scrolling
+/// results list, which `crate::palette::render::AdeApp::render_palette_groups` lays out flat as
+/// `[header, rows.., header, rows..]`. `gpui::ScrollHandle::scroll_to_item` addresses those
+/// children, so every group header above a row shifts it down by one. `None` for a row index past
+/// the end.
+pub fn row_child_index(groups: &[PaletteGroup], row: usize) -> Option<usize> {
+    let mut child = 0usize;
+    let mut rows_before = 0usize;
+    for group in groups {
+        child += 1; // the group's own header
+        if row < rows_before + group.entries.len() {
+            return Some(child + (row - rows_before));
+        }
+        child += group.entries.len();
+        rows_before += group.entries.len();
+    }
+    None
 }
 
 /// Leftmost case-insensitive substring search (see the module docs for why this is plain
 /// substring matching, not fuzzy/skip-char). Returns `(start_char_index, len_in_chars)`, or
 /// `None` if `needle` is empty or doesn't occur in `haystack`.
+///
+/// Case folding is ASCII-only and applied per `char` as the comparison walks, so it is
+/// position-preserving: a returned span always indexes back correctly into the *original*
+/// `haystack`. A full Unicode fold (`str::to_lowercase`) can change a string's char count (e.g.
+/// `'İ'` folds to two chars), which would misalign that mapping - not worth guarding against for
+/// this app's content, so the simpler, alignment-safe ASCII fold is used instead.
+///
+/// Allocation-free by construction: this runs once per candidate per *aux field* on every
+/// keystroke and every frame while the palette is open (see
+/// `crate::root::AdeApp::build_palette_groups`), so the two folded `Vec<char>` buffers it used to
+/// build per call dominated the cost of filtering a large repository.
 pub fn substring_match(haystack: &str, needle: &str) -> Option<(usize, usize)> {
     if needle.is_empty() {
         return None;
     }
-    let haystack_lower = ascii_fold(haystack);
-    let needle_lower = ascii_fold(needle);
-    if needle_lower.len() > haystack_lower.len() {
+
+    // Fast path for the overwhelmingly common case - file names, command labels, branch names.
+    // With both sides pure ASCII a byte index *is* a char index and a byte length *is* a char
+    // length, so the search runs straight over the bytes with no decoding at all.
+    if haystack.is_ascii() && needle.is_ascii() {
+        let haystack = haystack.as_bytes();
+        let needle = needle.as_bytes();
+        if needle.len() > haystack.len() {
+            return None;
+        }
+        return (0..=haystack.len() - needle.len())
+            .find(|&start| haystack[start..start + needle.len()].eq_ignore_ascii_case(needle))
+            .map(|start| (start, needle.len()));
+    }
+
+    let needle_len = needle.chars().count();
+    let haystack_len = haystack.chars().count();
+    if needle_len > haystack_len {
         return None;
     }
-    let last_start = haystack_lower.len() - needle_lower.len();
-    for start in 0..=last_start {
-        if haystack_lower[start..start + needle_lower.len()] == needle_lower[..] {
-            return Some((start, needle_lower.len()));
+
+    for (start, (byte_offset, _)) in haystack.char_indices().enumerate() {
+        // Past this point the remaining tail is shorter than `needle`, and `zip` below would
+        // silently stop early and report a false match.
+        if start + needle_len > haystack_len {
+            break;
+        }
+        let matches = needle
+            .chars()
+            .zip(haystack[byte_offset..].chars())
+            .all(|(want, got)| want.eq_ignore_ascii_case(&got));
+        if matches {
+            return Some((start, needle_len));
         }
     }
     None
@@ -448,10 +492,20 @@ fn match_against(
     None
 }
 
-fn finish_group(mut scored: Vec<(usize, PaletteEntry)>) -> Vec<PaletteEntry> {
+/// Ranks the matches, caps the group, and only *then* turns the survivors into rows.
+///
+/// Selecting before building is what keeps a large repository cheap: a broad query qualifies every
+/// file in the tree, and a [`PaletteEntry`] is not free (a cloned path, a formatted secondary
+/// line, a label split into three owned strings). Building one per match and discarding all but
+/// [`MAX_ENTRIES_PER_GROUP`] of them dominated the cost of a keystroke, which runs this on every
+/// key *and* every frame. `sort_by_key` is stable, so equal ranks keep candidate order.
+fn finish_group<T>(
+    mut scored: Vec<(usize, T)>,
+    build: impl Fn(T) -> PaletteEntry,
+) -> Vec<PaletteEntry> {
     scored.sort_by_key(|(rank, _)| *rank);
     scored.truncate(MAX_ENTRIES_PER_GROUP);
-    scored.into_iter().map(|(_, entry)| entry).collect()
+    scored.into_iter().map(|(_, item)| build(item)).collect()
 }
 
 fn filter_agents(agents: &[AgentCandidate], query: &str) -> Vec<PaletteEntry> {
@@ -462,23 +516,20 @@ fn filter_agents(agents: &[AgentCandidate], query: &str) -> Vec<PaletteEntry> {
         let Some((span, rank)) = match_against(&candidate.title, &aux, query) else {
             continue;
         };
-        scored.push((
-            rank,
-            PaletteEntry {
-                label: MatchedText::from_match(&candidate.title, span),
-                secondary: candidate
-                    .branch
-                    .clone()
-                    .unwrap_or_else(|| "(detached)".to_string()),
-                shortcut: None,
-                status: Some(candidate.status),
-                file_change: None,
-                process_kind: Some(candidate.kind),
-                target: EntryTarget::Agent(candidate.id),
-            },
-        ));
+        scored.push((rank, (candidate, span)));
     }
-    finish_group(scored)
+    finish_group(scored, |(candidate, span)| PaletteEntry {
+        label: MatchedText::from_match(&candidate.title, span),
+        secondary: candidate
+            .branch
+            .clone()
+            .unwrap_or_else(|| "(detached)".to_string()),
+        shortcut: None,
+        status: Some(candidate.status),
+        file_change: None,
+        process_kind: Some(candidate.kind),
+        target: EntryTarget::Agent(candidate.id),
+    })
 }
 
 fn filter_commands(commands: &[CommandCandidate], query: &str) -> Vec<PaletteEntry> {
@@ -489,20 +540,17 @@ fn filter_commands(commands: &[CommandCandidate], query: &str) -> Vec<PaletteEnt
         let Some((span, rank)) = match_against(label, &aux, query) else {
             continue;
         };
-        scored.push((
-            rank,
-            PaletteEntry {
-                label: MatchedText::from_match(label, span),
-                secondary: candidate.secondary.clone(),
-                shortcut: candidate.command.shortcut(),
-                status: None,
-                file_change: None,
-                process_kind: None,
-                target: EntryTarget::Command(candidate.command),
-            },
-        ));
+        scored.push((rank, (candidate, span)));
     }
-    finish_group(scored)
+    finish_group(scored, |(candidate, span)| PaletteEntry {
+        label: MatchedText::from_match(candidate.command.label(), span),
+        secondary: candidate.secondary.clone(),
+        shortcut: candidate.command.shortcut(),
+        status: None,
+        file_change: None,
+        process_kind: None,
+        target: EntryTarget::Command(candidate.command),
+    })
 }
 
 fn file_secondary(candidate: &FileCandidate) -> String {
@@ -530,20 +578,17 @@ fn filter_files(files: &[FileCandidate], query: &str) -> Vec<PaletteEntry> {
         let Some((span, rank)) = match_against(&candidate.name, &aux, query) else {
             continue;
         };
-        scored.push((
-            rank,
-            PaletteEntry {
-                label: MatchedText::from_match(&candidate.name, span),
-                secondary: file_secondary(candidate),
-                shortcut: None,
-                status: None,
-                file_change: candidate.changed,
-                process_kind: None,
-                target: EntryTarget::File(candidate.path.clone()),
-            },
-        ));
+        scored.push((rank, (candidate, span)));
     }
-    finish_group(scored)
+    finish_group(scored, |(candidate, span)| PaletteEntry {
+        label: MatchedText::from_match(&candidate.name, span),
+        secondary: file_secondary(candidate),
+        shortcut: None,
+        status: None,
+        file_change: candidate.changed,
+        process_kind: None,
+        target: EntryTarget::File(candidate.path.clone()),
+    })
 }
 
 /// Builds the [`PaletteStep::PickLanguageServer`] step's single group - the same
@@ -560,20 +605,17 @@ pub fn build_language_server_groups(
         let Some((span, rank)) = match_against(candidate.client_key, &aux, query) else {
             continue;
         };
-        scored.push((
-            rank,
-            PaletteEntry {
-                label: MatchedText::from_match(candidate.client_key, span),
-                secondary: candidate.secondary.clone(),
-                shortcut: None,
-                status: Some(candidate.status),
-                file_change: None,
-                process_kind: None,
-                target: EntryTarget::LanguageServer(candidate.client_key),
-            },
-        ));
+        scored.push((rank, (candidate, span)));
     }
-    let entries = finish_group(scored);
+    let entries = finish_group(scored, |(candidate, span)| PaletteEntry {
+        label: MatchedText::from_match(candidate.client_key, span),
+        secondary: candidate.secondary.clone(),
+        shortcut: None,
+        status: Some(candidate.status),
+        file_change: None,
+        process_kind: None,
+        target: EntryTarget::LanguageServer(candidate.client_key),
+    });
     if entries.is_empty() {
         return Vec::new();
     }
@@ -699,6 +741,107 @@ mod tests {
         assert_eq!(substring_match("anything", ""), None);
         assert_eq!(substring_match("short", "much too long"), None);
         assert_eq!(substring_match("query.rs", "zzz"), None);
+    }
+
+    #[test]
+    fn finish_group_only_builds_the_rows_it_actually_keeps() {
+        // The guard on the optimisation, not a timing assertion: a broad query qualifies every
+        // file in the repository, and building a row per match before capping is what made a
+        // keystroke cost milliseconds. Counting real `build` calls catches a regression here that
+        // no assertion on the returned rows could.
+        let built = std::cell::Cell::new(0usize);
+        let scored: Vec<(usize, usize)> = (0..1_000).map(|i| (i, i)).collect();
+
+        let entries = finish_group(scored, |i| {
+            built.set(built.get() + 1);
+            PaletteEntry {
+                label: MatchedText::plain(&format!("row{i}")),
+                secondary: String::new(),
+                shortcut: None,
+                status: None,
+                file_change: None,
+                process_kind: None,
+                target: EntryTarget::Command(PaletteCommand::NewShell),
+            }
+        });
+
+        assert_eq!(entries.len(), MAX_ENTRIES_PER_GROUP);
+        assert_eq!(
+            built.get(),
+            MAX_ENTRIES_PER_GROUP,
+            "1000 matches must build only the {MAX_ENTRIES_PER_GROUP} rows that survive the cap"
+        );
+        assert_eq!(
+            entries[0].label.pre, "row0",
+            "and the survivors must still be the best-ranked ones, in rank order"
+        );
+    }
+
+    #[test]
+    fn finish_group_keeps_candidate_order_within_an_equal_rank() {
+        let scored: Vec<(usize, usize)> = vec![(5, 10), (0, 20), (5, 11), (0, 21)];
+        let entries = finish_group(scored, |i| PaletteEntry {
+            label: MatchedText::plain(&format!("row{i}")),
+            secondary: String::new(),
+            shortcut: None,
+            status: None,
+            file_change: None,
+            process_kind: None,
+            target: EntryTarget::Command(PaletteCommand::NewShell),
+        });
+
+        let labels: Vec<&str> = entries.iter().map(|e| e.label.pre.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["row20", "row21", "row10", "row11"],
+            "ties must keep the order the candidates were scored in - the sort has to stay stable"
+        );
+    }
+
+    #[test]
+    fn substring_match_does_not_run_off_the_end_of_the_haystack() {
+        // A needle that starts matching but outruns the tail. Worth its own test: a comparison
+        // that walks the two strings in step will happily report a match here the moment it stops
+        // at whichever ran out first.
+        assert_eq!(substring_match("abc", "bcd"), None);
+        assert_eq!(substring_match("query.rs", "rs.more"), None);
+        assert_eq!(
+            substring_match("query.rs", ".rs"),
+            Some((5, 3)),
+            "a needle that ends exactly at the haystack's end still matches"
+        );
+    }
+
+    #[test]
+    fn substring_match_spans_are_char_indices_not_byte_indices() {
+        // `é` is two bytes, so a byte-indexed search reports 6 here and `MatchedText::from_match`
+        // (which slices by `char`) would then highlight the wrong span.
+        assert_eq!(
+            substring_match("café_query.rs", "query"),
+            Some((5, 5)),
+            "the span must be measured in chars, not bytes"
+        );
+        let matched =
+            MatchedText::from_match("café_query.rs", substring_match("café_query.rs", "query"));
+        assert_eq!(matched.pre, "café_");
+        assert_eq!(matched.mid, "query");
+        assert_eq!(matched.post, ".rs");
+    }
+
+    #[test]
+    fn substring_match_handles_a_non_ascii_needle_and_folds_only_ascii() {
+        assert_eq!(substring_match("Straße.rs", "STRA"), Some((0, 4)));
+        assert_eq!(
+            substring_match("Straße.rs", "ße"),
+            Some((4, 2)),
+            "a multi-byte needle matches at its real char offset"
+        );
+        assert_eq!(
+            substring_match("İstanbul.rs", "i"),
+            None,
+            "folding is ASCII-only on purpose - a Unicode fold would change the char count and \
+             misalign every span this returns"
+        );
     }
 
     #[test]
@@ -1112,6 +1255,75 @@ mod tests {
         assert_eq!(
             flat[1].target,
             EntryTarget::Command(PaletteCommand::NewShell)
+        );
+    }
+
+    /// `n` groups of `size` rows each, which is all [`row_child_index`] looks at.
+    fn sized_groups(sizes: &[usize]) -> Vec<PaletteGroup> {
+        sizes
+            .iter()
+            .map(|size| PaletteGroup {
+                label: "Commands",
+                entries: (0..*size)
+                    .map(|_| PaletteEntry {
+                        label: MatchedText::plain("row"),
+                        secondary: String::new(),
+                        shortcut: None,
+                        status: None,
+                        file_change: None,
+                        process_kind: None,
+                        target: EntryTarget::Command(PaletteCommand::NewShell),
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn row_child_index_skips_one_child_per_group_header() {
+        let groups = sized_groups(&[2, 3]);
+
+        // Children lay out as: header, r0, r1, header, r2, r3, r4.
+        assert_eq!(row_child_index(&groups, 0), Some(1));
+        assert_eq!(row_child_index(&groups, 1), Some(2));
+        assert_eq!(
+            row_child_index(&groups, 2),
+            Some(4),
+            "the first row of the second group sits after that group's own header, so it skips \
+             two children rather than one"
+        );
+        assert_eq!(row_child_index(&groups, 3), Some(5));
+        assert_eq!(row_child_index(&groups, 4), Some(6));
+    }
+
+    #[test]
+    fn row_child_index_agrees_with_flatten_on_every_row() {
+        let groups = sized_groups(&[1, 4, 2]);
+        let total = flatten(&groups).len();
+
+        let mapped: Vec<usize> = (0..total)
+            .map(|row| row_child_index(&groups, row).expect("every flattened row must map"))
+            .collect();
+        assert!(
+            mapped.windows(2).all(|pair| pair[1] > pair[0]),
+            "the mapping must be strictly increasing - two rows sharing a child index would \
+             scroll to the wrong one, got {mapped:?}"
+        );
+        assert_eq!(
+            mapped.last().copied(),
+            Some(total + groups.len() - 1),
+            "the last row's child index must account for every header above it"
+        );
+    }
+
+    #[test]
+    fn row_child_index_is_none_past_the_last_row() {
+        let groups = sized_groups(&[2, 1]);
+        assert_eq!(row_child_index(&groups, 3), None);
+        assert_eq!(
+            row_child_index(&[], 0),
+            None,
+            "an empty palette has no row to scroll to"
         );
     }
 
