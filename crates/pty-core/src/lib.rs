@@ -740,15 +740,18 @@ impl PtySession {
             }
         }
 
-        // Load-bearing, not cleanup: this is what closes ConPTY and unblocks the reader.
-        self.master = None;
-
-        if let Some(handle) = self.reader_thread.take() {
+        // All three of these are load-bearing, and the order is too. `ClosePseudoConsole` runs
+        // only once *every* `Arc` to the shared inner state is gone, and the writer taken from
+        // `master` holds one as well. Dropping `master` while the writer thread still owns its
+        // handle leaves conhost holding the output pipe, and the reader blocked in `read` forever.
+        self.writer_tx = None; // closes the channel, ending the writer thread's recv loop
+        if let Some(handle) = self.writer_thread.take() {
             let _ = handle.join();
         }
 
-        self.writer_tx = None; // closes the channel, ending the writer thread's recv loop
-        if let Some(handle) = self.writer_thread.take() {
+        self.master = None;
+
+        if let Some(handle) = self.reader_thread.take() {
             let _ = handle.join();
         }
 
@@ -996,14 +999,131 @@ mod pty_session_tests {
     #[cfg(unix)]
     const TEARDOWN_DEADLINE: Duration = Duration::from_secs(5);
 
+    /// Prints `text` and exits.
+    fn echo_command(text: &str) -> SpawnOptions {
+        if cfg!(windows) {
+            SpawnOptions::new("cmd.exe").arg("/c").arg("echo").arg(text)
+        } else {
+            SpawnOptions::new("echo").arg(text)
+        }
+    }
+
+    /// Prints every integer from 1 to `n` on its own line, then exits.
+    fn counting_command(n: usize) -> SpawnOptions {
+        if cfg!(windows) {
+            SpawnOptions::new("cmd.exe")
+                .arg("/c")
+                .arg(format!("for /l %i in (1,1,{n}) do @echo %i"))
+        } else {
+            SpawnOptions::new("seq").arg("1").arg(n.to_string())
+        }
+    }
+
+    /// Stays alive and lets whatever is written to the pty come back out of it - `cat` on unix,
+    /// and on Windows the shell itself, since ConPTY does the echoing rather than the child.
+    fn stdin_echoing_command() -> SpawnOptions {
+        if cfg!(windows) {
+            SpawnOptions::new("cmd.exe")
+        } else {
+            SpawnOptions::new("cat")
+        }
+    }
+
+    /// Stays alive for a couple of seconds without needing input.
+    fn long_lived_command() -> SpawnOptions {
+        if cfg!(windows) {
+            SpawnOptions::new("cmd.exe")
+        } else {
+            SpawnOptions::new("sleep").arg("2")
+        }
+    }
+
+    /// Exits successfully, immediately.
+    fn quick_exit_command() -> SpawnOptions {
+        if cfg!(windows) {
+            SpawnOptions::new("cmd.exe").arg("/c").arg("exit")
+        } else {
+            SpawnOptions::new("true")
+        }
+    }
+
+    /// ConPTY's startup Device Status Report query. It emits this and then produces no child
+    /// output at all until something answers, because it is waiting to learn where the cursor is.
+    #[cfg(windows)]
+    const CURSOR_POSITION_QUERY: &[u8] = b"\x1b[6n";
+
+    /// The minimal valid cursor position report: row 1, column 1.
+    #[cfg(windows)]
+    const CURSOR_POSITION_REPORT: &[u8] = b"\x1b[1;1R";
+
+    /// Answers [`CURSOR_POSITION_QUERY`] the first time it appears, standing in for the terminal
+    /// emulator a real consumer has. `crates/app`'s pane answers it from `alacritty_terminal`'s
+    /// `Term::device_status`; a test holding a bare [`PtySession`] has no emulator, so without
+    /// this every read on this platform blocks until the harness kills it.
+    #[cfg(windows)]
+    fn answer_cursor_position_query(session: &PtySession, seen: &[u8], answered: &mut bool) {
+        if !*answered
+            && seen
+                .windows(CURSOR_POSITION_QUERY.len())
+                .any(|window| window == CURSOR_POSITION_QUERY)
+        {
+            let _ = session.write_input(CURSOR_POSITION_REPORT);
+            *answered = true;
+        }
+    }
+
+    /// No-op off Windows: only ConPTY withholds output pending this answer, and injecting the
+    /// report into a unix shell's stdin would have it try to run `^[[1;1R` as a command.
+    #[cfg(not(windows))]
+    fn answer_cursor_position_query(_session: &PtySession, _seen: &[u8], _answered: &mut bool) {}
+
+    /// Drops CSI/OSC escape sequences, so an assertion can compare the text a shell printed
+    /// rather than the cursor moves and colour changes ConPTY wraps it in.
+    fn strip_ansi(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut chars = text.chars();
+        while let Some(ch) = chars.next() {
+            if ch != '\u{1b}' {
+                out.push(ch);
+                continue;
+            }
+            match chars.next() {
+                // CSI: parameters and intermediates, then one final byte in `@`..=`~`.
+                Some('[') => {
+                    for next in chars.by_ref() {
+                        if ('@'..='~').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: runs to BEL or the ST that follows an ESC.
+                Some(']') => {
+                    while let Some(next) = chars.next() {
+                        if next == '\u{7}' {
+                            break;
+                        }
+                        if next == '\u{1b}' {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                Some(_) | None => {}
+            }
+        }
+        out
+    }
+
     /// Reads from `session.output()` until `needle` appears in the accumulated (lossy
     /// UTF-8) output or `timeout` elapses, returning whatever was collected either way.
     /// Returns as soon as the needle is found rather than always waiting out the full
     /// timeout, so tests aren't needlessly slow.
     fn drain_until_contains(session: &PtySession, needle: &str, timeout: Duration) -> Vec<u8> {
         let mut collected = Vec::new();
+        let mut answered = false;
         let deadline = Instant::now() + timeout;
         loop {
+            answer_cursor_position_query(session, &collected, &mut answered);
             if String::from_utf8_lossy(&collected).contains(needle) {
                 return collected;
             }
@@ -1049,8 +1169,8 @@ mod pty_session_tests {
 
     #[test]
     fn spawns_and_reads_short_process_output() {
-        let session = spawn(SpawnOptions::new("echo").arg("hello-pty-core"))
-            .expect("spawning `echo hello-pty-core` should succeed");
+        let session =
+            spawn(echo_command("hello-pty-core")).expect("spawning an echo command should succeed");
 
         let output = drain_until_contains(&session, "hello-pty-core", Duration::from_secs(5));
         let text = String::from_utf8_lossy(&output);
@@ -1062,21 +1182,34 @@ mod pty_session_tests {
 
     #[test]
     fn long_output_arrives_complete_and_in_order_across_chunk_boundaries() {
-        const LINES: usize = 200_000;
+        // Enough lines to cross `OUTPUT_CHANNEL_CAPACITY` many times over, which is the point of
+        // the test. `cmd`'s `for /l` is orders of magnitude slower per line than `seq`, so Windows
+        // gets a smaller count rather than a longer timeout.
+        const LINES: usize = if cfg!(windows) { 20_000 } else { 200_000 };
 
-        let session = spawn(SpawnOptions::new("seq").arg("1").arg(LINES.to_string()))
-            .expect("spawning `seq` should succeed");
+        let session =
+            spawn(counting_command(LINES)).expect("spawning a counting command should succeed");
 
         let mut collected = Vec::new();
         let mut received = 0usize;
+        let mut answered = false;
+        // Counted incrementally: rescanning the whole buffer per chunk would be quadratic. ConPTY
+        // does not disconnect promptly when the child exits, so without this the loop would always
+        // wait out the full deadline on Windows.
+        let mut newlines = 0usize;
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
+            answer_cursor_position_query(&session, &collected, &mut answered);
+            if newlines >= LINES {
+                break;
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break;
             }
             match session.output().recv_timeout(remaining) {
                 Ok(chunk) => {
+                    newlines += chunk.iter().filter(|byte| **byte == b'\n').count();
                     collected.extend_from_slice(&chunk);
                     received += 1;
                     if received.is_multiple_of(OUTPUT_CHANNEL_CAPACITY) {
@@ -1087,7 +1220,8 @@ mod pty_session_tests {
             }
         }
 
-        let text = String::from_utf8(collected).expect("`seq` output is plain ASCII");
+        // ConPTY prefixes the child's first line with its own mode-setting and title sequences.
+        let text = strip_ansi(&String::from_utf8(collected).expect("counted output is ASCII"));
         let normalized = text.replace('\r', "");
         let lines: Vec<&str> = normalized.trim_end_matches('\n').split('\n').collect();
 
@@ -1358,6 +1492,12 @@ mod pty_session_tests {
             .expect("resume on an already-exited child must be a harmless no-op");
     }
 
+    // Unix-only by subject, not just by binary: the mechanism under test is the self-pipe that
+    // wakes a reader blocked on a pty whose line discipline has echo turned off. ConPTY has no
+    // `stty`, no caller-visible line discipline to turn off, and no self-pipe - its reader is
+    // woken by closing the ConPTY handle instead, which `shutdown_reaps_child_deterministically`
+    // already covers on that platform.
+    #[cfg(unix)]
     #[test]
     fn shutdown_joins_reader_thread_even_with_local_echo_disabled() {
         // With echo off - how most interactive programs run their ptys - the writer's
@@ -1422,7 +1562,8 @@ mod pty_session_tests {
 
     #[test]
     fn a_live_session_reports_a_healthy_writer_and_keeps_accepting_writes() {
-        let session = spawn(SpawnOptions::new("cat")).expect("spawning `cat` should succeed");
+        let session =
+            spawn(stdin_echoing_command()).expect("spawning an echoing shell should succeed");
         assert!(!session.writer_failed());
         for _ in 0..3 {
             session
@@ -1436,7 +1577,8 @@ mod pty_session_tests {
 
     #[test]
     fn a_shut_down_session_refuses_writes() {
-        let mut session = spawn(SpawnOptions::new("cat")).expect("spawning `cat` should succeed");
+        let mut session =
+            spawn(stdin_echoing_command()).expect("spawning an echoing shell should succeed");
         session.shutdown().expect("shutdown");
         assert!(matches!(
             session.write_input(b"too late"),
@@ -1448,7 +1590,8 @@ mod pty_session_tests {
     fn write_input_is_echoed_back_by_the_pty_line_discipline() {
         // A cooked-mode pty echoes writes back through the reader regardless of the child; `cat`
         // just keeps the session alive long enough to see it.
-        let session = spawn(SpawnOptions::new("cat")).expect("spawning `cat` should succeed");
+        let session =
+            spawn(stdin_echoing_command()).expect("spawning an echoing shell should succeed");
 
         session
             .write_input(b"ping-pty-core\n")
@@ -1465,7 +1608,7 @@ mod pty_session_tests {
     #[test]
     fn resize_on_a_live_session_succeeds() {
         let session =
-            spawn(SpawnOptions::new("sleep").arg("2")).expect("spawning `sleep 2` should succeed");
+            spawn(long_lived_command()).expect("spawning a long-lived command should succeed");
 
         session
             .resize(40, 120)
@@ -1491,10 +1634,57 @@ mod pty_session_tests {
         }
     }
 
+    /// An *interactive* shell, kept alive, plus the line to write to it to make it print its
+    /// working directory. A `/c`-style one-shot races ConPTY teardown on Windows: the child can
+    /// exit before its output is pumped, leaving only ConPTY's own `ESC[6n` probe behind.
+    fn pwd_shell_command() -> (SpawnOptions, &'static str) {
+        if cfg!(windows) {
+            (SpawnOptions::new("cmd.exe"), "cd\r\n")
+        } else {
+            (SpawnOptions::new("sh"), "pwd\n")
+        }
+    }
+
+    #[test]
+    fn a_spawned_shell_really_starts_in_the_requested_cwd() {
+        let dir = tempfile::tempdir().expect("creating a temp dir should succeed");
+        let requested = dir.path().to_path_buf();
+        let leaf = requested
+            .file_name()
+            .expect("a temp dir always has a final component")
+            .to_string_lossy()
+            .into_owned();
+
+        let (options, pwd_line) = pwd_shell_command();
+        let session = spawn(options.cwd(requested.clone()))
+            .expect("spawning a shell in a real directory should succeed");
+        session
+            .write_input(pwd_line.as_bytes())
+            .expect("writing to a freshly spawned shell should succeed");
+
+        let output = drain_until_contains(&session, &leaf, Duration::from_secs(15));
+        let text = strip_ansi(&String::from_utf8_lossy(&output));
+
+        // Substring, not line-splitting: ConPTY runs the prompt and the command's output together
+        // without a newline between them. Either spelling counts - `/var` is a symlink to
+        // `/private/var` on macOS, so a shell there reports the resolved form of what we passed.
+        let resolved = std::fs::canonicalize(&requested).expect("canonicalizing the temp dir");
+        let accepted = [
+            requested.display().to_string(),
+            resolved.display().to_string(),
+        ];
+        assert!(
+            accepted.iter().any(|path| text.contains(path)),
+            "the shell must start in the directory it was given, not silently somewhere else \
+             (portable-pty drops a cwd it cannot use and lets the child inherit ours). \
+             Expected one of {accepted:?}, got: {text:?}"
+        );
+    }
+
     #[test]
     fn spawn_rejects_nonexistent_cwd_instead_of_silently_falling_back_to_home() {
         let bogus = PathBuf::from("/definitely/not/a/real/directory/pty-core-test");
-        match spawn(SpawnOptions::new("true").cwd(bogus.clone())) {
+        match spawn(quick_exit_command().cwd(bogus.clone())) {
             Err(PtyError::InvalidCwd(path)) => assert_eq!(path, bogus),
             Err(other) => panic!("expected PtyError::InvalidCwd, got a different error: {other}"),
             Ok(_) => panic!("expected spawn to reject a nonexistent cwd, but it succeeded"),
