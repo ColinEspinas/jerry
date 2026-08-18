@@ -60,6 +60,9 @@ pub fn spawn_worktree_watcher(repo_path: &Path, dirty: DirtyFlag) -> Option<Reco
 /// `git worktree list` at its fast ~500ms cadence forever instead of only on real changes plus
 /// the 5s poll. Neutral churn is:
 ///
+/// - by *class*: every `Access` event — reads (Linux's inotify delivers one per file *open*,
+///   including git's own reads of `HEAD`/`config` on each invocation; no other backend emits
+///   them at all);
 /// - by *name*: the [`wt_core::diff::SHADOW_INDEX_PREFIX`] tempfiles every diff computation
 ///   writes beside the real index (git's `<name>.lock` sidecar shares the prefix), the real
 ///   `index`/`index.lock`, which `git status` opportunistically rewrites on the 3s status
@@ -76,6 +79,15 @@ pub fn spawn_worktree_watcher(repo_path: &Path, dirty: DirtyFlag) -> Option<Reco
 ///
 /// A pathless event (a rescan notice) still counts as a real change.
 fn worktree_list_neutral_churn(event: &notify::Event, worktrees_dir: &Path) -> bool {
+    // Reads first: Linux's inotify backend subscribes `IN_OPEN` (notify-8.2.0/src/inotify.rs's
+    // watch mask), so every git invocation that merely *opens* `HEAD` or `config` under a watch
+    // surfaces as an `Access` event - the status poll's own reads would re-dirty the flag
+    // forever (this is how the #466 loop survived on Linux while Windows, whose backend emits
+    // no Access events, looked fixed). A real change always also emits Modify/Create/Remove/
+    // rename, so dropping the whole Access class loses nothing.
+    if matches!(event.kind, notify::EventKind::Access(_)) {
+        return true;
+    }
     let dir_entry_mtime_bump = matches!(
         &event.kind,
         notify::EventKind::Modify(kind)
@@ -262,12 +274,56 @@ mod tests {
         );
     }
 
-    /// The inverse of [`wait_until_dirty`], mirroring `file_tree_watch`'s own
-    /// `assert_stays_clean`: proves churn is genuinely filtered rather than just slow.
-    fn assert_stays_clean(dirty: &DirtyFlag) {
+    /// Arms the real production watcher plus a second collector mirroring its exact watch
+    /// registrations, runs a real diff of `diff_target`, and asserts the dirty flag stays
+    /// clean — printing every event the production filter did NOT drop on failure, so a
+    /// platform-specific escape names itself in CI instead of leaving the assertion opaque
+    /// (Linux's inotify `Access(Open)` storm was found exactly this way; GitHub issue #466).
+    fn assert_diff_leaves_watcher_clean(repo_path: &Path, diff_target: &Path) {
+        let dirty: DirtyFlag = Arc::new(AtomicBool::new(false));
+        let _watcher =
+            spawn_worktree_watcher(repo_path, dirty.clone()).expect("spawn_worktree_watcher");
+
+        let escaped: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let common_dir = wt_core::git_common_dir(repo_path).expect("git_common_dir");
+        let worktrees_dir = common_dir.join("worktrees");
+        let filter_root = worktrees_dir.clone();
+        let sink = escaped.clone();
+        let mut collector =
+            notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
+                let Ok(event) = result else {
+                    return;
+                };
+                if !worktree_list_neutral_churn(&event, &filter_root) {
+                    sink.lock()
+                        .expect("collector lock")
+                        .push(format!("{:?} {:?}", event.kind, event.paths));
+                }
+            })
+            .expect("collector watcher");
+        if worktrees_dir.is_dir() {
+            collector
+                .watch(&worktrees_dir, RecursiveMode::Recursive)
+                .expect("watch worktrees dir");
+        } else {
+            collector
+                .watch(&common_dir, RecursiveMode::NonRecursive)
+                .expect("watch common dir");
+        }
+        let head_file = common_dir.join("HEAD");
+        if head_file.is_file() {
+            collector
+                .watch(&head_file, RecursiveMode::NonRecursive)
+                .expect("watch HEAD");
+        }
+
+        wt_core::diff::diff_against_head(diff_target).expect("diff_against_head");
+
         assert!(
             test_support::stays_false(Duration::from_millis(500), || dirty.load(Ordering::SeqCst)),
-            "index churn must never mark the worktree list dirty (GitHub issue #466)"
+            "index churn must never mark the worktree list dirty (GitHub issue #466); \
+             events the filter let through: {:#?}",
+            escaped.lock().expect("collector lock")
         );
     }
 
@@ -335,6 +391,18 @@ mod tests {
             "HEAD is a real signal, never filtered"
         );
         assert!(
+            worktree_list_neutral_churn(
+                &event_with(
+                    EventKind::Access(notify::event::AccessKind::Open(
+                        notify::event::AccessMode::Any
+                    )),
+                    std::slice::from_ref(&head)
+                ),
+                &worktrees_dir
+            ),
+            "a mere read of HEAD (inotify delivers one per git invocation on Linux) is neutral"
+        );
+        assert!(
             !worktree_list_neutral_churn(&event_with(modify, &[shadow, head]), &worktrees_dir),
             "an event mixing churn with a real path must still count as a real change"
         );
@@ -354,13 +422,7 @@ mod tests {
         std::fs::write(repo.path().join("untracked.txt"), "new content")
             .expect("write an untracked file so the diff has real shadow-index work to do");
 
-        let dirty: DirtyFlag = Arc::new(AtomicBool::new(false));
-        let _watcher =
-            spawn_worktree_watcher(repo.path(), dirty.clone()).expect("spawn_worktree_watcher");
-
-        wt_core::diff::diff_against_head(repo.path()).expect("diff_against_head");
-
-        assert_stays_clean(&dirty);
+        assert_diff_leaves_watcher_clean(repo.path(), repo.path());
     }
 
     /// The linked-worktree flavour of the loop above: with `worktrees/` present the watch is
@@ -384,13 +446,7 @@ mod tests {
         std::fs::write(linked_path.join("untracked.txt"), "new content")
             .expect("write an untracked file so the diff has real shadow-index work to do");
 
-        let dirty: DirtyFlag = Arc::new(AtomicBool::new(false));
-        let _watcher =
-            spawn_worktree_watcher(repo.path(), dirty.clone()).expect("spawn_worktree_watcher");
-
-        wt_core::diff::diff_against_head(&linked_path).expect("diff_against_head");
-
-        assert_stays_clean(&dirty);
+        assert_diff_leaves_watcher_clean(repo.path(), &linked_path);
     }
 
     #[test]
