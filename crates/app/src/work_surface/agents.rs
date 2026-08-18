@@ -4,7 +4,7 @@
 //! worktree" - see its module docs - this is that one layer up.
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{App, AppContext as _, Context, Entity, Focusable as _, Subscription, Window};
 
@@ -57,6 +57,35 @@ impl AgentKind {
             AgentKind::Codex => "codex",
             AgentKind::Cursor => "cursor-agent",
         }
+    }
+
+    /// The argument vector that makes this CLI reattach to `session_id`, or `None` for a kind
+    /// with no resume flag at all - the one place the two spellings live, so a call site can't
+    /// pick the wrong one. Both were checked against a real binary, and both genuinely resume the
+    /// named conversation rather than merely starting a fresh one in the same directory:
+    /// `claude` 2.1.228 (see `crate::hooks::event::HookReport::session_id`), and `cursor-agent`
+    /// 2026.08.11-e8db854, whose `--resume=<id>` recalled a token set by an earlier, separate
+    /// process.
+    ///
+    /// The spellings really do differ: `claude` takes the id as its own argv entry, while
+    /// `cursor-agent`'s `--resume [chatId]` is an *optional*-value option, so a detached
+    /// `--resume <id>` there means "prompt me to pick a session" and treats the id as a prompt.
+    pub fn resume_args(self, session_id: &str) -> Option<Vec<String>> {
+        match self {
+            AgentKind::Claude => Some(vec!["--resume".to_owned(), session_id.to_owned()]),
+            AgentKind::Cursor => Some(vec![format!("--resume={session_id}")]),
+            // `codex` has no resume flag this app has verified, so it never claims one.
+            AgentKind::Codex => None,
+        }
+    }
+
+    /// Whether this CLI can mint a chat id up front, for a kind whose id cannot arrive any other
+    /// way. `claude` learns its own `session_id` from its hooks after the fact; `cursor-agent` is
+    /// hookless here (see `crate::hooks::flow::AdeApp::hook_injection_for`), so its id has to be
+    /// created before the spawn that uses it - `cursor-agent create-chat` prints a bare UUID for
+    /// exactly this.
+    pub fn mints_chat_id(self) -> bool {
+        matches!(self, AgentKind::Cursor)
     }
 }
 
@@ -157,6 +186,12 @@ pub struct Agent {
     /// The same spawn moment as [`Self::spawned_at`], but as real wall-clock seconds since the
     /// Unix epoch - set from the identical call site, at the identical instant.
     pub spawned_at_unix: i64,
+    /// The conversation this pane is attached to, for a kind that cannot learn one from hooks.
+    /// `None` for `AgentKind::Claude`, whose id arrives later on the hook side-channel and is
+    /// read from there (`crate::hooks::HookRuntime::session_id_for`) rather than stored here, and
+    /// `None` for any Cursor pane whose id could not be minted at spawn time - an agent with no
+    /// id is simply not resumable, which is what the run-history footer already says.
+    pub session_id: Option<String>,
     /// Keeps [`Agents::spawn`]'s link-click-opens-a-file subscription (see
     /// [`TerminalPaneEvent`]) alive for this agent's lifetime - never read, only held.
     _link_subscription: Subscription,
@@ -298,16 +333,42 @@ impl Agents {
         window: &mut Window,
         cx: &mut Context<AdeApp>,
     ) -> AgentId {
-        self.spawn_inner(
+        // A kind with no verified resume flag ([`AgentKind::resume_args`]) is spawned bare rather
+        // than handed an invented one - it is then simply a fresh agent in the same worktree,
+        // which is what the run-history footer already tells the user it will be.
+        let leading_args = agent_kind.resume_args(&session_id).unwrap_or_default();
+        let id = self.spawn_inner(
             ProcessKind::Agent(agent_kind),
             cwd,
             terminal_font_size_px,
             shell_override,
             hooks,
-            vec!["--resume".to_owned(), session_id],
+            leading_args,
             window,
             cx,
-        )
+        );
+        // A hookless kind has no other way to report which conversation this pane is - see
+        // [`Agent::session_id`].
+        self.set_session_id(id, session_id);
+        id
+    }
+
+    /// Records the conversation id a pane is attached to, for a kind that cannot learn one from
+    /// hooks - see [`Agent::session_id`]. A no-op for an id that isn't open.
+    pub fn set_session_id(&mut self, id: AgentId, session_id: String) {
+        if let Some(agent) = self.agents.iter_mut().find(|agent| agent.id == id) {
+            agent.session_id = Some(session_id);
+        }
+    }
+
+    /// The conversation id this pane is attached to, if it was known at spawn time - `None` for
+    /// every kind whose id arrives through hooks instead (see [`Agent::session_id`]).
+    pub fn session_id_for(&self, id: AgentId) -> Option<&str> {
+        self.agents
+            .iter()
+            .find(|agent| agent.id == id)?
+            .session_id
+            .as_deref()
     }
 
     /// The real shared core of [`Self::spawn`]/[`Self::spawn_resume`] - identical in every way
@@ -358,6 +419,7 @@ impl Agents {
             pane,
             spawned_at: Instant::now(),
             spawned_at_unix: unix_now(),
+            session_id: None,
             _link_subscription: link_subscription,
         });
         self.active = Some(id);
@@ -609,6 +671,50 @@ mod tests {
     }
 
     #[test]
+    fn each_kinds_resume_spelling_is_the_one_its_own_cli_accepts() {
+        // The two spellings are not interchangeable, and neither is guessed: `claude` 2.1.228
+        // takes the id as a separate argv entry, while `cursor-agent`'s `--resume [chatId]` is an
+        // optional-value option, so a detached id there is read as a prompt rather than a chat.
+        assert_eq!(
+            AgentKind::Claude.resume_args("abc"),
+            Some(vec!["--resume".to_owned(), "abc".to_owned()])
+        );
+        assert_eq!(
+            AgentKind::Cursor.resume_args("abc"),
+            Some(vec!["--resume=abc".to_owned()]),
+            "cursor-agent must receive one argv entry, not two"
+        );
+        assert_eq!(
+            AgentKind::Codex.resume_args("abc"),
+            None,
+            "a kind with no verified resume flag must never claim one"
+        );
+    }
+
+    #[test]
+    fn only_a_hookless_kind_mints_its_own_chat_id() {
+        // Claude's id arrives on the hook side-channel after the fact, so minting one for it
+        // would attach the pane to a conversation its own CLI knows nothing about.
+        assert!(AgentKind::Cursor.mints_chat_id());
+        assert!(!AgentKind::Claude.mints_chat_id());
+        assert!(!AgentKind::Codex.mints_chat_id());
+    }
+
+    #[test]
+    fn a_kind_that_mints_an_id_can_always_spend_it() {
+        // The two halves have to agree: minting an id for a kind that has no resume flag would
+        // pay for a chat id and then spawn without it.
+        for kind in [AgentKind::Claude, AgentKind::Codex, AgentKind::Cursor] {
+            if kind.mints_chat_id() {
+                assert!(
+                    kind.resume_args("some-id").is_some(),
+                    "{kind:?} mints a chat id but has no way to pass one"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn the_construction_shorthands_are_exactly_their_long_forms() {
         // `claude()`/`codex()` exist only to keep call sites short; if they ever drifted from
         // the explicit construction, spawn sites would quietly disagree with match arms.
@@ -732,5 +838,134 @@ mod tests {
             PathBuf::from("claude"),
             "a configured shell must not be substituted for an agent CLI's own binary"
         );
+    }
+}
+
+/// How long [`AdeApp::spawn_with_minted_chat_id`] waits for a chat id before giving up and
+/// spawning a plain, unresumable agent. Generous because minting is a real network round-trip,
+/// bounded because `cursor-agent create-chat` hangs forever rather than failing when the user is
+/// not logged in.
+const CHAT_ID_MINT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Whether a line a CLI printed can be taken as a conversation id rather than a message it wrote
+/// to stdout instead. Shape-only - the real check is that the resumed agent attaches, which only
+/// the CLI itself can decide.
+fn is_plausible_chat_id(line: &str) -> bool {
+    !line.is_empty()
+        && line.len() <= 128
+        && line
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+}
+
+impl AdeApp {
+    /// Spawns a kind that has to be handed its conversation id up front
+    /// ([`AgentKind::mints_chat_id`]): mints one off the UI thread, then spawns attached to it.
+    ///
+    /// A mint that fails - no binary, not logged in, or the timeout - falls back to a plain bare
+    /// spawn. That agent is then simply not resumable, which the run-history footer already
+    /// reports honestly rather than offering a resume that would start a fresh chat instead.
+    pub(crate) fn spawn_with_minted_chat_id(
+        &mut self,
+        agent_kind: AgentKind,
+        cwd: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let font_size = self.settings.appearance.terminal_font_size;
+        let shell_override = self.settings.terminal.shell_override().map(str::to_owned);
+        let binary = agent_kind.binary_name();
+        let mint_cwd = cwd.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let chat_id = cx
+                .background_executor()
+                .spawn(async move { mint_chat_id(binary, &mint_cwd) })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let hook_injection = this.hook_injection_for(ProcessKind::Agent(agent_kind));
+                let id = match chat_id {
+                    Some(chat_id) => this.agents.spawn_resume(
+                        agent_kind,
+                        cwd,
+                        font_size,
+                        shell_override.as_deref(),
+                        hook_injection.as_ref(),
+                        chat_id,
+                        window,
+                        cx,
+                    ),
+                    None => this.agents.spawn(
+                        ProcessKind::Agent(agent_kind),
+                        cwd,
+                        font_size,
+                        shell_override.as_deref(),
+                        hook_injection.as_ref(),
+                        window,
+                        cx,
+                    ),
+                };
+                this.after_agent_spawn(id, window, cx);
+            });
+        });
+        // Same `TaskPool` reasoning as `AdeApp::new_agent_pane`: two rapid clicks must each get
+        // their own agent rather than the second cancelling the first.
+        self._new_agent_pane_task.push(task);
+    }
+}
+
+/// Runs the CLI's own "give me a new chat id" command, or `None` if it could not produce one.
+///
+/// Blocking - callers run it on the background executor.
+fn mint_chat_id(binary: &str, cwd: &Path) -> Option<String> {
+    // Tests never mint: this is a real subprocess making a real network call, and a UI test that
+    // reached it would hang on the machine of anyone who has the CLI installed. The fallback it
+    // takes instead is the same path production takes when minting fails, so the spawn stays
+    // covered either way, and the capture helper is tested directly in its own crate.
+    if cfg!(test) {
+        return None;
+    }
+    match pty_core::capture_first_line(binary, &["create-chat"], cwd, CHAT_ID_MINT_TIMEOUT) {
+        Ok(line) if is_plausible_chat_id(&line) => Some(line),
+        Ok(line) => {
+            log::warn!("`{binary} create-chat` printed {line:?}, not a chat id");
+            None
+        }
+        Err(err) => {
+            log::warn!("could not mint a {binary} chat id ({err}) - this agent starts unresumable");
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod chat_id_tests {
+    use super::is_plausible_chat_id;
+
+    #[test]
+    fn a_real_minted_id_is_accepted() {
+        // The exact shape `cursor-agent create-chat` really printed.
+        assert!(is_plausible_chat_id("51a6b5fa-fbf4-4116-b44c-cd3e0aa35a5e"));
+    }
+
+    #[test]
+    fn a_message_printed_instead_of_an_id_is_refused() {
+        // A CLI that reports a failure on stdout must not have its prose spliced into an argv as
+        // though it were a conversation id.
+        for line in [
+            "",
+            "Not logged in",
+            "error: authentication required",
+            "You must run `cursor-agent login` first",
+            "--resume=x; rm -rf /",
+        ] {
+            assert!(
+                !is_plausible_chat_id(line),
+                "{line:?} must not be treated as a chat id"
+            );
+        }
+    }
+
+    #[test]
+    fn an_absurdly_long_line_is_refused() {
+        assert!(!is_plausible_chat_id(&"a".repeat(129)));
     }
 }

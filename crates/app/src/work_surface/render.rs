@@ -110,6 +110,15 @@ impl AdeApp {
             cx.notify();
             return;
         }
+        // A kind whose conversation id can only be known by minting one first has to spawn
+        // asynchronously - see `Self::spawn_with_minted_chat_id`. Ordered after the discard guard
+        // so a doomed worktree costs no chat id.
+        if let ProcessKind::Agent(agent_kind) = kind {
+            if agent_kind.mints_chat_id() {
+                self.spawn_with_minted_chat_id(agent_kind, cwd, cx);
+                return;
+            }
+        }
         // GitHub issue #239 phase 2: a Claude agent is spawned against this instance's generated
         // `--settings` file and told, through its environment, where to report its hooks. Taken as
         // an owned snapshot because `self.agents.spawn` borrows `self.agents` mutably - see
@@ -124,13 +133,24 @@ impl AdeApp {
             window,
             cx,
         );
-        // GitHub issue #225: capture this agent's review baseline - a real snapshot of the
-        // worktree exactly as it stands right now, so "what has this agent changed" has a real
-        // base point to be measured against. Hooked here, at `Agents::spawn`'s caller rather than
-        // inside `Agents` itself, for the same reason `load_diff` is triggered by its caller:
-        // `Agents` owns processes and tabs, not git snapshots. See
-        // `crate::review::flow::AdeApp::capture_review_baseline` for the small, accepted race
-        // between the process starting and the snapshot landing.
+        self.after_agent_spawn(id, window, cx);
+    }
+
+    /// Everything that must follow a real spawn, wherever the spawn came from - shared so the
+    /// asynchronous Cursor door ([`Self::spawn_with_minted_chat_id`]) cannot drift from the
+    /// synchronous one.
+    ///
+    /// The review baseline is captured here, at `Agents::spawn`'s caller rather than inside
+    /// `Agents` itself, for the same reason `load_diff` is triggered by its caller: `Agents` owns
+    /// processes and tabs, not git snapshots. See
+    /// `crate::review::flow::AdeApp::capture_review_baseline` for the small, accepted race between
+    /// the process starting and the snapshot landing.
+    pub(crate) fn after_agent_spawn(
+        &mut self,
+        id: crate::work_surface::agents::AgentId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.capture_review_baseline(id, cx);
         // A new tab changes this worktree's real tab session - see `crate::work_surface::session`.
         self.record_worktree_session(cx);
@@ -1640,6 +1660,12 @@ impl AdeApp {
             // (`Self::focus_newly_spawned_agent`) - `Entity::update_in` provides it.
             let _ = this.update_in(cx, |this, window, cx| {
                 let kind = installed.unwrap_or(settings::AGENT_KINDS[0]);
+                // A minting kind needs a second async hop before it can spawn - see
+                // `Self::spawn_with_minted_chat_id`.
+                if kind.mints_chat_id() {
+                    this.spawn_with_minted_chat_id(kind, cwd, cx);
+                    return;
+                }
                 let hook_injection = this.hook_injection_for(ProcessKind::Agent(kind));
                 let id = this.agents.spawn(
                     ProcessKind::Agent(kind),
@@ -6082,7 +6108,6 @@ mod tab_label_tooltip_tests {
         );
     }
 }
-
 
 /// GitHub issue #463: the `Start an agent` split button's own agent picker, and the `+` menu's
 /// `New agent` row now opening it rather than spawning whichever CLI happened to resolve first.
