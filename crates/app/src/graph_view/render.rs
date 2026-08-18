@@ -1350,15 +1350,16 @@ pub(crate) fn render_graph_tab(app: &AdeApp, cx: &mut Context<AdeApp>) -> gpui::
         },
         cx,
     );
+    let (label_element, label_tooltip) = app.render_tab_label(
+        "Git graph",
+        theme::font::MONO,
+        app.ui_text_size(11.0),
+        colors.label,
+        cx,
+    );
     let content: Vec<gpui::AnyElement> = vec![
         render_graph_tab_chip().into_any_element(),
-        div()
-            .font(font(theme::font::MONO))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_size(app.ui_text_size(11.0))
-            .text_color(colors.label)
-            .child("Git graph")
-            .into_any_element(),
+        label_element,
         close_button.into_any_element(),
     ];
 
@@ -1370,6 +1371,7 @@ pub(crate) fn render_graph_tab(app: &AdeApp, cx: &mut Context<AdeApp>) -> gpui::
             drag_value,
             is_active,
             content,
+            label_tooltip,
             // Middle-click closes the graph tab too (GitHub issue #26) - the same real
             // `close_git_graph_tab` teardown the `×` button already uses, matching file/agent
             // tabs.

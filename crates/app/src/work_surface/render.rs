@@ -23,6 +23,29 @@ macro_rules! agent_jump_action_handler {
     };
 }
 
+/// How wide a tab label may get before it is ellipsised. A tab's title is arbitrary text this app
+/// doesn't control - a shell reporting a deep absolute path, an agent echoing a long task line, a
+/// generated file name - which uncapped stretches one tab across the whole strip and pushes every
+/// other tab out of reach. Capped and ellipsised the same way the pty header caps its own cwd
+/// (`AdeApp::render_pty_header`), rather than shortening the title itself: the tab shows as much of
+/// the real title as fits, and [`AdeApp::tab_label_tooltip`] carries the rest.
+pub(crate) const TAB_LABEL_MAX_WIDTH: gpui::Pixels = px(200.0);
+
+/// GPUI's own truncation affix (`vendor/zed/crates/gpui/src/styled.rs`'s private `ELLIPSIS`, which
+/// `.truncate()` passes down) - repeated here so the width [`AdeApp::tab_label_tooltip`] reserves
+/// for it is the width the drawn label really loses to it.
+const TAB_LABEL_ELLIPSIS: &str = "\u{2026}";
+
+const TAB_LABEL_WEIGHT: gpui::FontWeight = gpui::FontWeight::MEDIUM;
+
+/// The exact `Font` a tab label is drawn in, weight included - measuring at a different weight than
+/// the one painted is how a truncation check drifts from what the user actually sees.
+fn tab_label_font(font_name: &'static str) -> gpui::Font {
+    let mut label_font = font(font_name);
+    label_font.weight = TAB_LABEL_WEIGHT;
+    label_font
+}
+
 /// A tab chrome click handler - middle-click-to-close and click-to-activate share this exact
 /// shape (`&mut AdeApp, &mut Window, &mut Context<AdeApp>`), factored into a real alias per
 /// clippy's own `type_complexity` suggestion rather than spelling the `Box<dyn Fn(...)>` out
@@ -42,6 +65,11 @@ pub(crate) struct TabChromeArgs {
     pub(crate) drag_value: DraggedTab,
     pub(crate) is_active: bool,
     pub(crate) content: Vec<gpui::AnyElement>,
+    /// The full, untruncated title to reveal on hover - the second half of
+    /// [`AdeApp::render_tab_label`]'s return value, `None` whenever the label fits on screen
+    /// (GitHub issue #273). Hung on the whole tab rather than on the label element alone so the
+    /// hover target is the thing the user is pointing at.
+    pub(crate) label_tooltip: Option<gpui::SharedString>,
     pub(crate) on_middle_click: TabChromeClickHandler,
     pub(crate) on_activate: TabChromeClickHandler,
     /// A real GPUI `.debug_selector` (test-only bounds lookup, distinct from `outer_id` - see
@@ -961,6 +989,63 @@ impl AdeApp {
         bar.child(scroller)
     }
 
+    /// One tab label: capped at [`TAB_LABEL_MAX_WIDTH`], ellipsised past it, and paired with the
+    /// tooltip text that recovers whatever the ellipsis hid (`None` whenever the label really does
+    /// fit - a tooltip repeating text already on screen is noise). Both halves come from this one
+    /// call so the width that decides the tooltip is always measured at the same font and size the
+    /// label is actually drawn in.
+    pub(crate) fn render_tab_label(
+        &self,
+        label: impl Into<gpui::SharedString>,
+        font_name: &'static str,
+        text_size: gpui::Pixels,
+        color: gpui::Rgba,
+        cx: &App,
+    ) -> (gpui::AnyElement, Option<gpui::SharedString>) {
+        let label = label.into();
+        let tooltip = self.tab_label_tooltip(&label, font_name, text_size, cx);
+        let element = div()
+            .flex_none()
+            .max_w(TAB_LABEL_MAX_WIDTH)
+            .overflow_hidden()
+            .truncate()
+            .font(tab_label_font(font_name))
+            .font_weight(TAB_LABEL_WEIGHT)
+            .text_size(text_size)
+            .text_color(color)
+            .child(label)
+            .into_any_element();
+        (element, tooltip)
+    }
+
+    /// `Some(label)` exactly when `label` does not fit [`TAB_LABEL_MAX_WIDTH`] at this font and
+    /// size - i.e. when the drawn tab really is showing an ellipsis and hiding part of the title.
+    ///
+    /// `should_truncate_line` is the same predicate GPUI's own text element applies to decide
+    /// whether to ellipsise (`vendor/zed/crates/gpui/src/elements/text.rs`'s `TextLayout::layout`),
+    /// reached through the `App`-level text system rather than a `Window`, which this render path
+    /// doesn't carry. It sums per-character advances, so it very slightly over-estimates a shaped
+    /// line's real width; GPUI's element corrects for that with a `shape_text` pass that does need
+    /// a `Window`. The one consequence is a tooltip repeating a title that fit by a hair - never a
+    /// missing one on a title that didn't.
+    pub(crate) fn tab_label_tooltip(
+        &self,
+        label: &str,
+        font_name: &'static str,
+        text_size: gpui::Pixels,
+        cx: &App,
+    ) -> Option<gpui::SharedString> {
+        cx.text_system()
+            .line_wrapper(tab_label_font(font_name), text_size)
+            .should_truncate_line(
+                label,
+                TAB_LABEL_MAX_WIDTH,
+                TAB_LABEL_ELLIPSIS,
+                gpui::TruncateFrom::End,
+            )
+            .map(|_| gpui::SharedString::from(label.to_owned()))
+    }
+
     /// Every tab kind's own `×` close hit box - identical id-suffixing, size, hover, and styling
     /// regardless of which kind renders it (GitHub issue #103). Before this, `render_file_tab`/
     /// `render_agent_tab`/`render_graph_tab` each hand-rolled their own copy, which is exactly
@@ -1021,6 +1106,7 @@ impl AdeApp {
             drag_value,
             is_active,
             content,
+            label_tooltip,
             on_middle_click,
             on_activate,
             debug_selector,
@@ -1095,6 +1181,11 @@ impl AdeApp {
                     // shared chrome every tab kind (file, agent, graph) renders through - not
                     // per call site.
                     .when(!is_active, |el| hover_bg(el, theme::surface::ROW_HOVER))
+                    // GitHub issue #273: only present when this tab's label really is cut off -
+                    // see `Self::tab_label_tooltip`. A file tab's own `×` carries a second,
+                    // narrower tooltip ("click × again to close without saving"), which wins over
+                    // this one while the pointer is inside that 15px box, as it should.
+                    .when_some(label_tooltip, |el, title| el.tooltip(text_tooltip(title)))
                     .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
                         on_activate(this, window, cx);
                     }))
@@ -1226,6 +1317,13 @@ impl AdeApp {
             },
             cx,
         );
+        let (label_element, label_tooltip) = self.render_tab_label(
+            file_name,
+            theme::font::MONO,
+            self.ui_text_size(11.0),
+            colors.label,
+            cx,
+        );
         let mut content: Vec<gpui::AnyElement> = vec![
             div()
                 .flex_none()
@@ -1242,13 +1340,7 @@ impl AdeApp {
                 .text_color(chip_colors.fg)
                 .child(lang.label)
                 .into_any_element(),
-            div()
-                .font(font(theme::font::MONO))
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_size(self.ui_text_size(11.0))
-                .text_color(colors.label)
-                .child(file_name)
-                .into_any_element(),
+            label_element,
         ];
         if is_dirty {
             content.push(
@@ -1272,6 +1364,7 @@ impl AdeApp {
                 drag_value,
                 is_active,
                 content,
+                label_tooltip,
                 // Middle-click closes any file tab outright (GitHub issue #26), same real
                 // `request_close_file_tab` entry point as `×`/`Ctrl+W` - so a dirty tab still
                 // gets the real unsaved-changes confirmation rather than a middle-click silently
@@ -1758,30 +1851,24 @@ impl AdeApp {
             },
             cx,
         );
+        // The label is whatever the process inside the pane set as its title
+        // (`Self::agent_tab_label`), i.e. arbitrary-length text this app doesn't control - see
+        // `TAB_LABEL_MAX_WIDTH` for why it is capped, and `Self::tab_label_tooltip` for how the
+        // part the cap hides stays readable.
+        let (label_element, label_tooltip) = self.render_tab_label(
+            label,
+            if is_mono {
+                theme::font::MONO
+            } else {
+                theme::font::SANS
+            },
+            self.ui_text_size(if is_mono { 11.0 } else { 11.5 }),
+            colors.label,
+            cx,
+        );
         let content: Vec<gpui::AnyElement> = vec![
             render_tab_chip(agent.kind, is_active).into_any_element(),
-            div()
-                // The label is now whatever the process inside the pane set as its title
-                // (`Self::agent_tab_label`), i.e. arbitrary-length text this app doesn't
-                // control - a shell reporting a deep absolute path, or an agent echoing a long
-                // task line, would otherwise stretch one tab across the whole strip and push
-                // every other tab out of reach. Capped and ellipsised the same way the pty
-                // header caps its own cwd (`Self::render_pty_header`), rather than shortening
-                // the title itself: the tab shows as much of the real title as fits.
-                .flex_none()
-                .max_w(px(200.0))
-                .overflow_hidden()
-                .truncate()
-                .font(font(if is_mono {
-                    theme::font::MONO
-                } else {
-                    theme::font::SANS
-                }))
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_size(self.ui_text_size(if is_mono { 11.0 } else { 11.5 }))
-                .text_color(colors.label)
-                .child(label)
-                .into_any_element(),
+            label_element,
             div()
                 .flex_none()
                 .w(px(5.0))
@@ -1800,6 +1887,7 @@ impl AdeApp {
                 drag_value,
                 is_active,
                 content,
+                label_tooltip,
                 // Middle-click closes any agent/terminal tab too (GitHub issue #26) - the same
                 // `Self::close_agent` real teardown (`TerminalPane::shutdown`'s SIGHUP/grace/
                 // SIGKILL - see that method's own docs) every other close path already uses.
@@ -5673,6 +5761,163 @@ mod tab_strip_trailing_margin_tests {
             "premise, and the point of the assertion above: with only two short tabs open in a \
              maximized window the `+` must be nowhere near the strip's right edge - strip ends at \
              {bar_right}, `+` ends at {plus_right}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tab_label_tooltip_tests {
+    use super::TAB_LABEL_MAX_WIDTH;
+    use crate::root::AdeApp;
+    use crate::theme;
+    use crate::work_surface::agents::AgentId;
+    use crate::work_surface::state as work_surface;
+    use gpui::{px, Entity, Pixels, TestAppContext, VisualTestContext};
+
+    /// A title far past [`TAB_LABEL_MAX_WIDTH`] at any plausible font: 108 characters, where the
+    /// cap holds roughly 30 under `TestAppContext`'s own text system (GPUI's `NoopTextSystem`
+    /// reports a flat 0.6em advance per ASCII glyph, so 11px text is 6.6px a character and 200px
+    /// is ~30 of them). Deliberately nowhere near that boundary, so nothing here depends on the
+    /// exact number - the same reason `SHORT_TITLE` below is three characters rather than
+    /// twenty-nine.
+    const LONG_TITLE: &str =
+        "~/src/jerry/crates/app/src/work_surface/render.rs \u{2014} nvim \u{b7} feat/273-tab-title-tooltip";
+    const SHORT_TITLE: &str = "zsh";
+
+    /// That tab's real, `gpui::canvas`-painted width from the last drawn frame
+    /// (`AdeApp::tab_bounds`) - the same real measurement `tab_scoping_tests` takes of a tab it is
+    /// about to drag.
+    fn painted_tab_width(
+        app: &Entity<AdeApp>,
+        cx: &mut VisualTestContext,
+        tab_ref: &work_surface::TabRef,
+    ) -> Pixels {
+        app.read_with(cx, |app, _| {
+            app.tab_bounds.get(tab_ref).map(|bounds| bounds.size.width)
+        })
+        .expect("the tab must have really painted at least once before it can be measured")
+    }
+
+    /// Feeds `title` into agent `id`'s pane as a real OSC 0 window-title sequence, exactly as
+    /// `tab_scoping_tests::set_live_title` does - see that helper's own docs for why the title is
+    /// injected through the real `TerminalGrid` parser rather than by driving a real process.
+    fn set_live_title(app: &Entity<AdeApp>, cx: &mut VisualTestContext, id: AgentId, title: &str) {
+        let pane = app.read_with(cx, |app, _| {
+            app.agents
+                .iter()
+                .find(|agent| agent.id == id)
+                .expect("a live agent")
+                .pane
+                .clone()
+        });
+        pane.update(cx, |pane, cx| {
+            pane.inject_bytes_for_test(format!("\x1b]0;{title}\x07").as_bytes(), cx);
+        });
+    }
+
+    #[gpui::test]
+    fn a_label_that_fits_gets_no_tooltip_and_one_that_does_not_carries_the_full_title(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
+
+        let (short, long) = app.read_with(cx, |app, cx| {
+            let size = app.ui_text_size(11.0);
+            (
+                app.tab_label_tooltip(SHORT_TITLE, theme::font::MONO, size, cx),
+                app.tab_label_tooltip(LONG_TITLE, theme::font::MONO, size, cx),
+            )
+        });
+
+        assert_eq!(
+            short, None,
+            "a label the tab shows in full has nothing to reveal - a tooltip repeating text \
+             already on screen is noise, not a feature"
+        );
+        assert_eq!(
+            long.as_deref(),
+            Some(LONG_TITLE),
+            "a cut-off label's tooltip must carry the whole real title, untruncated and with no \
+             ellipsis of its own - reading what the ellipsis hid is the entire point"
+        );
+    }
+
+    #[gpui::test]
+    fn a_long_live_title_is_capped_on_screen_and_readable_on_hover(cx: &mut TestAppContext) {
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
+        let shell_id = app
+            .read_with(cx, |app, _| app.agents.active_id())
+            .expect("the real startup shell agent");
+        cx.run_until_parked();
+
+        set_live_title(&app, cx, shell_id, SHORT_TITLE);
+        cx.run_until_parked();
+        let tab_ref = work_surface::TabRef::Agent(shell_id);
+        let short_width = painted_tab_width(&app, cx, &tab_ref);
+
+        set_live_title(&app, cx, shell_id, LONG_TITLE);
+        cx.run_until_parked();
+        let long_width = painted_tab_width(&app, cx, &tab_ref);
+
+        assert!(
+            long_width > short_width,
+            "premise: the longer title must really have reached the strip and widened the tab - \
+             {short_width:?} -> {long_width:?}"
+        );
+        // The cap plus this tab's own chrome (chip, gaps, status dot, close box, 13px padding
+        // either side) - well under the ~700px 108 unconstrained characters would occupy.
+        assert!(
+            long_width < TAB_LABEL_MAX_WIDTH + px(120.0),
+            "an arbitrarily long process title must not stretch its tab across the whole strip - \
+             the label is capped at {TAB_LABEL_MAX_WIDTH:?}, yet the tab painted {long_width:?}"
+        );
+
+        let tooltip = app.read_with(cx, |app, cx| {
+            let agent = app
+                .agents
+                .iter()
+                .find(|agent| agent.id == shell_id)
+                .expect("a live agent");
+            let label = app.agent_tab_label(agent, cx);
+            app.tab_label_tooltip(&label, theme::font::MONO, app.ui_text_size(11.0), cx)
+        });
+        assert_eq!(
+            tooltip.as_deref(),
+            Some(LONG_TITLE),
+            "the title the tab had to cut off must be recoverable on hover"
+        );
+    }
+
+    #[gpui::test]
+    fn a_long_file_name_is_capped_too_not_just_an_agent_title(cx: &mut TestAppContext) {
+        let repo = crate::test_support::temp_root();
+        // A real, legal file name past the cap - file tabs used to have no cap at all, so one of
+        // these stretched its tab and pushed every other tab out of reach.
+        let long_name = "a_deliberately_and_extremely_long_generated_module_name_for_this_test.rs";
+        std::fs::write(repo.path().join(long_name), "// x\n").expect("write");
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_file_view(repo.path().join(long_name), window, cx);
+        });
+        cx.run_until_parked();
+
+        // Read the tab back out of the real combined order rather than rebuilding its `TabRef`
+        // here - a file tab is keyed by its path relative to `file_tree_root`, not the absolute
+        // one `open_file_view` is handed.
+        let tab_ref = app
+            .read_with(cx, |app, _| {
+                app.combined_tab_order()
+                    .into_iter()
+                    .find(|tab_ref| matches!(tab_ref, work_surface::TabRef::File(_)))
+            })
+            .expect("premise: opening the file must have put a real file tab in the strip");
+        let width = painted_tab_width(&app, cx, &tab_ref);
+        assert!(
+            width < TAB_LABEL_MAX_WIDTH + px(120.0),
+            "every tab kind goes through the same capped label, not just agent tabs - this file \
+             tab painted {width:?}"
         );
     }
 }
