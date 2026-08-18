@@ -185,8 +185,8 @@ repo_fail_count    = "#a66663"  # The repo header's red urgency **count**
 "codex.bg"  = "#bfd9d4"  # Teal - gpt-5-codex.
 "haiku.fg"  = "#6f669a"  # Periwinkle - haiku-4.5.
 "haiku.bg"  = "#dbd7ed"  # Periwinkle - haiku-4.5.
-"local.fg"  = "#586f99"  # Steel blue - qwen-local.
-"local.bg"  = "#c7d3ec"  # Steel blue - qwen-local.
+"local.fg"  = "#586f99"  # Steel blue - the Cursor agent CLI.
+"local.bg"  = "#c7d3ec"  # Steel blue - the Cursor agent CLI.
 
 # The Changes panel - four stacked, collapsible sections in one scroller, plus the file row's
 # own seen/unseen and discard states.

@@ -110,6 +110,15 @@ impl AdeApp {
             cx.notify();
             return;
         }
+        // A kind whose conversation id can only be known by minting one first has to spawn
+        // asynchronously - see `Self::spawn_with_minted_chat_id`. Ordered after the discard guard
+        // so a doomed worktree costs no chat id.
+        if let ProcessKind::Agent(agent_kind) = kind {
+            if agent_kind.mints_chat_id() {
+                self.spawn_with_minted_chat_id(agent_kind, cwd, cx);
+                return;
+            }
+        }
         // GitHub issue #239 phase 2: a Claude agent is spawned against this instance's generated
         // `--settings` file and told, through its environment, where to report its hooks. Taken as
         // an owned snapshot because `self.agents.spawn` borrows `self.agents` mutably - see
@@ -124,13 +133,24 @@ impl AdeApp {
             window,
             cx,
         );
-        // GitHub issue #225: capture this agent's review baseline - a real snapshot of the
-        // worktree exactly as it stands right now, so "what has this agent changed" has a real
-        // base point to be measured against. Hooked here, at `Agents::spawn`'s caller rather than
-        // inside `Agents` itself, for the same reason `load_diff` is triggered by its caller:
-        // `Agents` owns processes and tabs, not git snapshots. See
-        // `crate::review::flow::AdeApp::capture_review_baseline` for the small, accepted race
-        // between the process starting and the snapshot landing.
+        self.after_agent_spawn(id, window, cx);
+    }
+
+    /// Everything that must follow a real spawn, wherever the spawn came from - shared so the
+    /// asynchronous Cursor door ([`Self::spawn_with_minted_chat_id`]) cannot drift from the
+    /// synchronous one.
+    ///
+    /// The review baseline is captured here, at `Agents::spawn`'s caller rather than inside
+    /// `Agents` itself, for the same reason `load_diff` is triggered by its caller: `Agents` owns
+    /// processes and tabs, not git snapshots. See
+    /// `crate::review::flow::AdeApp::capture_review_baseline` for the small, accepted race between
+    /// the process starting and the snapshot landing.
+    pub(crate) fn after_agent_spawn(
+        &mut self,
+        id: crate::work_surface::agents::AgentId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.capture_review_baseline(id, cx);
         // A new tab changes this worktree's real tab session - see `crate::work_surface::session`.
         self.record_worktree_session(cx);
@@ -1525,9 +1545,10 @@ impl AdeApp {
                     )
                     .on_click(cx.listener(
                         |this, _event: &ClickEvent, _window, cx| {
-                            this.new_agent_pane(cx);
-                            this.plus_menu_open = false;
-                            cx.notify();
+                            // Opens the picker rather than spawning outright (GitHub issue #463):
+                            // the chip beside this row only ever showed the *resolved* kind, so
+                            // this row was the one door with no way to reach the others.
+                            this.toggle_agent_picker(work_surface::AgentPickerAnchor::PlusMenu, cx);
                         },
                     )),
                 )
@@ -1592,11 +1613,12 @@ impl AdeApp {
             )
     }
 
-    /// Which agent kind the `+` menu's "New agent" row would spawn right now: the first
+    /// Which agent kind a default `Start an agent` gesture resolves to right now: the first
     /// [`settings::AGENT_KINDS`] entry [`Self::agent_rows`] (refreshed on menu open) confirms is
     /// installed, or `AGENT_KINDS[0]` if none are (or `agent_rows` hasn't been populated yet).
-    /// Display-only - [`Self::new_agent_pane`] runs its own detection independently, off the
-    /// foreground thread, at the moment it actually spawns.
+    /// Display-only - it draws the `+` menu's "New agent" chip, and [`Self::new_agent_pane`] runs
+    /// its own detection independently, off the foreground thread, at the moment it actually
+    /// spawns. Picking a *specific* kind is [`Self::render_agent_picker_menu`], not this.
     pub(crate) fn resolved_new_agent_kind(&self) -> AgentKind {
         settings::AGENT_KINDS
             .into_iter()
@@ -1608,10 +1630,12 @@ impl AdeApp {
             .unwrap_or(settings::AGENT_KINDS[0])
     }
 
-    /// The `+` menu's "New agent" action (`secondary-shift-n`) - spawns the first
-    /// [`settings::AGENT_KINDS`] entry a background `$PATH` search
+    /// The default new-agent action (`secondary-shift-n`, and the `Start an agent` button's own
+    /// body) - spawns the first [`settings::AGENT_KINDS`] entry a background `$PATH` search
     /// (`pty_core::resolve_on_path`, the same search [`Self::load_agent_rows`] runs) confirms is
-    /// installed, rather than blocking the click on a filesystem walk.
+    /// installed, rather than blocking the click on a filesystem walk. The button's caret and the
+    /// `+` menu's "New agent" row go through [`Self::render_agent_picker_menu`] instead, which
+    /// spawns exactly the kind that was picked.
     pub(crate) fn new_agent_pane(&mut self, cx: &mut Context<Self>) {
         // GitHub issue #90: the same real "nothing to spawn into yet" guard [`Self::new_agent`]'s
         // own docs explain - see those for the concrete bug this closes.
@@ -1636,6 +1660,12 @@ impl AdeApp {
             // (`Self::focus_newly_spawned_agent`) - `Entity::update_in` provides it.
             let _ = this.update_in(cx, |this, window, cx| {
                 let kind = installed.unwrap_or(settings::AGENT_KINDS[0]);
+                // A minting kind needs a second async hop before it can spawn - see
+                // `Self::spawn_with_minted_chat_id`.
+                if kind.mints_chat_id() {
+                    this.spawn_with_minted_chat_id(kind, cwd, cx);
+                    return;
+                }
                 let hook_injection = this.hook_injection_for(ProcessKind::Agent(kind));
                 let id = this.agents.spawn(
                     ProcessKind::Agent(kind),
@@ -2012,9 +2042,12 @@ impl AdeApp {
         }
     }
 
-    /// The `Start an agent` button - a filled blue button with a `mod+shift+N` keycap hint. Real,
-    /// not decorative: dispatches [`Self::new_agent_pane`], the same entry point the tab strip's
-    /// `+` menu row and its own global `secondary-shift-n` keybinding already use.
+    /// The `Start an agent` split button - a filled blue button with a `mod+shift+N` keycap hint,
+    /// plus a caret half that opens [`Self::render_agent_picker_menu`] (GitHub issue #463). The
+    /// body keeps dispatching [`Self::new_agent_pane`], the same entry point the tab strip's `+`
+    /// menu row and the global `secondary-shift-n` keybinding already use, so nothing about the
+    /// existing gesture changes; the caret is how a machine with more than one agent CLI installed
+    /// reaches the kinds `new_agent_pane`'s first-installed-wins search doesn't pick.
     pub(in crate::work_surface) fn render_start_agent_button(
         &self,
         element_id: &'static str,
@@ -2023,38 +2056,192 @@ impl AdeApp {
         let colors = work_surface::action_button_colors(work_surface::ActionStyle::PrimaryBlue);
         let macos = self.window_controls_style().is_macos();
         let parts = keymap::resolve_combo("mod+shift+N", macos);
+        let anchor = work_surface::AgentPickerAnchor::StartButton(element_id);
+        let picker_open = self.agent_picker_open == Some(anchor);
 
         div()
             .id(element_id)
             .debug_selector(move || element_id.to_string())
             .flex_none()
-            .cursor_pointer()
             .h(px(20.0))
-            .px(px(8.0))
-            .gap(px(6.0))
             .rounded(theme::radius::BUTTON)
             .border_1()
             .border_color(colors.border)
             .bg(colors.bg)
             .flex()
             .items_center()
-            .hover(|el| el.bg(theme::button::BLUE_BG_HOVER))
+            .child({
+                let this = cx.entity();
+                gpui::canvas(
+                    move |bounds, _window, cx| {
+                        this.update(cx, |this, _cx| {
+                            this.agent_picker_button_bounds.insert(element_id, bounds);
+                        });
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full()
+            })
             .child(
                 div()
-                    .font(font(theme::font::SANS))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_size(px(10.5))
-                    .text_color(colors.fg)
-                    .child("Start an agent"),
+                    .id(format!("{element_id}-body"))
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .h_full()
+                    .px(px(8.0))
+                    .gap(px(6.0))
+                    .hover(|el| el.bg(theme::button::BLUE_BG_HOVER))
+                    .child(
+                        div()
+                            .font(font(theme::font::SANS))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_size(px(10.5))
+                            .text_color(colors.fg)
+                            .child("Start an agent"),
+                    )
+                    .child(render_action_keycap_row(
+                        &parts,
+                        colors.keycap_fg,
+                        colors.keycap_border,
+                    ))
+                    .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                        this.new_agent_pane(cx);
+                    })),
             )
-            .child(render_action_keycap_row(
-                &parts,
-                colors.keycap_fg,
-                colors.keycap_border,
-            ))
+            .child(div().flex_none().w(px(1.0)).h(px(12.0)).bg(colors.border))
+            .child(
+                div()
+                    .id(format!("{element_id}-caret"))
+                    .debug_selector(move || format!("{element_id}-caret"))
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .h_full()
+                    .w(px(16.0))
+                    .when(picker_open, |el| el.bg(theme::button::BLUE_BG_HOVER))
+                    .hover(|el| el.bg(theme::button::BLUE_BG_HOVER))
+                    .child(
+                        div()
+                            .font(font(theme::font::MONO))
+                            .text_size(px(8.0))
+                            .text_color(colors.fg)
+                            .child("\u{25be}"),
+                    )
+                    .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                        this.toggle_agent_picker(anchor, cx);
+                    })),
+            )
+    }
+
+    /// Opens the agent picker off `anchor`, or closes it if that same anchor already had it open.
+    /// Refreshes [`Self::load_agent_rows`] on open for the same reason
+    /// [`Self::render_tab_strip_plus`] does: the rows' ready/not-on-PATH text is only honest if the
+    /// `$PATH` search behind it is reasonably fresh rather than a possibly-empty cached snapshot.
+    pub(crate) fn toggle_agent_picker(
+        &mut self,
+        anchor: work_surface::AgentPickerAnchor,
+        cx: &mut Context<Self>,
+    ) {
+        let opening = self.agent_picker_open != Some(anchor);
+        // Read before the sweep and applied after it, exactly as `render_tab_strip_plus` does -
+        // the sweep clears `agent_picker_open` itself (GitHub issue #176's invariant).
+        let _ = self.close_menu_surfaces_except(Some(menus::MenuSurface::AgentPicker));
+        self.agent_picker_open = opening.then_some(anchor);
+        if opening {
+            self.load_agent_rows(cx);
+        }
+        cx.notify();
+    }
+
+    /// Whether the `$PATH` search has answered for `kind` yet, and what it said - `None` while
+    /// [`Self::agent_rows`] has no row for it (the search hasn't run, or hasn't landed). Never
+    /// collapses "not searched" into "not installed"; see
+    /// [`work_surface::agent_picker_secondary_text`].
+    pub(crate) fn agent_kind_is_installed(&self, kind: AgentKind) -> Option<bool> {
+        self.agent_rows
+            .iter()
+            .find(|row| row.kind == kind)
+            .map(|row| row.is_ready())
+    }
+
+    /// The agent picker popover (GitHub issue #463): one row per [`settings::AGENT_KINDS`] entry,
+    /// each spawning exactly that kind. Same overlay shape as [`Self::render_plus_menu`] - a
+    /// transparent scrim that closes on click, and a panel that stops the click bubbling - and
+    /// positioned off whichever control opened it (see
+    /// [`work_surface::AgentPickerAnchor`]).
+    pub(crate) fn render_agent_picker_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let bounds = match self.agent_picker_open {
+            Some(work_surface::AgentPickerAnchor::StartButton(element_id)) => self
+                .agent_picker_button_bounds
+                .get(element_id)
+                .copied()
+                .unwrap_or_default(),
+            // The `+` menu's own `New agent` row opens this, and that menu closes as it does, so
+            // the `+` button itself is the anchor left on screen to hang it off.
+            Some(work_surface::AgentPickerAnchor::PlusMenu) | None => self.plus_button_bounds,
+        };
+        let branch = self.current_worktree_branch();
+
+        let mut panel = menu_popover_chrome(
+            div()
+                .id("agent-picker-popover")
+                .absolute()
+                .left(bounds.origin.x)
+                .top(bounds.origin.y + bounds.size.height + px(4.0))
+                .w(theme::zone::PLUS_MENU_WIDTH)
+                .py(px(4.0)),
+            theme::shadow::MENU,
+        )
+        .on_click(cx.listener(|_this, _event: &ClickEvent, _window, cx| {
+            cx.stop_propagation();
+        }));
+
+        for kind in settings::AGENT_KINDS {
+            let installed = self.agent_kind_is_installed(kind);
+            let enabled = work_surface::agent_picker_row_enabled(installed);
+            let process_kind = ProcessKind::from(kind);
+            let (chip_fg, chip_bg) = work_surface::agent_tint(process_kind);
+            panel = panel.child(
+                render_dropdown_menu_row(
+                    work_surface::agent_initial(process_kind),
+                    chip_fg,
+                    chip_bg,
+                    kind.label(),
+                    work_surface::agent_picker_secondary_text(
+                        installed,
+                        kind.binary_name(),
+                        branch.as_deref(),
+                    ),
+                    // No keycap: only the resolved default has a keybinding, and printing
+                    // `mod+shift+N` beside every row would claim three shortcuts that don't exist.
+                    Vec::new(),
+                    enabled,
+                )
+                .when(enabled, |row| {
+                    row.on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                        this.agent_picker_open = None;
+                        this.new_agent(process_kind, window, cx);
+                    }))
+                }),
+            );
+        }
+
+        div()
+            .id("agent-picker-scrim")
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .bg(work_surface::TRANSPARENT)
             .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                this.new_agent_pane(cx);
+                this.agent_picker_open = None;
+                cx.notify();
             }))
+            .child(panel)
     }
 
     /// Surface A/B's shared header: the resolved program label (this app has no saved-agent
@@ -5919,5 +6106,202 @@ mod tab_label_tooltip_tests {
             "every tab kind goes through the same capped label, not just agent tabs - this file \
              tab painted {width:?}"
         );
+    }
+}
+
+/// GitHub issue #463: the `Start an agent` split button's own agent picker, and the `+` menu's
+/// `New agent` row now opening it rather than spawning whichever CLI happened to resolve first.
+#[cfg(test)]
+mod agent_picker_tests {
+    use crate::root::AdeApp;
+    use crate::settings::state as settings;
+    use crate::work_surface::agents::{AgentId, AgentKind, ProcessKind};
+    use crate::work_surface::state as work_surface;
+    use gpui::TestAppContext;
+    use std::path::PathBuf;
+
+    /// Clears the app's startup agents so the empty pane - and with it the `Start an agent`
+    /// button this whole module is about - is what paints.
+    fn close_every_agent(app: &gpui::Entity<AdeApp>, cx: &mut gpui::VisualTestContext) {
+        let startup: Vec<AgentId> = app.read_with(cx, |app, _| {
+            app.agents.iter().map(|agent| agent.id).collect()
+        });
+        app.update_in(cx, |app, window, cx| {
+            for id in startup {
+                app.close_agent(id, window, cx);
+            }
+        });
+        cx.run_until_parked();
+    }
+
+    /// Writes a real [`settings::AgentRow`] set directly, so a test's outcome doesn't depend on
+    /// which agent CLIs happen to be installed on the machine running it. `ready` names the kinds
+    /// whose `$PATH` search is to have succeeded; every other kind gets a row saying it genuinely
+    /// isn't installed.
+    fn set_agent_rows(
+        app: &gpui::Entity<AdeApp>,
+        cx: &mut gpui::VisualTestContext,
+        ready: &[AgentKind],
+    ) {
+        app.update(cx, |app, cx| {
+            app.agent_rows = settings::AGENT_KINDS
+                .into_iter()
+                .map(|kind| settings::AgentRow {
+                    kind,
+                    binary_name: kind.binary_name(),
+                    resolved_path: ready
+                        .contains(&kind)
+                        .then(|| PathBuf::from(format!("/usr/local/bin/{}", kind.binary_name()))),
+                })
+                .collect();
+            cx.notify();
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn the_start_agent_carets_picker_lists_every_agent_kind(cx: &mut TestAppContext) {
+        let repo = crate::test_support::temp_repo();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+        close_every_agent(&app, cx);
+
+        let caret = cx
+            .debug_bounds("empty-state-start-agent-caret")
+            .expect("the empty state's `Start an agent` button must have a real picker caret");
+        cx.simulate_click(caret.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        set_agent_rows(&app, cx, &settings::AGENT_KINDS);
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.agent_picker_open),
+            Some(work_surface::AgentPickerAnchor::StartButton(
+                "empty-state-start-agent"
+            )),
+            "a real click on the caret must open the picker off that button, not some other anchor"
+        );
+        // `debug_bounds` takes a `&'static str`, so the selectors are spelled out - and the
+        // length assertion below is what stops a fourth `AGENT_KINDS` entry from being added
+        // without a row here.
+        for selector in [
+            "dropdown-menu-row-Claude",
+            "dropdown-menu-row-Codex",
+            "dropdown-menu-row-Cursor",
+        ] {
+            assert!(
+                cx.debug_bounds(selector).is_some(),
+                "{selector} must be a real row in the picker - a kind this app can spawn but the \
+                 picker doesn't list is unreachable from every button door"
+            );
+        }
+        assert_eq!(
+            settings::AGENT_KINDS.len(),
+            3,
+            "the picker must list every spawnable agent kind, and this test only checks three"
+        );
+    }
+
+    #[gpui::test]
+    fn picking_cursor_really_spawns_a_cursor_agent(cx: &mut TestAppContext) {
+        let repo = crate::test_support::temp_repo();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+        close_every_agent(&app, cx);
+
+        let caret = cx
+            .debug_bounds("empty-state-start-agent-caret")
+            .expect("the picker caret must be painted");
+        cx.simulate_click(caret.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        set_agent_rows(&app, cx, &settings::AGENT_KINDS);
+
+        let cursor_row = cx
+            .debug_bounds("dropdown-menu-row-Cursor")
+            .expect("the Cursor row must be painted with the picker open");
+        cx.simulate_click(cursor_row.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.agents
+                    .iter()
+                    .any(|agent| agent.kind == ProcessKind::cursor()),
+                "picking Cursor must spawn a real Cursor agent - the whole point of the picker is \
+                 that it spawns the kind that was picked, not the first one on PATH"
+            );
+            assert!(
+                app.agent_picker_open.is_none(),
+                "and picking a row closes the picker, like every other menu row in this app"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn a_kind_that_is_really_not_on_path_cannot_be_picked(cx: &mut TestAppContext) {
+        let repo = crate::test_support::temp_repo();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+        close_every_agent(&app, cx);
+
+        let caret = cx
+            .debug_bounds("empty-state-start-agent-caret")
+            .expect("the picker caret must be painted");
+        cx.simulate_click(caret.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        // Only Claude resolved: Cursor's row is the real "the search came back negative" case.
+        set_agent_rows(&app, cx, &[AgentKind::Claude]);
+
+        let cursor_row = cx
+            .debug_bounds("dropdown-menu-row-Cursor")
+            .expect("an uninstalled kind is still listed - it just says why it can't be picked");
+        cx.simulate_click(cursor_row.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                !app.agents
+                    .iter()
+                    .any(|agent| agent.kind == ProcessKind::cursor()),
+                "a row whose binary the $PATH search really didn't find must not spawn anything - \
+                 a pane that exists only to show a spawn error is fake functionality"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn the_plus_menus_new_agent_row_opens_the_picker_rather_than_spawning(cx: &mut TestAppContext) {
+        let repo = crate::test_support::temp_repo();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+        let before = app.read_with(cx, |app, _| app.agents.iter().count());
+
+        app.update(cx, |app, cx| {
+            app.plus_menu_open = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let new_agent = cx
+            .debug_bounds("dropdown-menu-row-New agent")
+            .expect("\"New agent\" row must be painted while the + menu is open");
+        cx.simulate_click(new_agent.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.agent_picker_open,
+                Some(work_surface::AgentPickerAnchor::PlusMenu),
+                "the row must open the picker anchored to the + button the menu hung off"
+            );
+            assert!(
+                !app.plus_menu_open,
+                "and the + menu itself closes - two popovers painted at once is issue #176's bug"
+            );
+            assert_eq!(
+                app.agents.iter().count(),
+                before,
+                "the row no longer spawns on its own: the pick is what spawns"
+            );
+        });
     }
 }

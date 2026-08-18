@@ -176,7 +176,7 @@ pub fn nav_groups() -> Vec<NavGroup> {
 /// that's now structural rather than a documented exclusion: [`AgentKind`] has no `Shell`
 /// variant, so nothing can put one in this array (a shell is a
 /// `crate::work_surface::agents::ProcessKind::Shell`, a different type).
-pub const AGENT_KINDS: [AgentKind; 2] = [AgentKind::Claude, AgentKind::Codex];
+pub const AGENT_KINDS: [AgentKind; 3] = [AgentKind::Claude, AgentKind::Codex, AgentKind::Cursor];
 
 /// One row for the Agents page's Installed card - see [`detect_agent_rows`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1259,7 +1259,11 @@ mod tests {
     #[test]
     fn detect_agent_rows_reports_each_binarys_own_real_status() {
         let all_found = detect_agent_rows(|name| Some(PathBuf::from(format!("/usr/bin/{name}"))));
-        assert_eq!(all_found.len(), 2, "one row per AGENT_KINDS entry");
+        assert_eq!(
+            all_found.len(),
+            AGENT_KINDS.len(),
+            "one row per AGENT_KINDS entry"
+        );
         assert!(all_found.iter().all(|row| row.is_ready()));
         assert!(all_found.iter().all(|row| row.status_label() == "ready"));
         let claude = all_found
@@ -1286,6 +1290,20 @@ mod tests {
         };
         assert!(ready(AgentKind::Claude));
         assert!(!ready(AgentKind::Codex));
+        assert!(!ready(AgentKind::Cursor));
+
+        // The Cursor CLI's binary is `cursor-agent`; searching `$PATH` for `cursor` would find
+        // the editor's own launcher on a machine that has it, and report an agent as ready that
+        // this app cannot in fact spawn.
+        let cursor_only = detect_agent_rows(|name| {
+            (name == "cursor-agent").then(|| PathBuf::from("/usr/bin/cursor-agent"))
+        });
+        let cursor = cursor_only
+            .iter()
+            .find(|row| row.kind == AgentKind::Cursor)
+            .expect("a Cursor row should exist");
+        assert_eq!(cursor.binary_name, "cursor-agent");
+        assert!(cursor.is_ready());
     }
 
     fn note(clean: Option<bool>, merged: bool, is_locked: bool) -> WorktreeNote {

@@ -8,7 +8,6 @@ use crate::hooks::history::{PastAgent, RunDiffstat};
 use crate::rail::status::Status;
 use crate::root::plural;
 use crate::theme;
-use crate::work_surface::agents::AgentKind;
 
 /// How a run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -514,10 +513,17 @@ impl TranscriptLine {
 /// The command a resume of this run would really be - the transcript's opening line when none was
 /// captured. Only ever this run's own kind and its own checkout.
 fn resume_command_line(run: &PastAgent, branch: Option<&str>) -> String {
-    let command = match (run.kind, run.session_id.as_deref()) {
-        (AgentKind::Claude, Some(session_id)) => format!("claude --resume {session_id}"),
-        (AgentKind::Claude, None) => "claude".to_string(),
-        (AgentKind::Codex, _) => "codex".to_string(),
+    // Built from the same `resume_args` the spawn itself uses, so this line cannot advertise a
+    // flag the resume would not really pass - a kind with no verified resume flag, or a run with
+    // no captured id, prints the bare binary and really does start fresh.
+    let binary = run.kind.binary_name();
+    let command = match run
+        .session_id
+        .as_deref()
+        .and_then(|session_id| run.kind.resume_args(session_id))
+    {
+        Some(args) => format!("{binary} {}", args.join(" ")),
+        None => binary.to_string(),
     };
     match branch {
         Some(branch) => format!("\u{276f} {command} \u{b7} {branch}"),
@@ -622,6 +628,7 @@ pub fn closing_lines(run: &PastAgent, now_unix: i64) -> Vec<TranscriptLine> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::work_surface::agents::AgentKind;
 
     fn run(worktree: &str, spawned: i64) -> PastAgent {
         PastAgent {

@@ -218,6 +218,10 @@ pub fn agent_tint(kind: ProcessKind) -> (Rgba, Rgba) {
         ProcessKind::Agent(AgentKind::Codex) => {
             (theme::agent::CODEX.0.into(), theme::agent::CODEX.1.into())
         }
+        // steel blue - the pool's remaining unclaimed hue when Cursor arrived (issue #463).
+        ProcessKind::Agent(AgentKind::Cursor) => {
+            (theme::agent::LOCAL.0.into(), theme::agent::LOCAL.1.into())
+        }
         ProcessKind::Shell => (theme::text::DIM.into(), theme::surface::CHIP_NEUTRAL.into()),
     }
 }
@@ -227,6 +231,9 @@ pub fn agent_initial(kind: ProcessKind) -> &'static str {
     match kind {
         ProcessKind::Agent(AgentKind::Claude) => "C",
         ProcessKind::Agent(AgentKind::Codex) => "X",
+        // Not "C": that badge is Claude's, and every call site draws this in a one-character
+        // square, so a collision would make two different agents look identical at chip size.
+        ProcessKind::Agent(AgentKind::Cursor) => "U",
         ProcessKind::Shell => "$",
     }
 }
@@ -240,6 +247,7 @@ pub fn agent_icon_name(kind: ProcessKind) -> &'static str {
     match kind {
         ProcessKind::Agent(AgentKind::Claude) => "claude",
         ProcessKind::Agent(AgentKind::Codex) => "codex",
+        ProcessKind::Agent(AgentKind::Cursor) => "cursor",
         ProcessKind::Shell => "shell",
     }
 }
@@ -364,6 +372,44 @@ pub fn live_tab_label(title: Option<&str>, program: &str) -> String {
 /// two don't invent two different placeholder strings for the same "no branch" fact.
 pub fn new_agent_menu_secondary_text(branch: Option<&str>) -> String {
     format!("runs in {}", branch.unwrap_or("(detached)"))
+}
+
+/// Which control the agent picker popover (GitHub issue #463) is currently open off. Not a plain
+/// `bool`, because the popover is anchored to whichever control opened it and there is genuinely
+/// more than one: both `Start an agent` buttons can be in the tree at once, and the `+` menu's own
+/// `New agent` row opens the same list anchored to the `+` button instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentPickerAnchor {
+    /// A `Start an agent` split button's caret half, keyed by that button's element id
+    /// (`context-bar-start-agent` / `empty-state-start-agent`).
+    StartButton(&'static str),
+    /// The tab strip's `+` menu `New agent` row - anchored to the `+` button's own bounds, since
+    /// the menu the row lives in closes as the picker opens.
+    PlusMenu,
+}
+
+/// One agent picker row's secondary text: where this agent will run, or the real reason it can't.
+/// `installed` is three-state on purpose - `None` means the `$PATH` search
+/// (`crate::settings::state::detect_agent_rows`, the same one the Settings › Agents page shows)
+/// hasn't answered for this kind yet, which is not the same fact as "not installed" and must not
+/// be rendered as one.
+pub fn agent_picker_secondary_text(
+    installed: Option<bool>,
+    binary_name: &str,
+    branch: Option<&str>,
+) -> String {
+    match installed {
+        Some(false) => format!("{binary_name} not on PATH"),
+        Some(true) | None => new_agent_menu_secondary_text(branch),
+    }
+}
+
+/// Whether an agent picker row can be clicked: everything except a kind the `$PATH` search really
+/// came back negative for. A kind it hasn't answered for yet stays clickable - refusing a spawn on
+/// a search that simply hasn't finished would be a worse lie than letting the pane report a real
+/// `TerminalPane::spawn_error`.
+pub fn agent_picker_row_enabled(installed: Option<bool>) -> bool {
+    installed != Some(false)
 }
 
 /// A footer action button's colour treatment, backed by `theme::button::*`.
@@ -502,7 +548,59 @@ mod tests {
     fn agent_kinds_get_the_cli_chip_and_shell_gets_the_terminal_chip() {
         assert_eq!(tab_chip_kind(ProcessKind::claude()), TabChipKind::Cli);
         assert_eq!(tab_chip_kind(ProcessKind::codex()), TabChipKind::Cli);
+        assert_eq!(tab_chip_kind(ProcessKind::cursor()), TabChipKind::Cli);
         assert_eq!(tab_chip_kind(ProcessKind::Shell), TabChipKind::Term);
+    }
+
+    /// Every badge in this app is a one-character square, so two agents sharing a glyph read as
+    /// the same agent at chip size - the exact confusion the per-agent tint exists to prevent.
+    #[test]
+    fn no_two_process_kinds_share_a_badge_glyph_or_an_icon_name() {
+        let kinds = [
+            ProcessKind::claude(),
+            ProcessKind::codex(),
+            ProcessKind::cursor(),
+            ProcessKind::Shell,
+        ];
+        for (index, kind) in kinds.iter().enumerate() {
+            for other in &kinds[index + 1..] {
+                assert_ne!(
+                    agent_initial(*kind),
+                    agent_initial(*other),
+                    "{kind:?} and {other:?} draw the same badge glyph"
+                );
+                assert_ne!(
+                    agent_icon_name(*kind),
+                    agent_icon_name(*other),
+                    "{kind:?} and {other:?} resolve the same icon-pack file"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_picker_row_reports_the_real_path_search_and_never_guesses_at_an_unfinished_one() {
+        assert_eq!(
+            agent_picker_secondary_text(Some(true), "cursor-agent", Some("feature/x")),
+            "runs in feature/x"
+        );
+        assert_eq!(
+            agent_picker_secondary_text(Some(false), "cursor-agent", Some("feature/x")),
+            "cursor-agent not on PATH"
+        );
+        assert_eq!(
+            agent_picker_secondary_text(None, "cursor-agent", Some("feature/x")),
+            "runs in feature/x",
+            "a search that hasn't answered yet is not the same fact as \"not installed\", and \
+             must not be rendered as one"
+        );
+        assert!(agent_picker_row_enabled(Some(true)));
+        assert!(
+            agent_picker_row_enabled(None),
+            "a row must stay clickable while the search is still in flight - refusing the spawn \
+             there would be a worse lie than a real spawn error"
+        );
+        assert!(!agent_picker_row_enabled(Some(false)));
     }
 
     fn same(a: Rgba, b: Rgba) -> bool {

@@ -498,9 +498,9 @@ impl AdeApp {
 
     /// *Agents › Installed* - the designed card: agent badge, name, binary path, model, a
     /// `default` pill, a green dot and `ready`, then `Edit`. This app drops the
-    /// `model`/`default`/`Edit` pieces (see
-    /// `crate::settings::state`'s module docs for why) and shows [`settings::AGENT_KINDS`]'s two real
-    /// rows instead of the mockup's four fabricated ones, each with a live PATH-derived status.
+    /// `model`/`default`/`Edit` pieces (see `crate::settings::state`'s module docs for why) and
+    /// shows one real row per [`settings::AGENT_KINDS`] entry instead of the mockup's four
+    /// fabricated ones, each with a live PATH-derived status.
     pub(in crate::settings) fn render_settings_agents_page(
         &self,
         cx: &mut Context<Self>,

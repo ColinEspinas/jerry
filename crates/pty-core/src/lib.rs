@@ -23,12 +23,11 @@ use std::ffi::OsStr;
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-#[cfg(unix)]
 use std::time::Duration;
 #[cfg(unix)]
 use std::time::Instant;
@@ -104,6 +103,10 @@ pub enum PtyError {
     AlreadyShutDown,
     #[error("failed to signal child process: {0}")]
     Signal(String),
+    #[error("`{0}` did not finish within the timeout and was killed")]
+    CaptureTimeout(String),
+    #[error("`{0}` printed no usable line")]
+    CaptureEmpty(String),
 }
 
 /// Describes a process to spawn on a new PTY, plus the PTY's initial size.
@@ -166,6 +169,81 @@ impl SpawnOptions {
 /// passes a bare name. Both walk `$PATH` in the same order, so they agree in realistic cases.
 pub fn resolve_on_path(program: &str) -> Option<PathBuf> {
     resolve_in_path_var(&std::env::var_os("PATH")?, program)
+}
+
+/// Runs `program args` in `cwd` and returns the first non-empty line it prints to stdout, killing
+/// it and failing if it hasn't finished within `timeout`.
+///
+/// Blocking, like everything else here - call it off the UI thread. For helper commands that
+/// print one short line and exit; stdout is drained on its own thread, so a chattier command
+/// can't deadlock against a full pipe, but nothing here bounds how much it may print.
+///
+/// The timeout is not defensive padding. The real motivating case, `cursor-agent create-chat`,
+/// hangs indefinitely and prints nothing at all when the user isn't logged in - so a caller that
+/// merely waited would hang with it.
+///
+/// A timed-out command is torn down by [`windows_terminate_process_tree`] plus `Child::kill` on
+/// Windows, and by `Child::kill` alone on unix. The unix process-group teardown [`PtySession`]
+/// uses is deliberately not reused: nothing `setsid`s this child, so a `killpg` would signal the
+/// *caller's* group, Jerry included. A unix wrapper script's own child can therefore outlive the
+/// kill.
+pub fn capture_first_line(
+    program: &str,
+    args: &[&str],
+    cwd: &Path,
+    timeout: Duration,
+) -> Result<String, PtyError> {
+    let mut command = crate::command::new_std_command(program);
+    command
+        .args(args)
+        .current_dir(cwd)
+        // Never inherit this process's stdin: an interactive prompt would otherwise be able to
+        // block the helper forever on a terminal the user cannot see.
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut child = command
+        .spawn()
+        .map_err(|err| PtyError::Spawn(format!("{program}: {err}")))?;
+
+    let (sender, receiver) = mpsc::channel();
+    // `wait_with_output` consumes the child, so the kill path below can't hold it - it keeps a
+    // separate handle and signals by pid through `Child::kill`'s own stored handle instead.
+    let mut kill_handle = match child.stdout.take() {
+        Some(stdout) => {
+            let waiter = std::thread::spawn(move || {
+                let mut buffer = String::new();
+                let mut stdout = stdout;
+                let _ = std::io::Read::read_to_string(&mut stdout, &mut buffer);
+                let _ = sender.send(buffer);
+            });
+            drop(waiter);
+            child
+        }
+        None => {
+            return Err(PtyError::Spawn(format!(
+                "{program}: stdout was not captured"
+            )))
+        }
+    };
+
+    let captured = receiver.recv_timeout(timeout);
+    // Whatever happened, this helper has no further purpose - a timed-out one is still running.
+    // The tree kill first, because on Windows the direct kill reaches only a shim: `cursor-agent`
+    // is a `.cmd` wrapping a real `node.exe`, the same orphaning GitHub issue #468 fixed for pty
+    // children.
+    #[cfg(windows)]
+    windows_terminate_process_tree(kill_handle.id());
+    let _ = kill_handle.kill();
+    let _ = kill_handle.wait();
+
+    let captured = captured.map_err(|_| PtyError::CaptureTimeout(program.to_owned()))?;
+    captured
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| PtyError::CaptureEmpty(program.to_owned()))
 }
 
 /// [`resolve_on_path`]'s search loop, taking `PATH` as an argument so a test can pass an isolated
@@ -1468,5 +1546,90 @@ mod pty_session_tests {
             result, None,
             "a same-named directory on PATH must never be returned as a resolved binary"
         );
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::{capture_first_line, PtyError};
+    use std::time::{Duration, Instant};
+
+    /// A shell invocation that runs `script`, spelled for whichever shell this platform really
+    /// has - these tests are about [`capture_first_line`], not about which shell exists.
+    fn shell(script: &str) -> (&'static str, Vec<&str>) {
+        if cfg!(windows) {
+            ("cmd", vec!["/c", script])
+        } else {
+            ("sh", vec!["-c", script])
+        }
+    }
+
+    #[test]
+    fn the_first_line_a_command_prints_is_what_comes_back() {
+        let (program, args) = shell("echo 51a6b5fa-fbf4-4116-b44c-cd3e0aa35a5e");
+        let line = capture_first_line(
+            program,
+            &args,
+            &std::env::temp_dir(),
+            Duration::from_secs(30),
+        )
+        .expect("a shell echo should be captured");
+        assert_eq!(line, "51a6b5fa-fbf4-4116-b44c-cd3e0aa35a5e");
+    }
+
+    #[test]
+    fn a_command_that_never_finishes_is_killed_at_the_timeout() {
+        // The real motivating case: `cursor-agent create-chat` hangs forever, printing nothing,
+        // when the user is not logged in. Without the timeout the caller hangs with it.
+        // Spawned directly rather than through a shell: `Child::kill` reaches only the process it
+        // started, so a shell wrapper would be killed while its own sleeping child lived on.
+        let (program, args): (&str, Vec<&str>) = if cfg!(windows) {
+            ("ping", vec!["-n", "30", "127.0.0.1"])
+        } else {
+            ("sleep", vec!["30"])
+        };
+        let started = Instant::now();
+        let result = capture_first_line(
+            program,
+            &args,
+            &std::env::temp_dir(),
+            Duration::from_millis(300),
+        );
+        assert!(
+            matches!(result, Err(PtyError::CaptureTimeout(_))),
+            "a command that outlives its timeout must report the timeout, got {result:?}"
+        );
+        // Asserted by effect rather than by stopwatch precision: the point is that it returned
+        // long before the command's own 30s, not that it returned at exactly 300ms.
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the timeout must actually cut the wait short"
+        );
+    }
+
+    #[test]
+    fn a_command_that_prints_nothing_is_not_mistaken_for_a_result() {
+        let (program, args) = shell("exit 0");
+        let result = capture_first_line(
+            program,
+            &args,
+            &std::env::temp_dir(),
+            Duration::from_secs(30),
+        );
+        assert!(
+            matches!(result, Err(PtyError::CaptureEmpty(_))),
+            "silence must be an error, never an empty id, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn a_binary_that_does_not_exist_fails_instead_of_waiting() {
+        let result = capture_first_line(
+            "definitely-not-a-real-binary-xyz-pty-core-test",
+            &[],
+            &std::env::temp_dir(),
+            Duration::from_secs(30),
+        );
+        assert!(matches!(result, Err(PtyError::Spawn(_))), "got {result:?}");
     }
 }

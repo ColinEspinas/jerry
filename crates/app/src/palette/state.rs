@@ -113,6 +113,8 @@ pub enum PaletteCommand {
     NewClaudeAgent,
     /// `crate::root::AdeApp::new_agent(ProcessKind::codex(), ..)`.
     NewCodexAgent,
+    /// `crate::root::AdeApp::new_agent(ProcessKind::cursor(), ..)`.
+    NewCursorAgent,
     /// `crate::root::AdeApp::set_right_sidebar_view`, same as the `Files - Search - Changes`
     /// control.
     CycleRightPanel,
@@ -162,10 +164,11 @@ pub enum PaletteCommand {
 }
 
 impl PaletteCommand {
-    pub const ALL: [PaletteCommand; 13] = [
+    pub const ALL: [PaletteCommand; 14] = [
         PaletteCommand::NewShell,
         PaletteCommand::NewClaudeAgent,
         PaletteCommand::NewCodexAgent,
+        PaletteCommand::NewCursorAgent,
         PaletteCommand::CycleRightPanel,
         PaletteCommand::PruneWorktrees,
         PaletteCommand::OpenSettings,
@@ -189,6 +192,7 @@ impl PaletteCommand {
             PaletteCommand::NewShell => "New Shell",
             PaletteCommand::NewClaudeAgent => "New Claude Agent",
             PaletteCommand::NewCodexAgent => "New Codex Agent",
+            PaletteCommand::NewCursorAgent => "New Cursor Agent",
             PaletteCommand::CycleRightPanel => "Cycle Right Panel",
             PaletteCommand::PruneWorktrees => "Prune Worktrees",
             PaletteCommand::OpenSettings => "Open Settings",
@@ -209,6 +213,7 @@ impl PaletteCommand {
             PaletteCommand::NewShell => "shell terminal spawn agent",
             PaletteCommand::NewClaudeAgent => "claude agent spawn agent cli",
             PaletteCommand::NewCodexAgent => "codex agent spawn agent cli",
+            PaletteCommand::NewCursorAgent => "cursor agent spawn agent cli cursor-agent",
             PaletteCommand::CycleRightPanel => {
                 "files search changes find panel sidebar switch toggle tab"
             }
@@ -901,6 +906,7 @@ mod tests {
         assert!(labels.contains(&"New Shell"));
         assert!(labels.contains(&"New Claude Agent"));
         assert!(labels.contains(&"New Codex Agent"));
+        assert!(labels.contains(&"New Cursor Agent"));
         assert!(labels.contains(&"Prune Worktrees"));
         assert!(labels.contains(&"Open Settings"));
     }

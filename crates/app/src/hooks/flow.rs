@@ -3,7 +3,7 @@
 use gpui::{Context, Window};
 
 use crate::root::AdeApp;
-use crate::work_surface::agents::{AgentKind, ProcessKind};
+use crate::work_surface::agents::ProcessKind;
 
 impl AdeApp {
     /// Every currently open agent's own persisted-status key
@@ -55,16 +55,20 @@ impl AdeApp {
         let font_size = self.settings.appearance.terminal_font_size;
         let shell_override = self.settings.terminal.shell_override();
         let id = match (past.kind, past.session_id.clone()) {
-            (AgentKind::Claude, Some(session_id)) => self.agents.spawn_resume(
-                AgentKind::Claude,
-                past.worktree.clone(),
-                font_size,
-                shell_override,
-                hook_injection.as_ref(),
-                session_id,
-                window,
-                cx,
-            ),
+            // Every kind with a verified resume flag, not Claude alone - `spawn_resume` asks
+            // `AgentKind::resume_args` for the right spelling and spawns bare if there is none.
+            (kind, Some(session_id)) if kind.resume_args(&session_id).is_some() => {
+                self.agents.spawn_resume(
+                    kind,
+                    past.worktree.clone(),
+                    font_size,
+                    shell_override,
+                    hook_injection.as_ref(),
+                    session_id,
+                    window,
+                    cx,
+                )
+            }
             _ => self.agents.spawn(
                 process_kind,
                 past.worktree.clone(),
@@ -203,7 +207,10 @@ impl AdeApp {
                 let session_id = self
                     .hook_runtime
                     .as_ref()
-                    .and_then(|runtime| runtime.session_id_for(id));
+                    .and_then(|runtime| runtime.session_id_for(id))
+                    // A hookless kind carries its own id on the pane instead, minted before its
+                    // spawn - see `crate::work_surface::agents::Agent::session_id`.
+                    .or_else(|| self.agents.session_id_for(id).map(str::to_owned));
                 // GitHub issue #227: the run's own title and completed-turn count, from the same
                 // real hook stream and read ungated for the same reason as the session id - both
                 // describe the run, not the present (`HookListener::run_facts_for`).

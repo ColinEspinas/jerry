@@ -68,14 +68,23 @@ impl AdeApp {
             .collect()
     }
 
-    /// The real Claude Code `session_id` currently known for a live agent, or `None`.
+    /// The conversation id currently known for a live agent, or `None`.
+    ///
+    /// Two real sources, because the two kinds learn theirs differently: Claude's arrives on the
+    /// hook side-channel and lands in the persisted status record, while a hookless kind carries
+    /// its own on the pane from the moment it was minted
+    /// (`crate::work_surface::agents::Agent::session_id`). The pane is checked second so a hook
+    /// report, which reflects what the CLI itself believes, always wins.
     fn live_agent_session_id(
         &self,
         agent: &crate::work_surface::agents::Agent,
         kind: AgentKind,
     ) -> Option<String> {
         let key = crate::review::state::baseline_key(&agent.cwd, kind, agent.spawned_at_unix);
-        self.agent_status_state.get(&key)?.session_id.clone()
+        self.agent_status_state
+            .get(&key)
+            .and_then(|record| record.session_id.clone())
+            .or_else(|| agent.session_id.clone())
     }
 
     /// Reopens `cwd`'s persisted tab session for real - the read side of this module, and the one
@@ -152,12 +161,12 @@ impl AdeApp {
                     order.push(TabRef::Agent(id));
                 }
                 SessionTab::Agent {
-                    kind: AgentKind::Claude,
+                    kind,
                     session_id: Some(session_id),
-                } => {
-                    let hook_injection = self.hook_injection_for(ProcessKind::claude());
+                } if kind.resume_args(&session_id).is_some() => {
+                    let hook_injection = self.hook_injection_for(ProcessKind::Agent(kind));
                     let id = self.agents.spawn_resume(
-                        AgentKind::Claude,
+                        kind,
                         cwd.clone(),
                         self.settings.appearance.terminal_font_size,
                         self.settings.terminal.shell_override(),
@@ -171,7 +180,10 @@ impl AdeApp {
                 }
                 SessionTab::Agent { kind, session_id } => {
                     debug_assert!(
-                        session_id.is_none() || kind != AgentKind::Claude,
+                        session_id
+                            .as_deref()
+                            .and_then(|session_id| kind.resume_args(session_id))
+                            .is_none(),
                         "the resumable case is handled by the arm above"
                     );
                     self.note_session_restore_failure(format!(
@@ -302,8 +314,8 @@ mod session_restore_tests {
                     Some(match agent.kind {
                         ProcessKind::Shell => Slot::Shell,
                         ProcessKind::Agent(AgentKind::Claude) => Slot::Claude,
-                        ProcessKind::Agent(AgentKind::Codex) => {
-                            panic!("no test here spawns a Codex agent into a live strip")
+                        ProcessKind::Agent(AgentKind::Codex | AgentKind::Cursor) => {
+                            panic!("no test here spawns a Codex or Cursor agent into a live strip")
                         }
                     })
                 }

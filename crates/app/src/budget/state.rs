@@ -88,6 +88,11 @@ pub fn provider_of(kind: ProcessKind) -> Option<Provider> {
         ProcessKind::Shell => None,
         ProcessKind::Agent(AgentKind::Claude) => Some(Provider::Claude),
         ProcessKind::Agent(AgentKind::Codex) => Some(Provider::Codex),
+        // Cursor spends a real budget, but nothing here can read it: the popover's numbers come
+        // from `crate::budget::fetch`'s real Claude/Codex endpoints, and there is no Cursor
+        // equivalent wired up. `None` is the honest answer - a third row here would be a
+        // fabricated one.
+        ProcessKind::Agent(AgentKind::Cursor) => None,
     }
 }
 

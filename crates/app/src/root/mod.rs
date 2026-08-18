@@ -2001,6 +2001,15 @@ pub struct AdeApp {
     /// directly off this rather than a second, independently-computed offset that could drift
     /// once the rail's adjustable width shifts the button. `Bounds::default()` until first paint.
     pub(crate) plus_button_bounds: gpui::Bounds<Pixels>,
+    /// Which control the agent picker popover is open off, if any (GitHub issue #463) - see
+    /// [`Self::render_agent_picker_menu`]. Closed exactly the way [`Self::plus_menu_open`] is.
+    pub(crate) agent_picker_open: Option<work_surface::AgentPickerAnchor>,
+    /// Each `Start an agent` button's painted bounds, captured every render the same
+    /// `gpui::canvas` way [`Self::plus_button_bounds`] is, keyed by that button's element id.
+    /// A map rather than one field because both buttons (the agent context bar's and the empty
+    /// pane's) can be in the tree at once, and a single slot would hold whichever painted last
+    /// rather than the one actually clicked. Empty until first paint.
+    pub(crate) agent_picker_button_bounds: HashMap<&'static str, gpui::Bounds<Pixels>>,
     /// Which of the Windows/Linux title bar's five menu labels ([`crate::title_bar::menu::TitleMenu::ALL`])
     /// has its real dropdown open right now, if any - see [`crate::title_bar::menu::render_title_menu`]'s own
     /// docs. Closed the same way [`Self::plus_menu_open`] is: its own scrim click, picking a row,
@@ -2961,6 +2970,13 @@ impl Render for AdeApp {
             .child(self.render_status_bar(cx))
             .when(self.plus_menu_open, |el| {
                 el.child(self.render_plus_menu(cx))
+            })
+            // The `Start an agent` split button's agent picker (GitHub issue #463) - a
+            // window-positioned overlay for exactly the reason `render_plus_menu` is one: it is
+            // placed off its opener's `gpui::canvas`-captured window-space bounds, so `.absolute()`
+            // positioning built from them is only correct as a direct child of this root element.
+            .when(self.agent_picker_open.is_some(), |el| {
+                el.child(self.render_agent_picker_menu(cx))
             })
             // The status bar's Resources popover (GitHub issue #293) - a window-positioned
             // overlay for exactly the reason `render_plus_menu` is one: it is placed off the
