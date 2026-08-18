@@ -18,10 +18,13 @@ verified — the only two mentions of `gpui` in this crate are comments explaini
 ## `pty-core`
 
 **Scope.** Spawning and driving a PTY-backed child process (`portable-pty`), and nothing about what
-happens to the bytes that come out of it.
+happens to the bytes that come out of it — plus the workspace's "how children are spawned on this
+OS" helpers that aren't PTY-specific (`resolve_on_path`, `new_std_command`).
 
 **Owns.** `PtySession`, `SpawnOptions`, process lifecycle (`kill`, `pause`, `resume`, `try_wait`).
-Output is exposed as a plain `std::sync::mpsc::Receiver<Vec<u8>>`.
+Output is exposed as a plain `std::sync::mpsc::Receiver<Vec<u8>>`. Also `new_std_command`, the one
+sanctioned constructor for every non-PTY `std::process::Command` in the workspace — it suppresses
+the per-spawn console window on Windows GUI-subsystem release builds (decisions.md §10).
 
 **Does not own.** ANSI/terminal-grid parsing (that's `crates/app/src/terminal/`), any git concern,
 any gpui dependency.

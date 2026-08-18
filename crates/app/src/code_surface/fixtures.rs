@@ -42,7 +42,9 @@ impl TempRepo {
 
 pub(in crate::code_surface) fn temp_repo() -> TempRepo {
     let dir = tempfile::tempdir().expect("tempdir");
-    let root = dir.path().canonicalize().expect("canonicalize tempdir");
+    // `dunce`, matching `canonical_repo_path` - std's Windows `\\?\` spelling breaks git
+    // (GitHub issue #467).
+    let root = dunce::canonicalize(dir.path()).expect("canonicalize tempdir");
     TempRepo { _dir: dir, root }
 }
 

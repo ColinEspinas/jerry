@@ -25,15 +25,25 @@ pub fn spawn_file_tree_watcher(
     wt_core::git_common_dir(worktree_root).ok()?;
     // The OS reports every event path resolved (macOS `FSEvents` hands back `/private/var/...` for
     // a watch armed on `/var/...`), so a `.git` prefix built from an unresolved root would match
-    // nothing and every one of git's own internal writes would mark the tree dirty.
+    // nothing and every one of git's own internal writes would mark the tree dirty. `dunce`
+    // rather than `std::fs` so the prefix carries no Windows verbatim `\\?\` spelling — the same
+    // form `canonical_repo_path` keys the app by (GitHub issue #467).
     let resolved =
-        std::fs::canonicalize(worktree_root).unwrap_or_else(|_| worktree_root.to_path_buf());
+        dunce::canonicalize(worktree_root).unwrap_or_else(|_| worktree_root.to_path_buf());
     let git_dir: PathBuf = resolved.join(".git");
 
     let mut watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
         let Ok(event) = result else {
             return;
         };
+        // Reads never dirty the tree. Load-bearing on Linux, not defensive: inotify's watch mask
+        // includes `IN_OPEN`, so the Changes-pane refresh *reading* worktree files to diff them
+        // surfaces as `Access` events from this recursive watch - which used to re-dirty the
+        // flag and schedule the next refresh, a self-sustaining loop (GitHub issue #466's
+        // sibling). A real change always also emits Modify/Create/Remove/rename.
+        if matches!(event.kind, notify::EventKind::Access(_)) {
+            return;
+        }
         // Only a change with at least one real path outside `.git/` counts - see the module docs
         // on why `.git/`'s own churn must never mark the tree dirty.
         let outside_git = event.paths.iter().any(|path| !path.starts_with(&git_dir));
@@ -102,6 +112,25 @@ mod file_tree_watcher_tests {
 
         fs::remove_file(&created).expect("remove");
         assert!(wait_until_dirty(&dirty), "a deletion must be observed");
+    }
+
+    /// The Linux half of GitHub issue #466's sibling loop: the Changes-pane refresh *reads*
+    /// worktree files to diff them, inotify reports each open as an `Access` event from this
+    /// recursive watch, and that used to schedule the next refresh - forever. Reading must
+    /// never dirty the tree; only the other backends' silence made this look fixed elsewhere.
+    #[test]
+    fn merely_reading_a_worktree_file_never_marks_the_tree_dirty() {
+        let dir = seed_repo();
+        let tracked = dir.path().join("file.txt");
+
+        let dirty: DirtyFlag = Arc::new(AtomicBool::new(false));
+        let _watcher =
+            spawn_file_tree_watcher(dir.path(), dirty.clone()).expect("spawn_file_tree_watcher");
+
+        let contents = fs::read(&tracked).expect("read a real tracked file");
+        assert!(!contents.is_empty(), "seed_repo writes real content");
+
+        assert_stays_clean(&dirty);
     }
 
     #[test]

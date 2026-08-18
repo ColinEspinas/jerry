@@ -2,13 +2,21 @@
 # the Rust actually used to build this workspace.
 msrv = "1.95.0"
 
-# `disallowed-methods` is deliberately empty, not populated with `std::process::Command::new`
-# to enforce ADR 0003 (render.rs must dispatch a Command/Query, never call an adapter or shell
-# out directly): that method has other, legitimate call sites in this crate today (opening a
-# path in the OS file manager, relaunching the updater) that a blanket disallow would also
-# flag, and clippy.toml has no way to scope a disallowed method to specific files. A type-aware
-# version of this check needs the glob-import cleanup ADR 0003 itself names as the prerequisite.
-# In the meantime, `.claude/hooks/check-conventions.sh` enforces a coarser but real textual
-# ratchet on the same rule (and on new `use super::*` globs) - it needs no glob cleanup first,
-# runs in the pre-commit hook and in CI, and is documented in docs/architecture/decisions.md (§3).
-disallowed-methods = []
+# GitHub issue #465: the release binary is a GUI-subsystem process on Windows
+# (`windows_subsystem = "windows"` in `crates/app/src/main.rs`), where a console-subsystem
+# child spawned with default creation flags allocates its own *visible* console window per
+# spawn. `pty_core::new_std_command` is the one constructor that sets CREATE_NO_WINDOW there
+# (and is the identity elsewhere); it carries the workspace's only sanctioned bare
+# `Command::new`, behind a scoped `#[allow]`. This ban used to be impossible - legitimate call
+# sites (the OS open handler, the updater relaunch) would have been flagged with no way to
+# scope them out - but all of them now construct through the helper, so the objection is gone.
+# Test modules stay exempt via each crate root's `cfg_attr(test, allow(...))` (and
+# `test-support`'s crate-level allow): the test runner owns a console its children inherit.
+#
+# This is narrower than ADR 0003 (render.rs must dispatch a Command/Query, never call an
+# adapter or shell out directly) - that rule still needs the glob-import cleanup before a
+# type-aware lint can express it, and `.claude/hooks/check-conventions.sh` keeps enforcing its
+# coarser textual ratchet (plus the `use super::*` one) in pre-commit and CI.
+disallowed-methods = [
+    { path = "std::process::Command::new", reason = "flashes a visible console window per spawn in the windows_subsystem=\"windows\" release build (GitHub issue #465) - construct through `pty_core::new_std_command` instead" },
+]

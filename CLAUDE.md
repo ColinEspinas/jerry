@@ -83,6 +83,11 @@ either rule already holds everywhere.
   uses `gix` directly for reads and `std::process::Command` with explicit `&[&str]`/`&[OsString]`
   argv for the real `git` CLI. This matters for correctness (filenames with spaces/quotes), not just
   safety.
+- **Every non-PTY child process is constructed through `pty_core::new_std_command`, never a bare
+  `std::process::Command::new`.** The release binary is a GUI-subsystem process on Windows, where a
+  bare-constructed console child flashes its own visible console window per spawn (issue #465).
+  Enforced by `clippy.toml`'s `disallowed-methods`; test modules are exempt via each crate root's
+  `cfg_attr(test, allow(...))`. See `docs/architecture/decisions.md` §10.
 - **Every user-visible count goes through `crates/app/src/root/plural.rs`.** `plural::count(n,
   "file", None)` / `plural::form(n, "needs", "need")` — never `if n == 1 { "" } else { "s" }` at a
   call site, and never a hardcoded plural noun. Zero is plural in English and the helper knows that.

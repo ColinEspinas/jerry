@@ -27,7 +27,7 @@ pub fn tab_order_path_for(settings_path: &Path) -> PathBuf {
 /// The map key for one worktree - see `crate::sidebar::fold_state::worktree_key`'s own docs for
 /// the identical canonicalization/UTF-8 reasoning, copied here unchanged.
 pub fn worktree_key(root: &Path) -> Option<String> {
-    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let canonical = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     canonical.to_str().map(str::to_owned)
 }
 

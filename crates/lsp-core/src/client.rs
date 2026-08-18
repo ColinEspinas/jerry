@@ -18,7 +18,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -228,7 +228,8 @@ pub struct LspClient {
     connection_alive: Arc<AtomicBool>,
 }
 
-/// Resolves a bare `binary` name to the absolute path [`LspClient::spawn`] hands `Command::new`,
+/// Resolves a bare `binary` name to the absolute path [`LspClient::spawn`] hands
+/// [`pty_core::new_std_command`],
 /// through the same [`pty_core::resolve_on_path`] callers use to decide a server is installed.
 ///
 /// Resolving first is load-bearing on Windows. `std::process::Command` does its own lookup there,
@@ -274,7 +275,10 @@ impl LspClient {
 
         let name = config.name;
         let resolved_binary = resolve_server_binary(name, config.binary)?;
-        let mut command = Command::new(resolved_binary);
+        // Through `pty_core::new_std_command`, so a `.cmd`-shim server (which `std` launches
+        // via a console-subsystem `cmd.exe` host) opens no console window on Windows release
+        // builds (GitHub issue #465).
+        let mut command = pty_core::new_std_command(resolved_binary);
         command
             .args(&config.args)
             .current_dir(&repo_root)
@@ -1250,6 +1254,7 @@ fn run_stderr_drain_loop(stderr: std::process::ChildStderr, server: &'static str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use std::time::Instant;
     // Only `IncomingHarness` uses this, and it is `#[cfg(unix)]` - the import has to carry the
     // same gate or it is an unused import on Windows.
@@ -1261,9 +1266,17 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let resolved = canonicalize(dir.path()).expect("a real, existing directory must resolve");
         assert!(resolved.is_dir());
+        assert!(resolved.is_absolute());
+        // Same directory identity as std's answer - without demanding std's *spelling*, which
+        // on Windows is the verbatim `\\?\C:\...` form this function exists to avoid.
         assert_eq!(
-            resolved,
+            std::fs::canonicalize(&resolved).expect("std canonicalize of the resolved path"),
             std::fs::canonicalize(dir.path()).expect("std canonicalize")
+        );
+        #[cfg(windows)]
+        assert!(
+            !resolved.to_string_lossy().starts_with(r"\\?\"),
+            "the verbatim prefix breaks file:// URIs and must be simplified away, got {resolved:?}"
         );
     }
 
@@ -2660,7 +2673,7 @@ mod tests {
 
         assert_eq!(
             round_tripped,
-            path.canonicalize().expect("canonicalize"),
+            canonicalize(&path).expect("canonicalize"),
             "converting a real path to a URI and back should yield the same real, canonical path"
         );
         // `LspClient::path_for_uri` is a thin wrapper over the same logic - confirm

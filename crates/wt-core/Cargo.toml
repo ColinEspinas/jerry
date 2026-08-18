@@ -15,6 +15,12 @@ thiserror = { workspace = true }
 # Used at runtime (not just in tests) by `diff::prepare_shadow_index` to build a throwaway
 # copy of the real index for `git diff`'s untracked-file handling - see that function's docs.
 tempfile = "3"
+# Sole use: `new_std_command`, the workspace's one constructor for non-PTY child processes,
+# which suppresses the per-spawn console window on Windows GUI-subsystem release builds
+# (GitHub issue #465). The constructor must live in exactly one place, and pty-core owns
+# process spawning (docs/architecture/crates.md) - the portable-pty it drags along is already
+# in this workspace's build graph either way.
+pty-core = { path = "../pty-core" }
 # Fixed-length, collision-free ref-name components for `review::baseline_ref_name`. Raw hex
 # encoding of the key doubled its length and pushed real, ordinary worktree paths past the
 # filesystem's 255-byte `NAME_MAX` for a loose ref's filename, which failed baseline capture

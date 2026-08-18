@@ -769,8 +769,11 @@ pub(crate) enum ShadowIndexContent {
     TrackedOnly,
 }
 
-/// Filename prefix marking a shadow index as this app's, should a killed process leave one behind.
-const SHADOW_INDEX_PREFIX: &str = ".jerry-shadow-index-";
+/// Filename prefix marking a shadow index as this app's, should a killed process leave one
+/// behind. Public so a filesystem watcher over the git directory can recognize this crate's
+/// own churn (the tempfile and git's `<name>.lock` sidecar both carry it) and not re-trigger
+/// on every diff this app itself computes (GitHub issue #466).
+pub const SHADOW_INDEX_PREFIX: &str = ".jerry-shadow-index-";
 
 /// Creates the throwaway index file, beside `real_index_path` in the worktree's git directory.
 ///

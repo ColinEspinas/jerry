@@ -11,8 +11,12 @@
 //! crate's resolved version, deliberately not `vendor/zed`'s GPL fork. Framing itself is not
 //! something `lsp-types` defines; see [`transport`].
 
-// Only production code is held to `unwrap_used`/`expect_used`; see `CLAUDE.md`.
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+// Only production code is held to `unwrap_used`/`expect_used` and the bare-`Command::new`
+// ban (`clippy.toml`, GitHub issue #465); see `CLAUDE.md`.
+#![cfg_attr(
+    test,
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)
+)]
 
 mod client;
 // Unix-only: the `/proc` walk and `nix` signals have no Windows equivalent, so `client.rs` uses

@@ -5248,7 +5248,7 @@ mod caret_alignment_tests {
         crate::code_surface::fixtures::TempRepo,
     ) {
         let repo = temp_repo();
-        let root = repo.path().canonicalize().expect("canonical tempdir");
+        let root = dunce::canonicalize(repo.path()).expect("canonical tempdir");
         let file_path = root.join("dense.rs");
         std::fs::write(&file_path, format!("fn main() {{\n{DENSE_LINE}\n}}\n")).expect("write");
         let (app, cx) = open_test_app(cx, root.clone());

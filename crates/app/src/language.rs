@@ -211,7 +211,9 @@ fn vue_typescript_plugin_location() -> Result<String, String> {
          bundled `@vue/typescript-plugin`; none found"
             .to_string()
     })?;
-    let script = std::fs::canonicalize(&binary).map_err(|err| {
+    // `dunce`, not `std::fs`: the resolved location is handed to a Node-based server as a plain
+    // path argument, and std's Windows verbatim `\\?\` spelling breaks there (GitHub issue #467).
+    let script = dunce::canonicalize(&binary).map_err(|err| {
         format!(
             "could not resolve the real `vue-language-server` script behind {}: {err}",
             binary.display()

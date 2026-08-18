@@ -66,7 +66,10 @@ pub(crate) fn temp_repo_with(seed: impl FnOnce(&Path)) -> TempRoot {
 }
 
 fn canonicalized(dir: tempfile::TempDir) -> TempRoot {
-    let root = dir.path().canonicalize().expect("canonicalize tempdir");
+    // `dunce`, matching `crate::rail::repo::canonical_repo_path`: std's Windows spelling is the
+    // verbatim `\\?\C:\...` form, which git rejects - a fixture carrying it fails every
+    // `git worktree add`/`git add` in setup (GitHub issue #467).
+    let root = dunce::canonicalize(dir.path()).expect("canonicalize tempdir");
     TempRoot { _dir: dir, root }
 }
 

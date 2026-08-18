@@ -12,6 +12,10 @@
 // Every function here runs inside a consumer's `#[cfg(test)]` code, where a broken fixture must
 // abort the test with a diagnostic rather than propagate a `Result` nobody can act on.
 #![allow(clippy::expect_used)]
+// Bare `Command::new` (banned in production by `clippy.toml`, GitHub issue #465) is fine here:
+// fixtures run under the console-subsystem test runner, whose children inherit its console, so
+// no window can flash - and routing through the helper would couple this crate to `pty-core`.
+#![allow(clippy::disallowed_methods)]
 
 mod child;
 mod git;
