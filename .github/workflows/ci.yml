@@ -43,6 +43,10 @@ env:
   # holds for whatever this workflow grows to run - see
   # `crate::budget::state::DISABLE_PROVIDER_POLL_ENV`.
   JERRY_DISABLE_PROVIDER_POLL: "1"
+  # The update check hits the public GitHub releases API. No credential is involved, but it still
+  # makes the suite depend on network reachability and GitHub's rate limiter. Same crate-boundary
+  # reasoning as the variable above - see `crate::updater::state::DISABLE_UPDATE_CHECK_ENV`.
+  JERRY_DISABLE_UPDATE_CHECK: "1"
 
 jobs:
   # The platform-independent half of the gate, and the only job that is not tied to an OS.
