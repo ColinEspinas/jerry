@@ -1,7 +1,9 @@
 //! Resolves the user's real login-shell `PATH` when this process was launched by something that
 //! hands it a minimal one (macOS Finder / launchd, a Linux `.desktop` entry) rather than a
 //! terminal. Unix only - Windows processes inherit the same PATH a terminal would use, so the
-//! problem this exists to fix does not occur there.
+//! problem this exists to fix does not occur there. An MSYS shell's `/usr/bin` is a separate
+//! matter - not a PATH entry at all, but a mount `/etc/profile` establishes - and is handled by
+//! starting that shell as a login shell where it is spawned, not here.
 //!
 //! `crates/app/src/main.rs` is the only intended caller: it merges the result into the real
 //! process environment before `app::run`, so every spawned agent PTY inherits it too.

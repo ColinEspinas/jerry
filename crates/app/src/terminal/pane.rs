@@ -156,16 +156,14 @@ pub struct TerminalSpec {
 }
 
 impl TerminalSpec {
-    /// The user's shell, no extra arguments - GitHub issue #50 (real, `/bin/bash` unconditional
-    /// even on Windows): `$SHELL` is a real Unix environment-variable convention that Windows
-    /// itself never sets, so the fallback needs its own real Windows equivalent rather than the
-    /// same Unix path unconditionally, which is a real path (`/bin/bash`) that doesn't exist on
-    /// Windows at all - every default-shell spawn there was trying, and failing, to launch it.
+    /// The user's configured shell, or this platform's default, started with whatever
+    /// [`shell_startup_args`] decides that program needs.
     pub fn shell(cwd: PathBuf, configured: Option<&str>) -> Self {
+        let program =
+            configured_shell_program(configured).unwrap_or_else(Self::default_shell_program);
         Self {
-            program: configured_shell_program(configured)
-                .unwrap_or_else(Self::default_shell_program),
-            args: Vec::new(),
+            args: shell_startup_args(&program),
+            program,
             cwd,
             env: Vec::new(),
         }
@@ -249,6 +247,45 @@ fn configured_shell_program(configured: Option<&str>) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Shells that take `-l` to mean "login shell", matched on the program's file stem. An allowlist,
+/// so an unrecognized shell keeps the existing no-argument spawn rather than being handed a flag it
+/// may reject and failing to start at all.
+const POSIX_LOGIN_SHELL_STEMS: [&str; 10] = [
+    "bash", "sh", "dash", "ash", "zsh", "fish", "ksh", "mksh", "csh", "tcsh",
+];
+
+/// How `program` has to be started on this platform: on Windows a POSIX shell is started as a
+/// *login* shell (GitHub issue #452), and everywhere else nothing is added.
+///
+/// An MSYS shell (Git for Windows, MSYS2, Cygwin) reaches `/usr/bin` - `ls`, `clear`, `cat` - only
+/// through a mount `/etc/profile` establishes, and only a login shell reads `/etc/profile`; the
+/// `~/.bashrc` an interactive non-login shell does read sets up none of it. On Unix `/usr/bin` is
+/// already on a real `PATH` and `pty_core::login_shell` already covers the GUI-launch case, so
+/// `-l` would only change which rc files an existing user's shell reads.
+///
+/// `cfg!` rather than `#[cfg]` so both branches compile - and stay testable - on either host.
+fn shell_startup_args(program: &Path) -> Vec<String> {
+    if cfg!(windows) {
+        posix_login_shell_args(program)
+    } else {
+        Vec::new()
+    }
+}
+
+/// The `-l` decision, matched case- and `.exe`-insensitively.
+fn posix_login_shell_args(program: &Path) -> Vec<String> {
+    let is_posix_shell = program
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| POSIX_LOGIN_SHELL_STEMS.contains(&stem.to_ascii_lowercase().as_str()));
+
+    if is_posix_shell {
+        vec!["-l".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
 /// GitHub issue #50's real regression guard: the Windows fallback must be a real Windows path
 /// (`cmd.exe`), never the Unix `/bin/bash` [`TerminalSpec::shell`] used to fall back to
 /// unconditionally - `$SHELL` is a Unix-only convention Windows never sets, so every Windows
@@ -299,11 +336,11 @@ mod shell_program_tests {
             PathBuf::from("/usr/local/bin/fish"),
             "an absolute path must be used verbatim, not searched for on PATH"
         );
-        assert!(
-            TerminalSpec::shell(cwd.clone(), Some("fish"))
-                .args
-                .is_empty(),
-            "a configured shell is launched exactly like the default one: no extra arguments"
+        assert_eq!(
+            TerminalSpec::shell(cwd.clone(), Some("fish")).args,
+            shell_startup_args(Path::new("fish")),
+            "a configured shell is launched exactly like the default one - the startup arguments \
+             follow from the program, never from whether the user typed it or Jerry chose it"
         );
         assert_eq!(
             TerminalSpec::shell(cwd.clone(), Some("fish")).cwd,
@@ -329,6 +366,122 @@ mod shell_program_tests {
         assert_eq!(
             configured_shell_program(Some("  zsh  ")),
             Some(PathBuf::from("zsh"))
+        );
+    }
+
+    /// GitHub issue #452's actual regression. An MSYS shell (Git for Windows, MSYS2, Cygwin)
+    /// reaches `/usr/bin` - `ls`, `clear`, `cat`, `grep` - only via a mount `/etc/profile`
+    /// establishes, and only a login shell reads `/etc/profile`. Spawned without `-l`, every one
+    /// of those is `command not found` while builtins like `cd` still work.
+    #[test]
+    fn a_posix_shell_is_recognized_however_it_is_spelled_and_a_native_windows_one_never_is() {
+        for program in [
+            "bash",
+            "bash.exe",
+            "BASH.EXE",
+            r"C:\Program Files\Git\usr\bin\bash.exe",
+            r"C:\Program Files\Git\bin\bash.exe",
+            "/bin/sh",
+            "/usr/bin/zsh",
+            "fish",
+            "dash.exe",
+            "tcsh",
+        ] {
+            assert_eq!(
+                posix_login_shell_args(Path::new(program)),
+                vec!["-l".to_string()],
+                "{program} is a POSIX shell, so it must be started as a login shell"
+            );
+        }
+
+        for program in [
+            "cmd.exe",
+            r"C:\Windows\System32\cmd.exe",
+            "CMD.EXE",
+            "powershell.exe",
+            "pwsh.exe",
+            "nu",
+            "definitely-not-a-real-shell-xyz",
+            "bash-with-a-suffix",
+        ] {
+            assert!(
+                posix_login_shell_args(Path::new(program)).is_empty(),
+                "{program} is not a POSIX shell - handing it `-l` risks a flag it rejects, which \
+                 would turn a working terminal into one that cannot spawn at all"
+            );
+        }
+    }
+
+    /// The platform split: `-l` is a Windows-only repair. On Unix `/usr/bin` is a real directory on
+    /// a real `PATH`, an interactive non-login shell already reads `~/.bashrc`, and
+    /// `pty_core::login_shell` already merges a login `PATH` into the process environment - so
+    /// adding `-l` there would only change which rc files an existing user's shell reads.
+    #[test]
+    fn only_windows_starts_a_posix_shell_as_a_login_shell() {
+        let bash = shell_startup_args(Path::new("bash"));
+
+        #[cfg(windows)]
+        assert_eq!(
+            bash,
+            vec!["-l".to_string()],
+            "Windows is the platform where a non-login MSYS shell genuinely cannot find `ls`"
+        );
+        #[cfg(unix)]
+        assert!(
+            bash.is_empty(),
+            "Unix shells already start with a usable PATH; `-l` would only change rc-file loading"
+        );
+
+        assert!(
+            shell_startup_args(Path::new("cmd.exe")).is_empty(),
+            "the default Windows shell must be spawned exactly as it is today"
+        );
+        assert!(
+            shell_startup_args(Path::new("powershell.exe")).is_empty(),
+            "PowerShell finds `ls` through its own aliases and takes no `-l`"
+        );
+    }
+
+    /// GitHub issue #452 end to end, against a real installed bash: started with the arguments
+    /// [`TerminalSpec::shell`] actually chose, and given only the bare Windows `PATH` a
+    /// GUI-launched process really inherits, the shell can still find `ls` - a binary that lives
+    /// under MSYS's `/usr/bin` and is reachable only once `/etc/profile` has run.
+    ///
+    /// `PATH` is set explicitly rather than inherited so the assertion means the same thing on a
+    /// developer machine that happens to have `Git\usr\bin` on `PATH` already and on one that does
+    /// not. Only the positive is asserted: Git for Windows ships both a raw `usr\bin\bash.exe` and
+    /// a `bin\bash.exe` wrapper that sets the MSYS `PATH` up by itself, so "fails without `-l`"
+    /// would depend on which of the two this host resolves.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "external: bash.exe (Git for Windows/MSYS2); needs a real MSYS install"]
+    fn a_real_login_bash_reaches_usr_bin_from_a_bare_windows_path() {
+        let Some(bash) = pty_core::resolve_on_path("bash.exe") else {
+            panic!("this test tier requires a real bash.exe on PATH");
+        };
+
+        let spec = TerminalSpec::shell(std::env::temp_dir(), Some(&bash.display().to_string()));
+        assert_eq!(
+            spec.args,
+            vec!["-l".to_string()],
+            "a real installed bash must be started as a login shell"
+        );
+
+        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+        let output = pty_core::new_std_command(&spec.program)
+            .args(&spec.args)
+            .args(["-c", "command -v ls"])
+            .env("PATH", format!(r"{system_root}\System32;{system_root}"))
+            .current_dir(&spec.cwd)
+            .output()
+            .expect("a real bash.exe must run");
+
+        assert!(
+            output.status.success(),
+            "a login shell must reach /usr/bin even from a bare Windows PATH - this failing is \
+             exactly the `ls: command not found` GitHub issue #452 reports; stdout={:?} stderr={:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
         );
     }
 
