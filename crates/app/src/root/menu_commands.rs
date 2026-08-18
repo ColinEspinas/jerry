@@ -74,8 +74,13 @@ impl AdeApp {
                     && self.worktree_history_op_in_flight
                         != Some(worktree_history::WorktreeHistoryOpKind::Keep)
             }
+            // GitHub issue #462: the active agent's own checkout has to be one git will really
+            // remove. The main checkout is not, so this row is disabled on it rather than left to
+            // fail after the discard has already torn that agent down.
             MenuCommand::DiscardWorktree => {
-                self.agents.active_id().is_some()
+                self.agents
+                    .active()
+                    .is_some_and(|agent| !self.is_main_worktree_path(&agent.cwd))
                     && self.worktree_history_op_in_flight
                         != Some(worktree_history::WorktreeHistoryOpKind::Discard)
             }
@@ -488,6 +493,65 @@ mod menu_command_tests {
                 .menu_command_enabled(MenuCommand::ArchiveAgent)),
             "Archive Agent must be disabled once every real agent has been archived"
         );
+    }
+
+    /// GitHub issue #462: the Agent menu's `Discard Worktree` is the third door onto
+    /// `crate::worktree_history::flow`'s discard, and `git worktree remove` refuses the main
+    /// checkout - so an agent sitting in it must not be offered the row.
+    #[gpui::test]
+    fn discard_worktree_is_disabled_for_an_agent_in_the_main_checkout(cx: &mut TestAppContext) {
+        let repo = crate::test_support::temp_repo();
+        let container = crate::test_support::temp_root();
+        let feature = container.path().join("feature-wt");
+        test_support::git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                feature.to_str().expect("utf8 path"),
+            ],
+        );
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.agents.active().map(|agent| agent.cwd.clone()),
+                Some(repo.path().to_path_buf()),
+                "premise: the startup agent really sits in the repo's own main checkout"
+            );
+            assert!(
+                !app.menu_command_enabled(MenuCommand::DiscardWorktree),
+                "Discard Worktree must be disabled on the one checkout git refuses to remove"
+            );
+        });
+
+        app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                crate::work_surface::agents::ProcessKind::Shell,
+                feature.clone(),
+                app.settings.appearance.terminal_font_size,
+                app.settings.terminal.shell_override(),
+                None,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.agents.active().map(|agent| agent.cwd.clone()),
+                Some(feature.clone()),
+                "premise: the new agent really sits in the linked worktree"
+            );
+            assert!(
+                app.menu_command_enabled(MenuCommand::DiscardWorktree),
+                "and a worktree git will really remove keeps a real, runnable row"
+            );
+        });
     }
 
     #[gpui::test]

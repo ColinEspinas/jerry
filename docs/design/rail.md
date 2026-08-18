@@ -112,6 +112,12 @@ as a fact rather than an inference.
   loaded and genuinely-empty are different states and get different copy.
 - **Worktree inventory and its prune action belong here**, not in the status bar — one fact, one
   home.
+- **No removal affordance is offered on a repo's main checkout.** `git worktree remove` refuses it,
+  and the discard behind `Remove worktree…` kills that checkout's agents and language servers
+  *before* git gets to say no. The row still paints, disabled and carrying its reason
+  (`menu::REMOVE_MAIN_WORKTREE_REASON`) — a menu that changes shape per row costs more than one
+  greyed line. The pane footer's `Discard worktree` and the title bar's `Discard Worktree` read the
+  same predicate (`AdeApp::is_main_worktree_path`), so the three doors cannot drift.
 
 ## Not built yet
 

@@ -28,6 +28,21 @@ impl AdeApp {
             .unwrap_or_else(|| path.display().to_string())
     }
 
+    /// Whether `path` is a repository's own main checkout - the one worktree `git worktree remove`
+    /// refuses outright, and so the one [`Self::execute_discard_worktree_path`] can never succeed
+    /// on (`wt_core::undo::discard_worktree`'s `DiscardSourceIsMainWorktree`). Every removal
+    /// affordance consults this, so the refusal lands before that method's agent/language-server
+    /// teardown rather than after it. Reads the focused repo's list first and then every other
+    /// added repo's, because a rail row menu can be opened on a worktree belonging to a repo that
+    /// isn't focused. An unknown path is not main: a worktree list that hasn't loaded yet must not
+    /// disable a real action.
+    pub(crate) fn is_main_worktree_path(&self, path: &Path) -> bool {
+        self.worktrees
+            .iter()
+            .chain(self.repos.iter().flat_map(|repo| repo.worktrees.iter()))
+            .any(|item| item.path == path && item.is_main)
+    }
+
     /// Refreshes worktree/diff state after a real git mutation (keep/discard both change what's
     /// on disk) - the same `load_worktrees` + `load_diff` pair `Self::complete_merge_flow`'s own
     /// success arm already uses for the identical reason.

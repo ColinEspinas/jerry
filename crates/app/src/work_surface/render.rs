@@ -2467,6 +2467,15 @@ impl AdeApp {
             {
                 enabled = false;
             }
+            // GitHub issue #462: an agent whose cwd *is* the repository's main checkout has
+            // nothing this button can discard - `git worktree remove` refuses it, and
+            // `Self::execute_discard_worktree_path` would kill this agent and the worktree's
+            // language servers on the way to finding that out.
+            if action.kind == work_surface::ActionKind::DiscardWorktree
+                && self.is_main_worktree_path(&agent.cwd)
+            {
+                enabled = false;
+            }
             // Busy labels are keyed off the *specific* in-flight kind, not just "something is
             // running" - a real, live-reproduced bug an audit caught: keying this off the bare
             // in-flight flag alone made every visible `Discard worktree` button across every
@@ -5587,6 +5596,57 @@ mod agent_pane_readout_tests {
             worktree_path.exists(),
             "and an armed-but-unconfirmed discard must not have touched the real worktree"
         );
+    }
+
+    /// GitHub issue #462: the same failed run, in the repository's own main checkout. The button
+    /// still paints (its strip is the one `Status::Fail` defines), but it is inert - `git
+    /// worktree remove` refuses that checkout, and arming would only lead to a discard that kills
+    /// this agent and the worktree's language servers before git says no.
+    ///
+    /// `#[cfg(unix)]` for the same reason as the test above: a real `/bin/false` child.
+    #[cfg(unix)]
+    #[gpui::test]
+    fn a_failed_run_in_the_main_checkout_cannot_arm_its_discard(cx: &mut TestAppContext) {
+        let repo = crate::test_support::temp_repo();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+        let id = spawn_and_select(&app, cx, repo.path().to_path_buf(), Some("/bin/false"));
+        wait_for_exit(&app, cx, id);
+        app.update(cx, |app, cx| {
+            app.agents.set_kind_for_test(id, ProcessKind::claude());
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, cx| {
+            let agent = app
+                .agents
+                .iter()
+                .find(|agent| agent.id == id)
+                .expect("the spawned agent");
+            assert_eq!(
+                app.agent_status(agent, cx),
+                Status::Fail,
+                "premise: the run really failed, so the strip really offers the button"
+            );
+            assert!(
+                app.is_main_worktree_path(&agent.cwd),
+                "premise: and it really failed in the repo's own main checkout"
+            );
+        });
+
+        let discard = cx
+            .debug_bounds("footer-action-DiscardWorktree")
+            .expect("the button still paints - disabled, not hidden");
+        cx.simulate_click(discard.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.discard_confirm_armed),
+            None,
+            "a disabled button must not arm a discard that could never succeed"
+        );
+        assert!(repo.path().exists(), "and the main checkout is untouched");
     }
 
     #[gpui::test]
