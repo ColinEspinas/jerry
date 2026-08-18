@@ -558,6 +558,12 @@ pub fn ahead_behind_against_base(worktree_path: &Path) -> Result<Option<AheadBeh
     // `refs/remotes/origin/HEAD`, a bare `main...HEAD` resolves to a local `refs/heads/main`
     // first, which may be stale and would under-report how far behind the worktree is.
     // `...` computes the merge-base itself and reports `<behind>\t<ahead>`.
+    //
+    // A deliberate CLI holdout from GitHub issue #473's gix migration: gix 0.68's
+    // `rev_walk(..).with_pruned(..)` stops at the pruned *tip* plus a commit-time cutoff rather
+    // than excluding the pruned side's full ancestry the way `--not` does, so it counts
+    // common-history commits and cannot reproduce `--left-right --count` (verified against this
+    // module's own diverged-history tests).
     let args: Vec<OsString> = vec![
         "rev-list".into(),
         "--left-right".into(),
@@ -579,6 +585,97 @@ fn parse_ahead_behind_counts(text: &str) -> Option<AheadBehind> {
     let behind = parts.next().and_then(|part| part.parse::<usize>().ok())?;
     let ahead = parts.next().and_then(|part| part.parse::<usize>().ok())?;
     Some(AheadBehind { ahead, behind })
+}
+
+/// A cheap, spawn-free fingerprint of the git-side inputs the Changes panel's reload reads:
+/// `HEAD`'s resolved commit, the real index file's identity, every ref (loose and packed,
+/// common-dir wide, so another worktree moving the base branch registers too), and
+/// merge/rebase state.
+///
+/// **Worktree content is deliberately out of scope** — a plain file edit changes none of this —
+/// so a caller may only skip work on an unchanged fingerprint when a filesystem watcher covers
+/// the working tree itself (GitHub issue #473).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangesFingerprint {
+    head_commit: Option<String>,
+    /// The `HEAD` *file* itself, not just its peeled commit: a same-tip branch switch
+    /// (`git switch main` while the feature branch sits on main's commit) rewrites only this
+    /// file, yet flips [`diff_against_base`]'s whole on-base/off-base answer.
+    head_file: Option<(std::time::SystemTime, u64)>,
+    /// The main worktree's `HEAD`, which [`detect_default_base`]'s last resort reads.
+    main_head_file: Option<(std::time::SystemTime, u64)>,
+    index: Option<(std::time::SystemTime, u64)>,
+    packed_refs: Option<(std::time::SystemTime, u64)>,
+    loose_refs: Vec<(PathBuf, std::time::SystemTime, u64)>,
+    /// `config` (diff/base behavior can hinge on it) and `shallow` (history depth) - cheap to
+    /// stat, expensive to be stale about.
+    config: Option<(std::time::SystemTime, u64)>,
+    shallow: Option<(std::time::SystemTime, u64)>,
+    merge_head: bool,
+    rebase_merge: bool,
+    rebase_apply: bool,
+}
+
+/// Computes [`ChangesFingerprint`] for `worktree_path`. Blocking (gix open + a handful of
+/// `stat`s over `refs/`), but never a child process.
+pub fn changes_fingerprint(worktree_path: &Path) -> Result<ChangesFingerprint, Error> {
+    let repo = open_repo(worktree_path)?;
+    let mut head = repo
+        .head()
+        .map_err(|source| Error::Head(Box::new(source)))?;
+    let head_commit = head
+        .try_peel_to_id_in_place()
+        .map_err(|source| Error::PeelHead(Box::new(source)))?
+        .map(|id| id.to_string());
+
+    let meta = |path: &Path| -> Option<(std::time::SystemTime, u64)> {
+        let metadata = std::fs::metadata(path).ok()?;
+        Some((metadata.modified().ok()?, metadata.len()))
+    };
+
+    let index = meta(&repo.index_path());
+    let common_dir = repo.common_dir().to_path_buf();
+    let packed_refs = meta(&common_dir.join("packed-refs"));
+    let mut loose_refs = Vec::new();
+    collect_loose_ref_meta(&common_dir.join("refs"), &mut loose_refs);
+    loose_refs.sort();
+
+    let git_dir = repo.git_dir();
+    Ok(ChangesFingerprint {
+        head_commit,
+        head_file: meta(&git_dir.join("HEAD")),
+        main_head_file: meta(&common_dir.join("HEAD")),
+        index,
+        packed_refs,
+        loose_refs,
+        config: meta(&common_dir.join("config")),
+        shallow: meta(&common_dir.join("shallow")),
+        merge_head: git_dir.join("MERGE_HEAD").exists(),
+        rebase_merge: git_dir.join("rebase-merge").exists(),
+        rebase_apply: git_dir.join("rebase-apply").exists(),
+    })
+}
+
+/// Recursively records `(path, mtime, len)` for every file under `dir` — the loose-ref store is
+/// dozens of tiny files at most, so this stays trivially cheap. Unreadable entries are skipped:
+/// a fingerprint that errs toward "changed" only costs one extra reload.
+fn collect_loose_ref_meta(dir: &Path, out: &mut Vec<(PathBuf, std::time::SystemTime, u64)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            collect_loose_ref_meta(&path, out);
+        } else if let Ok(metadata) = entry.metadata() {
+            if let Ok(modified) = metadata.modified() {
+                out.push((path, modified, metadata.len()));
+            }
+        }
+    }
 }
 
 /// Detects the repository's default branch and its tip, per the module docs' order.
@@ -812,19 +909,13 @@ pub(crate) fn prepare_shadow_index(
     worktree_path: &Path,
     content: ShadowIndexContent,
 ) -> Result<tempfile::TempPath, Error> {
-    let index_path_args: Vec<OsString> =
-        vec!["rev-parse".into(), "--git-path".into(), "index".into()];
-    let output = run_git(worktree_path, &index_path_args)?;
-    check_success(&index_path_args, &output)?;
-    let printed = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let real_index_path = {
-        let candidate = PathBuf::from(&printed);
-        if candidate.is_absolute() {
-            candidate
-        } else {
-            worktree_path.join(candidate)
-        }
-    };
+    // gix, not a `git rev-parse --git-path index` child: this runs inside every diff of every
+    // worktree/agent on the app's 3s status poll and 5s Changes refresh, so the answer must not
+    // cost a process spawn (GitHub issue #473). `Repository::index_path()` resolves a linked
+    // worktree's private `.git/worktrees/<name>/index` the same way rev-parse does; the
+    // `GIT_INDEX_FILE` override rev-parse would honour is already scrubbed from every git child
+    // this crate spawns (`GIT_ENV_OVERRIDES`), so the two never disagreed here.
+    let real_index_path = open_repo(worktree_path)?.index_path();
 
     let shadow = shadow_index_file(&real_index_path)?;
     // Decided here, acted on only after the handle is closed below.
@@ -2429,6 +2520,78 @@ index 0000000..fedcba9
             "well-formed output must still parse normally"
         );
     }
+
+    #[test]
+    fn changes_fingerprint_is_stable_until_git_state_moves_and_ignores_plain_edits() {
+        let repo = test_support::seed_repo();
+        let first = changes_fingerprint(repo.path()).expect("fingerprint");
+        assert_eq!(
+            first,
+            changes_fingerprint(repo.path()).expect("fingerprint"),
+            "an untouched repository must fingerprint identically twice"
+        );
+
+        // The documented contract: worktree content is out of scope, the watcher covers it.
+        std::fs::write(repo.path().join("file.txt"), "edited, not staged").expect("write");
+        assert_eq!(
+            first,
+            changes_fingerprint(repo.path()).expect("fingerprint"),
+            "a plain, unstaged file edit must not change the fingerprint"
+        );
+
+        test_support::git(repo.path(), &["add", "file.txt"]);
+        let staged = changes_fingerprint(repo.path()).expect("fingerprint");
+        assert_ne!(
+            first, staged,
+            "staging rewrites the index and must register"
+        );
+
+        test_support::git(repo.path(), &["commit", "-q", "-m", "edit"]);
+        let committed = changes_fingerprint(repo.path()).expect("fingerprint");
+        assert_ne!(staged, committed, "a commit moves HEAD and must register");
+
+        // A same-tip branch switch rewrites only the HEAD file - no ref moves (the branch
+        // already exists), no new commit - yet flips diff_against_base's on-base/off-base
+        // answer, so it must register.
+        test_support::git(repo.path(), &["branch", "same-tip"]);
+        let before_switch = changes_fingerprint(repo.path()).expect("fingerprint");
+        test_support::git(repo.path(), &["switch", "-q", "same-tip"]);
+        assert_ne!(
+            before_switch,
+            changes_fingerprint(repo.path()).expect("fingerprint"),
+            "a branch switch to the same commit must register via the HEAD file itself"
+        );
+    }
+
+    #[test]
+    fn changes_fingerprint_registers_a_ref_moved_from_another_worktree() {
+        let repo = test_support::seed_repo();
+        let container = test_support::TempDir::new().expect("tempdir");
+        let linked = container.path().join("other-wt");
+        test_support::git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "other-branch",
+                linked.to_str().expect("utf8 path"),
+            ],
+        );
+
+        let before = changes_fingerprint(repo.path()).expect("fingerprint");
+        test_support::write_file(&linked, "other.txt", "content");
+        test_support::git(&linked, &["add", "other.txt"]);
+        test_support::git(&linked, &["commit", "-q", "-m", "moved elsewhere"]);
+
+        assert_ne!(
+            before,
+            changes_fingerprint(repo.path()).expect("fingerprint"),
+            "a branch tip moved from another worktree lives in the shared common dir and must \
+             register - it can change this worktree's base diff"
+        );
+    }
+
     /// A feature branch with one real commit of its own plus one still-uncommitted edit - the
     /// shape that makes the three Changes-panel scopes give three genuinely different answers
     /// (GitHub issue #285).

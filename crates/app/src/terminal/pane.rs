@@ -656,6 +656,20 @@ impl TerminalPane {
         }
     }
 
+    /// Hands the live session to the caller for teardown *sequenced with other work*, unlike
+    /// [`Self::shutdown`]'s detached fire-and-forget. The one caller is the worktree discard
+    /// flow (GitHub issue #470), which must have every process in the worktree confirmed dead
+    /// **before** deleting the directory - on Windows a live child's cwd holds an open handle
+    /// that makes the removal half-fail. The pane renders as exited from this point on.
+    pub fn take_session_for_teardown(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<pty_core::PtySession> {
+        self._task = None;
+        cx.notify();
+        self.session.take()
+    }
+
     /// `true` while a child process is alive (spawned and not yet observed to have exited).
     /// The rail's status derivation (`crate::rail::status::derive_status`) uses this to distinguish
     /// a still-running session from one that has exited or never started.

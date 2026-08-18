@@ -13,6 +13,9 @@ workspace = true
 portable-pty = "0.9.0"
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+# One warn-level line when Windows's `taskkill /T` tree-kill cannot run at all (see
+# `windows_terminate_process_tree`) - the same version every other crate here pins.
+log = "0.4"
 # The self-pipe (unix) `PtySession::shutdown_write` field's type - a real, already-resolved
 # transitive dep of `portable-pty` 0.9.0 on every platform (its own Windows backend uses it
 # too, see `portable-pty-0.9.0/src/win/conpty.rs`), so this is unconditional even though only

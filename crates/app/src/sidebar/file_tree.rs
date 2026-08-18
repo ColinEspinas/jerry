@@ -125,6 +125,179 @@ impl FileTreeListing {
 /// gracefully. Anything cut off here marks the listing [`FileTreeListing::partial`].
 pub const MAX_DEPTH: usize = 64;
 
+/// The listing the Files tab and palette actually load: git's own answer to "what does this
+/// worktree contain" (`wt_core::worktree_files`, decisions.md §6) - tracked plus
+/// untracked-unignored files - falling back to the real [`build_file_tree`] walk for a root
+/// that is not a git worktree.
+///
+/// Sourcing from git rather than walking is what keeps this from descending into gitignored
+/// build output: on a checkout with a populated `target/` (or the vendored zed tree) the walk
+/// was hundreds of thousands of `read_dir` results per reload, re-run at least every 5s
+/// (GitHub issue #472). The visible delta is deliberate and matches decisions.md §6's
+/// definition of content: gitignored files and empty directories no longer appear.
+pub fn build_worktree_file_tree(root: &Path) -> io::Result<FileTreeListing> {
+    build_worktree_file_tree_inner(root, SUBMODULE_RECURSION_BUDGET)
+}
+
+/// How many levels of nested submodules are grafted before the listing is marked partial
+/// instead - a defensive bound against a submodule cycle, not a product decision.
+const SUBMODULE_RECURSION_BUDGET: usize = 8;
+
+fn build_worktree_file_tree_inner(
+    root: &Path,
+    submodule_budget: usize,
+) -> io::Result<FileTreeListing> {
+    let list = match wt_core::worktree_files::list_worktree_files(root) {
+        Ok(list) => list,
+        // Only a genuinely non-git root falls back to the walk. Inside a real repository a
+        // transient git failure must surface as the error it is - silently swapping to the
+        // gitignore-blind walk for one cycle would flash a tree with target/ in it and pay
+        // the full-walk cost issue #472 removes.
+        Err(err) if root.join(".git").exists() => {
+            return Err(io::Error::other(err.to_string()));
+        }
+        Err(_) => return build_file_tree(root),
+    };
+    // A submodule's gitlink record is indistinguishable from a file in the plain listing, and
+    // its contents are a separate repository the listing never descends into - so gitlinks are
+    // typed as directories here and their own listings grafted underneath, preserving what the
+    // old filesystem walk showed. Failing to enumerate them (an older git, a corrupt module)
+    // only loses the typing, which the grafting loop then records as a partial listing.
+    let submodules = wt_core::worktree_files::list_submodule_paths(root).unwrap_or_default();
+    let (mut entries, mut partial) = entries_from_git_listing(root, &list, &submodules);
+
+    for submodule in &submodules {
+        let sub_root: PathBuf = {
+            let mut path = root.to_path_buf();
+            path.extend(submodule.split('/'));
+            path
+        };
+        let Some(index) = entries
+            .iter()
+            .position(|entry| entry.is_dir && entry.path == sub_root)
+        else {
+            // Dot-filtered or depth-cut - already accounted for at insertion.
+            continue;
+        };
+        if submodule_budget == 0 {
+            partial = true;
+            continue;
+        }
+        match build_worktree_file_tree_inner(&sub_root, submodule_budget - 1) {
+            Ok(child) => {
+                partial |= child.partial;
+                let base_depth = entries[index].depth + 1;
+                let grafted: Vec<FileTreeEntry> = child
+                    .tree
+                    .iter()
+                    .cloned()
+                    .map(|mut entry| {
+                        entry.depth += base_depth;
+                        entry
+                    })
+                    .collect();
+                entries.splice(index + 1..index + 1, grafted);
+            }
+            // An uninitialized or unreadable submodule keeps its directory row but its
+            // contents are genuinely unknown.
+            Err(_) => partial = true,
+        }
+    }
+
+    Ok(FileTreeListing {
+        tree: FileTree::new(entries),
+        partial,
+    })
+}
+
+/// [`entries_from_git_listing`] wrapped as a finished listing, with no submodule typing - the
+/// pure, directly-testable shape.
+#[cfg(test)]
+fn from_git_listing(
+    root: &Path,
+    list: &wt_core::worktree_files::WorktreeFileList,
+) -> FileTreeListing {
+    let (entries, partial) = entries_from_git_listing(root, list, &[]);
+    FileTreeListing {
+        tree: FileTree::new(entries),
+        partial,
+    }
+}
+
+/// Assembles pre-order entries from `list`'s worktree-relative `/`-separated paths: the same
+/// dirs-first-then-alphabetical order and the same dot-prefixed-name filter as the
+/// [`build_file_tree`] walk, so the two sources render identically where they overlap. Paths in
+/// `submodules` are typed as directories (their content is grafted by the caller). A path
+/// deeper than [`MAX_DEPTH`] is dropped at insertion - bounding the trie itself, not just the
+/// emission - and marks the listing partial.
+fn entries_from_git_listing(
+    root: &Path,
+    list: &wt_core::worktree_files::WorktreeFileList,
+    submodules: &[String],
+) -> (Vec<FileTreeEntry>, bool) {
+    #[derive(Default)]
+    struct Node {
+        children: std::collections::BTreeMap<String, Node>,
+        is_dir: bool,
+    }
+
+    let mut top = Node::default();
+    let mut partial = list.truncated;
+    let mut insert = |path: &str, force_dir: bool, partial: &mut bool| {
+        if path
+            .split('/')
+            .any(|component| component.starts_with('.') || component.is_empty())
+        {
+            return;
+        }
+        if path.split('/').count() > MAX_DEPTH {
+            *partial = true;
+            return;
+        }
+        let mut node = &mut top;
+        let mut components = path.split('/').peekable();
+        while let Some(component) = components.next() {
+            let is_last = components.peek().is_none();
+            node = node.children.entry(component.to_string()).or_default();
+            node.is_dir |= !is_last || force_dir;
+        }
+    };
+    for file in &list.files {
+        insert(file, false, &mut partial);
+    }
+    for submodule in submodules {
+        insert(submodule, true, &mut partial);
+    }
+
+    fn emit(node: &Node, dir: &Path, depth: usize, walk: &mut Walk) {
+        if depth >= MAX_DEPTH {
+            walk.partial = true;
+            return;
+        }
+        let (dirs, files): (Vec<_>, Vec<_>) =
+            node.children.iter().partition(|(_, child)| child.is_dir);
+        for (name, child) in dirs.into_iter().chain(files) {
+            let path = dir.join(name);
+            walk.entries.push(FileTreeEntry {
+                path: path.clone(),
+                name: name.clone(),
+                depth,
+                is_dir: child.is_dir,
+            });
+            if child.is_dir {
+                emit(child, &path, depth + 1, walk);
+            }
+        }
+    }
+
+    let mut walk = Walk {
+        entries: Vec::new(),
+        partial,
+    };
+    emit(&top, root, 0, &mut walk);
+    (walk.entries, walk.partial)
+}
+
 /// Recursively lists `root`'s contents (directories first, then alphabetically within each
 /// group) as a flattened, depth-annotated list suitable for indented rendering.
 pub fn build_file_tree(root: &Path) -> io::Result<FileTreeListing> {
@@ -279,6 +452,161 @@ pub fn indent_guide_x(level: usize) -> f32 {
 
 /// `render_tree_caret`'s real width - see [`indent_guide_x`].
 const CARET_WIDTH: f32 = 8.0;
+
+#[cfg(test)]
+mod git_listing_tree_tests {
+    use crate::sidebar::file_tree::{build_worktree_file_tree, from_git_listing, MAX_DEPTH};
+    use std::fs;
+    use std::path::Path;
+    use tempfile::TempDir;
+    use wt_core::worktree_files::WorktreeFileList;
+
+    fn listing_of(files: &[&str]) -> WorktreeFileList {
+        WorktreeFileList {
+            files: files.iter().map(|file| file.to_string()).collect(),
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn assembles_dirs_first_then_files_with_depths_from_git_paths() {
+        let root = Path::new("root");
+        let tree = from_git_listing(
+            root,
+            &listing_of(&["src/nested/a.rs", "src/lib.rs", "b.txt", "README.md"]),
+        );
+        assert!(tree.is_complete());
+        let shape: Vec<(&str, usize, bool)> = tree
+            .tree
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.depth, entry.is_dir))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("src", 0, true),
+                ("nested", 1, true),
+                ("a.rs", 2, false),
+                ("lib.rs", 1, false),
+                ("README.md", 0, false),
+                ("b.txt", 0, false),
+            ],
+            "same dirs-first, alphabetical-within-group order the walk produces"
+        );
+        assert_eq!(
+            tree.tree.iter().next().expect("first entry").path,
+            root.join("src")
+        );
+    }
+
+    #[test]
+    fn a_dot_prefixed_component_hides_the_whole_path_matching_the_walks_filter() {
+        let tree = from_git_listing(
+            Path::new("root"),
+            &listing_of(&[".github/ci.yml", "src/.hidden/x.rs", "src/real.rs"]),
+        );
+        let names: Vec<&str> = tree.tree.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, vec!["src", "real.rs"]);
+    }
+
+    #[test]
+    fn a_truncated_git_listing_is_an_incomplete_inventory() {
+        let mut listing = listing_of(&["a.txt"]);
+        listing.truncated = true;
+        assert!(
+            !from_git_listing(Path::new("root"), &listing).is_complete(),
+            "fold-state pruning must never treat a byte-capped listing as the whole truth"
+        );
+    }
+
+    #[test]
+    fn a_pathologically_deep_path_is_cut_at_max_depth_and_marked_partial() {
+        let deep = vec!["d"; MAX_DEPTH + 5].join("/") + "/file.txt";
+        let tree = from_git_listing(Path::new("root"), &listing_of(&[deep.as_str()]));
+        assert!(!tree.is_complete());
+        assert!(tree.tree.iter().all(|entry| entry.depth < MAX_DEPTH));
+    }
+
+    #[test]
+    fn a_real_repos_gitignored_build_output_is_not_walked_or_listed() {
+        let repo = test_support::seed_repo();
+        fs::write(repo.path().join(".gitignore"), "target/\n").expect("write");
+        test_support::git(repo.path(), &["add", ".gitignore"]);
+        test_support::git(repo.path(), &["commit", "-q", "-m", "ignore target"]);
+        fs::create_dir_all(repo.path().join("target/debug")).expect("mkdir");
+        fs::write(repo.path().join("target/debug/artifact.o"), "junk").expect("write");
+        fs::write(repo.path().join("untracked.rs"), "// new").expect("write");
+
+        let tree = build_worktree_file_tree(repo.path()).expect("build_worktree_file_tree");
+        let names: Vec<&str> = tree.tree.iter().map(|entry| entry.name.as_str()).collect();
+        assert!(
+            !names.contains(&"target"),
+            "gitignored build output must not appear (decisions.md §6), got {names:?}"
+        );
+        assert!(
+            names.contains(&"untracked.rs"),
+            "an untracked, unignored file is real content and must appear, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn a_submodules_contents_are_grafted_under_a_directory_typed_row() {
+        let sub = test_support::seed_empty_repo();
+        fs::write(sub.path().join("inner.rs"), "// inner\n").expect("write");
+        test_support::git(sub.path(), &["add", "inner.rs"]);
+        test_support::git(sub.path(), &["commit", "-q", "-m", "inner"]);
+
+        let outer = test_support::seed_repo();
+        test_support::git(
+            outer.path(),
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                sub.path().to_str().expect("utf8 path"),
+                "vendored",
+            ],
+        );
+
+        let tree = build_worktree_file_tree(outer.path()).expect("build_worktree_file_tree");
+        let vendored = tree
+            .tree
+            .iter()
+            .find(|entry| entry.name == "vendored")
+            .expect("the submodule must appear");
+        assert!(
+            vendored.is_dir,
+            "a gitlink is a directory, not a file with a language chip"
+        );
+        let inner = tree
+            .tree
+            .iter()
+            .find(|entry| entry.name == "inner.rs")
+            .expect("the submodule's own contents must appear, as the old walk showed them");
+        assert_eq!(inner.depth, vendored.depth + 1);
+    }
+
+    #[test]
+    fn a_git_failure_inside_a_real_repo_is_an_error_not_a_silent_walk() {
+        let dir = TempDir::new().expect("tempdir");
+        // A `.git` directory that is not a repository: `git ls-files` fails here, and the
+        // fallback walk must NOT paper over that - it would silently show a differently-shaped
+        // (gitignore-blind) tree for one cycle.
+        fs::create_dir(dir.path().join(".git")).expect("mkdir");
+        fs::write(dir.path().join("loose.txt"), "x").expect("write");
+        assert!(build_worktree_file_tree(dir.path()).is_err());
+    }
+
+    #[test]
+    fn a_plain_non_git_directory_still_lists_via_the_walk_fallback() {
+        let dir = TempDir::new().expect("tempdir");
+        fs::write(dir.path().join("loose.txt"), "x").expect("write");
+        let tree = build_worktree_file_tree(dir.path()).expect("build_worktree_file_tree");
+        let names: Vec<&str> = tree.tree.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, vec!["loose.txt"]);
+    }
+}
 
 #[cfg(test)]
 mod file_tree_walk_tests {

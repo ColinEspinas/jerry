@@ -2,12 +2,23 @@
 //! real switch behind it, and the Problems view it switches to.
 
 use super::*;
+use std::path::Path;
+
 use crate::icons::{IconRow, IconSize};
 use crate::lsp::client::LspClientState;
 use crate::lsp::diagnostics as diagnostics_view;
 use crate::rail::strip::{self, Problem, ProblemTally, SidebarView, StripCell, StripMarker};
 use crate::root::scrollbar;
 use crate::root::widgets::text_tooltip;
+
+/// Memo behind [`AdeApp::worktree_problems`] - see `AdeApp::problems_cache`'s own field docs.
+/// Holds the derived list plus exactly the inputs whose movement invalidates it.
+#[derive(Default)]
+pub(crate) struct ProblemsCache {
+    root: Option<std::path::PathBuf>,
+    generations: Vec<(std::path::PathBuf, &'static str, u64)>,
+    problems: std::rc::Rc<Vec<Problem>>,
+}
 
 impl AdeApp {
     /// Switches the sidebar to `view`.
@@ -28,11 +39,56 @@ impl AdeApp {
     }
 
     /// Every diagnostic the app really knows about in the currently selected worktree, worst
-    /// first, then by file and position.
-    pub(in crate::rail) fn worktree_problems(&self) -> Vec<Problem> {
+    /// first, then by file and position — memoized on `AdeApp::problems_cache`, recomputed only
+    /// when the worktree or some Ready client's diagnostics generation moved. This runs on
+    /// every render, and the uncached version cloned every diagnostic and `stat`ed every
+    /// diagnosed file per frame (GitHub issue #471).
+    pub(in crate::rail) fn worktree_problems(&self) -> std::rc::Rc<Vec<Problem>> {
         let Some(root) = self.current_worktree_path() else {
-            return Vec::new();
+            return std::rc::Rc::default();
         };
+        let mut generations: Vec<(PathBuf, &'static str, u64)> = self
+            .lsp_clients
+            .iter()
+            .filter_map(|((client_root, server), state)| match state {
+                LspClientState::Ready(client) if client_root == &root => Some((
+                    client_root.clone(),
+                    *server,
+                    client.diagnostics_generation(),
+                )),
+                _ => None,
+            })
+            .collect();
+        // `lsp_clients` is a `HashMap`; a stable order is what makes generation equality mean
+        // "nothing changed" rather than "same clients, different iteration order".
+        generations.sort();
+        {
+            let cache = self.problems_cache.borrow();
+            if cache.root.as_ref() == Some(&root) && cache.generations == generations {
+                return std::rc::Rc::clone(&cache.problems);
+            }
+        }
+        let problems = std::rc::Rc::new(self.compute_worktree_problems(&root));
+        *self.problems_cache.borrow_mut() = ProblemsCache {
+            root: Some(root),
+            generations,
+            problems: std::rc::Rc::clone(&problems),
+        };
+        problems
+    }
+
+    /// Drops the memo so the next [`Self::worktree_problems`] call recomputes. Called by the
+    /// file-tree watcher's event arm: diagnostics generations can't see *worktree* changes, and
+    /// the existence filter below must re-run once a published-about file may have been
+    /// deleted out from under its server (the watcher is how the real app notices that).
+    pub(crate) fn invalidate_problems_cache(&self) {
+        self.problems_cache.borrow_mut().root = None;
+    }
+
+    /// The real recomputation behind [`Self::worktree_problems`] — the only place the
+    /// per-diagnostic clones and the per-file existence `stat`s happen.
+    fn compute_worktree_problems(&self, root: &Path) -> Vec<Problem> {
+        let root = root.to_path_buf();
         // A diagnostic's uri is whatever real path the *server* opened, and `lsp_core`'s own
         // `path_to_uri` canonicalises on the way in - so a checkout reached through a symlink
         // (macOS' `/var` -> `/private/var`, or a worktree directory someone symlinked) yields
@@ -926,8 +982,8 @@ mod problems_view_tests {
     /// The list the view is really showing, as `(file, line, severity)` triples.
     fn rows(app: &AdeApp) -> Vec<(String, u32, diagnostics_view::Severity)> {
         app.worktree_problems()
-            .into_iter()
-            .map(|problem| (problem.file, problem.line, problem.severity))
+            .iter()
+            .map(|problem| (problem.file.clone(), problem.line, problem.severity))
             .collect()
     }
 
@@ -1264,7 +1320,16 @@ mod problems_view_tests {
         let root = repo.path().to_path_buf();
         let (doomed, doomed_uri) = real_file(&root, "src/scratch.rs", "fn tmp() {}\n");
 
-        let (app, cx) = crate::test_support::open_test_app(cx, root.clone());
+        // A real settings path, not `open_test_app`'s `None`: `start_file_tree_watch` refuses to
+        // arm without one, and this test's whole subject is that watcher noticing the deletion
+        // (see the problems memo, GitHub issue #471).
+        let settings_dir = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app_with_settings(
+            cx,
+            root.clone(),
+            crate::settings::store::Settings::default(),
+            Some(settings_dir.path().join("settings.toml")),
+        );
         cx.run_until_parked();
 
         let server = spawn_fake_server(&root, "rust-analyzer", "normal");
@@ -1285,17 +1350,25 @@ mod problems_view_tests {
         );
 
         // The server is never told. This is the real condition: an agent (or a `git checkout`)
-        // removes a file, and the server's own published map still names it.
+        // removes a file, and the server's own published map still names it. The problems memo
+        // (GitHub issue #471) only re-checks existence once the real file-tree watcher notices
+        // the worktree changed, so this drives that whole path: the deletion reaches the OS
+        // watcher in real time (`wait_until`'s bounded real-time loop), and `advance_clock`
+        // ticks the watch loop's own timer arm.
         std::fs::remove_file(&doomed).expect("remove the file");
+        let gone = test_support::wait_until(std::time::Duration::from_secs(5), || {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(600));
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| app.worktree_problems().is_empty())
+        });
+        assert!(
+            gone,
+            "the server still publishes it; the checkout no longer contains it - the row must \
+             drop once the file-tree watcher reports the deletion"
+        );
         app.update(cx, |_app, cx| cx.notify());
         cx.run_until_parked();
-
-        app.read_with(cx, |app, _| {
-            assert!(
-                app.worktree_problems().is_empty(),
-                "the server still publishes it; the checkout no longer contains it"
-            );
-        });
         assert!(
             cx.debug_bounds("sidebar-problems-row-0").is_none(),
             "so the row must be gone"

@@ -342,6 +342,7 @@ impl AdeApp {
             find_bar_focus_handle: cx.focus_handle(),
             diff_state: DiffLoadState::Loading,
             diff_totals: None,
+            problems_cache: std::cell::RefCell::default(),
             diff_reload_in_flight: false,
             agent_reviews: HashMap::new(),
             review_baseline_state,
@@ -543,6 +544,7 @@ impl AdeApp {
             prune_confirm_armed: false,
             prune_in_flight: false,
             worktree_history_op_in_flight: None,
+            discarding_worktree: None,
             worktree_history_status: None,
             update_state: updater::state::UpdateState::Idle,
             update_check_in_flight: false,
@@ -1325,7 +1327,9 @@ impl AdeApp {
         self.start_file_tree_watch(cx);
     }
 
-    /// Walks [`Self::file_tree_root`] and applies the result, off the foreground thread.
+    /// Loads [`Self::file_tree_root`]'s listing and applies the result, off the foreground
+    /// thread — from git's own content answer, walking the filesystem only for a non-git root
+    /// (see `file_tree::build_worktree_file_tree`, GitHub issue #472).
     pub(crate) fn load_file_tree(&mut self, root: PathBuf, cx: &mut Context<Self>) {
         self.set_file_tree_root(root.clone(), cx);
         let task = cx.spawn(async move |this, cx| {
@@ -1333,7 +1337,7 @@ impl AdeApp {
                 .background_executor()
                 .spawn({
                     let root = root.clone();
-                    async move { file_tree::build_file_tree(&root) }
+                    async move { file_tree::build_worktree_file_tree(&root) }
                 })
                 .await;
 
@@ -1360,12 +1364,25 @@ impl AdeApp {
                 }
             };
 
-            let Ok(Some(marks)) = this.update(cx, |this, _| {
-                (this.file_tree_root == root)
-                    .then(|| palette_render::file_diff_marks(this.current_diff()))
+            let Ok(Some((marks, unchanged))) = this.update(cx, |this, _| {
+                (this.file_tree_root == root).then(|| {
+                    // The steady-state poll usually re-derives an identical listing; applying
+                    // it anyway would rebuild every palette candidate and re-render the whole
+                    // window for no visible change (GitHub issue #472).
+                    let unchanged = this.file_tree_error.is_none()
+                        && this.file_tree_complete == listing.is_complete()
+                        && this.file_tree == listing.tree;
+                    (
+                        palette_render::file_diff_marks(this.current_diff()),
+                        unchanged,
+                    )
+                })
             }) else {
                 return;
             };
+            if unchanged {
+                return;
+            }
 
             let complete = listing.is_complete();
             let (tree, candidates) = cx
@@ -1430,6 +1447,12 @@ impl AdeApp {
 
         let task = cx.spawn(async move |this, cx| {
             let mut last_refresh = Instant::now();
+            // GitHub issue #473: what the last *poll-arm* diff reload saw of the git-side state.
+            // The poll arm exists only for `.git/`-internal changes the content watcher filters
+            // out, so when this fingerprint is unchanged the ~10-git-spawn reload is provably
+            // redundant and skipped. Reset (never trusted) across watcher firings - worktree
+            // content is outside the fingerprint's scope by contract.
+            let mut last_poll_fingerprint: Option<wt_core::diff::ChangesFingerprint> = None;
             loop {
                 cx.background_executor().timer(FILE_TREE_WATCH_TICK).await;
 
@@ -1448,12 +1471,53 @@ impl AdeApp {
                 }
                 last_refresh = Instant::now();
 
+                // The fingerprint gate's contract holds only while a real content watcher is
+                // armed (`changes_fingerprint`'s own docs): `spawn_file_tree_watcher` can
+                // genuinely fail - inotify watch exhaustion being the classic case - and this
+                // loop then runs on the poll arm alone, which must behave exactly as it did
+                // before the gate existed: reloading, and re-checking problem rows,
+                // unconditionally.
+                let watcher_armed = this
+                    .read_with(cx, |this, _| this._file_tree_watcher.is_some())
+                    .unwrap_or(false);
+
+                // `Some` only when this firing observed a fresh git-side fingerprint no reload
+                // has covered yet - committed below only once a reload really starts, so a
+                // skip-as-busy retries next poll instead of marking the change seen forever.
+                let mut pending_fingerprint: Option<Option<wt_core::diff::ChangesFingerprint>> =
+                    None;
+                let refresh_diff = if watcher_fired || !watcher_armed {
+                    last_poll_fingerprint = None;
+                    true
+                } else {
+                    let fingerprint_root = root.clone();
+                    let fingerprint =
+                        cx.background_executor()
+                            .spawn(async move {
+                                wt_core::diff::changes_fingerprint(&fingerprint_root).ok()
+                            })
+                            .await;
+                    // An unreadable fingerprint (`None`) always reloads: erring toward one
+                    // redundant reload beats a stale Changes counter.
+                    let changed = fingerprint.is_none() || fingerprint != last_poll_fingerprint;
+                    if changed {
+                        pending_fingerprint = Some(fingerprint);
+                    }
+                    changed
+                };
+
                 let updated = this.update(cx, |this, cx| {
                     // The active worktree may have changed since this loop's own last tick (a
                     // fresh loop for the new root already started - see this method's own docs -
                     // so this one only needs to stop cleanly rather than reload the wrong root).
                     if this.file_tree_root != root {
-                        return false;
+                        return None;
+                    }
+                    if watcher_fired || !watcher_armed {
+                        // A worktree change can delete a file a server still publishes
+                        // diagnostics about - see `Self::invalidate_problems_cache`. With no
+                        // watcher armed, the poll is the only path that ever notices.
+                        this.invalidate_problems_cache();
                     }
                     this.load_file_tree(root.clone(), cx);
                     // GitHub issue #415: the Changes pane and the sidebar's `+n`/`-n` totals used
@@ -1463,13 +1527,20 @@ impl AdeApp {
                     // watcher covers both halves: the watcher arm catches working-tree writes
                     // within one tick, and the poll arm catches the `.git/`-only changes
                     // (`git add`, `git commit`) that `spawn_file_tree_watcher` deliberately
-                    // filters out and would otherwise never report.
-                    this.refresh_diff_if_idle(cx);
-                    true
+                    // filters out and would otherwise never report - now only when
+                    // `changes_fingerprint` says that git-side state really moved (issue #473).
+                    let reload_started = refresh_diff && this.refresh_diff_if_idle(cx);
+                    Some(reload_started)
                 });
                 match updated {
-                    Ok(true) => {}
-                    Ok(false) | Err(_) => break,
+                    Ok(Some(reload_started)) => {
+                        if reload_started {
+                            if let Some(fingerprint) = pending_fingerprint.take() {
+                                last_poll_fingerprint = fingerprint;
+                            }
+                        }
+                    }
+                    Ok(None) | Err(_) => break,
                 }
             }
         });

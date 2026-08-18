@@ -48,11 +48,15 @@ impl AdeApp {
     /// five git queries take on a large worktree, so an ungated call would cancel its own
     /// still-running predecessor on every tick (assigning [`Self::_load_diff_task`] drops the
     /// previous task) and the pane could starve indefinitely while an agent keeps writing.
-    pub(crate) fn refresh_diff_if_idle(&mut self, cx: &mut Context<Self>) {
+    /// Returns whether a reload really started - `false` means the skip-as-busy path ran, and a
+    /// caller tracking "has the state I observed been reloaded" (the poll fingerprint,
+    /// GitHub issue #473) must not mark it observed.
+    pub(crate) fn refresh_diff_if_idle(&mut self, cx: &mut Context<Self>) -> bool {
         if self.diff_reload_in_flight {
-            return;
+            return false;
         }
         self.refresh_diff(cx);
+        true
     }
 
     /// The real background git reload both [`Self::load_diff`] and [`Self::refresh_diff`] run -

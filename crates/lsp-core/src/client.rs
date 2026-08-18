@@ -19,7 +19,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -192,6 +192,10 @@ pub struct LspClient {
     next_id: AtomicI64,
     pending: Arc<Mutex<HashMap<i64, SyncSender<PendingResponse>>>>,
     diagnostics: Arc<Mutex<HashMap<String, Vec<lsp_types::Diagnostic>>>>,
+    /// Bumped on every write to [`Self::diagnostics`] (push and pull paths alike), so a caller
+    /// can memoize anything derived from [`Self::published_diagnostics`] and recompute only when
+    /// this moves — that derivation used to run every frame (GitHub issue #471).
+    diagnostics_generation: Arc<AtomicU64>,
     /// Subscribed notifications in arrival order, `params` left raw since this crate knows
     /// nothing about what any of them mean.
     ///
@@ -330,6 +334,7 @@ impl LspClient {
             Arc::new(Mutex::new(HashMap::new()));
         let diagnostics: Arc<Mutex<HashMap<String, Vec<lsp_types::Diagnostic>>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let diagnostics_generation = Arc::new(AtomicU64::new(0));
         let custom_notifications: Arc<Mutex<VecDeque<(String, serde_json::Value)>>> =
             Arc::new(Mutex::new(VecDeque::new()));
         let capabilities = Mutex::new(ServerCapabilities::default());
@@ -343,6 +348,7 @@ impl LspClient {
         let reader_thread = std::thread::spawn({
             let pending = Arc::clone(&pending);
             let diagnostics = Arc::clone(&diagnostics);
+            let diagnostics_generation = Arc::clone(&diagnostics_generation);
             let custom_notifications = Arc::clone(&custom_notifications);
             let stdin_for_replies = Arc::clone(&stdin);
             let connection_alive = Arc::clone(&connection_alive);
@@ -352,6 +358,7 @@ impl LspClient {
                     IncomingSinks {
                         pending,
                         diagnostics,
+                        diagnostics_generation,
                         custom_notifications,
                         custom_notification_methods,
                         wake_tx,
@@ -375,6 +382,7 @@ impl LspClient {
             next_id: AtomicI64::new(1),
             pending,
             diagnostics,
+            diagnostics_generation,
             custom_notifications,
             diagnostics_version: Mutex::new(HashMap::new()),
             capabilities,
@@ -558,6 +566,7 @@ impl LspClient {
                 versions.insert(uri.as_str().to_string(), version);
                 drop(versions);
                 lock(&self.diagnostics).insert(uri.as_str().to_string(), items);
+                self.diagnostics_generation.fetch_add(1, Ordering::Relaxed);
                 let _ = self.wake_tx.try_send(());
             }
         }
@@ -636,6 +645,12 @@ impl LspClient {
     /// fabricating a path for it.
     pub fn path_for_uri(uri: &Uri) -> Result<PathBuf, LspError> {
         uri_to_path(uri)
+    }
+
+    /// The current [diagnostics](Self::published_diagnostics) generation — bumped on every
+    /// stored update, so equality means "nothing derived from them can have changed".
+    pub fn diagnostics_generation(&self) -> u64 {
+        self.diagnostics_generation.load(Ordering::Relaxed)
     }
 
     pub fn diagnostics_for_uri(&self, uri: &Uri) -> Option<Vec<lsp_types::Diagnostic>> {
@@ -885,10 +900,20 @@ impl LspClient {
         proc::terminate_tree(self.pid, SHUTDOWN_GRACE_PERIOD);
     }
 
-    /// Windows equivalent: kills the direct child only, with no grace period or tree walk, so its
-    /// `cargo check`/`rustc` descendants survive.
+    /// Windows equivalent: `taskkill /T` walks and terminates the whole tree synchronously
+    /// (no grace period - Windows has no `SIGTERM` tier), then the direct kill as backstop.
+    /// Without the tree walk a `.cmd`-shim server's real `node.exe`, and rust-analyzer's
+    /// `cargo check`/`rustc` children, survive with their cwd handles inside the worktree
+    /// (GitHub issues #468/#470).
     #[cfg(windows)]
     fn kill_process_tree(&mut self) {
+        match pty_core::new_std_command("taskkill")
+            .args(["/T", "/F", "/PID", &self.pid.to_string()])
+            .output()
+        {
+            Ok(_) => {}
+            Err(err) => log::warn!("taskkill /T /F /PID {} could not run: {err}", self.pid),
+        }
         if let Some(child) = self.child.as_mut() {
             let _ = child.kill();
         }
@@ -907,10 +932,21 @@ impl Drop for LspClient {
                     proc::signal_pid(*pid, nix::sys::signal::Signal::SIGKILL);
                 }
             }
-            // Windows has no process tree, so `child.kill()` leaves descendants orphaned.
+            // Fire-and-forget `taskkill /T` (spawned, never waited - `Drop` must not block),
+            // then the direct kill as backstop; see `kill_process_tree`. Stdio nulled so the
+            // detached child can't hold inherited pipes open - under `cargo nextest` an
+            // inherited stdout is reported as the test leaking.
             #[cfg(windows)]
-            if let Some(child) = self.child.as_mut() {
-                let _ = child.kill();
+            {
+                let _ = pty_core::new_std_command("taskkill")
+                    .args(["/T", "/F", "/PID", &self.pid.to_string()])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn();
+                if let Some(child) = self.child.as_mut() {
+                    let _ = child.kill();
+                }
             }
 
             let reaped_immediately = self
@@ -1032,6 +1068,8 @@ fn uri_to_path(uri: &Uri) -> Result<PathBuf, LspError> {
 struct IncomingSinks {
     pending: Arc<Mutex<HashMap<i64, SyncSender<PendingResponse>>>>,
     diagnostics: Arc<Mutex<HashMap<String, Vec<lsp_types::Diagnostic>>>>,
+    /// See `LspClient::diagnostics_generation` — bumped alongside every `diagnostics` write.
+    diagnostics_generation: Arc<AtomicU64>,
     custom_notifications: Arc<Mutex<VecDeque<(String, serde_json::Value)>>>,
     /// See [`ServerSpawnConfig::custom_notification_methods`].
     custom_notification_methods: Vec<&'static str>,
@@ -1163,6 +1201,7 @@ fn handle_incoming(value: serde_json::Value, sinks: &IncomingSinks) {
             return;
         };
         lock(&sinks.diagnostics).insert(parsed.uri.as_str().to_string(), parsed.diagnostics);
+        sinks.diagnostics_generation.fetch_add(1, Ordering::Relaxed);
         let _ = sinks.wake_tx.try_send(());
         return;
     }
@@ -1511,6 +1550,7 @@ mod tests {
                 sinks: IncomingSinks {
                     pending: Arc::new(Mutex::new(HashMap::new())),
                     diagnostics: Arc::new(Mutex::new(HashMap::new())),
+                    diagnostics_generation: Arc::new(AtomicU64::new(0)),
                     custom_notifications: Arc::new(Mutex::new(VecDeque::new())),
                     custom_notification_methods: subscribed.to_vec(),
                     wake_tx,

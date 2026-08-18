@@ -6155,6 +6155,7 @@ dependencies = [
  "anyhow",
  "filedescriptor",
  "libc",
+ "log",
  "nix",
  "portable-pty",
  "tempfile",

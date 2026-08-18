@@ -74,6 +74,14 @@ impl AdeApp {
         let Some(cwd) = self.current_worktree_path() else {
             return;
         };
+        // See `AdeApp::discarding_worktree` - spawning into a directory mid-delete would
+        // reproduce the half-failed removal GitHub issue #470 closes.
+        if self.discarding_worktree.as_deref() == Some(cwd.as_path()) {
+            self.worktree_history_status =
+                Some("this worktree is being discarded - nothing can be spawned into it".into());
+            cx.notify();
+            return;
+        }
         // GitHub issue #239 phase 2: a Claude agent is spawned against this instance's generated
         // `--settings` file and told, through its environment, where to report its hooks. Taken as
         // an owned snapshot because `self.agents.spawn` borrows `self.agents` mutably - see
@@ -498,6 +506,15 @@ impl AdeApp {
         };
         let kind = agent.kind;
         let cwd = agent.cwd.clone();
+        // See `AdeApp::discarding_worktree` - the taken-down pane's own footer offers Resume,
+        // and honouring it mid-delete would respawn into the directory being removed
+        // (GitHub issue #470).
+        if self.discarding_worktree.as_deref() == Some(cwd.as_path()) {
+            self.worktree_history_status =
+                Some("this worktree is being discarded - nothing can be spawned into it".into());
+            cx.notify();
+            return;
+        }
         self.close_agent(id, window, cx);
         // A respawned agent is a freshly spawned one in every other respect, so it gets the same
         // real hook injection - otherwise "Retry" would silently produce an agent whose status
