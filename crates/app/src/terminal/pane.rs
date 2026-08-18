@@ -379,8 +379,7 @@ mod shell_program_tests {
             "bash",
             "bash.exe",
             "BASH.EXE",
-            r"C:\Program Files\Git\usr\bin\bash.exe",
-            r"C:\Program Files\Git\bin\bash.exe",
+            "C:/Program Files/Git/usr/bin/bash.exe",
             "/bin/sh",
             "/usr/bin/zsh",
             "fish",
@@ -396,7 +395,6 @@ mod shell_program_tests {
 
         for program in [
             "cmd.exe",
-            r"C:\Windows\System32\cmd.exe",
             "CMD.EXE",
             "powershell.exe",
             "pwsh.exe",
@@ -408,6 +406,26 @@ mod shell_program_tests {
                 posix_login_shell_args(Path::new(program)).is_empty(),
                 "{program} is not a POSIX shell - handing it `-l` risks a flag it rejects, which \
                  would turn a working terminal into one that cannot spawn at all"
+            );
+        }
+
+        // The real spellings a Windows user's Settings field holds. Only Windows treats `\` as a
+        // separator, so on Unix `Path::file_stem` would read the whole string as one file name.
+        #[cfg(windows)]
+        {
+            for program in [
+                r"C:\Program Files\Git\usr\bin\bash.exe",
+                r"C:\Program Files\Git\bin\bash.exe",
+            ] {
+                assert_eq!(
+                    posix_login_shell_args(Path::new(program)),
+                    vec!["-l".to_string()],
+                    "{program} is the real path Settings stores for Git Bash"
+                );
+            }
+            assert!(
+                posix_login_shell_args(Path::new(r"C:\Windows\System32\cmd.exe")).is_empty(),
+                "the default Windows shell must never be handed `-l`"
             );
         }
     }
