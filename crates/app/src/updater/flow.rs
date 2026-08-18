@@ -113,8 +113,11 @@ impl AdeApp {
     /// subsequent tick. No-op while a check is already in flight (mirrors
     /// [`Self::worktree_history_op_in_flight`]'s own single-flight-per-feature discipline), so a
     /// manual palette click during the periodic loop's own in-flight check can never spawn a
-    /// second, racing one.
+    /// second, racing one. Also a no-op unless [`state::update_check_enabled`].
     pub(crate) fn check_for_update(&mut self, cx: &mut Context<Self>) {
+        if !state::update_check_enabled() {
+            return;
+        }
         if self.update_check_in_flight {
             return;
         }
@@ -162,8 +165,16 @@ impl AdeApp {
     /// `Self::new_with_settings`, right after `Self::start_worktree_watch`. Runs
     /// [`Self::check_for_update`] immediately (the real "startup" trigger), then again every
     /// [`state::UPDATE_CHECK_INTERVAL`] for as long as the app runs, mirroring
-    /// `Self::start_worktree_watch`'s own tick-loop shape.
+    /// `Self::start_worktree_watch`'s own tick-loop shape. Starts nothing unless
+    /// [`state::update_check_enabled`].
     pub(crate) fn start_update_check_loop(&mut self, cx: &mut Context<Self>) {
+        // [`Self::check_for_update`] would no-op on its own, but a disabled check should not leave
+        // a timer task running behind it either - a `#[gpui::test]` app that parks the executor
+        // would otherwise still be holding a live 6h tick loop.
+        // A disabled check must not leave a live 6h tick loop behind it either.
+        if !state::update_check_enabled() {
+            return;
+        }
         self.check_for_update(cx);
         let task = cx.spawn(async move |this, cx| loop {
             cx.background_executor()
@@ -281,5 +292,30 @@ mod relaunch_command_tests {
         let exe = Path::new("/usr/local/bin/jerry");
         let command = build_relaunch_command(exe, &[]);
         assert_eq!(command.get_args().count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod update_check_offline_tests {
+    use crate::test_support::open_test_app;
+    use gpui::TestAppContext;
+
+    #[gpui::test]
+    fn opening_an_app_starts_no_update_check_and_no_tick_loop(cx: &mut TestAppContext) {
+        let repo = test_support::seed_repo();
+
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                !app.update_check_in_flight,
+                "opening a test app must not start a real GitHub release check"
+            );
+            assert!(
+                app._update_check_task.is_none(),
+                "and must not leave a periodic re-check task running behind it either"
+            );
+        });
     }
 }

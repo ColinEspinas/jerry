@@ -14,6 +14,30 @@ use std::time::Duration;
 /// command added on top (a user would have to invoke it dozens of times an hour to matter).
 pub(crate) const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
+/// Whether this build compiles the update check in at all.
+pub(crate) const UPDATE_CHECK_ENABLED: bool = !cfg!(test);
+
+/// Runtime kill switch, for anything linking `app` across a crate boundary that `cfg(test)` can
+/// not reach.
+pub(crate) const DISABLE_UPDATE_CHECK_ENV: &str = "JERRY_DISABLE_UPDATE_CHECK";
+
+/// Whether a real GitHub release check may happen in this process, right now.
+pub(crate) fn update_check_enabled() -> bool {
+    update_check_enabled_from(
+        UPDATE_CHECK_ENABLED,
+        std::env::var_os(DISABLE_UPDATE_CHECK_ENV),
+    )
+}
+
+/// The pure half of [`update_check_enabled`], split out because `std::env::set_var` is unsound to
+/// race in a threaded test binary.
+pub(crate) fn update_check_enabled_from(
+    compiled_in: bool,
+    disable_env: Option<std::ffi::OsString>,
+) -> bool {
+    compiled_in && disable_env.is_none()
+}
+
 /// A real GitHub release this app could update to - built from `self_update::update::Release`
 /// (see `crate::updater::flow`'s own docs for exactly how, since that struct has no `tag_name`/
 /// `html_url` field of its own to read directly).
@@ -83,6 +107,37 @@ pub(crate) fn is_remote_version_newer(current: &str, remote_tag: &str) -> bool {
             );
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod update_check_gate_tests {
+    use crate::updater::state::{update_check_enabled, update_check_enabled_from};
+    use std::ffi::OsString;
+
+    #[test]
+    fn a_release_build_with_no_override_checks_for_updates() {
+        assert!(update_check_enabled_from(true, None));
+    }
+
+    #[test]
+    fn a_test_build_never_checks_for_updates() {
+        assert!(!update_check_enabled_from(false, None));
+    }
+
+    #[test]
+    fn the_environment_override_wins_over_a_release_build() {
+        assert!(!update_check_enabled_from(true, Some(OsString::from("1"))));
+        // The variable's presence is the whole signal, so an empty value still disables.
+        assert!(!update_check_enabled_from(true, Some(OsString::from(""))));
+    }
+
+    #[test]
+    fn this_very_test_binary_may_not_check_for_updates() {
+        assert!(
+            !update_check_enabled(),
+            "the compiled-in gate must hold for the app crate's own test targets"
+        );
     }
 }
 
