@@ -32,6 +32,52 @@ impl AdeApp {
         self._load_diff_task = Some(self.spawn_diff_reload(root, cx));
     }
 
+    /// Stashes [`Self::diff_root`]'s landed Changes content under its root, for
+    /// [`Self::load_diff_for_switch`] to paint straight back on the next visit (GitHub issue
+    /// #454). Refuses to record an in-flight `Loading` (nothing worth restoring) or a root that
+    /// no longer exists on disk (a discarded worktree's content must not be resurrected by the
+    /// switch away from it).
+    pub(crate) fn stash_changes_snapshot(&mut self) {
+        if matches!(self.diff_state, DiffLoadState::Loading) {
+            return;
+        }
+        if !self.diff_root.is_dir() {
+            return;
+        }
+        let snapshot = ChangesSnapshot {
+            diff_state: std::mem::replace(&mut self.diff_state, DiffLoadState::Loading),
+            diff_totals: self.diff_totals.take(),
+            change_set: std::mem::take(&mut self.change_set),
+            uncommitted_diff: std::mem::take(&mut self.uncommitted_diff),
+            uncommitted_change_set: std::mem::take(&mut self.uncommitted_change_set),
+            branch_commits: std::mem::take(&mut self.branch_commits),
+            dirty_files: self.dirty_files.take(),
+        };
+        self.changes_by_worktree
+            .insert(self.diff_root.clone(), snapshot);
+    }
+
+    /// [`Self::load_diff`] for a worktree switch (GitHub issue #454): when `root` has stashed
+    /// last-known content, restore it and reload without blanking - [`Self::refresh_diff`]'s own
+    /// no-blank shape - so the switch paints instantly. A first-ever visit falls back to the
+    /// honest blanking load.
+    pub(crate) fn load_diff_for_switch(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        let Some(snapshot) = self.changes_by_worktree.remove(&root) else {
+            self.load_diff(root, cx);
+            return;
+        };
+        self.diff_root = root.clone();
+        self.diff_state = snapshot.diff_state;
+        self.diff_totals = snapshot.diff_totals;
+        self.change_set = snapshot.change_set;
+        self.uncommitted_diff = snapshot.uncommitted_diff;
+        self.uncommitted_change_set = snapshot.uncommitted_change_set;
+        self.branch_commits = snapshot.branch_commits;
+        self.dirty_files = snapshot.dirty_files;
+        cx.notify();
+        self._load_diff_task = Some(self.spawn_diff_reload(root, cx));
+    }
+
     /// Re-runs exactly the same real git reload [`Self::load_diff`] does, for the *same* worktree
     /// [`Self::diff_root`] already names - GitHub issue #399. The one difference is what it does
     /// **not** do: unlike `load_diff`, this never blanks [`Self::diff_state`]/

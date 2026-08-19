@@ -1,8 +1,8 @@
 //! Surface C, the code surface: everything about one feature, in one folder.
 
 use crate::code_surface::state::{
-    BlameCacheEntry, BlameLoadState, CommitMessageState, DiffLoadState, FileLoadState, HoverAnchor,
-    HoverEntry, HoverStatus,
+    BlameCacheEntry, BlameLoadState, ChangesSnapshot, CommitMessageState, DiffLoadState,
+    FileLoadState, HoverAnchor, HoverEntry, HoverStatus,
 };
 use crate::language;
 use crate::lsp::client::LspClientState;
