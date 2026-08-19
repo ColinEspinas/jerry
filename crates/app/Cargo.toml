@@ -385,10 +385,16 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
+    # `SECURITY_ATTRIBUTES`: named by `CreateJobObjectW`'s signature, which is feature-gated on
+    # it - the call itself passes null (default security, non-inheritable handle).
+    "Win32_Security",
     # For `SYNCHRONIZE`, which is a *standard* access right shared by every securable object
     # (`WaitForSingleObject` needs it on the process handle) and not a filesystem thing at all -
     # this is just the module the generated bindings put it in.
     "Win32_Storage_FileSystem",
+    # The kill-on-close job object `crate::job_object` puts this whole process in, so spawned
+    # agents cannot outlive a force-killed Jerry (GitHub issue #482).
+    "Win32_System_JobObjects",
     # PSAPI: `GetProcessMemoryInfo`/`PROCESS_MEMORY_COUNTERS`, the working-set reading behind the
     # status bar's `Y GB` field on Windows.
     "Win32_System_ProcessStatus",

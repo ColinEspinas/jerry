@@ -8,6 +8,8 @@
 use super::*;
 use std::ffi::OsString;
 use std::path::Path;
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW};
 
 const REPO_OWNER: &str = "ColinEspinas";
 const REPO_NAME: &str = "jerry";
@@ -104,6 +106,22 @@ fn build_relaunch_command(exe: &Path, args: &[OsString]) -> std::process::Comman
     let mut command = pty_core::new_std_command(exe);
     command.args(args);
     command
+}
+
+/// What the Windows relaunch spawns with: `CREATE_BREAKAWAY_FROM_JOB` so the fresh instance
+/// escapes the old one's kill-on-close job (`crate::job_object`, GitHub issue #482) - without
+/// it the new Jerry is terminated the moment the old one exits and that job's last handle
+/// closes - and `CREATE_NO_WINDOW` again, because `creation_flags` *replaces* what
+/// `pty_core::new_std_command` set rather than ORing into it (GitHub issue #465).
+#[cfg(windows)]
+const RELAUNCH_CREATION_FLAGS: u32 = CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB;
+
+/// Applies [`RELAUNCH_CREATION_FLAGS`] - separate from [`build_relaunch_command`] so the
+/// no-breakaway retry in [`AdeApp::relaunch_and_exit`] can reuse the plain builder.
+#[cfg(windows)]
+fn add_breakaway_flags(command: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt as _;
+    command.creation_flags(RELAUNCH_CREATION_FLAGS);
 }
 
 impl AdeApp {
@@ -251,7 +269,26 @@ impl AdeApp {
             }
         };
         let args: Vec<OsString> = std::env::args_os().skip(1).collect();
-        match build_relaunch_command(&exe, &args).spawn() {
+        #[cfg(windows)]
+        let spawned = {
+            let mut command = build_relaunch_command(&exe, &args);
+            add_breakaway_flags(&mut command);
+            command.spawn().or_else(|err| {
+                // Only reachable when a job this process sits in forbids breakaway - ours
+                // permits it, so that means an outer one. The retry can't escape
+                // `crate::job_object`'s kill-on-close job, so if that adoption succeeded the
+                // relaunched instance still dies with this one; what the retry rescues is the
+                // adoption-failed case, where the same outer job is exactly what blocked it.
+                log::warn!(
+                    "relaunching with CREATE_BREAKAWAY_FROM_JOB failed ({err}); retrying without \
+                     breakaway"
+                );
+                build_relaunch_command(&exe, &args).spawn()
+            })
+        };
+        #[cfg(not(windows))]
+        let spawned = build_relaunch_command(&exe, &args).spawn();
+        match spawned {
             Ok(_child) => {
                 cx.quit();
             }
@@ -292,6 +329,23 @@ mod relaunch_command_tests {
         let exe = Path::new("/usr/local/bin/jerry");
         let command = build_relaunch_command(exe, &[]);
         assert_eq!(command.get_args().count(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_relaunch_flags_break_away_from_the_job_without_unhiding_the_console() {
+        assert_eq!(
+            RELAUNCH_CREATION_FLAGS & CREATE_BREAKAWAY_FROM_JOB,
+            CREATE_BREAKAWAY_FROM_JOB,
+            "without breakaway the relaunched instance dies with this one's kill-on-close job \
+             (GitHub issue #482)"
+        );
+        assert_eq!(
+            RELAUNCH_CREATION_FLAGS & CREATE_NO_WINDOW,
+            CREATE_NO_WINDOW,
+            "creation_flags replaces what new_std_command set, so dropping CREATE_NO_WINDOW here \
+             would regress the console flash (GitHub issue #465)"
+        );
     }
 }
 

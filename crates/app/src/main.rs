@@ -13,6 +13,11 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
+    // Before anything can spawn: children join the job at creation, so a child spawned earlier
+    // than this would be exactly the orphan issue #482 exists to prevent.
+    #[cfg(windows)]
+    app::job_object::adopt_this_process();
+
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     apply_display_scale_override();
 
