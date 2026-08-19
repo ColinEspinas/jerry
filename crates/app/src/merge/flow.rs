@@ -76,7 +76,6 @@ impl AdeApp {
             state: merge::MergeFlowState::Running,
         });
         self.prune_confirm_armed = false;
-        self.discard_confirm_armed = None;
         cx.notify();
 
         let task = cx.spawn(async move |this, cx| {
@@ -147,7 +146,6 @@ impl AdeApp {
             state: merge::MergeFlowState::Running,
         });
         self.prune_confirm_armed = false;
-        self.discard_confirm_armed = None;
         self.graph_state.status_message = Some(format!("Merging {source_branch}\u{2026}"));
         self.select_agent(agent_id, window, cx);
         cx.notify();
@@ -193,7 +191,6 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         self.prune_confirm_armed = false;
-        self.discard_confirm_armed = None;
         let Some(flow) = self.merge_flow.as_mut() else {
             return;
         };
@@ -292,7 +289,6 @@ impl AdeApp {
     /// and refreshes worktree/diff state to reflect the merge that just happened.
     pub(in crate::merge) fn complete_merge_flow(&mut self, cx: &mut Context<Self>) {
         self.prune_confirm_armed = false;
-        self.discard_confirm_armed = None;
         if self.merge_op_in_flight {
             return;
         }
@@ -358,7 +354,6 @@ impl AdeApp {
     /// is left in an `Error` state describing that rather than pretending it succeeded.
     pub(in crate::merge) fn abort_merge_flow(&mut self, cx: &mut Context<Self>) {
         self.prune_confirm_armed = false;
-        self.discard_confirm_armed = None;
         if self.merge_op_in_flight {
             return;
         }
@@ -435,7 +430,6 @@ impl AdeApp {
         self.merge_flow = None;
         self.clear_merge_edit_state();
         self.prune_confirm_armed = false;
-        self.discard_confirm_armed = None;
         cx.notify();
     }
 

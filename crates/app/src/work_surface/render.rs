@@ -161,7 +161,6 @@ impl AdeApp {
         self.close_gated_review_tab(window, cx);
         self.focus_newly_spawned_agent(window, cx);
         self.prune_confirm_armed = false;
-        self.discard_confirm_armed = None;
         cx.notify();
     }
 
@@ -296,7 +295,6 @@ impl AdeApp {
     ) {
         self.agents.set_active(id, cx);
         self.prune_confirm_armed = false;
-        self.discard_confirm_armed = None;
         // If the git graph tab was showing, this leaves it (without closing its tab) - see
         // `crate::graph_view::render::AdeApp::leave_graph_tab`'s own docs for why this must run
         // *after* `set_active` above: its `restore_focus` fallback resolves to
@@ -464,7 +462,6 @@ impl AdeApp {
     ) {
         self.close_agent(id, window, cx);
         self.prune_confirm_armed = false;
-        self.discard_confirm_armed = None;
         cx.notify();
     }
 
@@ -589,7 +586,6 @@ impl AdeApp {
         // relaunch reopens the retried agent's slot rather than the one it replaced.
         self.record_worktree_session(cx);
         self.prune_confirm_armed = false;
-        self.discard_confirm_armed = None;
         cx.notify();
     }
 
@@ -628,7 +624,6 @@ impl AdeApp {
                 // terminal that is already part of the recorded session.
                 self.record_worktree_session(cx);
                 self.prune_confirm_armed = false;
-                self.discard_confirm_armed = None;
                 cx.notify();
             }
         }
@@ -2457,43 +2452,7 @@ impl AdeApp {
             {
                 enabled = false;
             }
-            // `Discard worktree` shares the worktree-history in-flight guard
-            // (`Self::worktree_history_op_in_flight`) with the title bar's Agent menu row and the
-            // rail's own `Remove worktree…` - see `crate::worktree_history::flow`'s module docs.
-            // Disabled, not just relabelled, while busy - mirrors `Self::render_rail_footer`'s own
-            // `prune_in_flight` gating.
-            if action.kind == work_surface::ActionKind::DiscardWorktree
-                && self.worktree_history_op_in_flight.is_some()
-            {
-                enabled = false;
-            }
-            // GitHub issue #462: an agent whose cwd *is* the repository's main checkout has
-            // nothing this button can discard - `git worktree remove` refuses it, and
-            // `Self::execute_discard_worktree_path` would kill this agent and the worktree's
-            // language servers on the way to finding that out.
-            if action.kind == work_surface::ActionKind::DiscardWorktree
-                && self.is_main_worktree_path(&agent.cwd)
-            {
-                enabled = false;
-            }
-            // Busy labels are keyed off the *specific* in-flight kind, not just "something is
-            // running" - a real, live-reproduced bug an audit caught: keying this off the bare
-            // in-flight flag alone made every visible `Discard worktree` button across every
-            // agent read "discarding…" while an unrelated worktree-history op was running.
-            let label = match action.kind {
-                work_surface::ActionKind::DiscardWorktree
-                    if self.worktree_history_op_in_flight
-                        == Some(worktree_history::WorktreeHistoryOpKind::Discard) =>
-                {
-                    "discarding\u{2026}".to_string()
-                }
-                work_surface::ActionKind::DiscardWorktree
-                    if self.discard_confirm_armed == Some(id) =>
-                {
-                    "confirm discard?".to_string()
-                }
-                _ => action.label.to_string(),
-            };
+            let label = action.label.to_string();
             footer = footer.child(self.render_footer_action_button(id, action, label, enabled, cx));
         }
 
@@ -2635,9 +2594,6 @@ impl AdeApp {
                 .on_click(
                     cx.listener(move |this, _event: &ClickEvent, window, cx| match kind {
                         work_surface::ActionKind::Respawn => this.respawn_agent(id, window, cx),
-                        work_surface::ActionKind::DiscardWorktree => {
-                            this.request_discard_worktree(id, window, cx)
-                        }
                     }),
                 );
         } else {
@@ -5526,16 +5482,12 @@ mod agent_pane_readout_tests {
         });
     }
 
-    /// §4e/§4r's one surviving pair, and its two-click safety: `failed` keeps `Retry` and
-    /// `Discard worktree`, and the discard really arms before it destroys.
-    ///
-    /// Driven through the genuinely painted button (`debug_bounds` + `simulate_click`), not
-    /// through `request_discard_worktree` directly - the point is that this strip still offers
-    /// those two, and that `Open terminal` (which used to sit between them) does not paint.
-    /// `#[cfg(unix)]`: the failed run below is a real `/bin/false` child, which needs a `/bin`.
+    /// Driven through the genuinely painted strip rather than `footer_actions(Status::Fail)`,
+    /// which `work_surface::state`'s own unit test already pins - the point here is what really
+    /// renders. `#[cfg(unix)]`: the failed run below is a real `/bin/false` child.
     #[cfg(unix)]
     #[gpui::test]
-    fn a_failed_run_keeps_retry_and_a_two_click_discard_and_nothing_else(cx: &mut TestAppContext) {
+    fn a_failed_run_keeps_retry_and_offers_no_worktree_removal(cx: &mut TestAppContext) {
         let repo = crate::test_support::temp_repo();
         let worktree_container = crate::test_support::temp_root();
         let worktree_path = worktree_container.path().join("feature-wt");
@@ -5553,13 +5505,11 @@ mod agent_pane_readout_tests {
 
         let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
-        // `/bin/false` is a real child that really exits non-zero, so `Status::Fail` is derived
-        // from a genuine `ProcessSignal::Exited { success: false }` rather than being set.
+        // A real `/bin/false` child, so `Status::Fail` comes from a genuine non-zero exit.
         let id = spawn_and_select(&app, cx, worktree_path.clone(), Some("/bin/false"));
         wait_for_exit(&app, cx, id);
-        // Relabelled to a real agent kind: the strip this test measures is the *agent* pane's
-        // (`isChat` in the mock), and a `Shell` tab gets the terminal info footer instead. The
-        // failure is a genuine non-zero exit either way - only the chrome around it is gated.
+        // The strip this test measures is the *agent* pane's; a `Shell` tab gets the terminal
+        // info footer instead.
         app.update(cx, |app, cx| {
             app.agents.set_kind_for_test(id, ProcessKind::claude());
             cx.notify();
@@ -5580,73 +5530,14 @@ mod agent_pane_readout_tests {
             cx.debug_bounds("footer-action-Respawn").is_some(),
             "a failed run keeps its `Retry`"
         );
-        let discard = cx
-            .debug_bounds("footer-action-DiscardWorktree")
-            .expect("and its two-click `Discard worktree`");
-
-        cx.simulate_click(discard.center(), gpui::Modifiers::none());
-        cx.run_until_parked();
-
-        assert_eq!(
-            app.read_with(cx, |app, _| app.discard_confirm_armed),
-            Some(id),
-            "the first click must only arm - this is the one irreversible thing in the pane"
+        assert!(
+            cx.debug_bounds("footer-action-DiscardWorktree").is_none(),
+            "and offers no worktree removal - that lives on the rail's worktree row now"
         );
         assert!(
             worktree_path.exists(),
-            "and an armed-but-unconfirmed discard must not have touched the real worktree"
+            "and nothing this strip paints may have touched the real worktree"
         );
-    }
-
-    /// GitHub issue #462: the same failed run, in the repository's own main checkout. The button
-    /// still paints (its strip is the one `Status::Fail` defines), but it is inert - `git
-    /// worktree remove` refuses that checkout, and arming would only lead to a discard that kills
-    /// this agent and the worktree's language servers before git says no.
-    ///
-    /// `#[cfg(unix)]` for the same reason as the test above: a real `/bin/false` child.
-    #[cfg(unix)]
-    #[gpui::test]
-    fn a_failed_run_in_the_main_checkout_cannot_arm_its_discard(cx: &mut TestAppContext) {
-        let repo = crate::test_support::temp_repo();
-        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
-        cx.run_until_parked();
-        let id = spawn_and_select(&app, cx, repo.path().to_path_buf(), Some("/bin/false"));
-        wait_for_exit(&app, cx, id);
-        app.update(cx, |app, cx| {
-            app.agents.set_kind_for_test(id, ProcessKind::claude());
-            cx.notify();
-        });
-        cx.run_until_parked();
-
-        app.read_with(cx, |app, cx| {
-            let agent = app
-                .agents
-                .iter()
-                .find(|agent| agent.id == id)
-                .expect("the spawned agent");
-            assert_eq!(
-                app.agent_status(agent, cx),
-                Status::Fail,
-                "premise: the run really failed, so the strip really offers the button"
-            );
-            assert!(
-                app.is_main_worktree_path(&agent.cwd),
-                "premise: and it really failed in the repo's own main checkout"
-            );
-        });
-
-        let discard = cx
-            .debug_bounds("footer-action-DiscardWorktree")
-            .expect("the button still paints - disabled, not hidden");
-        cx.simulate_click(discard.center(), gpui::Modifiers::none());
-        cx.run_until_parked();
-
-        assert_eq!(
-            app.read_with(cx, |app, _| app.discard_confirm_armed),
-            None,
-            "a disabled button must not arm a discard that could never succeed"
-        );
-        assert!(repo.path().exists(), "and the main checkout is untouched");
     }
 
     #[gpui::test]

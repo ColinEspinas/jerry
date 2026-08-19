@@ -136,7 +136,7 @@ impl AdeApp {
     }
 
     /// The transient "keeping all changes…"/"discarded …" feedback from
-    /// `AdeApp::keep_all_changes`/`AdeApp::execute_discard_worktree` (`worktree_history::flow`,
+    /// `AdeApp::keep_all_changes`/`AdeApp::execute_discard_worktree_path` (`worktree_history::flow`,
     /// Revision R10) - `None` (nothing rendered at all) whenever
     /// [`AdeApp::worktree_history_status`] is `None`.
     fn render_status_worktree_history_notice(&self) -> Option<gpui::AnyElement> {

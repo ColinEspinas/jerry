@@ -12,7 +12,6 @@ use crate::sidebar::file_tree::{self};
 use crate::theme;
 use crate::work_surface::agents::{Agent, AgentId, AgentKind, ProcessKind};
 use crate::work_surface::state as work_surface;
-use crate::worktree_history::flow as worktree_history;
 use gpui::{div, font, prelude::*, px, App, ClickEvent, Context, Window};
 use std::path::{Path, PathBuf};
 

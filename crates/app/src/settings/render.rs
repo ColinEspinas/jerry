@@ -4762,7 +4762,7 @@ impl AdeApp {
     /// every other destructive action in this app). The first click on a given `name` only arms
     /// it; a second click on the *same* name actually deletes
     /// ([`Self::execute_remove_custom_theme`]) - mirroring
-    /// `crate::worktree_history::flow::AdeApp::request_discard_worktree`'s identical shape.
+    /// `crate::worktree_history::flow::AdeApp::request_discard_worktree_path`'s identical shape.
     fn request_remove_custom_theme(&mut self, name: String, cx: &mut Context<Self>) {
         if self.custom_theme_remove_armed.as_deref() != Some(name.as_str()) {
             self.custom_theme_remove_armed = Some(name);

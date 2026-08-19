@@ -28,15 +28,12 @@ impl AdeApp {
             .unwrap_or_else(|| path.display().to_string())
     }
 
-    /// Whether `path` is a repository's own main checkout - the one worktree `git worktree remove`
-    /// refuses outright, and so the one [`Self::execute_discard_worktree_path`] can never succeed
-    /// on (`wt_core::undo::discard_worktree`'s `DiscardSourceIsMainWorktree`). Every removal
-    /// affordance consults this, so the refusal lands before that method's agent/language-server
-    /// teardown rather than after it. Reads the focused repo's list first and then every other
-    /// added repo's, because a rail row menu can be opened on a worktree belonging to a repo that
-    /// isn't focused. An unknown path is not main: a worktree list that hasn't loaded yet must not
-    /// disable a real action.
+    /// Whether `path` is a repository's own main checkout - the one worktree
+    /// [`Self::execute_discard_worktree_path`] can never succeed on.
     pub(crate) fn is_main_worktree_path(&self, path: &Path) -> bool {
+        // Every added repo, not just the focused one: a rail row menu can be opened on a worktree
+        // belonging to a repo `Self::worktrees` says nothing about. An unknown path is not main,
+        // so a list that has not loaded yet cannot disable a real action.
         self.worktrees
             .iter()
             .chain(self.repos.iter().flat_map(|repo| repo.worktrees.iter()))
@@ -54,7 +51,7 @@ impl AdeApp {
 
     /// The Review footer's `Keep all` action - a real `wt_core::undo::commit_all_changes` on
     /// agent `id`'s worktree. Not gated by any confirmation (unlike
-    /// [`Self::request_discard_worktree`]): it's non-destructive.
+    /// [`Self::request_discard_worktree_path`]): it's non-destructive.
     pub(crate) fn keep_all_changes(&mut self, id: AgentId, cx: &mut Context<Self>) {
         if self.worktree_history_op_in_flight.is_some() {
             return;
@@ -65,7 +62,6 @@ impl AdeApp {
         let worktree_path = agent.cwd.clone();
         let branch_display = self.branch_display_for(&worktree_path);
         self.prune_confirm_armed = false;
-        self.discard_confirm_armed = None;
         self.worktree_history_op_in_flight = Some(WorktreeHistoryOpKind::Keep);
         self.worktree_history_status =
             Some(format!("keeping all changes in {branch_display}\u{2026}"));
@@ -96,52 +92,8 @@ impl AdeApp {
         self._worktree_history_task = Some(task);
     }
 
-    /// The Review/Fail footer's `Discard worktree` action - two-click confirmation (mirroring
-    /// [`Self::request_prune`]'s own reasoning: this is a real, destructive action - it
-    /// force-removes a worktree directory, preserving uncommitted/untracked content in a real git
-    /// stash first (see [`wt_core::undo::discard_worktree`]'s own docs), but not undoable from
-    /// within this app). The first click only arms [`AdeApp::discard_confirm_armed`] for `id`; a
-    /// second click on the *same* agent's button while armed actually runs it.
-    pub(crate) fn request_discard_worktree(
-        &mut self,
-        id: AgentId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.worktree_history_op_in_flight.is_some() {
-            return;
-        }
-        if self.discard_confirm_armed != Some(id) {
-            self.discard_confirm_armed = Some(id);
-            cx.notify();
-            return;
-        }
-        self.prune_confirm_armed = false;
-        self.discard_confirm_armed = None;
-        self.execute_discard_worktree(id, window, cx);
-    }
-
-    /// Runs the real, already-confirmed discard - only ever reached through
-    /// [`Self::request_discard_worktree`]'s second click. `_window` is accepted (not read
-    /// directly) purely to match every other footer-button click handler's signature - the real
-    /// `Window` [`Self::close_agent`] needs on success is obtained fresh, asynchronously, via
-    /// `update_in` in the completion handler below (see this module's own docs).
-    pub(in crate::worktree_history) fn execute_discard_worktree(
-        &mut self,
-        id: AgentId,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(agent) = self.agents.iter().find(|agent| agent.id == id) else {
-            return;
-        };
-        let worktree_path = agent.cwd.clone();
-        self.execute_discard_worktree_path(worktree_path, cx);
-    }
-
-    /// The rail's `Remove worktree…` row (GitHub issue #290), keyed by worktree path - two
-    /// clicks, exactly like [`Self::request_discard_worktree`]'s button, and running the same
-    /// real [`Self::execute_discard_worktree_path`] underneath.
+    /// The rail's `Remove worktree…` row, keyed by worktree path - two clicks, and the only door
+    /// onto [`Self::execute_discard_worktree_path`]. `true` once it really ran.
     pub(crate) fn request_discard_worktree_path(
         &mut self,
         worktree_path: PathBuf,
@@ -160,7 +112,6 @@ impl AdeApp {
             return false;
         }
         self.prune_confirm_armed = false;
-        self.discard_confirm_armed = None;
         self.remove_worktree_confirm_armed = None;
         self.execute_discard_worktree_path(worktree_path, cx);
         true
@@ -419,17 +370,17 @@ mod worktree_history_regression_tests {
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
         let id = spawn_agent(&app, cx, feature.clone());
 
-        app.update_in(cx, |app, window, cx| {
-            app.request_discard_worktree(id, window, cx)
+        app.update(cx, |app, cx| {
+            app.request_discard_worktree_path(feature.clone(), cx)
         });
         assert_eq!(
-            app.read_with(cx, |app, _| app.discard_confirm_armed),
-            Some(id)
+            app.read_with(cx, |app, _| app.remove_worktree_confirm_armed.clone()),
+            Some(feature.clone())
         );
         assert!(feature.exists(), "the first click must not touch anything");
 
-        app.update_in(cx, |app, window, cx| {
-            app.request_discard_worktree(id, window, cx)
+        app.update(cx, |app, cx| {
+            app.request_discard_worktree_path(feature.clone(), cx)
         });
         assert!(app.read_with(cx, |app, _| app.worktree_history_op_in_flight.is_some()));
         cx.run_until_parked();
@@ -464,12 +415,12 @@ mod worktree_history_regression_tests {
         .expect("write ignored file");
 
         let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
-        let id = spawn_agent(&app, cx, feature.clone());
-        app.update_in(cx, |app, window, cx| {
-            app.request_discard_worktree(id, window, cx)
+        let _id = spawn_agent(&app, cx, feature.clone());
+        app.update(cx, |app, cx| {
+            app.request_discard_worktree_path(feature.clone(), cx)
         });
-        app.update_in(cx, |app, window, cx| {
-            app.request_discard_worktree(id, window, cx)
+        app.update(cx, |app, cx| {
+            app.request_discard_worktree_path(feature.clone(), cx)
         });
         cx.run_until_parked();
 

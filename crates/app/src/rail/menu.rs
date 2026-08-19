@@ -53,8 +53,7 @@ pub enum RailMenuAction {
     OpenIn,
     OpenInFileManager,
     OpenInTerminal,
-    /// The app's one worktree-deletion entry point (the Changes panel deliberately has none) -
-    /// two clicks, routed into the existing discard flow. See
+    /// The app's only worktree-deletion entry point - two clicks, routed into
     /// `crate::worktree_history::flow::AdeApp::request_discard_worktree_path`.
     RemoveWorktree,
     /// Switch to this agent's tab.
@@ -81,9 +80,7 @@ pub const REMOVE_WORKTREE_HINT: &str = "Removes the checkout. Uncommitted and un
 pub const ARCHIVE_RUN_HINT: &str = "Ends the run. It stays in History with its transcript, \
                                     diffstat and notes; the files it wrote are untouched.";
 
-/// Why `Remove worktree…` is disabled on a repository's own main checkout (GitHub issue #462) -
-/// `git worktree remove` refuses it, so the row is gated here rather than left to fail after
-/// `crate::worktree_history::flow`'s discard has already torn down the worktree's agents.
+/// Why `Remove worktree…` is disabled on a repository's own main checkout.
 pub const REMOVE_MAIN_WORKTREE_REASON: &str =
     "this is the repository's main checkout - git cannot remove it";
 
@@ -125,8 +122,7 @@ pub fn worktree_menu_groups(
         vec![MenuEntry::new(
             RailMenuAction::RemoveWorktree,
             // The armed state re-labels *this* row rather than adding a second one - one
-            // command, one row, whichever click it is on. A main checkout never arms, so its
-            // row keeps the resting label under the gate below.
+            // command, one row, whichever click it is on.
             if remove_armed {
                 "Remove worktree \u{2014} click again"
             } else {

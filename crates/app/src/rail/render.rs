@@ -206,7 +206,6 @@ impl AdeApp {
         };
         if changed {
             self.prune_confirm_armed = false;
-            self.discard_confirm_armed = None;
             cx.notify();
             cx.stop_propagation();
         }
@@ -594,7 +593,6 @@ impl AdeApp {
 
         if candidates.is_empty() {
             self.prune_confirm_armed = false;
-            self.discard_confirm_armed = None;
             self.prune_status = Some("nothing to prune".to_string());
             cx.notify();
             return;
@@ -608,7 +606,6 @@ impl AdeApp {
         }
 
         self.prune_confirm_armed = false;
-        self.discard_confirm_armed = None;
         self.execute_prune(candidates, cx);
     }
 
@@ -856,7 +853,6 @@ impl AdeApp {
         widgets::TextFieldHandle::new(|app: &mut AdeApp| Some(&mut app.filter_query)).on_changed(
             |app: &mut AdeApp, _cx| {
                 app.prune_confirm_armed = false;
-                app.discard_confirm_armed = None;
             },
         )
     }

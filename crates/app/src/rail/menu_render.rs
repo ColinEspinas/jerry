@@ -457,14 +457,9 @@ mod rail_menu_tests {
         id
     }
 
-    /// Opens `worktree_path`'s row menu at a fixed anchor, without going through its rail row.
-    ///
-    /// The sibling tests here right-click the real painted row and are the right shape for
-    /// *that* wiring; this exists for tests about the popover's own rows, because the rail's
-    /// worktree rows do not paint under `TestAppContext` on Windows (GitHub issue #468 - every
-    /// test in this module that calls [`right_click_worktree_row`] is red there). The popover
-    /// itself paints on every platform, so a test anchored here still measures a real, painted,
-    /// really-clicked menu row.
+    /// Opens `worktree_path`'s row menu at a fixed anchor, without going through its rail row -
+    /// for tests about the popover's own rows. The rail's worktree rows do not paint under
+    /// `TestAppContext` on Windows (issue #468); the popover does, on every platform.
     fn open_worktree_menu(
         app: &gpui::Entity<AdeApp>,
         cx: &mut gpui::VisualTestContext,
@@ -881,9 +876,8 @@ mod rail_menu_tests {
         });
     }
 
-    /// GitHub issue #462: `git worktree remove` refuses a repository's own main checkout, and
-    /// `execute_discard_worktree_path` kills the worktree's agents and language servers on its
-    /// way to finding that out - so the row has to refuse first.
+    /// The row has to refuse before [`AdeApp::execute_discard_worktree_path`] tears down the
+    /// checkout's agents and language servers on its way to git refusing anyway.
     #[gpui::test]
     fn remove_worktree_is_disabled_on_the_main_checkout(cx: &mut TestAppContext) {
         let repo = crate::test_support::temp_repo();

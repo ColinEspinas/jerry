@@ -46,7 +46,6 @@ impl AdeApp {
         self.plus_menu_open = false;
         self.title_menu_open = None;
         self.prune_confirm_armed = false;
-        self.discard_confirm_armed = None;
 
         // The same "leaving Files"/"leaving the code surface" sweep `open_review_tab` performs,
         // for the identical reason: `self.open_change = None` above just unrendered the code

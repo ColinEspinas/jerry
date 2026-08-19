@@ -548,7 +548,6 @@ impl AdeApp {
             worktree_history_status: None,
             update_state: updater::state::UpdateState::Idle,
             update_check_in_flight: false,
-            discard_confirm_armed: None,
             settings_open: false,
             settings_nav_scroll_handle: gpui::ScrollHandle::new(),
             settings_content_scroll_handle: gpui::ScrollHandle::new(),
@@ -1639,7 +1638,6 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         self.prune_confirm_armed = false;
-        self.discard_confirm_armed = None;
         // Same reasoning for every floating menu (`crate::root::menus`): the commit composer's
         // split-button popover (Revision R12 §5) names the previously selected worktree's staged
         // set, the file tree's context menu targets a row that is about to stop existing, and the

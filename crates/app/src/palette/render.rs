@@ -414,7 +414,6 @@ impl AdeApp {
                 // `Self::open_palette`'s docs); the other branches already do this via the
                 // methods they call, so this one clears it explicitly.
                 self.prune_confirm_armed = false;
-                self.discard_confirm_armed = None;
                 self.set_right_sidebar_view(
                     next_right_sidebar_view(self.right_sidebar_view),
                     window,
@@ -456,7 +455,6 @@ impl AdeApp {
         // Every palette selection counts as a fresh gesture that disarms a pending prune
         // confirmation (see `Self::open_palette`'s docs).
         self.prune_confirm_armed = false;
-        self.discard_confirm_armed = None;
         let relative = path
             .strip_prefix(&self.file_tree_root)
             .map(|p| p.to_path_buf())
