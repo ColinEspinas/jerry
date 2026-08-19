@@ -249,6 +249,12 @@ impl AdeApp {
                         for id in orphaned {
                             this.close_agent(id, window, cx);
                         }
+                        // The discarded worktree's stashed switch-back content (GitHub issue
+                        // #454) describes a directory that no longer exists - evicted here, and
+                        // the stash helpers' own is-still-on-disk guard covers any later switch
+                        // that would otherwise re-record it.
+                        this.file_tree_by_worktree.remove(&discarded_path);
+                        this.changes_by_worktree.remove(&discarded_path);
                         this.remove_worktree_confirm_armed = None;
                         this.refresh_after_worktree_history_op(cx);
                     }

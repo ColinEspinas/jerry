@@ -322,6 +322,8 @@ impl AdeApp {
             selected: None,
             agents: Agents::new(),
             file_tree: file_tree::FileTree::default(),
+            file_tree_by_worktree: HashMap::new(),
+            changes_by_worktree: HashMap::new(),
             file_tree_error: None,
             right_sidebar_view: RightSidebarView::Files,
             file_tree_scroll_handle: UniformListScrollHandle::new(),
@@ -1332,6 +1334,26 @@ impl AdeApp {
     /// Loads [`Self::file_tree_root`]'s listing and applies the result, off the foreground
     /// thread — from git's own content answer, walking the filesystem only for a non-git root
     /// (see `file_tree::build_worktree_file_tree`, GitHub issue #472).
+    /// `stash_changes_snapshot`'s file-tree twin (GitHub issue #454): stashes the current
+    /// [`Self::file_tree_root`]'s loaded tree under its root, for
+    /// [`Self::reset_repo_scoped_state`] to paint straight back on the next visit. Refuses an
+    /// empty tree (nothing worth restoring) and a root that no longer exists on disk (a
+    /// discarded worktree's rows must not be resurrected by the switch away from it).
+    fn stash_file_tree_listing(&mut self) {
+        if self.file_tree.is_empty() {
+            return;
+        }
+        if !self.file_tree_root.is_dir() {
+            return;
+        }
+        let listing = file_tree::FileTreeListing {
+            tree: std::mem::take(&mut self.file_tree),
+            partial: !self.file_tree_complete,
+        };
+        self.file_tree_by_worktree
+            .insert(self.file_tree_root.clone(), listing);
+    }
+
     pub(crate) fn load_file_tree(&mut self, root: PathBuf, cx: &mut Context<Self>) {
         self.set_file_tree_root(root.clone(), cx);
         let task = cx.spawn(async move |this, cx| {
@@ -1638,6 +1660,11 @@ impl AdeApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // GitHub issue #454: before any reset below blanks them, stash the outgoing worktree's
+        // landed file tree and Changes content so its next visit paints instantly instead of
+        // showing an empty sidebar and Loading spinners until the async reloads land.
+        self.stash_changes_snapshot();
+        self.stash_file_tree_listing();
         self.prune_confirm_armed = false;
         self.discard_confirm_armed = None;
         // Same reasoning for every floating menu (`crate::root::menus`): the commit composer's
@@ -1689,10 +1716,22 @@ impl AdeApp {
         // below sets the root too, but its walk is asynchronous, so without this the frames
         // between here and the walk landing would render whatever was left's rows against the
         // new root's expanded set - and a click on one of those stale rows would reach
-        // `set_dir_expanded` with a path from an entirely different worktree/repo. Clearing
-        // `file_tree` makes that window render an honestly empty tree instead.
+        // `set_dir_expanded` with a path from an entirely different worktree/repo. What fills
+        // that window is `new_root`'s *own* stashed last-known tree when it has one (GitHub
+        // issue #454) - its rows are this worktree's real paths, so a click on one is valid,
+        // merely possibly stale until the walk lands - and an honestly empty tree on a first
+        // visit, exactly as before.
         self.set_file_tree_root(new_root.clone(), cx);
-        self.file_tree = file_tree::FileTree::default();
+        match self.file_tree_by_worktree.remove(&new_root) {
+            Some(listing) => {
+                self.file_tree_complete = listing.is_complete();
+                self.file_tree = listing.tree;
+            }
+            None => {
+                self.file_tree_complete = false;
+                self.file_tree = file_tree::FileTree::default();
+            }
+        }
         self.reload_expanded_dirs_from_fold_state();
         // Every one of these holds an absolute path in whatever was just left (GitHub issue #19):
         // a half-typed name for a folder in the old tree, a cut/copied entry a paste here would
@@ -1710,7 +1749,6 @@ impl AdeApp {
         // delete backups this leaves unreachable.
         self.clear_tree_undo_history();
         self.tree_op_error = None;
-        self.file_tree_complete = false;
         // `focus_newly_spawned_agent` (despite its name - its body has no "newly spawned" logic
         // in it, just the shared "move focus unless a file tab/Settings is showing" guard) closes
         // the dangling-focus risk this switch creates: the previously-active agent's pane may
@@ -1825,15 +1863,15 @@ impl AdeApp {
         // `load_file_tree` above already set `self.file_tree_root = new_root` synchronously, so
         // `new_root` is the active root by the time eviction runs.
         self.evict_stale_lsp_clients(&new_root, cx);
-        self.load_diff(new_root, cx);
+        self.load_diff_for_switch(new_root, cx);
         // The graph tab is repo-scoped, not worktree-scoped (design spec §1: "the graph is
         // repo-scoped"), but the toolbar's `HEAD` chip/upstream counts and the Worktrees scope
         // (`wt_core::graph::GraphScope::Worktrees`, driven by real worktree HEADs) are real facts
         // about whatever is genuinely current now - without this, switching while the graph tab
         // is open silently left it showing stale data (a real, adversarial-audit-found gap), and
         // the Commit panel's cached "Files changed" could even fail against the wrong repo path.
-        // `load_diff` above already updated `Self::diff_root` synchronously, so `load_graph`
-        // (which reads it) picks up the new root correctly.
+        // `load_diff_for_switch` above already updated `Self::diff_root` synchronously (both of
+        // its arms do), so `load_graph` (which reads it) picks up the new root correctly.
         if self.graph_tab_open {
             self.load_graph(cx);
         }
@@ -2703,5 +2741,170 @@ mod file_tree_watch_integration_tests {
             "switching worktrees must re-arm a real watcher on the newly selected root, not \
              leave the previous worktree's watcher (or none at all) in place"
         );
+    }
+}
+
+/// GitHub issue #454's contract: switching back to an already-visited worktree paints that
+/// worktree's own last-known file tree and Changes content in the very same frame - the fresh
+/// reload lands behind it - while a first-ever visit keeps the honest empty/`Loading` states.
+#[cfg(test)]
+mod instant_worktree_switch_tests {
+    use crate::code_surface::state::DiffLoadState;
+    use crate::root::AdeApp;
+    use gpui::TestAppContext;
+    use std::path::{Path, PathBuf};
+
+    fn add_worktree(repo_path: &Path, branch: &str, name: &str) -> PathBuf {
+        let container = crate::test_support::temp_root();
+        let path = container.path().join(name);
+        drop(container);
+        test_support::add_worktree(repo_path, branch, &path);
+        path
+    }
+
+    fn index_of(app: &AdeApp, path: &Path) -> usize {
+        app.worktrees
+            .iter()
+            .position(|item| item.path == path)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{} must be a real worktree row - the list is {:?}",
+                    path.display(),
+                    app.worktrees
+                        .iter()
+                        .map(|item| item.path.clone())
+                        .collect::<Vec<_>>()
+                )
+            })
+    }
+
+    #[gpui::test]
+    fn switching_back_to_a_visited_worktree_paints_its_last_known_content_immediately(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = crate::test_support::temp_repo();
+        let repo_path = repo.path().to_path_buf();
+        let feature = add_worktree(&repo_path, "feature", "instant-wt");
+        // A real uncommitted file, so the main worktree's Changes content is non-trivially real.
+        std::fs::write(repo_path.join("uncommitted.txt"), "wip\n").expect("write");
+
+        let (app, cx) = crate::test_support::open_test_app(cx, repo_path.clone());
+        cx.run_until_parked();
+        app.update(cx, |app, cx| app.load_worktrees(cx));
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(
+                !app.file_tree.is_empty(),
+                "premise: the main worktree's tree really loaded"
+            );
+            assert!(
+                app.uncommitted_diff.loaded().is_some(),
+                "premise: the main worktree's Changes scopes really loaded"
+            );
+            assert!(
+                !matches!(app.diff_state, DiffLoadState::Loading),
+                "premise: the against-base diff really landed"
+            );
+        });
+
+        app.update_in(cx, |app, window, cx| {
+            let index = index_of(app, &feature);
+            app.select_worktree(index, window, cx);
+        });
+        cx.run_until_parked();
+
+        // The switch back. Every assertion runs inside the same update the click handler runs
+        // in - nothing asynchronous has had a chance to land yet, so what these see is exactly
+        // the frame the user sees at click time.
+        app.update_in(cx, |app, window, cx| {
+            let index = index_of(app, &repo_path);
+            app.select_worktree(index, window, cx);
+            assert!(
+                !app.file_tree.is_empty(),
+                "a revisited worktree must paint its last-known file tree immediately, not a \
+                 blank sidebar until the fresh walk lands (GitHub issue #454)"
+            );
+            assert!(
+                app.uncommitted_diff.loaded().is_some(),
+                "a revisited worktree must paint its last-known uncommitted changes immediately, \
+                 not a Loading spinner"
+            );
+            assert!(
+                !matches!(app.diff_state, DiffLoadState::Loading),
+                "and its last-known against-base diff, for the same reason"
+            );
+        });
+
+        // The background refresh still runs and lands on top of the restored content.
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(
+                !app.file_tree.is_empty(),
+                "the fresh walk must land on top of the restored tree, never blank it"
+            );
+            let uncommitted = app
+                .uncommitted_diff
+                .loaded()
+                .expect("the fresh uncommitted scope must have landed");
+            assert!(
+                uncommitted
+                    .files
+                    .iter()
+                    .any(|file| file.path.ends_with("uncommitted.txt")),
+                "and it must be the real reloaded answer, not just the stale snapshot left in \
+                 place - got {:?}",
+                uncommitted
+                    .files
+                    .iter()
+                    .map(|f| f.path.clone())
+                    .collect::<Vec<_>>()
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn a_never_visited_worktree_still_starts_from_honest_loading_states(cx: &mut TestAppContext) {
+        let repo = crate::test_support::temp_repo();
+        let repo_path = repo.path().to_path_buf();
+        let feature = add_worktree(&repo_path, "feature", "honest-wt");
+
+        let (app, cx) = crate::test_support::open_test_app(cx, repo_path.clone());
+        cx.run_until_parked();
+        app.update(cx, |app, cx| app.load_worktrees(cx));
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(
+                !app.file_tree.is_empty(),
+                "premise: the main worktree's tree really loaded first"
+            );
+        });
+
+        // First-ever visit: there is no last-known content for this worktree, and the previous
+        // worktree's must never stand in for it - same-frame assertions, as above.
+        app.update_in(cx, |app, window, cx| {
+            let index = index_of(app, &feature);
+            app.select_worktree(index, window, cx);
+            assert!(
+                app.file_tree.is_empty(),
+                "a first visit has nothing honest to paint yet - and the previous worktree's \
+                 tree must never bleed across"
+            );
+            assert!(
+                app.uncommitted_diff.loaded().is_none(),
+                "same for the Changes scopes - Loading, never the previous worktree's answer"
+            );
+            assert!(
+                matches!(app.diff_state, DiffLoadState::Loading),
+                "and the against-base diff"
+            );
+        });
+
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(
+                !app.file_tree.is_empty(),
+                "and the real walk still lands afterwards"
+            );
+        });
     }
 }

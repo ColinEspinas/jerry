@@ -12,6 +12,20 @@ pub(crate) enum DiffLoadState {
     Error(String),
 }
 
+/// One worktree's last-known Changes content - every field [`AdeApp::load_diff`] blanks -
+/// stashed on switch-away and painted straight back on the next visit while the fresh reload
+/// runs behind it (GitHub issue #454). Never holds a `Loading` `diff_state`: the stash refuses
+/// to record one, so a restore always paints landed content.
+pub(crate) struct ChangesSnapshot {
+    pub(crate) diff_state: DiffLoadState,
+    pub(crate) diff_totals: Option<(u32, u32)>,
+    pub(crate) change_set: crate::provenance::change_set::ChangeSet,
+    pub(crate) uncommitted_diff: crate::sidebar::sections::ScopeLoad<WorktreeDiff>,
+    pub(crate) uncommitted_change_set: crate::provenance::change_set::ChangeSet,
+    pub(crate) branch_commits: crate::sidebar::sections::ScopeLoad<wt_core::diff::BranchCommits>,
+    pub(crate) dirty_files: Option<std::collections::HashSet<PathBuf>>,
+}
+
 /// The outcome of the most recent (or in-flight) `code_view::load_file` call for whichever path
 /// [`AdeApp::render_file_view`] most recently asked to load. Mirrors [`DiffLoadState`]'s shape:
 /// `load_file` does the same class of blocking I/O (`std::fs::read`, plus a `tree-sitter` parse

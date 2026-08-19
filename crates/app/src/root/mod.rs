@@ -48,8 +48,8 @@ use crate::work_surface::state as work_surface;
 use crate::worktree_history::flow as worktree_history;
 
 use crate::code_surface::state::{
-    BlameCacheEntry, BlameLoadState, CommitMessageState, DiffLoadState, FileLoadState, HoverAnchor,
-    HoverEntry,
+    BlameCacheEntry, BlameLoadState, ChangesSnapshot, CommitMessageState, DiffLoadState,
+    FileLoadState, HoverAnchor, HoverEntry,
 };
 use crate::lsp::client::LspClientState;
 use crate::lsp::completion_popup::CompletionsEntry;
@@ -782,6 +782,16 @@ pub struct AdeApp {
     /// *current* worktree's entry, creating it empty on first access rather than requiring a
     /// separate "new worktree" seeding step.
     pub(crate) open_files_by_worktree: HashMap<PathBuf, Vec<PathBuf>>,
+    /// Each visited worktree's last successfully loaded file tree, stashed on switch-away
+    /// ([`Self::reset_repo_scoped_state`]) and painted straight back on the next visit while the
+    /// fresh walk runs behind it - so a revisit never renders a blank sidebar (GitHub issue
+    /// #454). Keyed by worktree root like [`Self::open_files_by_worktree`]; entries move out on
+    /// restore and back in on the next switch-away, and a discarded worktree's entry is evicted
+    /// with it (`crate::worktree_history::flow`).
+    pub(crate) file_tree_by_worktree: HashMap<PathBuf, file_tree::FileTreeListing>,
+    /// [`Self::file_tree_by_worktree`]'s Changes-panel twin - see
+    /// [`crate::code_surface::state::ChangesSnapshot`]'s own docs.
+    pub(crate) changes_by_worktree: HashMap<PathBuf, ChangesSnapshot>,
     /// Which file tab (if any) the centre pane is showing instead of an agent -
     /// `Some(path)` iff `path` is also in [`Self::open_files`]. Set by a Changes row
     /// (`Self::open_change_diff`), a Files-tree row (`Self::open_file_view`), or an already-open
