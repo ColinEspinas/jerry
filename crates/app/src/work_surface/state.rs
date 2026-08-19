@@ -474,12 +474,6 @@ pub enum ActionKind {
     /// stand-in for `Retry`/`Resume` (this app has no saved-agent resumability to actually
     /// resume *from* - see [`pty_state_label`] on the same gap).
     Respawn,
-    /// `crate::worktree_history::flow::AdeApp::request_discard_worktree` (Revision R10): a real
-    /// `wt_core::undo::discard_worktree`, behind the same two-click confirmation as the rail
-    /// footer's `prune` button (see that method's own docs for why - this is a real, destructive
-    /// action that force-removes a worktree, preserving uncommitted/untracked content in a real
-    /// git stash first).
-    DiscardWorktree,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -509,22 +503,13 @@ pub fn footer_actions(status: Status) -> Vec<FooterAction> {
         // §4e: "`Interrupt` offered on an agent that is *waiting for you* - there is nothing to
         // interrupt", and a second terminal does not answer the question the agent is asking.
         Status::Ask => Vec::new(),
-        Status::Fail => vec![
-            FooterAction {
-                kind: ActionKind::Respawn,
-                label: "Retry",
-                keycap: Some("mod+R"),
-                style: ActionStyle::Outline,
-                implemented: true,
-            },
-            FooterAction {
-                kind: ActionKind::DiscardWorktree,
-                label: "Discard worktree",
-                keycap: None,
-                style: ActionStyle::Ghost,
-                implemented: true,
-            },
-        ],
+        Status::Fail => vec![FooterAction {
+            kind: ActionKind::Respawn,
+            label: "Retry",
+            keycap: Some("mod+R"),
+            style: ActionStyle::Outline,
+            implemented: true,
+        }],
         // §4t: "`Interrupt` was the last button on it, and the pane is a terminal: `⌃C` already
         // interrupts and `mod+R` already retries, so a button duplicating a keystroke that works
         // in the focused surface is the same unearned space as §4r."
@@ -712,13 +697,12 @@ mod tests {
     }
 
     #[test]
-    fn fail_actions_are_exactly_a_real_retry_then_a_real_discard() {
+    fn fail_actions_are_exactly_a_real_retry() {
         let actions = footer_actions(Status::Fail);
         let labels: Vec<&str> = actions.iter().map(|action| action.label).collect();
-        assert_eq!(labels, vec!["Retry", "Discard worktree"]);
+        assert_eq!(labels, vec!["Retry"]);
         assert_eq!(actions[0].kind, ActionKind::Respawn);
-        assert_eq!(actions[1].kind, ActionKind::DiscardWorktree);
-        assert!(actions.iter().all(|action| action.implemented));
+        assert!(actions[0].implemented);
     }
 
     #[test]
@@ -745,6 +729,7 @@ mod tests {
                             | "Open in editor"
                             | "Merge"
                             | "Archive"
+                            | "Discard worktree"
                     ),
                     "{status:?} still offers {:?}, which GitHub issue #295 moved out of the \
                      agent pane's bottom strip",
@@ -758,7 +743,6 @@ mod tests {
     fn surviving_buttons_advertise_only_keycaps_that_really_exist() {
         let fail = footer_actions(Status::Fail);
         assert_eq!(fail[0].keycap, Some("mod+R"));
-        assert_eq!(fail[1].keycap, None);
         assert_eq!(footer_actions(Status::Idle)[0].keycap, Some("mod+enter"));
     }
 

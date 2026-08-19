@@ -53,8 +53,7 @@ pub enum RailMenuAction {
     OpenIn,
     OpenInFileManager,
     OpenInTerminal,
-    /// The app's one worktree-deletion entry point (the Changes panel deliberately has none) -
-    /// two clicks, routed into the existing discard flow. See
+    /// The app's only worktree-deletion entry point - two clicks, routed into
     /// `crate::worktree_history::flow::AdeApp::request_discard_worktree_path`.
     RemoveWorktree,
     /// Switch to this agent's tab.
@@ -81,11 +80,16 @@ pub const REMOVE_WORKTREE_HINT: &str = "Removes the checkout. Uncommitted and un
 pub const ARCHIVE_RUN_HINT: &str = "Ends the run. It stays in History with its transcript, \
                                     diffstat and notes; the files it wrote are untouched.";
 
+/// Why `Remove worktree…` is disabled on a repository's own main checkout.
+pub const REMOVE_MAIN_WORKTREE_REASON: &str =
+    "this is the repository's main checkout - git cannot remove it";
+
 /// The worktree row menu (§4's list, in §4's order).
 pub fn worktree_menu_groups(
     branch: Option<&str>,
     agent_count: usize,
     remove_armed: bool,
+    is_main: bool,
 ) -> Vec<Vec<MenuEntry<RailMenuAction>>> {
     let archive = if agent_count == 0 {
         MenuEntry::new(
@@ -126,6 +130,7 @@ pub fn worktree_menu_groups(
             },
         )
         .tooltip(REMOVE_WORKTREE_HINT)
+        .gated(!is_main, REMOVE_MAIN_WORKTREE_REASON)
         .destructive()],
     ]
 }
@@ -196,9 +201,12 @@ pub fn menu_rows(
     agent_count: usize,
     remove_armed: bool,
     agent_running: bool,
+    is_main: bool,
 ) -> Vec<MenuRow<RailMenuAction>> {
     crate::menu::model::menu_rows(match target {
-        RailMenuTarget::Worktree(_) => worktree_menu_groups(branch, agent_count, remove_armed),
+        RailMenuTarget::Worktree(_) => {
+            worktree_menu_groups(branch, agent_count, remove_armed, is_main)
+        }
         RailMenuTarget::WorktreeOpenIn(_) => open_in_menu_groups(),
         RailMenuTarget::Agent(_) => agent_menu_groups(agent_running),
     })
@@ -218,7 +226,7 @@ mod tests {
     #[test]
     fn the_worktree_menu_is_the_row_set_the_revision_lists() {
         assert_eq!(
-            labels(&worktree_menu_groups(Some("fix/auth"), 2, false)),
+            labels(&worktree_menu_groups(Some("fix/auth"), 2, false, false)),
             vec![
                 vec!["New agent here", "Archive 2 agents"],
                 vec!["Copy branch name", "Copy path", "Open in\u{2026}"],
@@ -234,7 +242,7 @@ mod tests {
             RailMenuTarget::WorktreeOpenIn(PathBuf::from("/wt")),
             RailMenuTarget::Agent(1),
         ] {
-            let rows = menu_rows(&target, Some("main"), 1, false, true);
+            let rows = menu_rows(&target, Some("main"), 1, false, true, false);
             assert!(
                 !matches!(rows.first(), Some(MenuRow::Separator)),
                 "a leading divider is what a stripped title row leaves behind: {target:?}"
@@ -245,10 +253,10 @@ mod tests {
 
     #[test]
     fn the_archive_row_counts_the_worktrees_real_agents_and_disables_itself_at_zero() {
-        let one = worktree_menu_groups(Some("main"), 1, false);
+        let one = worktree_menu_groups(Some("main"), 1, false, false);
         assert_eq!(one[0][1].label, "Archive 1 agent");
         assert!(one[0][1].enabled);
-        let none = worktree_menu_groups(Some("main"), 0, false);
+        let none = worktree_menu_groups(Some("main"), 0, false, false);
         assert_eq!(none[0][1].label, "No agents to archive");
         assert!(!none[0][1].enabled);
         assert!(none[0][1].disabled_reason.is_some());
@@ -256,17 +264,17 @@ mod tests {
 
     #[test]
     fn copy_branch_name_is_disabled_without_a_branch() {
-        let detached = worktree_menu_groups(None, 1, false);
+        let detached = worktree_menu_groups(None, 1, false, false);
         let row = &detached[1][0];
         assert_eq!(row.action, RailMenuAction::CopyBranchName);
         assert!(!row.enabled);
         assert!(row.disabled_reason.is_some());
-        assert!(worktree_menu_groups(Some("main"), 1, false)[1][0].enabled);
+        assert!(worktree_menu_groups(Some("main"), 1, false, false)[1][0].enabled);
     }
 
     #[test]
     fn only_remove_worktree_is_destructive_and_arming_relabels_it() {
-        let groups = worktree_menu_groups(Some("main"), 2, false);
+        let groups = worktree_menu_groups(Some("main"), 2, false, false);
         let destructive: Vec<&str> = groups
             .iter()
             .flatten()
@@ -275,11 +283,35 @@ mod tests {
             .collect();
         assert_eq!(destructive, vec!["Remove worktree\u{2026}"]);
 
-        let armed = worktree_menu_groups(Some("main"), 2, true);
+        let armed = worktree_menu_groups(Some("main"), 2, true, false);
         assert_eq!(armed.len(), groups.len());
         assert_eq!(armed[2].len(), 1, "arming must not add a row");
         assert_eq!(armed[2][0].label, "Remove worktree \u{2014} click again");
         assert!(armed[2][0].destructive);
+    }
+
+    #[test]
+    fn remove_worktree_is_disabled_on_the_main_checkout() {
+        let main = worktree_menu_groups(Some("main"), 1, false, true);
+        let row = &main[2][0];
+        assert_eq!(row.action, RailMenuAction::RemoveWorktree);
+        assert_eq!(
+            row.label, "Remove worktree\u{2026}",
+            "the row stays, so the menu is the same shape on every worktree row"
+        );
+        assert!(
+            !row.enabled,
+            "git worktree remove refuses the main checkout"
+        );
+        assert_eq!(
+            row.disabled_reason.as_deref(),
+            Some(REMOVE_MAIN_WORKTREE_REASON),
+            "and says why, rather than being a row that silently does nothing"
+        );
+        assert!(
+            worktree_menu_groups(Some("feature"), 1, false, false)[2][0].enabled,
+            "every other worktree keeps a real, runnable row"
+        );
     }
 
     #[test]
@@ -343,7 +375,7 @@ mod tests {
         let bindings = crate::default_key_bindings();
         let mut all: Vec<MenuEntry<RailMenuAction>> = Vec::new();
         all.extend(
-            worktree_menu_groups(Some("main"), 2, false)
+            worktree_menu_groups(Some("main"), 2, false, false)
                 .into_iter()
                 .flatten(),
         );

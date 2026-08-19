@@ -72,7 +72,6 @@ impl AdeApp {
         self.palette_query.reset();
         self.palette_selected = 0;
         self.prune_confirm_armed = false;
-        self.discard_confirm_armed = None;
         window.focus(&self.palette_focus_handle, cx);
         cx.notify();
     }
@@ -144,7 +143,6 @@ impl AdeApp {
         self.settings_open = true;
         self.settings_focus.capture(window, &self.agents, cx);
         self.prune_confirm_armed = false;
-        self.discard_confirm_armed = None;
         self.custom_theme_remove_armed = None;
         window.focus(&self.settings_focus_handle, cx);
         self.load_agent_rows(cx);

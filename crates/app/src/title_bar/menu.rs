@@ -294,11 +294,6 @@ impl AdeApp {
                 theme::text::DIM.into(),
                 theme::surface::CHIP_NEUTRAL.into(),
             ),
-            MenuCommand::DiscardWorktree => (
-                "D",
-                theme::diff::STAT_DEL.into(),
-                theme::surface::CHIP_NEUTRAL.into(),
-            ),
             MenuCommand::Documentation => (
                 "?",
                 theme::text::DIM.into(),
@@ -354,7 +349,6 @@ impl AdeApp {
             MenuCommand::ArchiveAgent => "close the active tab".to_string(),
             MenuCommand::ReviewAgent => "what this agent changed".to_string(),
             MenuCommand::KeepAllChanges => "commit the active worktree".to_string(),
-            MenuCommand::DiscardWorktree => "force-remove uncommitted content".to_string(),
             MenuCommand::Documentation => "README on GitHub".to_string(),
             MenuCommand::ReportIssue => "GitHub issues".to_string(),
             MenuCommand::About => "Jerry".to_string(),
@@ -367,12 +361,8 @@ impl AdeApp {
     }
 
     /// This command's real display label - [`MenuCommand::label`] for every command except the
-    /// two whose real label is a live status string (GitHub issue #235 preserves both dynamic
-    /// labels exactly as the pre-issue popover had them): [`MenuCommand::KeepAllChanges`] swaps
-    /// to `"keeping…"` mid-flight, and [`MenuCommand::DiscardWorktree`] swaps to `"discarding…"`
-    /// mid-flight or `"confirm discard?"` once armed by a first click - see
-    /// [`AdeApp::perform_menu_command`]'s own `DiscardWorktree` arm for the real arm/confirm
-    /// state machine this label mirrors.
+    /// one whose real label is a live status string: [`MenuCommand::KeepAllChanges`] swaps to
+    /// `"keeping…"` mid-flight.
     fn menu_command_label(&self, cmd: MenuCommand) -> &'static str {
         match cmd {
             MenuCommand::KeepAllChanges => {
@@ -380,19 +370,6 @@ impl AdeApp {
                     == Some(worktree_history::WorktreeHistoryOpKind::Keep)
                 {
                     "keeping\u{2026}"
-                } else {
-                    cmd.label()
-                }
-            }
-            MenuCommand::DiscardWorktree => {
-                let active_id = self.agents.active_id();
-                let discard_busy = self.worktree_history_op_in_flight
-                    == Some(worktree_history::WorktreeHistoryOpKind::Discard);
-                let discard_armed = active_id.is_some() && self.discard_confirm_armed == active_id;
-                if discard_busy {
-                    "discarding\u{2026}"
-                } else if discard_armed {
-                    "confirm discard?"
                 } else {
                     cmd.label()
                 }
@@ -816,98 +793,6 @@ mod title_menu_tests {
         assert!(
             cx.debug_bounds("tree-context-menu").is_none(),
             "the context menu must really stop painting, not merely have its state cleared"
-        );
-    }
-
-    /// The title menu's own click-handling for the Discard row (not just
-    /// `request_discard_worktree` itself, already covered above): the first, arming click must
-    /// leave the menu open so the row's label can really swap to "confirm discard?" for a second
-    /// click, and the second, executing click must close it. Drives this through two real
-    /// simulated clicks on the actual rendered Discard row ([`nth_row_click_point`]), matching
-    /// this file's own established style for every other title-menu test - an earlier version of
-    /// this test hand-copied the row's `on_click` condition inline instead, which meant it could
-    /// never actually catch a bug in the real rendered row's own click wiring (e.g. a wrong
-    /// bounds computation, or the row silently missing its `on_click` entirely).
-    #[gpui::test]
-    fn agent_menu_discard_row_stays_open_while_armed_and_closes_once_confirmed(
-        cx: &mut TestAppContext,
-    ) {
-        let repo = crate::test_support::temp_repo();
-        let worktree_container = crate::test_support::temp_root();
-        let worktree_path = worktree_container.path().join("feature-wt");
-        drop(worktree_container);
-        test_support::add_worktree(repo.path(), "feature", &worktree_path);
-        test_support::write_file(&worktree_path, "dirty.txt", "uncommitted\n");
-
-        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
-        app.update(cx, |app, cx| {
-            app.set_window_controls_style(WindowControlsStyle::WindowsLinuxStyle, cx);
-        });
-        let id = app.update_in(cx, |app, window, cx| {
-            app.agents.spawn(
-                ProcessKind::Shell,
-                worktree_path.clone(),
-                app.settings.appearance.terminal_font_size,
-                app.settings.terminal.shell_override(),
-                None,
-                window,
-                cx,
-            )
-        });
-        app.update_in(cx, |app, window, cx| {
-            app.select_agent(id, window, cx);
-        });
-        cx.run_until_parked();
-        app.update(cx, |app, cx| {
-            app.title_menu_open = Some(TitleMenu::Agent);
-            cx.notify();
-        });
-        cx.run_until_parked();
-
-        // The Discard row is the 8th real row (index 7, 0-based) in the Agent menu: New
-        // Terminal, New Agent Pane, [divider], Next Agent, Previous Agent, [divider], Review
-        // Agent, Archive Agent, Keep All Changes, Discard Worktree - seven real rows and two
-        // dividers sit above it (see `MenuCommand::rows`'s own row order).
-        let bounds = app.read_with(cx, |app, _| {
-            app.title_menu_button_bounds[TitleMenu::Agent.index()]
-        });
-        let discard_row_point = nth_row_click_point(bounds, 7, 2);
-
-        cx.simulate_click(discard_row_point, gpui::Modifiers::none());
-        cx.run_until_parked();
-        assert_eq!(
-            app.read_with(cx, |app, _| app.discard_confirm_armed),
-            Some(id),
-            "a real click on the rendered Discard row should have armed confirmation"
-        );
-        assert_eq!(
-            app.read_with(cx, |app, _| app.title_menu_open),
-            Some(TitleMenu::Agent),
-            "an arming first click must leave the menu open"
-        );
-        assert!(
-            worktree_path.exists(),
-            "an armed-but-not-yet-confirmed discard must not have touched the real worktree"
-        );
-
-        // Second, confirming click at the exact same point - the row's own position doesn't
-        // change when its label swaps to "confirm discard?", only its text.
-        cx.simulate_click(discard_row_point, gpui::Modifiers::none());
-        cx.run_until_parked();
-        assert_eq!(
-            app.read_with(cx, |app, _| app.discard_confirm_armed),
-            None,
-            "the confirming second click should have run the real discard and cleared the arm \
-             flag"
-        );
-        assert_eq!(
-            app.read_with(cx, |app, _| app.title_menu_open),
-            None,
-            "the confirming second click must close the menu"
-        );
-        assert!(
-            !worktree_path.exists(),
-            "the confirming click should have actually removed the real worktree directory"
         );
     }
 

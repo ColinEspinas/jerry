@@ -74,11 +74,6 @@ impl AdeApp {
                     && self.worktree_history_op_in_flight
                         != Some(worktree_history::WorktreeHistoryOpKind::Keep)
             }
-            MenuCommand::DiscardWorktree => {
-                self.agents.active_id().is_some()
-                    && self.worktree_history_op_in_flight
-                        != Some(worktree_history::WorktreeHistoryOpKind::Discard)
-            }
             MenuCommand::OpenFile
             | MenuCommand::OpenFolder
             | MenuCommand::NewWindow
@@ -216,20 +211,6 @@ impl AdeApp {
                 if let Some(id) = self.agents.active_id() {
                     self.title_menu_open = None;
                     self.keep_all_changes(id, cx);
-                }
-            }
-            MenuCommand::DiscardWorktree => {
-                if let Some(id) = self.agents.active_id() {
-                    self.request_discard_worktree(id, window, cx);
-                    // The first click only arms confirmation
-                    // (`AdeApp::discard_confirm_armed`) - keep the menu open so its own row can
-                    // swap to "confirm discard?" for a real second click, mirroring the agent
-                    // footer's identical two-step button and the pre-issue-#235 popover's own
-                    // `agent_menu_rows` handler for this exact row.
-                    if self.discard_confirm_armed != Some(id) {
-                        self.title_menu_open = None;
-                    }
-                    cx.notify();
                 }
             }
             MenuCommand::Documentation => {
@@ -379,15 +360,6 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         self.perform_menu_command(MenuCommand::KeepAllChanges, window, cx);
-    }
-
-    pub(crate) fn handle_discard_worktree_menu_command(
-        &mut self,
-        _: &DiscardWorktree,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.perform_menu_command(MenuCommand::DiscardWorktree, window, cx);
     }
 
     pub(crate) fn handle_open_documentation_menu_command(

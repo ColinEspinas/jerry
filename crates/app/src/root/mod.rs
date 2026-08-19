@@ -189,7 +189,6 @@ actions!(
         ArchiveAgent,
         ReviewAgent,
         KeepAllChanges,
-        DiscardWorktree,
         OpenDocumentation,
         ReportIssue,
         About,
@@ -802,9 +801,9 @@ pub struct AdeApp {
     /// affordance (`×`, middle-click, or `Ctrl+W` - GitHub issue #26), cleared by the confirming
     /// second gesture on the same `path` (which then really closes it) or by most other tab/file
     /// navigation in the meantime - the same real two-gesture confirmation idiom
-    /// [`Self::prune_confirm_armed`]/[`Self::discard_confirm_armed`] already establish for this
-    /// app's other destructive-feeling actions. A clean (non-dirty) tab never arms this at all -
-    /// see [`crate::code_surface::tabs::AdeApp::request_close_file_tab`]'s own docs for why an
+    /// [`Self::prune_confirm_armed`]/[`Self::remove_worktree_confirm_armed`] already establish
+    /// for this app's other destructive-feeling actions. A clean (non-dirty) tab never arms this
+    /// at all - see [`crate::code_surface::tabs::AdeApp::request_close_file_tab`]'s docs for why an
     /// unsaved-changes prompt for a tab with nothing unsaved would be real, unnecessary friction.
     pub(crate) close_tab_confirm_armed: Option<PathBuf>,
     /// Cached `DiffFile` for whichever path [`Self::open_change`] names (`None` if it has no
@@ -1381,11 +1380,11 @@ pub struct AdeApp {
     /// spawning, reset in that same task's completion handler.
     pub(crate) prune_in_flight: bool,
     /// `Some(kind)` for the duration of any in-flight "keep all changes"/"discard worktree"
-    /// operation, naming *which* one - not just a bare `bool` - so `Self::render_pty_footer`'s
-    /// busy label ("keeping…"/"discarding…") can honestly reflect what's actually running instead
-    /// of guessing from which button happens to be visible (a real, live-reproduced bug an audit
-    /// caught: a running "keep all changes" made every visible `Discard worktree` button across
-    /// every agent read "discarding…"). A single field shared across both, not two independent
+    /// operation, naming *which* one - not just a bare `bool` - so a busy label reflects what is
+    /// actually running rather than guessing from which control happens to be visible. The title
+    /// bar's `Keep All Changes` row is the one label reading the kind today; `Discard` is still
+    /// written so the other two operations serialize behind it. A single field shared across both,
+    /// not two independent
     /// guards: these are the only operations that ever mutate real git history or a worktree's
     /// own existence for this feature, so fully serializing them (a second click of either while
     /// one is in flight is a no-op, mirroring [`Self::prune_in_flight`]'s own
@@ -1418,16 +1417,6 @@ pub struct AdeApp {
     /// click, or vice versa) - the same single-flag-per-feature discipline
     /// [`Self::prune_in_flight`]/[`Self::worktree_history_op_in_flight`] already establish.
     pub(crate) update_check_in_flight: bool,
-    /// `Some(id)` after one click on agent `id`'s "Discard worktree" footer button, cleared by
-    /// most other gestures in the meantime (mirroring [`Self::prune_confirm_armed`]'s own "most
-    /// other gestures disarm it" discipline, applied everywhere that field is - see
-    /// `crate::worktree_history::flow::AdeApp::request_discard_worktree`'s own docs for why this
-    /// destructive-feeling action gets the same two-click confirmation as prune, even though it's
-    /// now genuinely undoable). Not a universal "any gesture at all clears it" guarantee, though:
-    /// arming *this* field's own sibling ([`Self::prune_confirm_armed`]'s first, arming click)
-    /// does not clear this one, and vice versa - only each field's own confirm/cancel/execute
-    /// paths, and a handful of other real navigation gestures, clear it.
-    pub(crate) discard_confirm_armed: Option<AgentId>,
     /// Whether the Settings surface is currently replacing the three-zone body - see
     /// [`Self::open_settings`]/[`Self::close_settings`], which use the same
     /// capture-and-restore shape as [`Self::palette_open`].
@@ -2204,11 +2193,11 @@ pub struct AdeApp {
     /// A real, just-armed "Remove" click on a custom theme card, by name - an adversarial audit
     /// caught the first version of this action deleting the user's file on a single click, unlike
     /// every other destructive action in this app (`Self::prune_confirm_armed`,
-    /// `Self::discard_confirm_armed`). `Self::request_remove_custom_theme`
+    /// `Self::remove_worktree_confirm_armed`). `Self::request_remove_custom_theme`
     /// is the one real place this is armed/consumed - a first click on a given name arms it, a
     /// second click on the *same* name actually deletes. Disarmed by leaving the Themes settings
     /// page or reopening Settings (`Self::select_settings_page`/`Self::open_settings`), the same
-    /// "most other gestures clear it" discipline `Self::discard_confirm_armed`'s own docs
+    /// "most other gestures clear it" discipline `Self::remove_worktree_confirm_armed`'s own docs
     /// describe, scoped to this control's own page since nothing else in the app can arm it.
     pub(crate) custom_theme_remove_armed: Option<String>,
     /// The Themes page's most recent icon-pack action result (GitHub issue #5's "custom icon
@@ -2951,10 +2940,6 @@ impl Render for AdeApp {
             .when(
                 self.menu_command_enabled(MenuCommand::KeepAllChanges),
                 |el| el.on_action(cx.listener(Self::handle_keep_all_changes_menu_command)),
-            )
-            .when(
-                self.menu_command_enabled(MenuCommand::DiscardWorktree),
-                |el| el.on_action(cx.listener(Self::handle_discard_worktree_menu_command)),
             )
             .child(self.render_title_bar(cx))
             // The Settings surface is a separate surface, not a modal: it replaces the three

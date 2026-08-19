@@ -373,7 +373,6 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         self.prune_confirm_armed = false;
-        self.discard_confirm_armed = None;
         // Clear any stale pending cursor line from an abandoned navigation;
         // `open_file_at_line` re-sets it right after this if it has a target line.
         self.pending_cursor_line = None;
@@ -443,7 +442,6 @@ impl AdeApp {
         self.dismiss_completions();
         self.code_cursor = None;
         self.prune_confirm_armed = false;
-        self.discard_confirm_armed = None;
         self.close_tab_confirm_armed = None;
         // `push_open_file` above can genuinely add a tab here (see this method's own docs on why
         // it calls it at all), so this is a real session change, not just an activation.
@@ -521,7 +519,6 @@ impl AdeApp {
             }
         }
         self.prune_confirm_armed = false;
-        self.discard_confirm_armed = None;
         // A closed file tab must stay closed across a relaunch - see
         // `crate::work_surface::session`.
         self.record_worktree_session(cx);

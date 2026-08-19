@@ -377,7 +377,6 @@ impl AdeApp {
         self.new_file_input = None;
         self.new_file_error = None;
         self.prune_confirm_armed = false;
-        self.discard_confirm_armed = None;
         // A second real "open a file" path that doesn't go through
         // `crate::code_surface::tabs::AdeApp::open_and_focus_file` - a real, adversarial-audit-
         // found gap: without this, creating a file while the graph tab was active left it

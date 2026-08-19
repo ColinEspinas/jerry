@@ -72,7 +72,9 @@ the real invocation, the real pid and the real pty state (`attached · waiting o
 
 Its footer band is a **readout, not an action bar** — the strip below an agent pane reports; it does
 not offer git operations the CLI could have done itself. `work_surface::state::ActionKind` is down
-to two variants (`Respawn`, `DiscardWorktree`) and the five it lost were deleted rather than hidden.
+to one variant (`Respawn`) and the six it lost were deleted rather than hidden - `DiscardWorktree`
+last, in GitHub issue #462, which left worktree removal with a single home on the rail's worktree
+row.
 Anything still listed renders honestly disabled when it has no backing logic
 (`FooterAction::implemented`).
 

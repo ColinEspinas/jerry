@@ -149,12 +149,19 @@ impl AdeApp {
             RailMenuTarget::Agent(id) => self.rail_agent_is_running(*id, cx),
             RailMenuTarget::Worktree(_) | RailMenuTarget::WorktreeOpenIn(_) => false,
         };
+        let is_main = match target {
+            RailMenuTarget::Worktree(path) | RailMenuTarget::WorktreeOpenIn(path) => {
+                self.is_main_worktree_path(path)
+            }
+            RailMenuTarget::Agent(_) => false,
+        };
         rail_menu::menu_rows(
             target,
             branch.as_deref(),
             agent_count,
             remove_armed,
             agent_running,
+            is_main,
         )
     }
 
@@ -448,6 +455,21 @@ mod rail_menu_tests {
         });
         cx.run_until_parked();
         id
+    }
+
+    /// Opens `worktree_path`'s row menu at a fixed anchor, without going through its rail row -
+    /// for tests about the popover's own rows. The rail's worktree rows do not paint under
+    /// `TestAppContext` on Windows (issue #468); the popover does, on every platform.
+    fn open_worktree_menu(
+        app: &gpui::Entity<AdeApp>,
+        cx: &mut gpui::VisualTestContext,
+        worktree_path: &Path,
+    ) {
+        let target = RailMenuTarget::Worktree(worktree_path.to_path_buf());
+        app.update_in(cx, |app, window, cx| {
+            app.open_rail_row_menu(target, 200.0, 200.0, window, cx);
+        });
+        cx.run_until_parked();
     }
 
     /// Right-clicks agent `id`'s real painted row.
@@ -851,6 +873,56 @@ mod rail_menu_tests {
         app.read_with(cx, |app, _| {
             assert!(app.rail_row_menu.is_none(), "and close the menu");
             assert!(app.remove_worktree_confirm_armed.is_none());
+        });
+    }
+
+    /// The row has to refuse before [`AdeApp::execute_discard_worktree_path`] tears down the
+    /// checkout's agents and language servers on its way to git refusing anyway.
+    #[gpui::test]
+    fn remove_worktree_is_disabled_on_the_main_checkout(cx: &mut TestAppContext) {
+        let repo = crate::test_support::temp_repo();
+        let feature = add_worktree(repo.path(), "feature", "feature");
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
+        cx.run_until_parked();
+        let agent_id = spawn_agent(&app, cx);
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.is_main_worktree_path(repo.path()),
+                "premise: the opened repo's own path must really be its main checkout"
+            );
+            assert!(
+                !app.is_main_worktree_path(&feature),
+                "premise: and a linked worktree must not be"
+            );
+        });
+
+        open_worktree_menu(&app, cx, repo.path());
+        // The row still paints, in the same place - a menu that changes shape per row costs more
+        // than a visibly disabled row with its reason attached.
+        click_menu_row(cx, "rail-row-menu", "Remove worktree\u{2026}");
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.remove_worktree_confirm_armed.is_none(),
+                "a disabled row must not even arm the confirmation"
+            );
+            assert!(
+                app.agents.iter().any(|agent| agent.id == agent_id),
+                "and must not have torn down the agents living in that checkout"
+            );
+        });
+        assert!(repo.path().exists(), "the main checkout is untouched");
+
+        // The same menu on a worktree git *will* remove still arms on its first click, so this
+        // test cannot pass on a `Remove worktree…` that stopped working everywhere.
+        open_worktree_menu(&app, cx, &feature);
+        click_menu_row(cx, "rail-row-menu", "Remove worktree\u{2026}");
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.remove_worktree_confirm_armed.as_deref(),
+                Some(feature.as_path()),
+                "a linked worktree's row is still a real, runnable one"
+            );
         });
     }
 

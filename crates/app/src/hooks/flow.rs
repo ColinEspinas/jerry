@@ -90,7 +90,6 @@ impl AdeApp {
         // will itself be resumable again after the next quit. See `crate::work_surface::session`.
         self.record_worktree_session(cx);
         self.prune_confirm_armed = false;
-        self.discard_confirm_armed = None;
         cx.notify();
         true
     }

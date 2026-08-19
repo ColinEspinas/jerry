@@ -220,6 +220,10 @@ all, review diff, open in editor, discard, retry, interrupt, open terminal.
 
 **Decision:** It is a readout. `work_surface::state::ActionKind` went from seven variants to two
 (`Respawn`, `DiscardWorktree`); the other five were **deleted**, not hidden behind a condition.
+GitHub issue #462 then took `DiscardWorktree` too, leaving one (`Respawn`): worktree removal has a
+single home, the rail's own worktree row, and a removal offered under one agent of a two-agent
+worktree threw away the other agent's work from a pane that never mentioned them - the same reason
+§4r had already given for taking it off `Review`.
 
 **Consequences:** The pane reports what the agent is doing rather than competing with it for the
 bottom of the screen, and the actions that survive are the ones the CLI genuinely cannot perform for

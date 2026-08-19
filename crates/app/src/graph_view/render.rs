@@ -74,7 +74,6 @@ impl AdeApp {
         self.plus_menu_open = false;
         self.title_menu_open = None;
         self.prune_confirm_armed = false;
-        self.discard_confirm_armed = None;
 
         // Opening the graph tab replaces the right sidebar's Files/Changes panel with Commit/
         // Branches (`Self::render_right_sidebar`), unrendering the file tree exactly the way
