@@ -310,3 +310,38 @@ already attaches them to a headless pseudo console via `PROC_THREAD_ATTRIBUTE_PS
 `CREATE_NO_WINDOW` is neither needed nor passable there. Anything that spawns without
 `std::process::Command` (direct `CreateProcessW` FFI, a future async runtime's command type)
 must apply the same flag at its own call site; none exists today.
+
+## 11. A process-wide kill-on-close job object backstops child cleanup on Windows
+
+**Status:** Accepted.
+
+**Context:** Every cleanup path for spawned children — `PtySession::drop`/`kill`/`shutdown`'s
+`taskkill /T` tree kills, `HookFiles::drop`'s temp-dir removal — is code running *inside* the
+Jerry process. A force-killed (Task Manager "End task", `taskkill /F` without `/T`), crashed, or
+aborted Jerry runs none of it, and unlike a unix process group, a Windows child is simply not
+affected by its parent dying. In practice that leaked ~180 orphaned `claude.exe` agents per day,
+which the user's own settings hooks amplified into ~10,000 processes (#482). `portable-pty`
+creates no job object of its own.
+
+**Decision:** At the top of `main()`, before anything can spawn, `crates/app`'s `job_object`
+module creates one unnamed job object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE |
+JOB_OBJECT_LIMIT_BREAKAWAY_OK` and assigns *this process* to it. Children join a member's job
+automatically at `CreateProcess` time, so every spawn — agent PTYs through ConPTY, every
+`new_std_command` child, LSP servers, future call sites — is covered with no per-site plumbing.
+The job handle is deliberately never closed: the kernel closes it when the process terminates,
+by any means, and then kills every remaining member. Setup failure is logged and non-fatal
+(behavior degrades to exactly the destructor-only world this replaces).
+
+It lives in `crates/app`, not `pty-core`, for two reasons: the job is app-lifecycle policy, not
+per-session PTY mechanics, and CLAUDE.md pins the core crates as `unsafe`-free — `crates/app`
+already carries the sanctioned Win32 FFI sites (`hooks/settings_file.rs`,
+`status_bar/process_stats/windows.rs`) and the `windows-sys` dependency.
+
+**Consequences:** The in-session kill paths (`taskkill /T` and friends) stay: the job only fires
+when the whole process dies, while sessions are killed and discarded continuously during normal
+use. A child that must *outlive* Jerry has to break away explicitly — the updater's relaunch is
+the one such child, spawned with `CREATE_BREAKAWAY_FROM_JOB` (permitted by `BREAKAWAY_OK`), with
+a logged no-breakaway retry for the corner where an outer job forbids it. If job creation or
+self-assignment fails, orphans are again possible; the startup sweep of `jerry-hooks-*`
+directories (`hooks/settings_file.rs`) remains the independent cleanup for what a dead instance
+leaves on disk.

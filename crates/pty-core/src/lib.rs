@@ -761,7 +761,9 @@ impl PtySession {
 
 /// Terminates `pid` and every descendant, synchronously: `taskkill /T` walks the parent-pid
 /// chain, the closest Windows equivalent of the unix process-group signal plus descendant walk,
-/// without the job-object `unsafe` FFI this project rules out. Best-effort by nature (a
+/// without job-object `unsafe` FFI in this crate (the process-wide kill-on-close job object
+/// backstopping a Jerry that dies without running `Drop` lives in `crates/app`'s `job_object`
+/// module - GitHub issue #482; this walk covers the in-session kill paths). Best-effort by nature (a
 /// descendant that re-parented is missed; one that exited already is fine) - but without it a
 /// bare `TerminateProcess` on the direct child orphans every grandchild, which is how an npm
 /// `.cmd`-shim agent's real `node.exe` survived kills (GitHub issue #468) and how a discarded

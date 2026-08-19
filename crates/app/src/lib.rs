@@ -24,6 +24,8 @@ pub mod graph_view;
 pub mod hooks;
 pub mod icon_pack;
 pub mod icons;
+#[cfg(windows)]
+pub mod job_object;
 pub mod keymap;
 pub mod keymap_overrides;
 pub mod language;
