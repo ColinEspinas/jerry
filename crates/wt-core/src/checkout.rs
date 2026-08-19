@@ -485,8 +485,14 @@ mod tests {
         );
         match result.unwrap_err() {
             Error::GitCommand { stderr, .. } => {
+                // Lowercased on both sides: older git (2.39, still Debian bookworm's default)
+                // capitalizes this message ("Cannot delete branch..."), newer git doesn't - a
+                // wording-only difference across git's own versions, not something this test
+                // should pin to one binary's exact casing.
                 assert!(
-                    stderr.contains("cannot delete branch 'main'"),
+                    stderr
+                        .to_lowercase()
+                        .contains("cannot delete branch 'main'"),
                     "git's own real refusal reason must be preserved verbatim: {stderr}"
                 );
             }
