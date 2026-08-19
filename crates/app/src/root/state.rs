@@ -2749,9 +2749,10 @@ mod file_tree_watch_integration_tests {
 /// reload lands behind it - while a first-ever visit keeps the honest empty/`Loading` states.
 #[cfg(test)]
 mod instant_worktree_switch_tests {
-    use super::*;
+    use crate::code_surface::state::DiffLoadState;
+    use crate::root::AdeApp;
     use gpui::TestAppContext;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     fn add_worktree(repo_path: &Path, branch: &str, name: &str) -> PathBuf {
         let container = crate::test_support::temp_root();
