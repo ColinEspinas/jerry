@@ -345,3 +345,42 @@ a logged no-breakaway retry for the corner where an outer job forbids it. If job
 self-assignment fails, orphans are again possible; the startup sweep of `jerry-hooks-*`
 directories (`hooks/settings_file.rs`) remains the independent cleanup for what a dead instance
 leaves on disk.
+
+## 12. A hookless agent CLI with no config-path flag gets a merged, opt-in entry in its own global
+config file, never a file inside the worktree
+
+**Status:** Accepted.
+
+**Context:** GitHub issue #239 phase 2 gave Claude Code a real status side-channel by generating a
+whole `--settings <path>` file Jerry owns outright and passing it on the CLI - zero footprint,
+because nothing is shared and nothing is written unless that exact flag is present. `cursor-agent`
+(issue #479) has real, working hooks in the same spawn mode Jerry already uses, but no equivalent
+flag or environment variable to point it at an alternate config: hooks load from exactly four
+fixed locations, and the only one Jerry can reach at all is the user-level
+`~/.cursor/hooks.json` - a file the user owns and other tools may already be managing entries in.
+`<worktree>/.cursor/hooks.json` was considered and rejected: it would appear in Jerry's own
+Changes pane and review diff, and the agent could commit it - dirtying the very surface the diff
+is supposed to review.
+
+**Decision:** For an agent CLI shaped like this - real hooks, no config-path override, config
+loaded from one global, shared, `.json`-with-an-array-of-`{command, timeout}`-entries file - Jerry
+does a real read-modify-write merge (`crates/app/src/hooks/cursor_hooks_file.rs`) rather than
+generating the file outright: unparseable JSON aborts the whole operation untouched, every
+unrelated key and entry survives byte-for-byte, and Jerry's own entries are identified by a
+forwarder script path substring rather than a marker field (the entry shape has no room for one).
+The forwarder script itself moves out of the per-launch, `Drop`-deleted temp directory
+`crates/app/src/hooks/settings_file.rs` uses for Claude into a stable, version-stamped path under
+Jerry's own config dir, because `~/.cursor/hooks.json` outlives any single Jerry process. Because
+this genuinely writes into a file the user owns - unlike Claude's entirely Jerry-owned, per-launch
+`--settings` file - it is gated behind an explicit, default-off setting
+(`Settings.agents.cursor_hooks_enabled`) reconciled (installed or removed) on every launch and
+immediately on toggle, rather than default-on the way a similar integration in another Cursor
+client ships it.
+
+**Consequences:** The forwarder itself stays inert without Jerry's own `JERRY_HOOK_PORT`/
+`JERRY_HOOK_TOKEN`/`JERRY_AGENT_ID` environment, so a `cursor-agent` session started outside Jerry
+is unaffected by the entry's mere presence - the opt-in setting gates whether Jerry *writes* the
+entry, not whether a stray entry could ever do anything on its own. The next agent CLI that is
+hookless-by-default in this same shape (a real hook mechanism, no config-path flag, one shared
+global config file) should read this entry and `cursor_hooks_file.rs` before inventing a new
+merge strategy.

@@ -534,6 +534,50 @@ impl AdeApp {
                     }))
                     .child(self.render_settings_agents_footer()),
             )
+            .child(
+                div()
+                    .pt(px(20.0))
+                    .pb(px(6.0))
+                    .font(font(theme::font::SANS))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_size(px(9.5))
+                    .text_color(theme::palette::GROUP_HEADER)
+                    .child("Hooks"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .rounded(theme::radius::CARD)
+                    .border_1()
+                    .border_color(theme::border::CARD)
+                    .overflow_hidden()
+                    .child(self.render_settings_row(
+                        "Cursor agent hooks",
+                        "Writes a small, reversible entry into your own ~/.cursor/hooks.json so a \
+                         Cursor agent Jerry spawns reports real status into the rail and History - \
+                         off by default. A Cursor session started outside Jerry is unaffected \
+                         either way, and nothing is ever written into any repository or worktree.",
+                        self.render_toggle_control(
+                            "settings-cursor-hooks-enabled",
+                            self.settings.agents.cursor_hooks_enabled,
+                            cx,
+                            |this, cx| this.toggle_cursor_hooks_enabled(cx),
+                        ),
+                    )),
+            )
+    }
+
+    /// Flips `agents.cursor_hooks_enabled` (GitHub issue #479), persists it, and immediately
+    /// reconciles `~/.cursor/hooks.json` against the new value - installing Jerry's managed
+    /// entries when turning it on, removing them when turning it off - rather than leaving that
+    /// for the next restart. See `crate::hooks::flow::AdeApp::reconcile_cursor_hooks`'s own docs
+    /// for why the real filesystem work happens on the background executor.
+    fn toggle_cursor_hooks_enabled(&mut self, cx: &mut Context<Self>) {
+        self.settings.agents.cursor_hooks_enabled = !self.settings.agents.cursor_hooks_enabled;
+        self.persist_settings(cx);
+        self.reconcile_cursor_hooks(cx);
+        cx.notify();
     }
 
     pub(in crate::settings) fn render_settings_agent_row(
@@ -7887,6 +7931,116 @@ mod bracket_pair_colorization_settings_tests {
                 .settings
                 .appearance
                 .bracket_pair_colorization),
+            "and clicking it again must flip it back"
+        );
+    }
+}
+
+/// GitHub issue #479's Agents page toggle - same real-mutator-and-real-click shape
+/// `bracket_pair_colorization_settings_tests` already established, plus the "off by default"
+/// assertion that's the whole point of this setting differing from Superset's own equivalent.
+#[cfg(test)]
+mod cursor_hooks_settings_tests {
+    use crate::root::{AdeApp, ToggleSettings};
+    use crate::settings::state::SettingsPage;
+    use crate::settings::store as settings_store;
+    use gpui::TestAppContext;
+    use std::path::PathBuf;
+
+    fn open_app_with_state_dir(
+        cx: &mut TestAppContext,
+        repo_path: PathBuf,
+        settings_path: PathBuf,
+    ) -> (gpui::Entity<AdeApp>, &mut gpui::VisualTestContext) {
+        let settings = settings_store::Settings::load_or_init_at(&settings_path);
+        cx.add_window_view(|window, cx| {
+            AdeApp::new_with_settings(
+                Some(repo_path),
+                true,
+                settings,
+                Some(settings_path),
+                window,
+                cx,
+            )
+        })
+    }
+
+    #[gpui::test]
+    fn toggle_cursor_hooks_enabled_flips_the_real_setting_and_persists_across_reload(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = state_dir.path().join("settings.toml");
+        let (app, cx) =
+            open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path.clone());
+
+        assert!(
+            !app.read_with(cx, |app, _| app.settings.agents.cursor_hooks_enabled),
+            "sanity check: off by default - an explicit opt-in, unlike Superset's equivalent"
+        );
+
+        app.update(cx, |app, cx| {
+            app.toggle_cursor_hooks_enabled(cx);
+        });
+        assert!(
+            app.read_with(cx, |app, _| app.settings.agents.cursor_hooks_enabled),
+            "the real Settings field must have flipped on"
+        );
+        cx.run_until_parked();
+
+        let (reloaded, cx) = open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path);
+        assert!(
+            reloaded.read_with(cx, |app, _| app.settings.agents.cursor_hooks_enabled),
+            "the toggle must have really been persisted to disk, not just flipped in memory"
+        );
+
+        app.update(cx, |app, cx| {
+            app.toggle_cursor_hooks_enabled(cx);
+        });
+        assert!(
+            !app.read_with(cx, |app, _| app.settings.agents.cursor_hooks_enabled),
+            "the real Settings field must have flipped back off"
+        );
+    }
+
+    #[gpui::test]
+    fn the_agents_page_row_paints_and_clicking_it_flips_the_real_setting(cx: &mut TestAppContext) {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let settings_path = state_dir.path().join("settings.toml");
+        let (app, cx) = open_app_with_state_dir(cx, repo.path().to_path_buf(), settings_path);
+
+        cx.dispatch_action(ToggleSettings);
+        app.update_in(cx, |app, window, cx| {
+            app.select_settings_page(SettingsPage::Agents, window, cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.settings_content_scroll_handle.scroll_to_bottom();
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let bounds = cx
+            .debug_bounds("settings-cursor-hooks-enabled")
+            .expect("the Cursor agent hooks toggle must really paint on the Agents page");
+        assert!(
+            !app.read_with(cx, |app, _| app.settings.agents.cursor_hooks_enabled),
+            "premise: off before the click"
+        );
+
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            app.read_with(cx, |app, _| app.settings.agents.cursor_hooks_enabled),
+            "clicking the real row must flip the real setting"
+        );
+
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            !app.read_with(cx, |app, _| app.settings.agents.cursor_hooks_enabled),
             "and clicking it again must flip it back"
         );
     }

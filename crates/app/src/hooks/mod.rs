@@ -1,5 +1,7 @@
 //! A real, structural status side-channel for Claude Code agents (GitHub issue #239, phase 2).
 
+pub mod cursor_event;
+pub mod cursor_hooks_file;
 pub mod event;
 pub mod flow;
 pub mod history;
@@ -124,5 +126,16 @@ impl HookInjection {
             (settings_file::AGENT_ENV.to_owned(), id.to_string()),
         ];
         Some((args, env))
+    }
+
+    /// The environment-only counterpart of [`Self::spawn_extras`], for an agent CLI with no
+    /// `--settings <path>`-equivalent flag (`cursor-agent`, GitHub issue #479) - just the same
+    /// `PORT_ENV`/`TOKEN_ENV`/`AGENT_ENV` triplet, with no extra CLI arguments to prepend.
+    pub fn env_only(&self, id: AgentId) -> Vec<(String, String)> {
+        vec![
+            (settings_file::PORT_ENV.to_owned(), self.port.to_string()),
+            (settings_file::TOKEN_ENV.to_owned(), self.token.clone()),
+            (settings_file::AGENT_ENV.to_owned(), id.to_string()),
+        ]
     }
 }
