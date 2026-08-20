@@ -445,6 +445,7 @@ impl AdeApp {
             _tree_copy_task: None,
             staged_files: HashSet::new(),
             dirty_files: None,
+            change_scope: crate::sidebar::sections::ChangeScope::default(),
             changes_row_error: None,
             _stage_tasks: TaskPool::new(),
             change_row_hover: None,
@@ -1396,7 +1397,7 @@ impl AdeApp {
                         && this.file_tree_complete == listing.is_complete()
                         && this.file_tree == listing.tree;
                     (
-                        palette_render::file_diff_marks(this.current_diff()),
+                        palette_render::file_diff_marks(this.scoped_diff()),
                         unchanged,
                     )
                 })
@@ -1436,7 +1437,7 @@ impl AdeApp {
                 // before it. Re-deriving here is the O(loaded files) foreground pass this whole
                 // arrangement exists to avoid, so it is gated on the marks having genuinely moved
                 // - which needs one cheap comparison over the diff's files, not the tree's.
-                if palette_render::file_diff_marks(this.current_diff()) != marks {
+                if palette_render::file_diff_marks(this.scoped_diff()) != marks {
                     this.rebuild_palette_file_candidates();
                 }
                 this.prune_stale_fold_state(cx);
