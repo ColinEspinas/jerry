@@ -634,6 +634,10 @@ pub enum TerminalPaneEvent {
     /// pane's rendered grid - `path` is already resolved against this pane's own
     /// `TerminalSpec::cwd` (see [`render_link_span`]), never a bare, unresolved string.
     OpenPath { path: PathBuf, line: Option<u32> },
+    /// This pane's child process exited and its real [`ExitStatus`] was observed. `clean` is
+    /// that status' own `success()` - a `0` exit and no signal, i.e. the process was asked to
+    /// quit (`exit`, `/quit`, `Ctrl-D`) rather than having crashed or been killed.
+    ProcessExited { clean: bool },
 }
 
 pub struct TerminalPane {
@@ -1762,7 +1766,9 @@ impl TerminalPane {
                     }
 
                     if let Some(status) = newly_exited {
+                        let clean = status.success();
                         this.exit_status = Some(status);
+                        cx.emit(TerminalPaneEvent::ProcessExited { clean });
                     }
 
                     if process_ended {
@@ -3430,6 +3436,80 @@ mod pane_teardown_tests {
                  real-pty test in this file leaks a process if this stops holding"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod process_exit_event_tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use gpui::TestAppContext;
+
+    use super::pty_pane_fixtures::{pump_until, release, spawn_pane};
+    use super::TerminalPaneEvent;
+
+    /// A real child process that does nothing but exit with `code`, spelled for this platform's
+    /// own always-present interpreter - `cmd.exe` ships with every Windows install, `/bin/sh`
+    /// with every unix one, so neither spelling depends on a POSIX toolchain being on `PATH`.
+    fn exiting_pane(cx: &mut TestAppContext, code: u8) -> gpui::Entity<super::TerminalPane> {
+        let script = format!("exit {code}");
+        #[cfg(windows)]
+        let (program, args) = ("cmd", ["/c", script.as_str()]);
+        #[cfg(unix)]
+        let (program, args) = ("sh", ["-c", script.as_str()]);
+        spawn_pane(cx, program, &args)
+    }
+
+    /// Collects every [`TerminalPaneEvent`] the pane emits for the rest of the test.
+    fn watch(
+        cx: &mut TestAppContext,
+        pane: &gpui::Entity<super::TerminalPane>,
+    ) -> (Rc<RefCell<Vec<TerminalPaneEvent>>>, gpui::Subscription) {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let recorder = Rc::clone(&seen);
+        let subscription = cx.update(|cx| {
+            cx.subscribe(pane, move |_pane, event: &TerminalPaneEvent, _cx| {
+                recorder.borrow_mut().push(event.clone());
+            })
+        });
+        (seen, subscription)
+    }
+
+    #[gpui::test]
+    fn a_process_that_exits_zero_reports_a_clean_exit(cx: &mut TestAppContext) {
+        let pane = exiting_pane(cx, 0);
+        let (seen, _subscription) = watch(cx, &pane);
+
+        assert!(
+            pump_until(cx, |_cx| !seen.borrow().is_empty()),
+            "the real child exited, so its pane must announce that exit"
+        );
+        assert_eq!(
+            seen.borrow().as_slice(),
+            [TerminalPaneEvent::ProcessExited { clean: true }],
+            "`exit 0` is the user asking to quit - the one case a tab may close itself over"
+        );
+
+        release(cx, pane);
+    }
+
+    #[gpui::test]
+    fn a_process_that_exits_nonzero_reports_an_unclean_exit(cx: &mut TestAppContext) {
+        let pane = exiting_pane(cx, 3);
+        let (seen, _subscription) = watch(cx, &pane);
+
+        assert!(
+            pump_until(cx, |_cx| !seen.borrow().is_empty()),
+            "a failing child exits just as really as a succeeding one"
+        );
+        assert_eq!(
+            seen.borrow().as_slice(),
+            [TerminalPaneEvent::ProcessExited { clean: false }],
+            "a non-zero exit must not be reported as clean - the pane stays open on it"
+        );
+
+        release(cx, pane);
     }
 }
 
