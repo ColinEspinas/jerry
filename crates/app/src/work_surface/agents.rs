@@ -213,9 +213,9 @@ pub struct Agent {
     /// `None` for any Cursor pane whose id could not be minted at spawn time - an agent with no
     /// id is simply not resumable, which is what the run-history footer already says.
     pub session_id: Option<String>,
-    /// Keeps [`Agents::spawn`]'s link-click-opens-a-file subscription (see
-    /// [`TerminalPaneEvent`]) alive for this agent's lifetime - never read, only held.
-    _link_subscription: Subscription,
+    /// Keeps [`Agents::spawn`]'s subscription to this agent's pane (see [`TerminalPaneEvent`])
+    /// alive for this agent's lifetime - never read, only held.
+    _pane_subscription: Subscription,
 }
 
 /// Owns every open agent/tab and which one is active.
@@ -422,11 +422,23 @@ impl Agents {
         };
         let spec = kind.spec(cwd.clone(), shell_override, extras);
         let pane = cx.new(|cx| TerminalPane::new(spec, terminal_font_size_px, cx));
-        let link_subscription =
-            cx.subscribe_in(&pane, window, move |app, _pane, event, window, cx| {
-                let TerminalPaneEvent::OpenPath { path, line } = event;
-                app.open_terminal_link(path.clone(), *line, window, cx);
-            });
+        let pane_subscription = cx.subscribe_in(
+            &pane,
+            window,
+            move |app, _pane, event, window, cx| match event {
+                TerminalPaneEvent::OpenPath { path, line } => {
+                    app.open_terminal_link(path.clone(), *line, window, cx);
+                }
+                // A process the user asked to quit takes its tab with it; a crashed or killed
+                // one keeps its pane so its last output, and the footer's Retry/Resume, are
+                // still there to read.
+                TerminalPaneEvent::ProcessExited { clean } => {
+                    if *clean {
+                        app.close_agent(id, window, cx);
+                    }
+                }
+            },
+        );
 
         self.agents.push(Agent {
             id,
@@ -436,7 +448,7 @@ impl Agents {
             spawned_at: Instant::now(),
             spawned_at_unix: unix_now(),
             session_id: None,
-            _link_subscription: link_subscription,
+            _pane_subscription: pane_subscription,
         });
         self.active = Some(id);
         self.active_by_cwd.insert(cwd, id);

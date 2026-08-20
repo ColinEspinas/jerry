@@ -6256,3 +6256,76 @@ mod agent_picker_tests {
         });
     }
 }
+
+#[cfg(test)]
+mod process_exit_close_tests {
+    use gpui::{Entity, TestAppContext};
+
+    use crate::root::AdeApp;
+    use crate::terminal::pane::{TerminalPane, TerminalPaneEvent};
+    use crate::work_surface::agents::AgentId;
+
+    /// The app's initial shell agent, and the pane whose process exit the tab hangs off.
+    fn initial_agent(
+        app: &Entity<AdeApp>,
+        cx: &mut TestAppContext,
+    ) -> (AgentId, Entity<TerminalPane>) {
+        app.read_with(cx, |app, _| {
+            let agent = app.agents.iter().next().expect("initial shell agent");
+            (agent.id, agent.pane.clone())
+        })
+    }
+
+    fn open_agent_ids(app: &Entity<AdeApp>, cx: &mut TestAppContext) -> Vec<AgentId> {
+        app.read_with(cx, |app, _| {
+            app.agents.iter().map(|agent| agent.id).collect()
+        })
+    }
+
+    #[gpui::test]
+    fn a_clean_process_exit_closes_that_agents_tab(cx: &mut TestAppContext) {
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
+        let (id, pane) = initial_agent(&app, cx);
+        // A sibling tab, so this exercises closing *a* tab rather than emptying the work
+        // surface - the tab strip's own "nothing is open" path is a different test's subject.
+        app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                crate::work_surface::agents::ProcessKind::Shell,
+                repo.path().to_path_buf(),
+                app.settings.appearance.terminal_font_size,
+                app.settings.terminal.shell_override(),
+                None,
+                window,
+                cx,
+            )
+        });
+
+        pane.update(cx, |_pane, cx| {
+            cx.emit(TerminalPaneEvent::ProcessExited { clean: true })
+        });
+        cx.run_until_parked();
+
+        assert!(
+            !open_agent_ids(&app, cx).contains(&id),
+            "typing `exit` into an agent ends that session, so its tab must go with it"
+        );
+    }
+
+    #[gpui::test]
+    fn a_crash_leaves_the_tab_open_to_be_read(cx: &mut TestAppContext) {
+        let repo = crate::test_support::temp_root();
+        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
+        let (id, pane) = initial_agent(&app, cx);
+
+        pane.update(cx, |_pane, cx| {
+            cx.emit(TerminalPaneEvent::ProcessExited { clean: false })
+        });
+        cx.run_until_parked();
+
+        assert!(
+            open_agent_ids(&app, cx).contains(&id),
+            "a failed process's last output, and the footer's Retry, must survive the exit"
+        );
+    }
+}
