@@ -147,7 +147,10 @@ pub struct HookReport {
 impl HookReport {
     /// A report carrying only a state fact - the common case for the turn-boundary events, which
     /// have no text worth rendering (see the module docs on `last_assistant_message`).
-    fn bare(fact: HookFact) -> HookReport {
+    ///
+    /// `pub(crate)`: `crate::hooks::cursor_event` builds every one of its own reports off this
+    /// too, rather than repeating the same all-`None` literal for a second agent kind.
+    pub(crate) fn bare(fact: HookFact) -> HookReport {
         HookReport {
             kind: EventKind::Transition,
             fact,
@@ -163,7 +166,10 @@ impl HookReport {
 /// Truncates on a real `char` boundary, appending an ellipsis only when something was actually
 /// cut. Returns `None` for text that is empty or whitespace-only, so a present-but-blank JSON
 /// field is treated as the absence of information rather than rendered as an empty row.
-fn truncated(text: &str, max_chars: usize) -> Option<String> {
+///
+/// `pub(crate)`: `crate::hooks::cursor_event` reuses this for the same truncation, rather than a
+/// second implementation of the same rule.
+pub(crate) fn truncated(text: &str, max_chars: usize) -> Option<String> {
     let text = text.trim();
     if text.is_empty() {
         return None;

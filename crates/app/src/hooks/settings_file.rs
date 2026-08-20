@@ -392,7 +392,10 @@ fn process_is_alive(pid: u32) -> bool {
 }
 
 /// A short random, hex-encoded suffix - see [`create_private_dir`].
-fn random_suffix() -> String {
+///
+/// `pub(crate)`: `crate::hooks::cursor_hooks_file`'s own atomic-write temp file name reuses this
+/// rather than a second random-suffix implementation.
+pub(crate) fn random_suffix() -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 8];
     rand::rng().fill_bytes(&mut bytes);
@@ -469,7 +472,11 @@ pub fn windows_hook_entry(forwarder: &str, event: &str) -> io::Result<serde_json
 /// Wraps `value` in POSIX single quotes, escaping any single quote inside it via the standard
 /// `'\''` idiom. Single quotes are used rather than double because inside them the shell expands
 /// nothing at all - so a path containing `$`, backticks or `\` is passed through literally.
-fn shell_quote(value: &str) -> String {
+///
+/// `pub(crate)` rather than private: `crate::hooks::cursor_hooks_file` reuses this verbatim for
+/// the Cursor forwarder's own `hooks.json` command string (GitHub issue #479), rather than
+/// re-implementing the same escaping a second time.
+pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 

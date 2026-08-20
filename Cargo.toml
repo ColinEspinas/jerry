@@ -51,3 +51,15 @@ thiserror = "1"
 serde = { version = "1.0.221", features = ["derive"] }
 toml = "0.8"
 serde_json = "1"
+
+# Debug info is the bulk of a debug `target/` on MSVC, and almost none of it is ever read: a
+# backtrace or a debugger session wants this workspace's own frames, not `aws-lc-sys`' or a
+# tree-sitter grammar's. Dependencies therefore get none, and this workspace's crates keep
+# line tables - enough for file/line in panics and backtraces, without the full type/variable
+# DWARF that a step-through debugger needs. Raise `[profile.dev] debug` back to `2` locally
+# (or `--config 'profile.dev.debug=2'`) for a real debugging session.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = 0

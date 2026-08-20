@@ -160,6 +160,27 @@ impl ProcessKind {
 /// `crate::hooks::HookInjection::spawn_extras` and consumed by [`ProcessKind::spec`].
 pub type SpawnExtras = (Vec<String>, Vec<(String, String)>);
 
+/// [`Agent::spawn_inner`]'s hook-injection gate, split out as a pure function so it's directly
+/// unit-testable without a real `TerminalPane` spawn. Claude gets `--settings <path>` plus env
+/// (`HookInjection::spawn_extras`); Cursor (GitHub issue #479) has no such flag, so it gets only
+/// the env triplet (`HookInjection::env_only`) and no extra leading argument - and only when
+/// `hooks` is `Some` at all, which `crate::hooks::flow::AdeApp::hook_injection_for` already
+/// withholds unless the user has opted in via the `cursor_hooks_enabled` setting. Every other
+/// kind (`Codex`, or any kind with no injection offered) gets no extras.
+fn hook_extras_for(
+    kind: ProcessKind,
+    hooks: Option<&crate::hooks::HookInjection>,
+    id: AgentId,
+) -> Option<SpawnExtras> {
+    match (kind, hooks) {
+        (ProcessKind::Agent(AgentKind::Claude), Some(hooks)) => hooks.spawn_extras(id),
+        (ProcessKind::Agent(AgentKind::Cursor), Some(hooks)) => {
+            Some((Vec::new(), hooks.env_only(id)))
+        }
+        _ => None,
+    }
+}
+
 impl From<AgentKind> for ProcessKind {
     fn from(agent: AgentKind) -> Self {
         ProcessKind::Agent(agent)
@@ -192,9 +213,9 @@ pub struct Agent {
     /// `None` for any Cursor pane whose id could not be minted at spawn time - an agent with no
     /// id is simply not resumable, which is what the run-history footer already says.
     pub session_id: Option<String>,
-    /// Keeps [`Agents::spawn`]'s link-click-opens-a-file subscription (see
-    /// [`TerminalPaneEvent`]) alive for this agent's lifetime - never read, only held.
-    _link_subscription: Subscription,
+    /// Keeps [`Agents::spawn`]'s subscription to this agent's pane (see [`TerminalPaneEvent`])
+    /// alive for this agent's lifetime - never read, only held.
+    _pane_subscription: Subscription,
 }
 
 /// Owns every open agent/tab and which one is active.
@@ -391,12 +412,7 @@ impl Agents {
         let id = self.next_id;
         self.next_id += 1;
 
-        // Claude Code only, and gated here rather than inside `spec` so the gate is one
-        // legible line next to the spawn it guards.
-        let hook_extras = match (kind, hooks) {
-            (ProcessKind::Agent(AgentKind::Claude), Some(hooks)) => hooks.spawn_extras(id),
-            _ => None,
-        };
+        let hook_extras = hook_extras_for(kind, hooks, id);
         let extras = if leading_args.is_empty() {
             hook_extras
         } else {
@@ -406,11 +422,23 @@ impl Agents {
         };
         let spec = kind.spec(cwd.clone(), shell_override, extras);
         let pane = cx.new(|cx| TerminalPane::new(spec, terminal_font_size_px, cx));
-        let link_subscription =
-            cx.subscribe_in(&pane, window, move |app, _pane, event, window, cx| {
-                let TerminalPaneEvent::OpenPath { path, line } = event;
-                app.open_terminal_link(path.clone(), *line, window, cx);
-            });
+        let pane_subscription = cx.subscribe_in(
+            &pane,
+            window,
+            move |app, _pane, event, window, cx| match event {
+                TerminalPaneEvent::OpenPath { path, line } => {
+                    app.open_terminal_link(path.clone(), *line, window, cx);
+                }
+                // A process the user asked to quit takes its tab with it; a crashed or killed
+                // one keeps its pane so its last output, and the footer's Retry/Resume, are
+                // still there to read.
+                TerminalPaneEvent::ProcessExited { clean } => {
+                    if *clean {
+                        app.close_agent(id, window, cx);
+                    }
+                }
+            },
+        );
 
         self.agents.push(Agent {
             id,
@@ -420,7 +448,7 @@ impl Agents {
             spawned_at: Instant::now(),
             spawned_at_unix: unix_now(),
             session_id: None,
-            _link_subscription: link_subscription,
+            _pane_subscription: pane_subscription,
         });
         self.active = Some(id);
         self.active_by_cwd.insert(cwd, id);
@@ -802,6 +830,41 @@ mod tests {
         assert_eq!(
             spec.env,
             vec![("JERRY_HOOK_PORT".to_owned(), "5000".to_owned())]
+        );
+    }
+
+    #[test]
+    fn cursor_gets_env_only_hook_extras_claude_keeps_its_settings_flag_and_codex_gets_neither() {
+        // GitHub issue #479's real gate, exercised against a real `HookInjection` (not a
+        // hand-built fake tuple) - `cursor-agent` has no `--settings`-equivalent flag, so it must
+        // never receive one, while still getting the same env triplet Claude does.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime = crate::hooks::HookRuntime::start(temp.path()).expect("runtime must start");
+        let injection = runtime.injection();
+
+        let (claude_args, claude_env) = hook_extras_for(ProcessKind::claude(), Some(&injection), 1)
+            .expect("claude must get extras");
+        assert!(
+            claude_args.iter().any(|arg| arg == "--settings"),
+            "claude keeps its --settings flag: {claude_args:?}"
+        );
+        assert!(claude_env.iter().any(|(key, _)| key == "JERRY_HOOK_PORT"));
+
+        let (cursor_args, cursor_env) = hook_extras_for(ProcessKind::cursor(), Some(&injection), 1)
+            .expect("cursor must get extras");
+        assert!(
+            cursor_args.is_empty(),
+            "cursor-agent has no --settings-equivalent flag: {cursor_args:?}"
+        );
+        assert!(cursor_env.iter().any(|(key, _)| key == "JERRY_HOOK_PORT"));
+
+        assert!(
+            hook_extras_for(ProcessKind::codex(), Some(&injection), 1).is_none(),
+            "codex has no hook wiring at all yet"
+        );
+        assert!(
+            hook_extras_for(ProcessKind::cursor(), None, 1).is_none(),
+            "no injection offered (the setting is off) means no extras, not a bare env_only"
         );
     }
 

@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::hooks::cursor_event;
 use crate::hooks::event::{self, EditedFile, HookFact, HookReport, MAX_PAYLOAD_BYTES};
 use crate::work_surface::agents::AgentId;
 
@@ -639,9 +640,14 @@ fn read_and_record(
         Some((path, query)) => (path, query),
         None => (target, ""),
     };
-    if path != "/hook" {
-        return Some(Response::NotFound);
-    }
+    // The route decides only which parser turns a payload into a `HookReport` - the auth, body
+    // bounding, and everything downstream of getting one (edits/inbox recording) stay identical
+    // and agent-agnostic (GitHub issue #479's second route, `/hook/cursor`).
+    let parse: fn(&str, &[u8]) -> Option<HookReport> = match path {
+        "/hook" => event::parse,
+        "/hook/cursor" => cursor_event::parse,
+        _ => return Some(Response::NotFound),
+    };
 
     // -- bound the body by the declared length before buffering any of it --
     let length = content_length?;
@@ -661,7 +667,7 @@ fn read_and_record(
     // An unparseable or absent agent id is a real, expected case (the forwarder ran outside a
     // Jerry-spawned pane, or a hand-made request): accept the request so the client isn't left
     // retrying, but record nothing - there is no row it could belong to.
-    if let (Some(agent_id), Some(report)) = (agent_id, event::parse(&event_name, &body)) {
+    if let (Some(agent_id), Some(report)) = (agent_id, parse(&event_name, &body)) {
         // The edit is appended *before* the inbox merge and from the same parse, so it is never
         // affected by `merge_nudge` deciding the report itself is superseded - a file really was
         // written whatever the row's status ends up saying (GitHub issue #284).
@@ -766,10 +772,16 @@ mod tests {
     }
 
     fn post(port: u16, token: &str, query: &str, body: &str) -> String {
+        post_to(port, token, "/hook", query, body)
+    }
+
+    /// [`post`], with the request path parameterized - GitHub issue #479's second route,
+    /// `/hook/cursor`, is exercised through this rather than a separate near-duplicate helper.
+    fn post_to(port: u16, token: &str, path: &str, query: &str, body: &str) -> String {
         raw_request(
             port,
             &format!(
-                "POST /hook?{query} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body}",
+                "POST {path}?{query} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body}",
                 body.len()
             ),
         )
@@ -966,6 +978,54 @@ mod tests {
         assert_eq!(activity.as_deref(), Some("Bash: cargo test"));
         assert_eq!(question, None);
         assert_eq!(listener.signal_for(8).fact, None);
+    }
+
+    #[test]
+    fn a_real_tokened_post_to_the_cursor_route_round_trips_through_the_cursor_parser() {
+        // GitHub issue #479's second route: `/hook/cursor` must dispatch to
+        // `crate::hooks::cursor_event::parse`, not `event::parse` - a Cursor-shaped payload
+        // (`conversation_id`, `preToolUse`) is not valid under Claude's own schema at all, so a
+        // round trip through the *wrong* parser would record nothing rather than the right fact.
+        let listener = HookListener::start().expect("listener must start");
+        let body = r#"{"conversation_id":"conv-9","tool_name":"Bash"}"#;
+        let response = post_to(
+            listener.port(),
+            listener.token(),
+            "/hook/cursor",
+            "event=preToolUse&agent=42",
+            body,
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 204"),
+            "expected 204, got {response:?}"
+        );
+        assert_eq!(listener.signal_for(42).fact, Some(HookFact::Working));
+        assert_eq!(
+            listener.text_for(42).0.as_deref(),
+            Some("Bash"),
+            "the Cursor parser's own activity formatting must be the one that ran"
+        );
+        assert_eq!(
+            listener.session_id_for(42).as_deref(),
+            Some("conv-9"),
+            "conversation_id is Cursor's session_id equivalent"
+        );
+    }
+
+    #[test]
+    fn an_unknown_route_is_a_real_404_not_a_silent_accept() {
+        let listener = HookListener::start().expect("listener must start");
+        let response = post_to(
+            listener.port(),
+            listener.token(),
+            "/hook/not-a-real-route",
+            "event=Stop&agent=1",
+            "{}",
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 404"),
+            "expected 404, got {response:?}"
+        );
     }
 
     #[test]

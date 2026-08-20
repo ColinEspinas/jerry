@@ -1,6 +1,6 @@
 //! Recording what the hooks taught Jerry about each agent, onto disk (GitHub issue #239 phase 2).
 
-use gpui::{Context, Window};
+use gpui::{AppContext as _, Context, Window};
 
 use crate::root::AdeApp;
 use crate::work_surface::agents::ProcessKind;
@@ -100,7 +100,16 @@ impl AdeApp {
         kind: crate::work_surface::agents::ProcessKind,
     ) -> Option<crate::hooks::HookInjection> {
         use crate::work_surface::agents::{AgentKind, ProcessKind};
-        if !matches!(kind, ProcessKind::Agent(AgentKind::Claude)) {
+        let wants_injection = match kind {
+            ProcessKind::Agent(AgentKind::Claude) => true,
+            // Opt-in (GitHub issue #479): unlike Claude's per-launch, entirely Jerry-owned
+            // `--settings <path>`, a Cursor injection implies a real write into
+            // `~/.cursor/hooks.json`, a file the user owns - see `crate::settings::store::Settings`'s
+            // `agents.cursor_hooks_enabled` and this app's own Agents settings page toggle.
+            ProcessKind::Agent(AgentKind::Cursor) => self.settings.agents.cursor_hooks_enabled,
+            _ => false,
+        };
+        if !wants_injection {
             return None;
         }
         // Bring-up is attempted exactly once per `AdeApp`. Keyed on a `tried` flag rather than on
@@ -116,6 +125,48 @@ impl AdeApp {
         self.hook_runtime
             .as_ref()
             .map(|runtime| runtime.injection())
+    }
+
+    /// Reconciles `~/.cursor/hooks.json` against the current `agents.cursor_hooks_enabled`
+    /// setting (GitHub issue #479): installs Jerry's managed entries when it's on, removes them
+    /// when it's off. Called once at startup (`Self::start_update_check_loop`'s own call site in
+    /// `crate::root::state`) so a stale entry from an older forwarder version, or a toggle flipped
+    /// while the app was closed, self-heals - and again immediately whenever the setting itself
+    /// flips, so turning it on or off has a real, immediate effect rather than "next restart".
+    /// Every real filesystem call happens on the background executor
+    /// (`crate::hooks::cursor_hooks_file`'s own I/O is all synchronous, like every other module
+    /// under `crate::hooks`) - never on the UI thread, per this codebase's GPUI blocking-call rule.
+    ///
+    /// A no-op under `cfg!(test)`: this is the one piece of hook wiring that would otherwise touch
+    /// the *real* user's home directory rather than a test-owned tempdir (every other hooks test
+    /// passes its own paths straight into `crate::hooks::cursor_hooks_file`'s pure functions),
+    /// mirroring `crate::updater::state::UPDATE_CHECK_ENABLED`'s identical reasoning for why a
+    /// background side effect with a real external footprint must not run under the test harness.
+    pub(crate) fn reconcile_cursor_hooks(&mut self, cx: &mut Context<Self>) {
+        if cfg!(test) {
+            return;
+        }
+        let enabled = self.settings.agents.cursor_hooks_enabled;
+        cx.background_spawn(async move {
+            let (Some(hooks_json), Some(forwarder)) = (
+                crate::hooks::cursor_hooks_file::hooks_json_path(),
+                crate::hooks::cursor_hooks_file::forwarder_path(),
+            ) else {
+                log::warn!("could not resolve a home directory - Cursor agent hooks are skipped");
+                return;
+            };
+            let result = if enabled {
+                crate::hooks::cursor_hooks_file::ensure_forwarder_written(&forwarder).and_then(
+                    |()| crate::hooks::cursor_hooks_file::install(&hooks_json, &forwarder),
+                )
+            } else {
+                crate::hooks::cursor_hooks_file::remove_managed_entries(&hooks_json, &forwarder)
+            };
+            if let Err(err) = result {
+                log::warn!("could not reconcile {}: {err}", hooks_json.display());
+            }
+        })
+        .detach();
     }
 
     /// Folds every live agent's current real state into the persisted record, and writes the file

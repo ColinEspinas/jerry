@@ -30,6 +30,24 @@ pub struct Settings {
     pub icon_pack: IconPackSettings,
     pub lsp: BTreeMap<String, LspServerSettings>,
     pub sound: SoundSettings,
+    pub agents: AgentsSettings,
+}
+
+/// Settings about the agent CLIs themselves, rather than about the Jerry UI around them - separate
+/// from [`TerminalSettings`] (which is about *shell* spawn behaviour) for the same reason that
+/// section is its own key rather than folded into [`AppearanceSettings`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentsSettings {
+    /// GitHub issue #479: whether Jerry writes its managed forwarder entries into
+    /// `~/.cursor/hooks.json` so a Jerry-spawned `cursor-agent` reports real status into the rail
+    /// and History. Off by default - an explicit, reversible opt-in, unlike Superset's own
+    /// default-on equivalent (see issue #479's design comment for the incident report that
+    /// argues for being stricter here) - because this genuinely writes into a file the user owns,
+    /// even though the entries themselves are inert for any `cursor-agent` session Jerry didn't
+    /// spawn (`crate::hooks::cursor_hooks_file`'s forwarder scripts no-op without Jerry's own
+    /// environment).
+    pub cursor_hooks_enabled: bool,
 }
 
 /// The integrated terminal's own behavioural settings (GitHub issue #213: "Allow to select
@@ -1561,6 +1579,30 @@ mod tests {
             Settings::load_or_init_at(&path).terminal.shell.as_deref(),
             Some("fish")
         );
+    }
+
+    #[test]
+    fn cursor_hooks_enabled_defaults_off_and_round_trips_through_a_real_file() {
+        // GitHub issue #479: explicit opt-in, off by default - see `AgentsSettings`'s own docs
+        // for why this deliberately differs from Superset's default-on equivalent.
+        assert!(!Settings::default().agents.cursor_hooks_enabled);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+
+        let mut configured = Settings::default();
+        configured.agents.cursor_hooks_enabled = true;
+        configured.save_at(&path).expect("write configured");
+
+        assert!(Settings::load_or_init_at(&path).agents.cursor_hooks_enabled);
+
+        // An install that has never touched this setting still gets a real, loadable file with
+        // no `[agents]` section written for it at all - `#[serde(default)]` covers the gap.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, "[terminal]\nshell = \"fish\"\n")
+            .expect("write a file with no agents section");
+        assert!(!Settings::load_or_init_at(&path).agents.cursor_hooks_enabled);
     }
 
     #[test]
