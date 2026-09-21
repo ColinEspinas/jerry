@@ -440,7 +440,10 @@ given action, and where I/O lives.
   classification (unlike `Invocability`, which a Query may leave at its `Allowed` default). Git-locality Queries run locally in any process.
   Session-locality anything reaches the host. Git-locality Commands go to the host when one exists
   and run locally only in standalone mode, because the host owns the worktree-to-session coupling
-  (`DiscardWorktree` must kill the agent living there).
+  (`DiscardWorktree` must kill the agent living there). The trust boundary is the user, not the
+  process: the socket is reachable only by the user's own uid, and an agent's identity is what
+  its environment says. `Invocability` and cwd confinement keep an agent from acting outside its
+  lane by accident; they are guardrails, not a sandbox against a process that lies about itself.
 - **`jerry-core` owns no threads.** Types, codec, stable error codes, the registry and a blocking
   client connect, plus the Git-locality implementations. The listener, dispatch task and session
   table are `jerry-host`'s. Every method carries the same envelope, `{cwd, agent?, params}`, so a host classifies and
@@ -457,3 +460,29 @@ duplicated from `jerry-lsp`'s JSON-RPC client rather than shared, since `jerry-l
 on this crate without a cycle. Which executor a Git-locality Command reaches is the transport
 choice `jerry-cli` makes (#499), not something this crate decides. `jerry-git` gained `worktree_root` so a `Ctx` can be built from any
 directory inside a worktree.
+
+## 16. Tasks wake on channels; a timer is only for time itself
+
+**Status:** Accepted (2026-09-22, issue #496; decision Q9 of the UI-optional plan).
+
+**Context:** Every source of asynchronous data in the app was consumed by a timer loop: the
+terminal pane polled a `std` channel every 8 ms, the rail drained hook events every 3 s, file
+watchers set an atomic flag that a 300 ms tick read back, LSP diagnostics were polled at 250 ms.
+The pattern came from the core crates handing out `std::sync::mpsc` channels and flags, which
+have no async waker, so every consumer had to wake itself. The first pass of the control-plane
+design added a fourth timer, a "tight pump" for Commands, to work around the 3 s hook drain.
+
+**Decision:** A task wakes when its data arrives. Producers hand out awaitable channels
+(`futures::channel::{mpsc, oneshot}`, sendable from a plain thread); consumers spawn one task
+per source and loop on `receiver.next().await`; GPUI's executor parks the task until then. The
+host's dispatch thread sleeps on its job channel, the app's client awaits a oneshot per call, and
+hook events are pushed as `event/*` notifications to every subscriber, the app's own client
+included once `jerry hook` (#500) sends them. A timer remains only
+where time is the semantics: caret blink, debounce, staleness, backoff, and a CPU sample, which is
+a delta by definition. Migrating the pre-existing loops is out of scope; new code and every seam
+the UI-optional plan touches follow the rule, `jerry-pty`'s output channel first (#504).
+
+**Consequences:** No per-request latency floor, no idle wakeups, and the same shape whether the
+producer is a thread in this process or, at stage 3, a socket. The one cost is that a producer
+must be given its channel rather than polled, which is why `jerry-core` exposes no threads and
+`jerry-host` owns the only ones.

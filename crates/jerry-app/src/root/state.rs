@@ -38,14 +38,18 @@ impl AdeApp {
     ) -> Self {
         let settings_path = settings_store::settings_toml_path();
         let settings = settings_store::Settings::load_or_init();
-        Self::new_with_settings(
+        let mut app = Self::new_with_settings(
             repo_path,
             use_remembered_repo,
             settings,
             settings_path,
             window,
             cx,
-        )
+        );
+        // Only a real instance publishes itself; test apps build through `new_with_settings`
+        // and must never leave sockets in the registry.
+        app.start_host(cx);
+        app
     }
 
     /// The real constructor - takes an already-resolved [`Settings`] and its optional source
@@ -353,6 +357,7 @@ impl AdeApp {
             review_mark_in_flight: None,
             hook_runtime,
             hook_runtime_tried: false,
+            host_runtime: None,
             agent_status_state,
             agent_status_path,
             agent_status_owned: std::collections::BTreeSet::new(),

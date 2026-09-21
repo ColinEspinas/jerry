@@ -41,6 +41,20 @@ Git-locality Command and Query implementations live here so standalone `jerry-cl
 
 **Does not own.** Dispatch, the listener and the session table (`jerry-host`); anything `gpui`.
 
+## `jerry-host`
+
+**Scope.** The session host: the one place a `Call` is authorized and executed. A dispatch
+thread woken by a channel, the AF_UNIX listener with a reader and writer per connection, the
+table of agents the host spawned (identity and confining worktree), and notification fan-out to
+every connected client. In-process inside `jerry-app` through stage 2; its own process at stage 3.
+
+**Owns.** Caller classification (an env-injected agent id the host itself handed out, or a
+human), `Invocability` and cwd confinement, `event/*` push. From stage 2 (#505): every PTY
+session and the hook store.
+
+**Does not own.** The wire contract and the Git-locality implementations (`jerry-core`), any
+rendering, anything `gpui`.
+
 ## `jerry-lsp`
 
 **Scope.** A Language Server Protocol client: spawn, initialize, request/notify, diagnostics.

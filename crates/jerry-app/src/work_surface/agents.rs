@@ -229,6 +229,10 @@ pub struct Agents {
     /// apart from "has a real tab to restore" by nothing more than `HashMap::get`.
     active_by_cwd: HashMap<PathBuf, AgentId>,
     next_id: AgentId,
+    /// The host's table of agents, once the host is up. Every agent spawn registers here and
+    /// every close forgets, so `jerry` calls from an agent classify as that agent and stay
+    /// confined to its worktree. Plain shells carry no `JERRY_AGENT_ID` and are never entered.
+    host_agents: Option<jerry_host::AgentTable>,
 }
 
 impl Agents {
@@ -238,7 +242,18 @@ impl Agents {
             active: None,
             active_by_cwd: HashMap::new(),
             next_id: 0,
+            host_agents: None,
         }
+    }
+
+    /// Hands the host every agent already open and every one spawned from now on.
+    pub fn attach_host(&mut self, table: jerry_host::AgentTable) {
+        for agent in &self.agents {
+            if agent.kind.is_agent_session() {
+                table.register(host_agent_id(agent.id), agent.cwd.clone());
+            }
+        }
+        self.host_agents = Some(table);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -411,6 +426,11 @@ impl Agents {
     ) -> AgentId {
         let id = self.next_id;
         self.next_id += 1;
+        if let Some(table) = &self.host_agents {
+            if kind.is_agent_session() {
+                table.register(host_agent_id(id), cwd.clone());
+            }
+        }
 
         let hook_extras = hook_extras_for(kind, hooks, id);
         let extras = if leading_args.is_empty() {
@@ -614,6 +634,9 @@ impl Agents {
             return;
         };
         let cwd = self.agents[index].cwd.clone();
+        if let Some(table) = &self.host_agents {
+            table.forget(&host_agent_id(id));
+        }
 
         self.agents[index]
             .pane
@@ -1031,4 +1054,9 @@ mod chat_id_tests {
     fn an_absurdly_long_line_is_refused() {
         assert!(!is_plausible_chat_id(&"a".repeat(129)));
     }
+}
+
+/// The identity the host knows an agent by: the same text `JERRY_AGENT_ID` carries.
+fn host_agent_id(id: AgentId) -> jerry_core::AgentId {
+    jerry_core::AgentId(id.to_string())
 }

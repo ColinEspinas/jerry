@@ -4368,7 +4368,9 @@ dependencies = [
  "gpui_platform",
  "image",
  "imara-diff",
+ "jerry-core",
  "jerry-git",
+ "jerry-host",
  "jerry-lsp",
  "jerry-pty",
  "libc",
@@ -4386,6 +4388,7 @@ dependencies = [
  "streaming-iterator",
  "tempfile",
  "test-support",
+ "thiserror 1.0.69",
  "toml 0.8.23",
  "tree-sitter",
  "tree-sitter-c",
@@ -4427,6 +4430,19 @@ dependencies = [
  "gix",
  "jerry-pty",
  "sha2",
+ "tempfile",
+ "test-support",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "jerry-host"
+version = "0.2.0"
+dependencies = [
+ "futures",
+ "jerry-core",
+ "log",
+ "serde_json",
  "tempfile",
  "test-support",
  "thiserror 1.0.69",
