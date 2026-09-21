@@ -343,10 +343,14 @@ fn sweep_stale_directories(parent: &Path) {
 }
 
 /// Whether a process with this id currently exists.
+///
+/// `pub(crate)`: the Windows host-survival spike (`crate::windows_host_survival_spike`, GitHub
+/// issue #494) reuses this on its own Windows twin below to check whether a spawned "host"
+/// process is still alive after its parent has exited, rather than a second liveness check.
 #[cfg(unix)]
 // SAFETY of the FFI call below is justified at its own call site.
 #[allow(unsafe_code)]
-fn process_is_alive(pid: u32) -> bool {
+pub(crate) fn process_is_alive(pid: u32) -> bool {
     // SAFETY: `kill` with signal 0 performs only an existence/permission check. It has no effect
     // on the target process, and takes no pointers, so there is nothing to invalidate.
     let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
@@ -357,11 +361,11 @@ fn process_is_alive(pid: u32) -> bool {
 }
 
 /// Whether a process with this id currently exists - the Windows twin of the `kill(pid, 0)` check
-/// above.
+/// above. See the unix twin's docs for why this is `pub(crate)`.
 #[cfg(windows)]
 // SAFETY of each FFI call below is justified at its own call site.
 #[allow(unsafe_code)]
-fn process_is_alive(pid: u32) -> bool {
+pub(crate) fn process_is_alive(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0};
     use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
     use windows_sys::Win32::System::Threading::{

@@ -413,3 +413,85 @@ until `jerry-cli` (#499) claims that name and the GUI ships as `jerry-app`. The 
 greps `jerry_git::`/`jerry_pty::`/`jerry_lsp::` and its baseline counts are unchanged, since the
 rename moves no call. Older entries in this file were rewritten to the new names in the same PR;
 `CHANGELOG.md` keeps the names each release shipped with, and the table above is the map.
+
+## 14. Windows spike: a session host can outlive the app (GitHub issue #494)
+
+**Status:** Accepted - all four points pass on real Windows 11 hardware.
+
+**Context:** Stage 3 of the `jerry-core`/`jerry-cli`/`jerry-host` overhaul plans to make
+`jerry-host` its own process, supervising a session's PTY and surviving Jerry's own exit (a
+restart, a crash, an update). Decision §11's kill-on-close job kills *everything* when Jerry
+dies, by design - the opposite of what a surviving host needs, so before any of stage 3 is built
+this had to be proven possible on Windows at all: a job-jobbed process spawning a child that
+escapes the job, that child setting up its own supervision, and a third process reading a live
+session from it after the original spawner is gone. GitHub issue #494 scoped this as a throwaway
+spike (`crates/jerry-app/src/windows_host_survival_spike.rs`, two `#[ignore]`d `external`-tier
+tests, never part of the PR gate), rather than building any real `jerry-host` code first.
+
+**Decision:** Ship the spike as a permanent regression test (not deleted after this entry was
+written) - the claims below are load-bearing for stage 3, and a future Windows platform change
+regressing any of them is exactly the kind of thing this test should catch. Results:
+
+1. **PASS** - a process inside a kill-on-close job survives its own exit's job-close by spawning a
+   child with `CREATE_BREAKAWAY_FROM_JOB`. The exact shape: `crate::job_object::create_kill_on_close_job`
+   already creates the job with both `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and
+   `JOB_OBJECT_LIMIT_BREAKAWAY_OK` (decision §11); the spike's "parent" role calls
+   `adopt_this_process_returning_job()` (unchanged) to join one, then spawns the "host" role
+   through `jerry_pty::new_std_command` with
+   `.creation_flags(CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB)` - `creation_flags` *replaces*
+   rather than ORs, so both flags are always set together (the same care `updater::flow` already
+   documents). The parent then returns, its job's last handle closes with it, and the host - polled
+   by a real Win32 liveness check (`OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, ..)`
+   + `WaitForSingleObject(handle, 0)`, `crate::hooks::settings_file::process_is_alive`) - is still
+   running afterward, and stays running for as long as the spike keeps checking.
+2. **PASS** - a job that forbids breakaway is detected and reported as a typed error
+   (`SpikeSpawnError::BreakawayForbidden`), never a silent in-job fallback spawn. Detection is a
+   real, second Win32 read distinct from interpreting the failed spawn's OS error code:
+   `IsProcessInJob(GetCurrentProcess(), null, &mut in_any_job)` to confirm the process is jobbed at
+   all, then `QueryInformationJobObject(null, JobObjectExtendedLimitInformation, &mut info, ..)`
+   with a **null job handle**, which answers for the calling process's own job with no handle to it
+   needed - `info.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_BREAKAWAY_OK == 0` is the
+   forbidding case. The spike proves the identical failure Windows would produce from a real outer
+   (ancestor-created) restrictive job by having the "parent" role assign *itself* into a job built
+   with `create_job_object_with_limits(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)` (no breakaway flag) -
+   Windows' breakaway check depends only on which job(s) currently contain the process at spawn
+   time, not on how many process-creation hops away the job's creator was, so self-assignment and a
+   true nested-ancestor job exercise the same `CreateProcess` failure path. No host process is ever
+   spawned in this scenario (verified: no pid file is ever written) - the failure is caught before
+   the in-job spawn `updater::flow::relaunch_and_exit`'s own retry-without-breakaway pattern would
+   otherwise fall back to, which is fine for a relaunch (being killed with the old instance is an
+   acceptable degraded outcome there) but would not be for a session host.
+3. **PASS** - the surviving host gives its *own* descendants a fresh kill-on-close job, independent
+   of whatever job (if any) contains the host itself, via the exact same
+   `job_object::adopt_this_process_returning_job()` the app's own `main()` calls on itself
+   (decision §11) - reused unmodified, now proven to also work correctly for a process that arrived
+   at its current state via breakaway rather than at cold start. Verified with
+   `IsProcessInJob(conpty_child_handle, host_job_handle, &mut inside)` against the host's own job
+   handle (not a null query) once the ConPTY child is spawned: `inside != 0`.
+4. **PASS** - the host spawns a ConPTY session through `jerry_pty::spawn` (unmodified), the
+   original parent has already exited, and a third process (the spike's own top-level test body)
+   keeps reading live output and resizes it. Coordination is deliberately the simplest thing that
+   proves the claim: plain files in a shared temp directory rather than a named pipe or socket - an
+   output file the host appends `PtySession::output()` chunks to as they arrive, a resize-request
+   file the host polls for and answers via the real `PtySession::resize(rows, cols)`, both observed
+   from the third process via `wait_until` polling on file size/existence, never a `thread::sleep`.
+   One real Windows-specific snag, not a claim failure: ConPTY's own startup Device Status Report
+   query (`\x1b[6n`) withholds further output until answered, exactly as
+   `jerry_pty::pty_session_tests` already documents for its own Windows tests - the host answers it
+   the same way (`\x1b[1;1R`) before it will see output keep growing.
+
+**Consequences:** Stage 3 can proceed without a Windows-specific fallback design - the same
+`CREATE_BREAKAWAY_FROM_JOB` + self-owned job + `jerry_pty::spawn` shape this spike proves is
+real `jerry-host` architecture, not just a spike-only trick. Two things worth carrying forward
+verbatim: `create_kill_on_close_job`/`assign_process`/`adopt_this_process_returning_job` in
+`job_object.rs` are now `pub(crate)` (previously private) specifically so this spike - and, later,
+real `jerry-host` bootstrap code in the same crate - can reuse them instead of duplicating the
+FFI; and `crate::hooks::settings_file::process_is_alive` is `pub(crate)` for the same reason,
+being exactly the liveness primitive a supervising third process needs. A real design pitfall this
+spike hit once, worth remembering for real `jerry-host` code: a process that escaped a job via
+breakaway is *not reachable* by anything in its spawner's own process (no `Drop`, no
+`ChildGuard`, no tree-kill) - if whatever supervises it dies before telling it to stop, it runs
+forever. `run_host_role`'s bounded 120s self-shutdown and the orchestrating test's
+panic-safe `StopHostOnDrop` guard are the two mitigations the spike needed for its own hygiene;
+real `jerry-host` needs an equivalent "I have not heard from my supervisor in N" self-check from
+day one, not as an afterthought.
