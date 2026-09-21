@@ -436,19 +436,24 @@ given action, and where I/O lives.
   steering reply needs no framing change. Rejected: gRPC/tonic (tokio and protobuf for a local
   socket), Cap'n Proto (fd passing we do not need yet), MessagePack-RPC (not inspectable from a
   shell), tarpc (ties the wire to Rust types, and MCP would still need JSON-RPC beside it).
-- **`Locality { Git, Session }`** is a required method on both traits, like `Invocability`, so
-  adding an action forces the classification. Git-locality Queries run locally in any process.
+- **`Locality { Git, Session }`** is a required method on both traits, so adding an action forces the
+  classification (unlike `Invocability`, which a Query may leave at its `Allowed` default). Git-locality Queries run locally in any process.
   Session-locality anything reaches the host. Git-locality Commands go to the host when one exists
   and run locally only in standalone mode, because the host owns the worktree-to-session coupling
   (`DiscardWorktree` must kill the agent living there).
 - **`jerry-core` owns no threads.** Types, codec, stable error codes, the registry and a blocking
   client connect, plus the Git-locality implementations. The listener, dispatch task and session
-  table are `jerry-host`'s. The wire contract is verified mechanically: one JSON fixture per
-  request variant under `crates/jerry-core/fixtures/`, compared and round-tripped by a table-driven
-  test, and an exhaustive match that gives every `jerry-git` failure a stable kebab-case code.
+  table are `jerry-host`'s. Every method carries the same envelope, `{cwd, agent?, params}`, so a host classifies and
+  confines every caller the same way. The wire contract is verified mechanically: one JSON
+  fixture per catalogued example under `crates/jerry-core/fixtures/`, compared and round-tripped
+  by a table-driven test, and an exhaustive match that gives every `jerry-git` failure a stable
+  kebab-case code. The client refuses a descriptor of another protocol version before connecting,
+  bounds every call as a whole, and poisons itself after a mid-frame failure rather than reading
+  stale bytes on the next call.
 
 **Consequences:** The GUI consumes `Report`s only (plan decision Q1), so it re-derives detail
 through local Queries and nothing in it changes when the host becomes a process. The codec is
 duplicated from `jerry-lsp`'s JSON-RPC client rather than shared, since `jerry-lsp` cannot depend
-on this crate without a cycle. `jerry-git` gained `worktree_root` so a `Ctx` can be built from any
+on this crate without a cycle. Which executor a Git-locality Command reaches is the transport
+choice `jerry-cli` makes (#499), not something this crate decides. `jerry-git` gained `worktree_root` so a `Ctx` can be built from any
 directory inside a worktree.

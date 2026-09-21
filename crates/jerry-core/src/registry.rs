@@ -5,14 +5,16 @@
 use crate::wire::PROTOCOL_VERSION;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::RandomState;
+use std::ffi::OsString;
 use std::fs;
 use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// macOS caps `sun_path` at 104 bytes; the runtime directory must stay short enough that an
-/// instance socket fits with room to spare.
+/// The tightest `sun_path` is macOS's 104 bytes (Linux and Windows allow 108); 100 leaves room
+/// for the terminator on every platform.
 pub const MAX_SOCKET_PATH_BYTES: usize = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,8 +23,9 @@ pub struct Descriptor {
     pub pid: u32,
     /// Seconds since the Unix epoch.
     pub started_at: u64,
-    /// The repository's common `.git` directory, canonicalized.
-    pub repo: PathBuf,
+    /// The common `.git` directory of every repository this host serves, canonicalized. An
+    /// in-process host serves every repository the app has open; a stage 3 host serves one.
+    pub repos: Vec<PathBuf>,
     pub socket: PathBuf,
 }
 
@@ -55,6 +58,8 @@ pub enum RegistryError {
     MissingEnv(&'static str),
     #[error("socket path {} is {len} bytes, over the {MAX_SOCKET_PATH_BYTES}-byte limit", path.display())]
     SocketPathTooLong { path: PathBuf, len: usize },
+    #[error("{} exists but is not a plain directory", path.display())]
+    NotADirectory { path: PathBuf },
     #[error("registry I/O at {}: {source}", path.display())]
     Io {
         path: PathBuf,
@@ -92,14 +97,15 @@ impl Os {
 
 /// The private runtime directory for `os`, from an environment lookup:
 /// `%LOCALAPPDATA%\jerry\run`, `$TMPDIR/jerry-<user>`, or `$XDG_RUNTIME_DIR/jerry` with a
-/// `/tmp/jerry-<user>` fallback.
+/// `/tmp/jerry-<user>` fallback. The lookup hands back `OsString`s because these are paths.
 pub fn runtime_dir_for(
     os: Os,
-    env: &dyn Fn(&str) -> Option<String>,
+    env: &dyn Fn(&str) -> Option<OsString>,
 ) -> Result<PathBuf, RegistryError> {
     let user = || {
         env("USER")
             .or_else(|| env("LOGNAME"))
+            .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "unknown".to_owned())
     };
     Ok(match os {
@@ -108,7 +114,7 @@ pub fn runtime_dir_for(
                 .join("jerry")
                 .join("run")
         }
-        Os::MacOs => PathBuf::from(env("TMPDIR").unwrap_or_else(|| "/tmp".to_owned()))
+        Os::MacOs => PathBuf::from(env("TMPDIR").unwrap_or_else(|| "/tmp".into()))
             .join(format!("jerry-{}", user())),
         Os::Unix => match env("XDG_RUNTIME_DIR") {
             Some(dir) => PathBuf::from(dir).join("jerry"),
@@ -119,7 +125,7 @@ pub fn runtime_dir_for(
 
 /// [`runtime_dir_for`] on this host, reading the real environment.
 pub fn runtime_dir() -> Result<PathBuf, RegistryError> {
-    runtime_dir_for(Os::host(), &|key| std::env::var(key).ok())
+    runtime_dir_for(Os::host(), &|key| std::env::var_os(key))
 }
 
 pub struct Registry {
@@ -127,7 +133,8 @@ pub struct Registry {
 }
 
 impl Registry {
-    /// Creates the directory if needed, private to the user on Unix (`0700`).
+    /// Creates the directory if needed, private to the user on Unix (`0700`). An existing path
+    /// that is not a plain directory (a symlink, a file) is refused rather than adopted.
     pub fn open(dir: PathBuf) -> Result<Registry, RegistryError> {
         create_private_dir(&dir)?;
         Ok(Registry { dir })
@@ -137,9 +144,9 @@ impl Registry {
         &self.dir
     }
 
-    /// Reserves a fresh instance name. Random, never derived from a repository or reused.
+    /// Reserves a fresh instance name, unique per process and never derived from a repository.
     pub fn allocate(&self) -> Result<Instance, RegistryError> {
-        let name = format!("{:x}-{:08x}", std::process::id(), random_u32());
+        let name = format!("{:x}-{:08x}", std::process::id(), fresh_u32());
         let socket = self.dir.join(format!("{name}.sock"));
         let len = socket.as_os_str().len();
         if len > MAX_SOCKET_PATH_BYTES {
@@ -152,12 +159,21 @@ impl Registry {
         })
     }
 
-    /// Writes the descriptor atomically (temp file, then rename).
-    pub fn publish(&self, instance: &Instance, repo: &Path) -> Result<Descriptor, RegistryError> {
-        let repo = fs::canonicalize(repo).map_err(|source| RegistryError::Io {
-            path: repo.to_path_buf(),
-            source,
-        })?;
+    /// Writes the descriptor atomically (temp file, then rename); republish to change `repos`.
+    pub fn publish(
+        &self,
+        instance: &Instance,
+        repos: &[PathBuf],
+    ) -> Result<Descriptor, RegistryError> {
+        let repos = repos
+            .iter()
+            .map(|repo| {
+                fs::canonicalize(repo).map_err(|source| RegistryError::Io {
+                    path: repo.clone(),
+                    source,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let descriptor = Descriptor {
             protocol_version: PROTOCOL_VERSION,
             pid: std::process::id(),
@@ -165,7 +181,7 @@ impl Registry {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
-            repo,
+            repos,
             socket: instance.socket.clone(),
         };
         let body =
@@ -187,24 +203,44 @@ impl Registry {
 
     /// Removes an instance's descriptor and socket file; missing files are not errors.
     pub fn remove(&self, instance: &Instance) -> Result<(), RegistryError> {
-        for path in [&instance.descriptor, &instance.socket] {
-            match fs::remove_file(path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(source) => {
-                    return Err(RegistryError::Io {
-                        path: path.clone(),
-                        source,
-                    })
-                }
-            }
-        }
-        Ok(())
+        remove_if_present(&instance.descriptor)?;
+        remove_if_present(&instance.socket)
     }
 
     /// Every readable descriptor, live or not. Unparseable files are skipped, not fatal: one
     /// half-written entry must not hide every other host.
     pub fn entries(&self) -> Result<Vec<Descriptor>, RegistryError> {
+        Ok(self
+            .read_entries()?
+            .into_iter()
+            .map(|(_, descriptor)| descriptor)
+            .collect())
+    }
+
+    /// The live host(s) for `repo`, sweeping dead entries for that repository along the way.
+    pub fn resolve(&self, repo: &Path) -> Result<Resolution, RegistryError> {
+        let repo = fs::canonicalize(repo).map_err(|source| RegistryError::Io {
+            path: repo.to_path_buf(),
+            source,
+        })?;
+        let mut live = Vec::new();
+        for (path, descriptor) in self.read_entries()? {
+            if !descriptor.repos.contains(&repo) {
+                continue;
+            }
+            match probe(&descriptor.socket) {
+                Liveness::Live => live.push(descriptor),
+                Liveness::Dead => self.sweep(&path, &descriptor)?,
+            }
+        }
+        Ok(match live.len() {
+            0 => Resolution::None,
+            1 => Resolution::One(live.remove(0)),
+            _ => Resolution::Many(live),
+        })
+    }
+
+    fn read_entries(&self) -> Result<Vec<(PathBuf, Descriptor)>, RegistryError> {
         let read = fs::read_dir(&self.dir).map_err(|source| RegistryError::Io {
             path: self.dir.clone(),
             source,
@@ -222,49 +258,21 @@ impl Registry {
             }
             let Ok(body) = fs::read(&path) else { continue };
             if let Ok(descriptor) = serde_json::from_slice::<Descriptor>(&body) {
-                entries.push(descriptor);
+                entries.push((path, descriptor));
             }
         }
         Ok(entries)
     }
 
-    /// The live host(s) for `repo`, sweeping dead entries for that repository along the way.
-    pub fn resolve(&self, repo: &Path) -> Result<Resolution, RegistryError> {
-        let repo = fs::canonicalize(repo).map_err(|source| RegistryError::Io {
-            path: repo.to_path_buf(),
-            source,
-        })?;
-        let mut live = Vec::new();
-        for descriptor in self.entries()? {
-            if descriptor.repo != repo {
-                continue;
-            }
-            match probe(&descriptor.socket) {
-                Liveness::Live => live.push(descriptor),
-                Liveness::Dead => {
-                    let instance = self.instance_of(&descriptor);
-                    self.remove(&instance)?;
-                }
-            }
+    /// Unlinks a dead entry's own files only: the descriptor at the path it was read from, and
+    /// its socket only when that sits in this registry directory. A descriptor is untrusted
+    /// input and must never make this process delete an arbitrary path.
+    fn sweep(&self, descriptor_path: &Path, descriptor: &Descriptor) -> Result<(), RegistryError> {
+        remove_if_present(descriptor_path)?;
+        if descriptor.socket.parent() == Some(self.dir.as_path()) {
+            remove_if_present(&descriptor.socket)?;
         }
-        Ok(match live.len() {
-            0 => Resolution::None,
-            1 => Resolution::One(live.remove(0)),
-            _ => Resolution::Many(live),
-        })
-    }
-
-    fn instance_of(&self, descriptor: &Descriptor) -> Instance {
-        let name = descriptor
-            .socket
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        Instance {
-            descriptor: self.dir.join(format!("{name}.json")),
-            socket: descriptor.socket.clone(),
-            name,
-        }
+        Ok(())
     }
 }
 
@@ -276,9 +284,29 @@ pub fn probe(socket: &Path) -> Liveness {
     }
 }
 
-fn random_u32() -> u32 {
+fn remove_if_present(path: &Path) -> Result<(), RegistryError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(RegistryError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// Distinct on every call within a process: a per-process counter mixed with the clock and the
+/// pid through the standard library's randomly keyed hasher.
+fn fresh_u32() -> u32 {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
     let mut hasher = RandomState::new().build_hasher();
-    hasher.write_u64(std::process::id().into());
+    hasher.write_u32(std::process::id());
+    hasher.write_u32(nanos);
+    hasher.write_u32(COUNTER.fetch_add(1, Ordering::Relaxed));
     hasher.finish() as u32
 }
 
@@ -289,13 +317,20 @@ fn create_private_dir(dir: &Path) -> Result<(), RegistryError> {
         path: dir.to_path_buf(),
         source,
     };
-    match fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-    {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+    match fs::symlink_metadata(dir) {
+        Ok(meta) if meta.file_type().is_dir() => {}
+        Ok(_) => {
+            return Err(RegistryError::NotADirectory {
+                path: dir.to_path_buf(),
+            })
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)
+                .map_err(io)?;
+        }
         Err(error) => return Err(io(error)),
     }
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(io)
@@ -304,10 +339,16 @@ fn create_private_dir(dir: &Path) -> Result<(), RegistryError> {
 #[cfg(windows)]
 fn create_private_dir(dir: &Path) -> Result<(), RegistryError> {
     // `%LOCALAPPDATA%` is already private to the user; its default ACL is the defence here.
-    fs::create_dir_all(dir).map_err(|source| RegistryError::Io {
-        path: dir.to_path_buf(),
-        source,
-    })
+    match fs::symlink_metadata(dir) {
+        Ok(meta) if meta.file_type().is_dir() => Ok(()),
+        Ok(_) => Err(RegistryError::NotADirectory {
+            path: dir.to_path_buf(),
+        }),
+        Err(_) => fs::create_dir_all(dir).map_err(|source| RegistryError::Io {
+            path: dir.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -315,13 +356,14 @@ mod registry_tests {
     use super::{runtime_dir_for, Os, Registry, RegistryError, Resolution};
     use crate::client::Listener;
     use std::collections::HashMap;
+    use std::ffi::OsString;
     use std::fs;
     use std::path::PathBuf;
 
-    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
-        let map: HashMap<String, String> = pairs
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
+        let map: HashMap<String, OsString> = pairs
             .iter()
-            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .map(|(k, v)| ((*k).to_owned(), OsString::from(*v)))
             .collect();
         move |key: &str| map.get(key).cloned()
     }
@@ -360,36 +402,53 @@ mod registry_tests {
         ));
     }
 
-    /// Windows' AF_UNIX path limit is 108 bytes and a nested temp dir is often longer; anchor the
-    /// registry at the real runtime dir on Windows and clean up after ourselves.
-    fn short_registry() -> (Registry, Option<tempfile::TempDir>) {
+    /// A registry in a directory of its own, short enough for [`super::MAX_SOCKET_PATH_BYTES`]
+    /// on every platform (a nested temp dir is often too long on Windows, so there it sits
+    /// under the real runtime dir), and removed on drop even when the test fails.
+    struct TestRegistry {
+        registry: Registry,
+        _temp: Option<tempfile::TempDir>,
+    }
+
+    impl Drop for TestRegistry {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(self.registry.dir());
+        }
+    }
+
+    fn short_registry(tag: &str) -> TestRegistry {
         if cfg!(windows) {
             let dir = super::runtime_dir()
                 .expect("runtime dir")
-                .join(format!("t-{:x}", std::process::id()));
-            (Registry::open(dir).expect("registry"), None)
+                .join(format!("t-{:x}-{tag}", std::process::id()));
+            TestRegistry {
+                registry: Registry::open(dir).expect("registry"),
+                _temp: None,
+            }
         } else {
             let temp = tempfile::TempDir::new().expect("tempdir");
-            (
-                Registry::open(temp.path().join("r")).expect("registry"),
-                Some(temp),
-            )
+            TestRegistry {
+                registry: Registry::open(temp.path().join("r")).expect("registry"),
+                _temp: Some(temp),
+            }
         }
     }
 
     #[test]
     fn a_published_host_is_found_by_its_repository_and_a_dead_one_is_swept() {
-        let (registry, _keep) = short_registry();
+        let test = short_registry("resolve");
+        let registry = &test.registry;
         let repo = test_support::seed_empty_repo();
+        let repos = vec![repo.path().to_path_buf()];
 
         let dead = registry.allocate().expect("allocate");
-        registry.publish(&dead, repo.path()).expect("publish dead");
+        registry.publish(&dead, &repos).expect("publish dead");
         assert!(dead.descriptor.exists());
 
         let live = registry.allocate().expect("allocate");
         assert_ne!(live.name, dead.name);
         let _listener = Listener::bind(&live.socket).expect("bind");
-        registry.publish(&live, repo.path()).expect("publish live");
+        registry.publish(&live, &repos).expect("publish live");
 
         match registry.resolve(repo.path()).expect("resolve") {
             Resolution::One(descriptor) => {
@@ -415,15 +474,40 @@ mod registry_tests {
             registry.resolve(repo.path()).expect("resolve"),
             Resolution::None
         );
-        let _ = fs::remove_dir_all(registry.dir());
+    }
+
+    #[test]
+    fn a_dead_descriptor_never_makes_the_sweep_unlink_a_foreign_path() {
+        let test = short_registry("foreign");
+        let registry = &test.registry;
+        let repo = test_support::seed_empty_repo();
+        let outside = tempfile::TempDir::new().expect("tempdir");
+        let victim = outside.path().join("not-ours.sock");
+        fs::write(&victim, b"").expect("victim");
+
+        let descriptor = super::Descriptor {
+            protocol_version: crate::wire::PROTOCOL_VERSION,
+            pid: 1,
+            started_at: 0,
+            repos: vec![fs::canonicalize(repo.path()).expect("canonical")],
+            socket: victim.clone(),
+        };
+        let path = registry.dir().join("forged.json");
+        fs::write(&path, serde_json::to_vec(&descriptor).expect("json")).expect("write");
+
+        assert_eq!(
+            registry.resolve(repo.path()).expect("resolve"),
+            Resolution::None
+        );
+        assert!(!path.exists(), "the dead descriptor itself is swept");
+        assert!(victim.exists(), "a path outside the registry is left alone");
     }
 
     #[test]
     fn a_half_written_descriptor_hides_nothing_else() {
-        let (registry, _keep) = short_registry();
-        fs::write(registry.dir().join("broken.json"), b"{").expect("write");
-        assert_eq!(registry.entries().expect("entries"), Vec::new());
-        let _ = fs::remove_dir_all(registry.dir());
+        let test = short_registry("broken");
+        fs::write(test.registry.dir().join("broken.json"), b"{").expect("write");
+        assert_eq!(test.registry.entries().expect("entries"), Vec::new());
     }
 
     #[test]
@@ -434,6 +518,17 @@ mod registry_tests {
         assert!(matches!(
             registry.allocate(),
             Err(RegistryError::SocketPathTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn a_file_where_the_registry_directory_should_be_is_refused() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let file = temp.path().join("run");
+        fs::write(&file, b"").expect("file");
+        assert!(matches!(
+            Registry::open(file),
+            Err(RegistryError::NotADirectory { .. })
         ));
     }
 }

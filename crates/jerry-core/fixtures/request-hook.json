@@ -1,8 +1,11 @@
 {
   "method": "hook",
   "params": {
+    "cwd": "/repo/wt-agent-7",
     "agent": "agent-7",
-    "event": "PreToolUse",
-    "payload": { "tool_name": "Edit" }
+    "params": {
+      "event": "PreToolUse",
+      "payload": { "tool_name": "Edit" }
+    }
   }
 }

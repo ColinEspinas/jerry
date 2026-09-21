@@ -7,8 +7,8 @@ use crate::error::Error;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Where am I: the worktree and the repository a caller is acting in. The skeleton the wire is
-/// proven against; later issues add the agent and merge state.
+/// Where am I: the worktree, the repository and the caller a request acts as, as the host
+/// resolved them from the call envelope.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusQuery {}
 

@@ -1,4 +1,7 @@
 {
   "method": "query/status",
-  "params": {}
+  "params": {
+    "cwd": "/repo",
+    "params": {}
+  }
 }

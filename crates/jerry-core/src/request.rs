@@ -2,8 +2,8 @@
 //! event. One enum per kind so dispatch applies each kind's default policy without inspecting
 //! variants, and so a CLI or an MCP tool list can be generated from the same source.
 
-use crate::command::{run_query, Invocability, Locality, Query};
-use crate::ctx::{AgentId, Ctx};
+use crate::command::{permits, run_query, Invocability, Locality, Query};
+use crate::ctx::Ctx;
 use crate::method::Method;
 use crate::queries::StatusQuery;
 use crate::report::Report;
@@ -11,10 +11,10 @@ use crate::wire::{rpc_code, RpcError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// One agent hook event, forwarded verbatim by `jerry hook <event>`.
+/// One agent hook event, forwarded verbatim by `jerry hook <event>`. The agent's identity
+/// travels in the call envelope, not here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HookEvent {
-    pub agent: AgentId,
     /// The agent CLI's own event name, e.g. `PreToolUse`.
     pub event: String,
     /// The hook's stdin, parsed. Never interpreted here.
@@ -47,10 +47,16 @@ pub enum Request {
     Query(AppQuery),
 }
 
-/// A Session-locality request reached a process that has no session table.
+/// Why a request could not run in this process.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{0} needs a running host")]
-pub struct NeedsHost(pub Method);
+pub enum LocalDispatchError {
+    /// A Session-locality request reached a process that has no session table.
+    #[error("{0} needs a running host")]
+    NeedsHost(Method),
+    /// The caller may not ask for this (`Invocability`).
+    #[error("{0} is not invocable by this caller")]
+    Forbidden(Method),
+}
 
 impl AppCommand {
     fn name(&self) -> &'static str {
@@ -96,8 +102,7 @@ impl Request {
         }
     }
 
-    /// The JSON-RPC `params` for this request: the payload without the name, which the method
-    /// already carries.
+    /// The payload alone: the name is the method's and the caller is the envelope's.
     pub fn params(&self) -> Result<Value, serde_json::Error> {
         match self {
             Request::Hook(event) => serde_json::to_value(event),
@@ -108,7 +113,7 @@ impl Request {
         }
     }
 
-    /// Classifies an incoming method and its params. Unknown methods and unknown names are
+    /// Classifies an incoming method and its payload. Unknown methods and unknown names are
     /// `METHOD_NOT_FOUND`; a known name with the wrong payload is `INVALID_PARAMS`.
     pub fn from_wire(method: &str, params: Value) -> Result<Request, RpcError> {
         let parsed = Method::parse(method).ok_or_else(|| method_not_found(method))?;
@@ -154,14 +159,12 @@ impl Request {
         }
     }
 
-    /// One instance per variant, named for its on-disk fixture. The contract test in
-    /// `request_catalogue_tests` compares each against `fixtures/<name>.json`.
+    /// One instance per variant, named for its fixture; `Call::examples` wraps these.
     pub fn examples() -> Vec<(&'static str, Request)> {
         vec![
             (
                 "request-hook",
                 Request::Hook(HookEvent {
-                    agent: AgentId::from("agent-7"),
                     event: "PreToolUse".into(),
                     payload: serde_json::json!({ "tool_name": "Edit" }),
                 }),
@@ -176,12 +179,15 @@ impl Request {
 
 /// Runs a Git-locality request in this process. Anything needing the session table, hooks
 /// included, is handed back as `NeedsHost` so the caller can forward it or fail with exit 4.
-pub fn execute_locally(request: &Request, ctx: &Ctx) -> Result<Report, NeedsHost> {
+pub fn execute_locally(request: &Request, ctx: &Ctx) -> Result<Report, LocalDispatchError> {
+    if !permits(&ctx.caller, request.invocability()) {
+        return Err(LocalDispatchError::Forbidden(request.method()));
+    }
     if request.locality() == Locality::Session {
-        return Err(NeedsHost(request.method()));
+        return Err(LocalDispatchError::NeedsHost(request.method()));
     }
     match request {
-        Request::Hook(_) => Err(NeedsHost(request.method())),
+        Request::Hook(_) => Err(LocalDispatchError::NeedsHost(request.method())),
         Request::Command(command) | Request::Validate(command) => match *command {},
         Request::Query(AppQuery::Status(query)) => Ok(run_query(query, ctx)),
     }
@@ -225,49 +231,23 @@ fn invalid_params(method: &str, error: &serde_json::Error) -> RpcError {
 
 #[cfg(test)]
 mod request_catalogue_tests {
-    use super::{execute_locally, AppQuery, NeedsHost, Request, COMMAND_NAMES, QUERY_NAMES};
+    use super::{
+        execute_locally, AppQuery, LocalDispatchError, Request, COMMAND_NAMES, QUERY_NAMES,
+    };
     use crate::command::Locality;
     use crate::ctx::{Caller, Ctx};
     use crate::method::Method;
     use crate::wire::rpc_code;
-    use std::fs;
-    use std::path::{Path, PathBuf};
-
-    fn fixture_dir() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures")
-    }
-
-    /// The wire contract, checked mechanically: every variant has a fixture on disk that matches
-    /// its serialization byte for byte after normalization, and decodes back to the same value.
-    #[test]
-    fn every_request_variant_matches_its_fixture_and_round_trips() {
-        for (name, request) in Request::examples() {
-            let path = fixture_dir().join(format!("{name}.json"));
-            let on_disk: serde_json::Value = serde_json::from_str(
-                &fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display())),
-            )
-            .expect("fixture is JSON");
-
-            let method = request.method().to_string();
-            let params = request.params().expect("params serialize");
-            let produced = serde_json::json!({ "method": method, "params": params });
-            assert_eq!(produced, on_disk, "fixture {name} drifted from the code");
-
-            let back = Request::from_wire(&method, params).expect("decodes");
-            assert_eq!(back, request, "{name} does not round-trip");
-        }
-    }
+    use std::path::PathBuf;
 
     #[test]
     fn the_name_lists_cover_exactly_the_catalogue() {
-        let mut queries: Vec<&str> = Vec::new();
-        let mut commands: Vec<&str> = Vec::new();
+        let mut queries: Vec<String> = Vec::new();
+        let mut commands: Vec<String> = Vec::new();
         for (_, request) in Request::examples() {
             match request.method() {
-                Method::Query(name) => queries.push(Box::leak(name.into_boxed_str())),
-                Method::Command(name) | Method::Validate(name) => {
-                    commands.push(Box::leak(name.into_boxed_str()))
-                }
+                Method::Query(name) => queries.push(name),
+                Method::Command(name) | Method::Validate(name) => commands.push(name),
                 Method::Hook | Method::Event(_) => {}
             }
         }
@@ -277,20 +257,6 @@ mod request_catalogue_tests {
         commands.dedup();
         assert_eq!(queries, QUERY_NAMES);
         assert_eq!(commands, COMMAND_NAMES);
-        let fixtures = fs::read_dir(fixture_dir())
-            .expect("fixtures dir")
-            .filter(|entry| {
-                entry
-                    .as_ref()
-                    .map(|e| e.file_name().to_string_lossy().starts_with("request-"))
-                    .unwrap_or(false)
-            })
-            .count();
-        assert_eq!(
-            fixtures,
-            Request::examples().len(),
-            "a stray or missing request fixture"
-        );
     }
 
     #[test]
@@ -312,7 +278,10 @@ mod request_catalogue_tests {
             worktree_path: PathBuf::from("/r"),
             caller: Caller::Human,
         };
-        assert_eq!(execute_locally(&hook, &ctx), Err(NeedsHost(Method::Hook)));
+        assert_eq!(
+            execute_locally(&hook, &ctx),
+            Err(LocalDispatchError::NeedsHost(Method::Hook))
+        );
     }
 
     #[test]

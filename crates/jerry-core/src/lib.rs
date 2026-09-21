@@ -8,6 +8,7 @@
 // Only production code is held to `unwrap_used`/`expect_used` (`CLAUDE.md`).
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod call;
 pub mod client;
 pub mod command;
 pub mod ctx;
@@ -19,6 +20,7 @@ pub mod report;
 pub mod request;
 pub mod wire;
 
+pub use call::Call;
 pub use command::{
     permits, run_command, run_query, validate_command, Command, Denied, Invocability, Locality,
     Query,
@@ -27,5 +29,5 @@ pub use ctx::{AgentId, Caller, Ctx};
 pub use error::Error;
 pub use method::Method;
 pub use report::Report;
-pub use request::{execute_locally, AppCommand, AppQuery, HookEvent, NeedsHost, Request};
+pub use request::{execute_locally, AppCommand, AppQuery, HookEvent, LocalDispatchError, Request};
 pub use wire::{Message, RequestId, RpcError, PROTOCOL_VERSION};

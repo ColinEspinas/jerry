@@ -20,7 +20,7 @@ thiserror = { workspace = true }
 # AF_UNIX on Windows 10 1803+. Pinned to the exact version already resolved in Cargo.lock
 # (pulled by `zbus` via gpui), so this adds no new version surface.
 [target.'cfg(windows)'.dependencies]
-uds_windows = "1.2.1"
+uds_windows = "=1.2.1"
 
 [dev-dependencies]
 tempfile = "3"

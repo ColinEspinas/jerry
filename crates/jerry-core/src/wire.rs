@@ -6,8 +6,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::io::{self, Read, Write};
 
-/// Bumped only for a framing or envelope change. The registry descriptor carries it so a
-/// mismatched client and host refuse each other loudly instead of talking past each other.
+/// Bumped only for a framing or envelope change. The registry descriptor carries it and
+/// `Client::connect_to` refuses a host whose version differs.
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Hook payloads can embed file contents; anything past this is a bug or an attack, not data.
@@ -34,11 +34,13 @@ pub mod rpc_code {
     pub const NEEDS_HOST: i64 = -32005;
 }
 
+/// `Null` is only legal on a response to a request whose id could not be read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RequestId {
     Number(i64),
     Text(String),
+    Null,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -86,13 +88,18 @@ pub enum Message {
 #[derive(Serialize, Deserialize)]
 struct Raw {
     jsonrpc: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // An explicit `"id": null` and an explicit `"result": null` both carry meaning; a plain
+    // `Option` would erase them.
+    #[serde(
+        default,
+        deserialize_with = "present_id",
+        skip_serializing_if = "Option::is_none"
+    )]
     id: Option<RequestId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     method: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     params: Option<Value>,
-    // An explicit `"result": null` is a real (null) result, which a plain `Option` would erase.
     #[serde(
         default,
         deserialize_with = "present",
@@ -107,6 +114,19 @@ fn present<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Value>, 
     Value::deserialize(deserializer).map(Some)
 }
 
+fn present_id<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<RequestId>, D::Error> {
+    RequestId::deserialize(deserializer).map(Some)
+}
+
+/// JSON-RPC requires `params` to be structured when present, so a null payload is omitted.
+fn structured(params: Value) -> Option<Value> {
+    if params.is_null() {
+        None
+    } else {
+        Some(params)
+    }
+}
+
 impl From<Message> for Raw {
     fn from(message: Message) -> Raw {
         let jsonrpc = JSONRPC.to_owned();
@@ -115,7 +135,7 @@ impl From<Message> for Raw {
                 jsonrpc,
                 id: Some(id),
                 method: Some(method),
-                params: Some(params),
+                params: structured(params),
                 result: None,
                 error: None,
             },
@@ -123,7 +143,7 @@ impl From<Message> for Raw {
                 jsonrpc,
                 id: None,
                 method: Some(method),
-                params: Some(params),
+                params: structured(params),
                 result: None,
                 error: None,
             },
@@ -153,6 +173,7 @@ impl TryFrom<Raw> for Message {
             return Err(format!("jsonrpc must be \"2.0\", got {:?}", raw.jsonrpc));
         }
         match (raw.id, raw.method, raw.result, raw.error) {
+            (Some(RequestId::Null), Some(_), _, _) => Err("a request id must not be null".into()),
             (Some(id), Some(method), None, None) => Ok(Message::Request {
                 id,
                 method,
@@ -254,6 +275,10 @@ mod frame_codec_tests {
                     "no such method",
                 )),
             },
+            Message::Response {
+                id: RequestId::Null,
+                result: Err(RpcError::new(super::rpc_code::PARSE_ERROR, "unreadable")),
+            },
         ]
     }
 
@@ -272,15 +297,42 @@ mod frame_codec_tests {
     }
 
     #[test]
-    fn a_null_result_is_a_result_not_a_missing_one() {
-        let json = r#"{"jsonrpc":"2.0","id":1,"result":null}"#;
-        let message: Message = serde_json::from_str(json).expect("a null result is valid");
+    fn a_null_result_is_a_result_and_a_null_id_answers_an_unreadable_request() {
+        let message: Message = serde_json::from_str(r#"{"jsonrpc":"2.0","id":1,"result":null}"#)
+            .expect("a null result is valid");
         assert_eq!(
             message,
             Message::Response {
                 id: RequestId::Number(1),
                 result: Ok(serde_json::Value::Null)
             }
+        );
+
+        let message: Message = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"bad"}}"#,
+        )
+        .expect("a null-id error response is the spec's reply to an unparseable request");
+        assert!(matches!(
+            message,
+            Message::Response {
+                id: RequestId::Null,
+                result: Err(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn a_null_payload_is_omitted_and_a_null_request_id_is_refused() {
+        let json = serde_json::to_string(&Message::Notification {
+            method: "event/x".into(),
+            params: serde_json::Value::Null,
+        })
+        .expect("serializes");
+        assert!(!json.contains("params"), "{json}");
+
+        assert!(
+            serde_json::from_str::<Message>(r#"{"jsonrpc":"2.0","id":null,"method":"hook"}"#)
+                .is_err()
         );
     }
 
