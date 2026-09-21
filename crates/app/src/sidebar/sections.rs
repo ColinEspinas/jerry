@@ -47,15 +47,14 @@ pub enum ChangesSection {
 }
 
 impl ChangesSection {
-    /// Top to bottom, exactly as the design paints them and states in as many words:
-    /// "Four stacked sections, in this order: Uncommitted, Commits, Against main, Runs.
-    /// The first three are one ladder of git state, narrowing to widening. Runs is not on that
-    /// ladder — it indexes the same changes by author — so it sits after it rather than inside it,
-    /// which also keeps Uncommitted's top edge fixed however many agents have run."
+    /// Top to bottom *before* [`ChangeScope::shows`] filters it: the two file sections lead so
+    /// that whichever one the scope keeps is the panel's first section - the scope's own list is
+    /// the panel's main content - with Commits under it and Runs last, off the git ladder
+    /// (it re-indexes the same changes by author). Only one of the first two ever renders.
     pub const ORDER: [ChangesSection; 4] = [
         ChangesSection::Uncommitted,
-        ChangesSection::Commits,
         ChangesSection::AgainstMain,
+        ChangesSection::Commits,
         ChangesSection::Runs,
     ];
 
@@ -86,11 +85,15 @@ impl ChangesSection {
         }
     }
 
-    /// Runs and Uncommitted open by default; the two git-history sections start collapsed.
+    /// Every section that can carry the scope's file list opens by default - only one of the two
+    /// is ever visible at a time ([`ChangeScope::shows`]), and a default scope whose file list
+    /// started collapsed would render the panel empty. Commits alone starts collapsed.
     pub fn starts_open(self) -> bool {
         match self {
-            ChangesSection::Runs | ChangesSection::Uncommitted => true,
-            ChangesSection::Commits | ChangesSection::AgainstMain => false,
+            ChangesSection::Runs | ChangesSection::Uncommitted | ChangesSection::AgainstMain => {
+                true
+            }
+            ChangesSection::Commits => false,
         }
     }
 
@@ -107,6 +110,51 @@ impl ChangesSection {
     /// Whether rows in this section carry a staging checkbox.
     pub fn has_checkboxes(self) -> bool {
         matches!(self, ChangesSection::Uncommitted)
+    }
+}
+
+/// Which git scope the Changes panel's file list - and every surface that marks changed files:
+/// tree markers, palette marks, the opened diff's hunks - derives from (GitHub issue #487).
+/// One value drives all of them, which is the whole point: the surfaces used to pick scopes
+/// independently and visibly disagree.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ChangeScope {
+    /// Everything this branch would land on its base - committed and uncommitted together. The
+    /// default: Jerry reviews agent branch work first, and agents commit on their own, so an
+    /// uncommitted-only default would blank the panel exactly when there is the most to review.
+    #[default]
+    AllChanges,
+    /// The working tree against `HEAD` - what a commit right now would pick up. The one scope
+    /// where staging and the commit composer make sense.
+    Uncommitted,
+}
+
+impl ChangeScope {
+    /// The section carrying this scope's file list; the other file section is hidden outright.
+    pub fn file_section(self) -> ChangesSection {
+        match self {
+            ChangeScope::AllChanges => ChangesSection::AgainstMain,
+            ChangeScope::Uncommitted => ChangesSection::Uncommitted,
+        }
+    }
+
+    /// Whether `section` renders at all under this scope: the two file sections swap with the
+    /// scope, Commits and Runs are scope-independent and always render.
+    pub fn shows(self, section: ChangesSection) -> bool {
+        match section {
+            ChangesSection::Uncommitted | ChangesSection::AgainstMain => {
+                self.file_section() == section
+            }
+            ChangesSection::Commits | ChangesSection::Runs => true,
+        }
+    }
+
+    /// The selector segment's label.
+    pub fn label(self) -> &'static str {
+        match self {
+            ChangeScope::AllChanges => "All changes",
+            ChangeScope::Uncommitted => "Uncommitted",
+        }
     }
 }
 
@@ -322,15 +370,15 @@ pub enum SectionRow {
     /// time so a diff replaced between this frame's row count and this row's build renders
     /// nothing rather than indexing a stale snapshot.
     UncommittedFile(usize),
+    /// [`SectionRow::UncommittedFile`]'s against-base twin: an index into the **against-base**
+    /// change set, re-resolved at build time for the same stale-snapshot reason. Per-file rows
+    /// here reverse issue #285's "no committed rows under Against main" call, which predated the
+    /// scope selector: with only one file list visible at a time ([`ChangeScope::shows`]), the
+    /// duplication that call removed cannot occur (GitHub issue #487).
+    AgainstMainFile(usize),
     Commit(wt_core::diff::BranchCommit),
-    /// The Against-main section's *only* body row (besides its own notes): what would land, and
-    /// how far ahead or behind the branch is. Unlike the other three sections, Against main never
-    /// lists a row per file - the design carries a plain file *count* here, never an array of
-    /// files, and the panel's
-    /// own header count reads that count directly (`Self::changes_section_rows`), not the number
-    /// of rows this section renders - a deliberate exception to `SectionHeader::count`'s usual
-    /// "derived from the body" rule, and a deliberate removal of this section's earlier per-file
-    /// listing (a committed file is no longer its own row here at all).
+    /// The Against-main section's summary row: what would land, and how far ahead or behind the
+    /// branch is. Renders after the file rows as the section's footer.
     AgainstMainContext {
         text: String,
         sub: String,
@@ -348,7 +396,10 @@ impl SectionRow {
     pub fn is_counted(&self) -> bool {
         matches!(
             self,
-            SectionRow::Run(_) | SectionRow::UncommittedFile(_) | SectionRow::Commit(_)
+            SectionRow::Run(_)
+                | SectionRow::UncommittedFile(_)
+                | SectionRow::AgainstMainFile(_)
+                | SectionRow::Commit(_)
         )
     }
 
@@ -361,6 +412,7 @@ impl SectionRow {
             SectionRow::Header(header) => header.section,
             SectionRow::Run(_) => ChangesSection::Runs,
             SectionRow::UncommittedFile(_) => ChangesSection::Uncommitted,
+            SectionRow::AgainstMainFile(_) => ChangesSection::AgainstMain,
             SectionRow::Commit(_) => ChangesSection::Commits,
             SectionRow::AgainstMainContext { .. } => ChangesSection::AgainstMain,
             SectionRow::Note { section, .. } => *section,
@@ -605,12 +657,14 @@ mod changes_section_tests {
     }
 
     #[test]
-    fn runs_and_uncommitted_start_open_and_the_two_git_history_sections_start_collapsed() {
+    fn every_possible_file_list_and_runs_start_open_and_only_commits_starts_collapsed() {
+        // Both file sections start open because whichever one the scope keeps is the panel's
+        // main content (GitHub issue #487) - see `ChangesSection::starts_open`'s own docs.
         let collapse = SectionCollapse::default();
         assert!(collapse.is_open(ChangesSection::Runs));
         assert!(collapse.is_open(ChangesSection::Uncommitted));
+        assert!(collapse.is_open(ChangesSection::AgainstMain));
         assert!(!collapse.is_open(ChangesSection::Commits));
-        assert!(!collapse.is_open(ChangesSection::AgainstMain));
     }
 
     #[test]
@@ -779,5 +833,48 @@ mod changes_section_tests {
             seen_label(1, change_set.len()),
             Some(format!("1/{} seen", change_set.len()))
         );
+    }
+}
+
+/// GitHub issue #487: one scope value decides which file section renders; Commits and Runs are
+/// scope-independent.
+#[cfg(test)]
+mod change_scope_tests {
+    use super::{ChangeScope, ChangesSection};
+
+    #[test]
+    fn the_default_scope_is_all_changes_the_review_scope() {
+        assert_eq!(
+            ChangeScope::default(),
+            ChangeScope::AllChanges,
+            "agents commit on their own, so an uncommitted-only default would blank the panel \
+             exactly when there is the most to review"
+        );
+    }
+
+    #[test]
+    fn each_scope_shows_exactly_its_own_file_section() {
+        assert!(ChangeScope::AllChanges.shows(ChangesSection::AgainstMain));
+        assert!(!ChangeScope::AllChanges.shows(ChangesSection::Uncommitted));
+        assert!(ChangeScope::Uncommitted.shows(ChangesSection::Uncommitted));
+        assert!(!ChangeScope::Uncommitted.shows(ChangesSection::AgainstMain));
+    }
+
+    #[test]
+    fn commits_and_runs_render_under_both_scopes() {
+        for scope in [ChangeScope::AllChanges, ChangeScope::Uncommitted] {
+            assert!(scope.shows(ChangesSection::Commits));
+            assert!(scope.shows(ChangesSection::Runs));
+        }
+    }
+
+    #[test]
+    fn every_scopes_own_file_section_starts_open() {
+        for scope in [ChangeScope::AllChanges, ChangeScope::Uncommitted] {
+            assert!(
+                scope.file_section().starts_open(),
+                "a default-collapsed file list would render {scope:?} as an empty panel"
+            );
+        }
     }
 }

@@ -548,13 +548,41 @@ impl AdeApp {
         }
     }
 
+    /// The one diff every changed-file surface derives from under the current
+    /// [`crate::sidebar::sections::ChangeScope`] (GitHub issue #487): tree markers, palette
+    /// marks, and the open file's diff hunks all read this, never
+    /// [`Self::current_diff`]/`uncommitted_diff` directly.
+    pub(crate) fn scoped_diff(&self) -> Option<&WorktreeDiff> {
+        match self.change_scope {
+            crate::sidebar::sections::ChangeScope::AllChanges => self.current_diff(),
+            crate::sidebar::sections::ChangeScope::Uncommitted => self.uncommitted_diff.loaded(),
+        }
+    }
+
+    /// Switches the change scope and recomputes everything derived from [`Self::scoped_diff`]
+    /// synchronously - the toggle must repaint every surface consistently in its own frame, not
+    /// leave some waiting on the next background reload.
+    pub(crate) fn set_change_scope(
+        &mut self,
+        scope: crate::sidebar::sections::ChangeScope,
+        cx: &mut Context<Self>,
+    ) {
+        if self.change_scope == scope {
+            return;
+        }
+        self.change_scope = scope;
+        self.refresh_open_diff_file_cache();
+        self.rebuild_palette_file_candidates();
+        cx.notify();
+    }
+
     /// Recomputes [`Self::open_diff_file_cache`] (and [`Self::file_view_changed_lines`] with it)
-    /// from [`Self::open_change`] and [`Self::current_diff`]. Called whenever either input
+    /// from [`Self::open_change`] and [`Self::scoped_diff`]. Called whenever either input
     /// changes; never from a render method, to avoid a per-render `DiffFile` clone - also the
     /// real hook [`Self::ensure_diff_highlight_cache`] recomputes real syntax highlighting from,
     /// for the same reason (see that method's own docs).
     pub(crate) fn refresh_open_diff_file_cache(&mut self) {
-        self.open_diff_file_cache = match (&self.open_change, self.current_diff()) {
+        self.open_diff_file_cache = match (&self.open_change, self.scoped_diff()) {
             (Some(open_path), Some(diff)) => diff
                 .files
                 .iter()

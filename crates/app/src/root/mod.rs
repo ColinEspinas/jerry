@@ -731,6 +731,11 @@ pub struct AdeApp {
     /// unstaged, or untracked (`wt_core::stage::dirty_paths`, a real `git status --porcelain`
     /// read), or `None` while that answer isn't known yet.
     pub(crate) dirty_files: Option<HashSet<PathBuf>>,
+    /// Which git scope every changed-file surface shows (GitHub issue #487) - the Changes
+    /// panel's file list, the tree markers, the palette marks, and the opened diff's hunks all
+    /// derive from [`Self::scoped_diff`], never from `current_diff`/`uncommitted_diff` directly.
+    /// A viewing mode, not worktree state: it survives worktree switches on purpose.
+    pub(crate) change_scope: sections::ChangeScope,
     /// The most recent real git failure from one Changes row's own controls - `(path, message)`.
     /// Two writers today: [`Self::toggle_staged`]'s `git add`/`git reset`, and
     /// [`Self::discard_change_row`]'s `git checkout HEAD -- <path>` (GitHub issue #286's floating

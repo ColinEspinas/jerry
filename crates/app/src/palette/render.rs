@@ -354,14 +354,14 @@ impl AdeApp {
     }
 
     /// Rebuilds [`Self::palette_file_candidates`] from the current real [`Self::file_tree`]/
-    /// [`Self::current_diff`], on the calling (foreground) thread. This is the *diff* side's
-    /// entry point - [`Self::load_diff`]'s completion handler, and `open_file_tab`'s - where the
-    /// tree is unchanged and only the marks laid over it moved.
+    /// [`Self::scoped_diff`], on the calling (foreground) thread. This is the *diff* side's
+    /// entry point - [`Self::load_diff`]'s completion handler, `open_file_tab`'s, and a change-
+    /// scope switch's - where the tree is unchanged and only the marks laid over it moved.
     pub(crate) fn rebuild_palette_file_candidates(&mut self) {
         self.palette_file_candidates = build_file_candidates(
             &self.file_tree,
             &self.file_tree_root,
-            &file_diff_marks(self.current_diff()),
+            &file_diff_marks(self.scoped_diff()),
         );
     }
 

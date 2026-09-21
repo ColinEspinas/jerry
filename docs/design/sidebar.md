@@ -58,21 +58,36 @@ buffer, reusing the same three-state count.
 
 ### Changes
 
-Four stacked sections (`sidebar::sections::ChangesSection`), in a fixed render order that
-`ChangesSection::ORDER` is the single place recording:
+A **scope selector** heads the panel (`sidebar::sections::ChangeScope`, issue #487):
+`Uncommitted | All changes`, defaulting to All changes — Jerry reviews agent branch work first,
+and agents commit on their own, so an uncommitted-only default would blank the panel exactly when
+there is the most to review. The scope is one piece of app state every changed-file surface
+derives from: this panel's file list, the file tree's A/M markers, the palette's marks, and the
+hunks an open file shows all read `AdeApp::scoped_diff`, never a particular diff directly. Before
+the selector, each surface picked its own scope and they visibly disagreed.
 
-| Section | Answers |
-|---|---|
-| `UNCOMMITTED` | what is dirty in this worktree right now |
-| `COMMITS` | what has been committed on this branch |
-| `AGAINST <BASE>` | how this worktree differs from the merge-base with its base branch |
-| `RUNS` | the same changes, indexed by which agent produced them |
+The sections (`sidebar::sections::ChangesSection`, in `ChangesSection::ORDER` filtered by
+`ChangeScope::shows`):
 
-The first three are **one ladder of git state**, narrowing to widening. Runs is not on that ladder —
-it re-indexes the same changes by author — so it sits after the ladder rather than inside it, which
-also keeps `UNCOMMITTED`'s top edge fixed however many agents have run.
+| Section | Answers | Visible under |
+|---|---|---|
+| `UNCOMMITTED` | what is dirty in this worktree right now | Uncommitted scope |
+| `AGAINST <BASE>` | everything this branch would land on its base, one row per file | All-changes scope |
+| `COMMITS` | what has been committed on this branch | both |
+| `RUNS` | the same changes, indexed by which agent produced them | both |
 
-Rows carry a **seen** mark, a directory, a name, a tag pill, `+n −n`, and a stat bar.
+Only one of the two file sections exists at a time — that is the selector's whole point, and it is
+what superseded issue #285's earlier "no per-file rows under Against main" call (which prevented
+the same file listing twice when both sections stacked). The scope's own file section leads the
+filtered order, so the scope's list is always the panel's first section; Runs stays off the git
+ladder — it re-indexes the same changes by author — and sits last.
+
+The commit composer, staging checkboxes, and the `space stage` / `V seen` footer keys belong to
+the Uncommitted scope alone: they act on exactly that scope's list, and every one of them funnels
+through the scope-gated `open_uncommitted_change`.
+
+Rows carry a **seen** mark (Uncommitted scope), a directory, a name, a tag pill, `+n −n`, and a
+stat bar.
 
 `sections::SeenFiles` is deliberately **not** the staged set. A file counts as seen only if it was
 marked *and still has the diffstat it had when marked* — so a file you reviewed and an agent then
@@ -87,6 +102,9 @@ into another's.
 - **Files is the default tab.** Changes is where a review flow lands you, not where you start.
 - **`ChangesSection::ORDER` is the only place the section order is written down.** Re-deriving it at
   a render site is how the two get out of sync.
+- **One scope drives every surface.** Anything that marks or lists changed files reads
+  `AdeApp::scoped_diff`; reaching for `current_diff`/`uncommitted_diff` directly at a surface is
+  exactly how the panel, the tree, and the open diff disagreed before issue #487.
 - **Seen ≠ staged.** Two different questions; conflating them would make "reviewed" survive an
   agent's next edit.
 - **Panel-tab icons share one optical box.** Never one size per icon.
