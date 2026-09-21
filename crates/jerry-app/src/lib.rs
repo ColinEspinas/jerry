@@ -22,6 +22,7 @@ pub mod env_info;
 pub mod fonts;
 pub mod graph_view;
 pub mod hooks;
+pub mod host;
 pub mod icon_pack;
 pub mod icons;
 #[cfg(windows)]

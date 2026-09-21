@@ -498,6 +498,9 @@ pub struct AdeApp {
     /// attempt is not silently retried on every subsequent Claude spawn - see
     /// `crate::hooks::flow::AdeApp::hook_injection_for`.
     pub(crate) hook_runtime_tried: bool,
+    /// The in-process session host, once `Self::start_host` has brought it up; `None` until
+    /// then and after a failed start, in which case every dispatch answers `NEEDS_HOST`.
+    pub(crate) host_runtime: Option<crate::host::HostRuntime>,
     /// The on-disk record of what [`Self::hook_runtime`] learned, for GitHub issue #227 to build
     /// on - see `crate::hooks::store`'s module docs, including the honest note that no UI reads
     /// it back yet.
@@ -2567,6 +2570,7 @@ impl AdeApp {
         // both call `Self::load_worktrees` right afterward): that real fetch simply mirrors the
         // same, now-current data into this same repo entry a moment later.
         self.load_repo_worktrees(id, cx);
+        self.serve_repo_from_host(self.repos[self.repos.len() - 1].path.clone(), cx);
         cx.notify();
         id
     }

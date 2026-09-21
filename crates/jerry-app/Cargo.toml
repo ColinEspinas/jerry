@@ -25,6 +25,10 @@ jerry-pty = { path = "../jerry-pty" }
 # crate) rather than this crate adding its own separate `lsp-types` dependency, so there is
 # only ever one resolved version of it in this workspace.
 jerry-lsp = { path = "../jerry-lsp" }
+# The contract crate and the in-process session host (decisions.md §15, §16).
+jerry-core = { path = "../jerry-core" }
+jerry-host = { path = "../jerry-host" }
+thiserror = { workspace = true }
 anyhow = { workspace = true }
 env_logger = "0.11"
 log = "0.4"
