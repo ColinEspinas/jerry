@@ -339,7 +339,7 @@ mod run_tests {
         assert!(out.contains("connected"), "{out}");
         assert!(out.contains("caller      human"), "{out}");
 
-        host.shutdown();
+        host.shutdown_and_join();
         registry.remove(&instance).expect("remove");
     }
 
