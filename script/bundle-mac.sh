@@ -9,9 +9,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 readonly APP_NAME="Jerry"
-readonly BIN_NAME="app"
+readonly BIN_NAME="jerry-app"
 readonly EXECUTABLE_NAME="jerry"
-readonly RESOURCES_DIR="crates/app/resources/macos"
+readonly RESOURCES_DIR="crates/jerry-app/resources/macos"
 readonly DIST_DIR="dist"
 readonly APP_BUNDLE="${DIST_DIR}/${APP_NAME}.app"
 readonly DMG_PATH="${DIST_DIR}/${APP_NAME}-macos.dmg"
@@ -26,7 +26,7 @@ if [[ -z "$VERSION" ]]; then
 fi
 echo "==> Bundling ${APP_NAME} ${VERSION}"
 
-# CI already runs `cargo build --release -p app` as its own step; SKIP_BUILD lets it hand this
+# CI already runs `cargo build --release -p jerry-app` as its own step; SKIP_BUILD lets it hand this
 # script an already-built binary instead of paying for a second build.
 readonly RELEASE_BIN="target/release/${BIN_NAME}"
 if [[ -n "${SKIP_BUILD:-}" ]]; then
@@ -35,7 +35,7 @@ elif [[ -f "$RELEASE_BIN" ]]; then
     echo "==> ${RELEASE_BIN} already exists - reusing it"
 else
     echo "==> Building ${RELEASE_BIN}"
-    cargo build --release -p app
+    cargo build --release -p jerry-app
 fi
 
 if [[ ! -f "$RELEASE_BIN" ]]; then

@@ -3,7 +3,7 @@
 #
 # The generated files are committed rather than built in CI: the release runners then need no
 # extra tooling, and the master artwork changes roughly never. Run this only when
-# `crates/app/resources/app-icon.png` itself changes, and commit what it writes.
+# `crates/jerry-app/resources/app-icon.png` itself changes, and commit what it writes.
 #
 # macOS-only (`sips`/`iconutil` ship with the OS and have no cross-platform equivalent worth
 # depending on). That's fine for a maintainer-run regeneration step - nothing in the build or
@@ -12,10 +12,10 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-readonly MASTER="crates/app/resources/app-icon.png"
-readonly MACOS_DIR="crates/app/resources/macos"
-readonly WINDOWS_DIR="crates/app/resources/windows"
-readonly LINUX_DIR="crates/app/resources/linux"
+readonly MASTER="crates/jerry-app/resources/app-icon.png"
+readonly MACOS_DIR="crates/jerry-app/resources/macos"
+readonly WINDOWS_DIR="crates/jerry-app/resources/windows"
+readonly LINUX_DIR="crates/jerry-app/resources/linux"
 
 if [[ ! -f "$MASTER" ]]; then
     echo "error: $MASTER not found" >&2

@@ -1,7 +1,7 @@
 # Visual vocabulary
 
-- **Code:** `crates/app/src/{theme.rs, icons.rs, keymap.rs, language.rs}`,
-  `crates/app/src/rail/status.rs`, `crates/app/src/root/widgets.rs`
+- **Code:** `crates/jerry-app/src/{theme.rs, icons.rs, keymap.rs, language.rs}`,
+  `crates/jerry-app/src/rail/status.rs`, `crates/jerry-app/src/root/widgets.rs`
 - **Tokens:** `theme::{status, agent, lang, tag, button, radius, band}`
 
 ## What it's for

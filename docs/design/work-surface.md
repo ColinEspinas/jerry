@@ -1,6 +1,6 @@
 # Zone 2 — the work surface
 
-- **Code:** `crates/app/src/work_surface/`, and the surfaces it hosts — `terminal/`,
+- **Code:** `crates/jerry-app/src/work_surface/`, and the surfaces it hosts — `terminal/`,
   `code_surface/`, `lsp/`, `merge/`, `graph_view/`, `review/`, `review_notes/`, `run_history/`,
   `provenance/`, `budget/`
 - **Tokens:** `theme::{term, editor, diff, syntax, band, button, completions_popup}`
@@ -62,7 +62,7 @@ moment the centre zone narrows. ([`principles.md`](./principles.md) rule 6.)
 
 ### Surface A — the agent pane
 
-**There is no chat UI.** The agent runs in a real pty (`pty-core` + `alacritty_terminal` via
+**There is no chat UI.** The agent runs in a real pty (`jerry-pty` + `alacritty_terminal` via
 `terminal::pane` and `terminal::grid`) and Jerry renders its output verbatim, cell by cell. The
 agent's question is *its own* numbered prompt, never a card Jerry designed for it.
 
@@ -133,7 +133,7 @@ fixture responses rather than against a live server.
 ### Surface D — merge conflict
 
 Reached from the conflict banner. `merge/` holds a pure conflict/segment/choice model (`state`), the
-real `wt_core::merge` calls and the surface's own state machine (`flow`), a whole-file hand-edit
+real `jerry_git::merge` calls and the surface's own state machine (`flow`), a whole-file hand-edit
 buffer for conflicts the side-picker can't resolve (`editing`), and the view (`render`).
 
 **Each side is headed by its agent, not by "ours" and "theirs".** That is the single most important
@@ -186,6 +186,6 @@ action where both edits can be kept.
   same kind and cwd — an approximate stand-in for `Retry`/`Resume`, because there is no saved agent
   session to actually resume *from*. `pty_state_label` names the same gap.
 - **The render layer still calls adapters directly.** Several `render.rs` files here reach into
-  `wt_core::`/`pty_core::` rather than dispatching a Command/Query. This is a known architectural
+  `jerry_git::`/`jerry_pty::` rather than dispatching a Command/Query. This is a known architectural
   gap, ratcheted by `.claude/hooks/check-conventions.sh` and tracked in
   [`docs/architecture/decisions.md`](../architecture/decisions.md) §3 — not a pattern to copy.

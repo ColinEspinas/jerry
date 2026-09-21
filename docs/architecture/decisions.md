@@ -17,21 +17,21 @@ application of one that already exists here.
 
 **Status:** Accepted.
 
-**Context:** `wt-core`, `pty-core`, and `lsp-core` were already built with no `gpui` dependency —
+**Context:** `jerry-git`, `jerry-pty`, and `jerry-lsp` were already built with no `gpui` dependency —
 verified: the only two occurrences of the string `gpui` in those three crates are comments, one
 about a version pin, the other noting that a real GPUI fake-clock test isn't possible without one.
 This wasn't written down anywhere, so it was one dependency addition away from silently breaking.
 
-**Decision:** No crate other than `crates/app` (and the planned `crates/jerry-cli`, which must
+**Decision:** No crate other than `crates/jerry-app` (and the planned `crates/jerry-cli`, which must
 never gain one either) may depend on `gpui` or `gpui_platform`. This is the foundation the rest of
 the target architecture is built on: it's what makes a headless CLI over the same domain logic
 possible at all.
 
-**Consequences:** A PR adding `gpui` to `wt-core`/`pty-core`/`lsp-core`'s `Cargo.toml` is a hard
-reject, not a design discussion. Any type crossing from a core crate into `crates/app` and back
-must be plain data — never a `gpui::Context`, `Window`, or similar (`crates/app/src/work_surface/agents.rs`
+**Consequences:** A PR adding `gpui` to `jerry-git`/`jerry-pty`/`jerry-lsp`'s `Cargo.toml` is a hard
+reject, not a design discussion. Any type crossing from a core crate into `crates/jerry-app` and back
+must be plain data — never a `gpui::Context`, `Window`, or similar (`crates/jerry-app/src/work_surface/agents.rs`
 violates this today by taking `Context<AdeApp>` directly in agent-lifecycle methods; tracked as
-follow-up, not retroactively blessed). `lsp-core`'s one cross-crate dependency (`pty-core`, for
+follow-up, not retroactively blessed). `jerry-lsp`'s one cross-crate dependency (`jerry-pty`, for
 `resolve_on_path`) staying a path dependency between two gpui-free crates is fine and doesn't need
 repeating elsewhere.
 
@@ -39,7 +39,7 @@ repeating elsewhere.
 
 **Status:** Accepted.
 
-**Context:** `wt-core` exposes its capabilities as loose, well-named functions —
+**Context:** `jerry-git` exposes its capabilities as loose, well-named functions —
 `commit_all_changes`, `attempt_merge`, `discard_worktree`, `resolve_hunk`, and about forty more.
 Clean, but no shared shape: each has its own argument list and result type, so nothing can dispatch
 them generically. That matters because the same action needs to be triggerable from the GPUI view
@@ -63,17 +63,17 @@ pub trait Command {
 }
 ```
 
-`wt-core`'s existing functions map onto this almost one-to-one — `commit_all_changes` becomes
+`jerry-git`'s existing functions map onto this almost one-to-one — `commit_all_changes` becomes
 `CommitAllChanges { paths: Vec<PathBuf> } -> CommitAllChangesOutcome`, and so on. The
 transformation is mechanical: the logic inside each function doesn't change, only its calling
 convention does.
 
 **Consequences:** `crates/jerry-cli` becomes possible without duplicating logic — it constructs the
 same `Command` values the view does and calls the same `execute`. New capabilities are added as new
-`Command`/`Query` types starting now, even though the existing `wt-core` functions aren't
+`Command`/`Query` types starting now, even though the existing `jerry-git` functions aren't
 retrofitted in this pass. This is deliberately *not* a command bus with an execution log — undo/redo
-and provenance tracking already exist as their own hand-built mechanisms (`wt-core::undo`,
-`crates/app/src/provenance/`); layering a generic event-sourced bus on top would duplicate them for
+and provenance tracking already exist as their own hand-built mechanisms (`jerry-git::undo`,
+`crates/jerry-app/src/provenance/`); layering a generic event-sourced bus on top would duplicate them for
 no immediate benefit. A real need for a unified execution log would be its own new entry here, not
 an assumption baked into this one.
 
@@ -81,21 +81,21 @@ an assumption baked into this one.
 
 **Status:** Accepted. Partially enforced — see Consequences.
 
-**Context:** `crates/app`'s render layer currently calls straight into `wt-core` and, in one place,
-straight into a raw process spawn: `graph_view/render.rs` alone has 109 `wt_core::` references,
+**Context:** `crates/jerry-app`'s render layer currently calls straight into `jerry-git` and, in one place,
+straight into a raw process spawn: `graph_view/render.rs` alone has 109 `jerry_git::` references,
 `sidebar/render.rs` has 33, and `sidebar/render.rs:6534` shells out to
-`std::process::Command::new("git")` directly, bypassing `wt-core` entirely. Several `render.rs`
+`std::process::Command::new("git")` directly, bypassing `jerry-git` entirely. Several `render.rs`
 files also call `cx.background_spawn`/`cx.spawn` directly around adapter calls, duplicating the
 offload-to-background decision ad hoc at every call site.
 
-This works today because `crates/app` is the only consumer of `wt-core`. It becomes a real problem
+This works today because `crates/jerry-app` is the only consumer of `jerry-git`. It becomes a real problem
 the moment a second consumer (`crates/jerry-cli`) exists: behavior implemented as "whatever the
-render function happens to do around the `wt_core::` call" isn't available to the CLI, and a bug
+render function happens to do around the `jerry_git::` call" isn't available to the CLI, and a bug
 fixed in the view's copy has to be separately remembered in the CLI's.
 
 **Decision:** Render code (`render.rs`, anything returning `impl IntoElement` or implementing
 `Render`) may only read state already held on `AdeApp` and dispatch a `Command`/`Query`, rendering
-the outcome. It may never call `wt_core::`, `pty_core::`, `lsp_core::`, or `std::process::Command`
+the outcome. It may never call `jerry_git::`, `jerry_pty::`, `jerry_lsp::`, or `std::process::Command`
 directly. The background-spawn decision moves into the dispatch layer, once, instead of being
 repeated at every call site.
 
@@ -104,7 +104,7 @@ repeated at every call site.
 this decision — it's the target; the gap is tracked as GitHub issues. New render code must not add
 new adapter calls, effective immediately, and this is now **mechanically checked**, not just
 reviewed against: `.claude/hooks/check-conventions.sh` greps every `render.rs` file for
-`wt_core::`/`pty_core::`/`lsp_core::`/`process::Command::new` and fails — in the pre-commit hook and
+`jerry_git::`/`jerry_pty::`/`jerry_lsp::`/`process::Command::new` and fails — in the pre-commit hook and
 in CI — if the count exceeds the checked-in baseline. It's a textual ratchet (the count may only go
 down), not a type-aware lint, and it needs no prerequisite. A full `clippy::disallowed-methods`
 version, scoped to `render.rs` files, is still blocked on cleaning up `use super::*` globs first:
@@ -141,7 +141,7 @@ paragraph in a long-running file.
 
 **Status:** Accepted.
 
-**Context:** `wt-core` has both `gix` and `std::process::Command` available to it, and the choice
+**Context:** `jerry-git` has both `gix` and `std::process::Command` available to it, and the choice
 was being re-argued per function, inline, in module comments. The two are not interchangeable.
 `gix` is a library over the object database and refs; it has no formatter that reproduces
 `git diff`'s unified-diff text (hunk headers, rename and binary detection, and working-tree state
@@ -171,7 +171,7 @@ repository's own `target/` is the large majority of its files — and a filesyst
 `stat` all of it before discovering there was nothing to search, because ignore matching happens
 after descent. Git's happens before it.
 
-**Decision:** `wt-core::worktree_files` is the single answer, built on `git ls-files --cached
+**Decision:** `jerry-git::worktree_files` is the single answer, built on `git ls-files --cached
 --others --exclude-standard`. New callers use it rather than growing a third walk.
 
 **Consequences:** "Content" means what git would show: tracked paths stay listed even under a
@@ -214,7 +214,7 @@ git, so every embedded path must be POSIX-single-quoted. The editor script is `/
 this path Unix-only; elsewhere it surfaces as an ordinary spawn failure. Conflicts are never
 auto-resolved or rolled back, matching `crate::rewrite`.
 
-## 8. `pty-core` owns spawning only; `alacritty_terminal` stays in `crates/app`
+## 8. `jerry-pty` owns spawning only; `alacritty_terminal` stays in `crates/jerry-app`
 
 **Status:** Accepted.
 
@@ -222,8 +222,8 @@ auto-resolved or rolled back, matching `crate::rewrite`.
 own a thread that both pumps bytes and feeds the `Term` grid parser — one composition, not
 separable into a standalone spawn primitive.
 
-**Decision:** `pty-core` owns spawn, raw-byte output, resize and kill via `portable-pty`, and knows
-nothing about ANSI escapes or grid state. `crates/app` owns the `Term` grid, driven by the bytes
+**Decision:** `jerry-pty` owns spawn, raw-byte output, resize and kill via `portable-pty`, and knows
+nothing about ANSI escapes or grid state. `crates/jerry-app` owns the `Term` grid, driven by the bytes
 this crate streams.
 
 **Consequences, all load-bearing:**
@@ -262,12 +262,12 @@ non-unix target fails to compile instead of silently inheriting Windows semantic
 **Status:** Accepted.
 
 **Context:** Test setup had no shared home, so it was copy-pasted instead: `fn git(dir, args)`
-appeared ~30 times across `wt-core` and `app`, alongside 1,223 separate tempdir setups and 303
-wall-clock waits. The obvious single crate to fix that has a trap in it — `crates/app`'s fixtures
-need `gpui` (a test window, `VisualTestContext`), and `wt-core`/`pty-core`/`lsp-core` must be able
+appeared ~30 times across `jerry-git` and `jerry-app`, alongside 1,223 separate tempdir setups and 303
+wall-clock waits. The obvious single crate to fix that has a trap in it — `crates/jerry-app`'s fixtures
+need `gpui` (a test window, `VisualTestContext`), and `jerry-git`/`jerry-pty`/`jerry-lsp` must be able
 to dev-depend on the same crate without acquiring `gpui` (§1).
 
-A Cargo feature (`test-support = { features = ["gpui"] }` for `app` only) looks like it solves
+A Cargo feature (`test-support = { features = ["gpui"] }` for `jerry-app` only) looks like it solves
 this and does not: features unify across a workspace build, so one crate enabling `gpui` enables it
 for every other crate resolving the same dependency. The core crates' dev graph would silently
 regain `gpui` — exactly the outcome §1 exists to prevent, and one no `Cargo.toml` review would
@@ -275,19 +275,19 @@ catch.
 
 **Decision:** Two homes, split by dependency rather than by feature. `crates/test-support` is
 `gpui`-free and depends only on `tempfile`; anything needing `gpui` lives in
-`crates/app/src/test_support.rs`, inside the one crate already allowed to have it.
+`crates/jerry-app/src/test_support.rs`, inside the one crate already allowed to have it.
 
-**Consequences:** `cargo tree -e normal,dev,build -i gpui` reaching only `crates/app` is a
+**Consequences:** `cargo tree -e normal,dev,build -i gpui` reaching only `crates/jerry-app` is a
 checkable invariant, not a convention. A helper that "just needs a `TestAppContext`" is not added
-to `crates/test-support` under any flag — it goes in `crates/app` or it is restructured to take
+to `crates/test-support` under any flag — it goes in `crates/jerry-app` or it is restructured to take
 plain data. The policy those fixtures serve is [`docs/testing.md`](../testing.md).
 
-## 10. Every non-PTY child process is constructed through `pty_core::new_std_command`
+## 10. Every non-PTY child process is constructed through `jerry_pty::new_std_command`
 
 **Status:** Accepted.
 
 **Context:** The release binary is a GUI-subsystem process on Windows (`windows_subsystem =
-"windows"` in `crates/app/src/main.rs`, adopted from Zed in #451 so no console opens behind the
+"windows"` in `crates/jerry-app/src/main.rs`, adopted from Zed in #451 so no console opens behind the
 window). On Windows, a console-subsystem child — `git.exe`, an npm `.cmd` shim, `cmd /c start` —
 spawned from a consoleless parent allocates its own *visible* console window unless the spawn
 passes `CREATE_NO_WINDOW`. Jerry spawns git continuously from launch (status poll, worktree
@@ -296,11 +296,11 @@ watch, Changes refresh), so the missing flag showed up as an endless storm of co
 (`util::command`/`gpui_util::new_std_command` upstream) plus a clippy ban on bare constructors;
 #451 copied the attribute without the wrapper.
 
-**Decision:** One constructor, `pty_core::new_std_command`, sets `CREATE_NO_WINDOW` on Windows
+**Decision:** One constructor, `jerry_pty::new_std_command`, sets `CREATE_NO_WINDOW` on Windows
 and is the identity elsewhere; every production `std::process::Command` in the workspace is built
-through it. It lives in `pty-core` because that crate already owns "how children are spawned on
-this OS" (`resolve_on_path`), and a one-function helper does not earn its own crate. `wt-core`
-takes a dependency on `pty-core` for it — the constructor must exist in exactly one place.
+through it. It lives in `jerry-pty` because that crate already owns "how children are spawned on
+this OS" (`resolve_on_path`), and a one-function helper does not earn its own crate. `jerry-git`
+takes a dependency on `jerry-pty` for it — the constructor must exist in exactly one place.
 Enforced by `clippy.toml`'s `disallowed-methods` on `std::process::Command::new`; test modules
 are exempt (each crate root's `cfg_attr(test, allow(clippy::disallowed_methods))`,
 `test-support`'s crate-level allow) because the test runner owns a console its children inherit.
@@ -323,7 +323,7 @@ affected by its parent dying. In practice that leaked ~180 orphaned `claude.exe`
 which the user's own settings hooks amplified into ~10,000 processes (#482). `portable-pty`
 creates no job object of its own.
 
-**Decision:** At the top of `main()`, before anything can spawn, `crates/app`'s `job_object`
+**Decision:** At the top of `main()`, before anything can spawn, `crates/jerry-app`'s `job_object`
 module creates one unnamed job object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE |
 JOB_OBJECT_LIMIT_BREAKAWAY_OK` and assigns *this process* to it. Children join a member's job
 automatically at `CreateProcess` time, so every spawn — agent PTYs through ConPTY, every
@@ -332,8 +332,8 @@ The job handle is deliberately never closed: the kernel closes it when the proce
 by any means, and then kills every remaining member. Setup failure is logged and non-fatal
 (behavior degrades to exactly the destructor-only world this replaces).
 
-It lives in `crates/app`, not `pty-core`, for two reasons: the job is app-lifecycle policy, not
-per-session PTY mechanics, and CLAUDE.md pins the core crates as `unsafe`-free — `crates/app`
+It lives in `crates/jerry-app`, not `jerry-pty`, for two reasons: the job is app-lifecycle policy, not
+per-session PTY mechanics, and CLAUDE.md pins the core crates as `unsafe`-free — `crates/jerry-app`
 already carries the sanctioned Win32 FFI sites (`hooks/settings_file.rs`,
 `status_bar/process_stats/windows.rs`) and the `windows-sys` dependency.
 
@@ -364,12 +364,12 @@ is supposed to review.
 
 **Decision:** For an agent CLI shaped like this - real hooks, no config-path override, config
 loaded from one global, shared, `.json`-with-an-array-of-`{command, timeout}`-entries file - Jerry
-does a real read-modify-write merge (`crates/app/src/hooks/cursor_hooks_file.rs`) rather than
+does a real read-modify-write merge (`crates/jerry-app/src/hooks/cursor_hooks_file.rs`) rather than
 generating the file outright: unparseable JSON aborts the whole operation untouched, every
 unrelated key and entry survives byte-for-byte, and Jerry's own entries are identified by a
 forwarder script path substring rather than a marker field (the entry shape has no room for one).
 The forwarder script itself moves out of the per-launch, `Drop`-deleted temp directory
-`crates/app/src/hooks/settings_file.rs` uses for Claude into a stable, version-stamped path under
+`crates/jerry-app/src/hooks/settings_file.rs` uses for Claude into a stable, version-stamped path under
 Jerry's own config dir, because `~/.cursor/hooks.json` outlives any single Jerry process. Because
 this genuinely writes into a file the user owns - unlike Claude's entirely Jerry-owned, per-launch
 `--settings` file - it is gated behind an explicit, default-off setting
@@ -384,3 +384,32 @@ entry, not whether a stray entry could ever do anything on its own. The next age
 hookless-by-default in this same shape (a real hook mechanism, no config-path flag, one shared
 global config file) should read this entry and `cursor_hooks_file.rs` before inventing a new
 merge strategy.
+
+## 13. Every crate is named `jerry-<role>`
+
+**Status:** Accepted (2026-09-22, issue #493).
+
+**Context:** The workspace carried two naming families: role-only `app` and the `-core` adapters
+(`wt-core`, `pty-core`, `lsp-core`). The UI-optional architecture plan (tracking epic #492) adds
+`jerry-core`, `jerry-host`, `jerry-cli` and `jerry-ui`; with adapters still ending in `-core`,
+`jerry-core` would read as a fourth adapter rather than the application-layer contract crate. `wt`
+was also opaque to anyone outside the project.
+
+**Decision:** One rule, no exceptions: every crate is `jerry-<role>`.
+
+| Before | After | Role |
+|---|---|---|
+| `wt-core` | `jerry-git` | git adapter (`gix` reads, argv `git` writes) |
+| `pty-core` | `jerry-pty` | PTY spawning adapter |
+| `lsp-core` | `jerry-lsp` | language-server adapter |
+| `app` | `jerry-app` | GPUI shell; bin target `jerry-app` |
+
+`test-support` is unchanged: dev-only, never shipped. Rejected: Zed-style bare role names (`ui`,
+`cli`, `host`), which keep two families alive and grep-collide with Zed's own crates during vendor
+reading; and `jerryd`, a Unix daemon-ism on a project whose second platform is Windows.
+
+**Consequences:** The bundle scripts still install the GUI binary under the product name `jerry`
+until `jerry-cli` (#499) claims that name and the GUI ships as `jerry-app`. The conventions ratchet
+greps `jerry_git::`/`jerry_pty::`/`jerry_lsp::` and its baseline counts are unchanged, since the
+rename moves no call. Older entries in this file were rewritten to the new names in the same PR;
+`CHANGELOG.md` keeps the names each release shipped with, and the table above is the map.

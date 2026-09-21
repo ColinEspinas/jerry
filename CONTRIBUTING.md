@@ -40,7 +40,7 @@ equivalent and will sit there indefinitely — prefer `cargo nextest run`. While
 to what you're touching:
 
 ```sh
-cargo nextest run -p wt-core
+cargo nextest run -p jerry-git
 ```
 
 That covers the `unit` and `ui` tiers. The `external` tier — tests that spawn a real language
@@ -76,7 +76,7 @@ architecture one below. If you're working on UI, read
 [`docs/design/vocabulary.md`](docs/design/vocabulary.md) first, then the page for the surface
 you're changing.
 
-These pages deliberately never reprint a value. `crates/app/src/theme.rs` is the source of truth
+These pages deliberately never reprint a value. `crates/jerry-app/src/theme.rs` is the source of truth
 for every colour and dimension — each token carries its own doc comment, and the bundled themes in
 `assets/themes/` are generated from it — so a page names the token rather than a hex, and cannot
 drift from it.
@@ -96,8 +96,8 @@ entry there rather than explaining the decision in a code comment or a commit me
 ## Commit / PR expectations
 
 - Keep commits focused; this project's own commit history (`git log`) is a reasonable model for
-  scope and message style (`feat(app): ...`, `fix(pty-core): ...`, `docs: ...`).
+  scope and message style (`feat(jerry-app): ...`, `fix(jerry-pty): ...`, `docs: ...`).
 - Branch names follow `<type>/<issue>-<slug>` (e.g. `fix/336-text-input-selection`).
 - Don't add a dependency that duplicates something already available — check upstream Zed's own
   dependency choices first, as several crates in this workspace deliberately mirror its pinned
-  versions (see e.g. `crates/app/Cargo.toml`'s `tree-sitter`/`alacritty_terminal` comments for why).
+  versions (see e.g. `crates/jerry-app/Cargo.toml`'s `tree-sitter`/`alacritty_terminal` comments for why).

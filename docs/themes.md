@@ -1,6 +1,6 @@
 # Themes
 
-Jerry's entire interface is painted from about 270 named color tokens (`crates/app/src/theme.rs`),
+Jerry's entire interface is painted from about 270 named color tokens (`crates/jerry-app/src/theme.rs`),
 grouped into modules — `surface`, `border`, `text`, `status`, `syntax`, `term`, `diff`, `editor`,
 `graph`, and so on. A **theme** is a file that names any subset of those tokens; everything it
 doesn't name is inherited from the theme it declares as its `base`, and ultimately from Jerry
@@ -21,7 +21,7 @@ default palette; the other five are complete, literal, hand-editable palettes.
 ## File format
 
 One `.toml` file per theme. Jerry writes them with section headings and a comment on most keys —
-the comments are pulled from the color tokens' own doc comments in `crates/app/src/theme.rs`, so
+the comments are pulled from the color tokens' own doc comments in `crates/jerry-app/src/theme.rs`, so
 they can't drift from what the code says — and reads them liberally: key order, grouping and
 comments carry no meaning, so a hand-edited file never has to look like a generated one.
 
@@ -97,7 +97,7 @@ also has a two-click **Remove** action that deletes its backing file.
 Jerry rotates its whole palette so its accent blue lands on that hue, scales saturation to match,
 leaves lightness alone (so the theme's light/dark structure survives), and writes the result out as
 a complete, literal theme file — all ~270 keys, ready to hand-tune line by line. This is the same
-HSL derivation (`derive_shift`/`apply_shift` in `crates/app/src/theme.rs`) that used to compute
+HSL derivation (`derive_shift`/`apply_shift` in `crates/jerry-app/src/theme.rs`) that used to compute
 every non-Jerry-Dark color live on every render; it is now strictly an authoring tool that produces
 files, never part of live rendering.
 

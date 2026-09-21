@@ -29,15 +29,15 @@ in CI's nightly job (see "Testing" below). `cargo nextest`, not `cargo test`: `.
 gives each test its own process and a real timeout, so a hung test fails that test instead of
 sitting on the whole run forever.
 
-Run the app with `cargo run --release -p app [repo-path]`. Use `--release` unless you're actively
+Run the app with `cargo run --release -p jerry-app [repo-path]`. Use `--release` unless you're actively
 recompiling every few seconds: a debug-profile GPUI build is commonly 5–20× slower for the per-frame
 work this app does (layout/paint, `tree-sitter` parsing, terminal-grid decode), and no performance
 observation made against a debug build is trustworthy.
 
 ## Architecture
 
-Dependencies point inward. `wt-core`, `pty-core`, `lsp-core` are pure domain/infrastructure crates
-with **zero `gpui` dependency** — that must never change. `crates/app` is the only crate allowed to
+Dependencies point inward. `jerry-git`, `jerry-pty`, `jerry-lsp` are pure domain/infrastructure crates
+with **zero `gpui` dependency** — that must never change. `crates/jerry-app` is the only crate allowed to
 depend on `gpui`. Full detail and the reasoning behind each rule:
 [`docs/architecture/overview.md`](docs/architecture/overview.md),
 [`docs/architecture/crates.md`](docs/architecture/crates.md),
@@ -49,7 +49,7 @@ This is what lets the same action be dispatched from the GPUI view and, eventual
 `crates/jerry-cli`. See `docs/architecture/decisions.md` §2.
 
 Render code (`render.rs`, anything implementing `Render`/`IntoElement`) dispatches a Command or
-Query and draws the outcome. It never calls `wt_core::`, `pty_core::`, `lsp_core::`, or
+Query and draws the outcome. It never calls `jerry_git::`, `jerry_pty::`, `jerry_lsp::`, or
 `std::process::Command` directly. This is a *target*, not yet the current state — see
 `docs/architecture/decisions.md` §3 for the gap and the tracking issues. New code follows the rule
 starting now; existing violations are backlog, not license to add more.
@@ -73,22 +73,22 @@ either rule already holds everywhere.
 - **`unsafe` only for justified FFI**, each site with its own `#[allow(unsafe_code)]` and a `SAFETY`
   comment explaining why it's sound: `main.rs`'s one `env::set_var` call, and the libc/Win32 process
   liveness/sampling calls in `hooks/settings_file.rs` and `status_bar/process_stats/{macos,windows}.rs`
-  (there's no safe way to ask the OS for another process's CPU/memory or existence). `wt-core`,
-  `pty-core`, and `lsp-core` have none, and shouldn't gain any. Any new `unsafe` needs the same
+  (there's no safe way to ask the OS for another process's CPU/memory or existence). `jerry-git`,
+  `jerry-pty`, and `jerry-lsp` have none, and shouldn't gain any. Any new `unsafe` needs the same
   treatment — a safe alternative checked first, and if there truly isn't one, flagged for discussion
   rather than added quietly.
 - **`PathBuf`/`&Path`, never `String`, for filesystem paths.** Not stringly-typed and re-parsed at
   call sites.
-- **Every git invocation is a real argument vector, never an interpolated shell string.** `wt-core`
+- **Every git invocation is a real argument vector, never an interpolated shell string.** `jerry-git`
   uses `gix` directly for reads and `std::process::Command` with explicit `&[&str]`/`&[OsString]`
   argv for the real `git` CLI. This matters for correctness (filenames with spaces/quotes), not just
   safety.
-- **Every non-PTY child process is constructed through `pty_core::new_std_command`, never a bare
+- **Every non-PTY child process is constructed through `jerry_pty::new_std_command`, never a bare
   `std::process::Command::new`.** The release binary is a GUI-subsystem process on Windows, where a
   bare-constructed console child flashes its own visible console window per spawn (issue #465).
   Enforced by `clippy.toml`'s `disallowed-methods`; test modules are exempt via each crate root's
   `cfg_attr(test, allow(...))`. See `docs/architecture/decisions.md` §10.
-- **Every user-visible count goes through `crates/app/src/root/plural.rs`.** `plural::count(n,
+- **Every user-visible count goes through `crates/jerry-app/src/root/plural.rs`.** `plural::count(n,
   "file", None)` / `plural::form(n, "needs", "need")` — never `if n == 1 { "" } else { "s" }` at a
   call site, and never a hardcoded plural noun. Zero is plural in English and the helper knows that.
 - **No fake functionality.** No UI element bound to hardcoded/sample data standing in for a real
@@ -104,7 +104,7 @@ either rule already holds everywhere.
 
 ## GPUI patterns
 
-- Every `wt-core`/`lsp-core` call is documented blocking — offload it with `cx.background_spawn` or
+- Every `jerry-git`/`jerry-lsp` call is documented blocking — offload it with `cx.background_spawn` or
   `cx.spawn`; never call one directly on the UI thread.
 - Respect entity lifecycle: a `Task` spawned against an entity should be cancelled, not orphaned,
   when that entity drops. Don't hold a `Context<T>` past the callback that received it.
@@ -134,7 +134,7 @@ Every test is one of three tiers: `unit` (plain `#[test]`, pure logic or a tempd
 < 2 s), or `external` (`#[ignore = "external: <binary>; …"]`, a real language server or agent
 process, its own CI job and never the PR gate). Shared fixtures — argv-only `git`, seeded
 repositories, `wait_until`, `ChildGuard` — come from `crates/test-support`, which stays `gpui`-free;
-GPUI ones from `crates/app/src/test_support.rs`. What deserves a test, what gets deleted and why,
+GPUI ones from `crates/jerry-app/src/test_support.rs`. What deserves a test, what gets deleted and why,
 and the no-`thread::sleep` rule: [`docs/testing.md`](docs/testing.md).
 
 ## Workflow
@@ -144,10 +144,10 @@ GitHub issue to a merged PR, and which skill (`plan`, `architecture`, `implement
 `rust-standards`, `verify`, `ship`, `review`, `triage`) covers which step.
 
 - Branches: `<type>/<issue>-<slug>` (e.g. `fix/336-text-input-selection`). One convention, matching
-  the conventional-commit style already used for commit messages (`feat(app): ...`,
-  `fix(pty-core): ...`).
+  the conventional-commit style already used for commit messages (`feat(jerry-app): ...`,
+  `fix(jerry-pty): ...`).
 - Everything issue/PR-related goes through `gh`, not the web UI, so it's scriptable from a session:
   `gh issue view`, `gh pr create`, `gh pr review`.
 - Don't add a dependency that duplicates something already available — check upstream
-  `zed-industries/zed`'s own pinned versions first (see `crates/app/Cargo.toml`'s `tree-sitter`/
+  `zed-industries/zed`'s own pinned versions first (see `crates/jerry-app/Cargo.toml`'s `tree-sitter`/
   `alacritty_terminal` comments for the pattern this project already follows).

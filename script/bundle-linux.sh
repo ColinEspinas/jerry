@@ -9,8 +9,8 @@ cd "$(dirname "$0")/.."
 readonly APP_NAME="Jerry"
 readonly APP_CLI="jerry"
 export APP_CLI
-readonly BIN_NAME="app"
-readonly RESOURCES_DIR="crates/app/resources/linux"
+readonly BIN_NAME="jerry-app"
+readonly RESOURCES_DIR="crates/jerry-app/resources/linux"
 readonly DIST_DIR="dist"
 readonly STAGE_DIR="${DIST_DIR}/jerry"
 readonly ARCHIVE_PATH="${DIST_DIR}/jerry-linux.tar.gz"
@@ -39,7 +39,7 @@ else
         echo "==> ${RELEASE_BIN} already exists - reusing it (set SKIP_BUILD=1 to make this explicit, or remove it to force a rebuild)"
     else
         echo "==> Building ${RELEASE_BIN}"
-        cargo build --release -p app
+        cargo build --release -p jerry-app
     fi
 fi
 
