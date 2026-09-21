@@ -26,7 +26,7 @@ isn't the happy path."
    quote is the case an interpolated string gets wrong, and it's exactly the kind of input a real
    user's repo can contain.
 
-3. **Pluralization.** Every user-visible count through `crates/app/src/root/plural.rs` —
+3. **Pluralization.** Every user-visible count through `crates/jerry-app/src/root/plural.rs` —
    `plural::count(n, "file", None)`, `plural::form(n, "needs", "need")`. Grep for a raw `if n == 1`
    ternary or a hardcoded plural noun (`format!("{n} agents")`) near any count; both are the same
    bug wearing different clothes, and the single-item case is usually the common one that ships
@@ -37,13 +37,13 @@ isn't the happy path."
    nothing? If a piece genuinely isn't built yet, is that stated visibly (a real "not implemented"
    state or `todo!("unverified: ...")` with an explanation), not silently faked?
 
-5. **GPUI blocking calls.** Every call into `wt-core`/`lsp-core` — both documented blocking — goes
+5. **GPUI blocking calls.** Every call into `jerry-git`/`jerry-lsp` — both documented blocking — goes
    through `cx.background_spawn`/`cx.spawn`, never called directly from a render path. Does a
    spawned `Task` get cancelled when the entity it belongs to drops, rather than orphaned? Does
    `cx.notify()` fire exactly when state the render function reads actually changed?
 
 6. **Layering.** Does render code (`render.rs`, anything implementing `Render`/`IntoElement`) call
-   `wt_core::`/`pty_core::`/`lsp_core::` or shell out via `std::process::Command` directly, instead
+   `jerry_git::`/`jerry_pty::`/`jerry_lsp::` or shell out via `std::process::Command` directly, instead
    of dispatching a Command/Query? New code follows the target in
    `docs/architecture/overview.md`/`docs/architecture/decisions.md` (§3) even though most of
    the existing codebase doesn't yet — if you're unsure whether something needs a full

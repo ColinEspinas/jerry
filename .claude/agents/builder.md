@@ -9,7 +9,7 @@ Implement the assigned step. Tests first, then implementation. `cargo fmt`, `car
 
 Never fake functionality: no hardcoded data behind UI, no simulated output, no component bound to
 nothing. Render code dispatches a Command/Query and draws the outcome — it does not call
-`wt_core::`/`pty_core::`/`lsp_core::` or shell out directly (CLAUDE.md's architecture section).
+`jerry_git::`/`jerry_pty::`/`jerry_lsp::` or shell out directly (CLAUDE.md's architecture section).
 Comments are a non-obvious *why* only — never restate the line below them, never narrate design
 history or alternatives-considered (that belongs in the commit body, or a new entry in
 `docs/architecture/decisions.md` for something genuinely architectural).

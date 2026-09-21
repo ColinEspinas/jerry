@@ -4,7 +4,7 @@
 //! Every crate here may dev-depend on this one, so it stays free of `gpui`
 //! (`docs/architecture/decisions.md` §1) — including behind a Cargo feature, since workspace
 //! feature unification would leak `gpui` back into the core crates' dev graph. GPUI-flavoured
-//! helpers live in `crates/app/src/test_support.rs` instead.
+//! helpers live in `crates/jerry-app/src/test_support.rs` instead.
 //!
 //! The policy these fixtures serve — the three tiers, what deserves a test, and what gets
 //! deleted — is [`docs/testing.md`](../../../docs/testing.md).
@@ -14,7 +14,7 @@
 #![allow(clippy::expect_used)]
 // Bare `Command::new` (banned in production by `clippy.toml`, GitHub issue #465) is fine here:
 // fixtures run under the console-subsystem test runner, whose children inherit its console, so
-// no window can flash - and routing through the helper would couple this crate to `pty-core`.
+// no window can flash - and routing through the helper would couple this crate to `jerry-pty`.
 #![allow(clippy::disallowed_methods)]
 
 mod child;

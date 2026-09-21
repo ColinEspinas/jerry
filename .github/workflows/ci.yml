@@ -37,9 +37,9 @@ env:
   RUST_BACKTRACE: "1"
   # GitHub issue #294's provider rate-limit poll reads an OAuth credential off disk and sends it
   # to a real provider usage endpoint. `crate::budget::state::POLLING_ENABLED` already turns that
-  # off for `cargo test -p app --lib` (where `cfg(test)` is true of the `app` crate itself), but a
-  # `cfg` does not survive a crate boundary: an integration test under `crates/app/tests/` would
-  # link `app` as an ordinary dependency with the gate re-armed. Set here, for every job, so that
+  # off for `cargo test -p jerry-app --lib` (where `cfg(test)` is true of the `jerry-app` crate itself), but a
+  # `cfg` does not survive a crate boundary: an integration test under `crates/jerry-app/tests/` would
+  # link `jerry-app` as an ordinary dependency with the gate re-armed. Set here, for every job, so that
   # holds for whatever this workflow grows to run - see
   # `crate::budget::state::DISABLE_PROVIDER_POLL_ENV`.
   JERRY_DISABLE_PROVIDER_POLL: "1"
@@ -115,7 +115,7 @@ jobs:
     # xkbcommon headers, Vulkan (gpui_wgpu's renderer), and fontconfig (cosmic-text's
     # font matching). Trimmed down from the authoritative full list at upstream Zed's
     # own `script/linux`'s Ubuntu/Debian branch, which also installs several packages
-    # this project's own dependency set never touches (libgit2 - wt-core uses `gix`, a
+    # this project's own dependency set never touches (libgit2 - jerry-git uses `gix`, a
     # pure-Rust reimplementation, never libgit2; musl-tools/musl-dev - no musl target
     # is built here; pipewire/xdg-desktop-portal/libva-dev - GPUI's optional
     # `screen-capture` feature, which nothing in this workspace enables). OpenSSL,
@@ -166,7 +166,7 @@ jobs:
 
       # Pinned to the version this change was actually written and validated against, per this
       # project's "same version we verified against, not latest" convention (see
-      # `crates/app/Cargo.toml`'s `tree-sitter`/`alacritty_terminal` comments).
+      # `crates/jerry-app/Cargo.toml`'s `tree-sitter`/`alacritty_terminal` comments).
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
         with:
@@ -182,7 +182,7 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/master' }}
 
-      # A fresh runner has no global git identity, unlike every developer machine. `wt-core`'s
+      # A fresh runner has no global git identity, unlike every developer machine. `jerry-git`'s
       # `discard_worktree_refuses_when_stash_push_captures_nothing_and_an_unrelated_stash_already_exists`
       # runs `git commit` inside a real submodule checkout, and `git submodule update --init`
       # creates an independent git directory that does not inherit the parent fixture's *local*
@@ -217,7 +217,7 @@ jobs:
   # so a `PathBuf` comparison that holds on Linux does not hold there), and it went unseen
   # precisely because no macOS runner ever executed the tests that would have caught it.
   #
-  # `crates/app/Cargo.toml` has real per-target `[target.'cfg(target_os =
+  # `crates/jerry-app/Cargo.toml` has real per-target `[target.'cfg(target_os =
   # "...")'.dependencies]` sections for `gpui_platform` (Revision R11, extended in R12):
   # Linux requests both the `wayland` and `x11` features, macOS and Windows request no
   # feature at all, because - unlike
@@ -261,7 +261,7 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/master' }}
 
-      # Same reason as the Linux job's identical step: `wt-core`'s submodule-commit test
+      # Same reason as the Linux job's identical step: `jerry-git`'s submodule-commit test
       # needs a global git identity a fresh runner does not have.
       - name: Configure git identity
         run: |
@@ -352,7 +352,7 @@ jobs:
       # executes it on a real Windows machine. Without it, the backend's own "CI covers this"
       # claim would be empty.
       - name: cargo test (per-process sampling backend)
-        run: cargo test -p app --lib status_bar::process_stats
+        run: cargo test -p jerry-app --lib status_bar::process_stats
 
   # The `external` tier (docs/testing.md): tests that spawn a real language server. Never on a PR,
   # by the `if` below - these need binaries the repo does not vendor and a live npm registry, so
@@ -406,7 +406,7 @@ jobs:
         with:
           tool: cargo-nextest@0.9.143
 
-      # Pinned to the version verified against, not latest, per `crates/app/Cargo.toml`'s
+      # Pinned to the version verified against, not latest, per `crates/jerry-app/Cargo.toml`'s
       # `tree-sitter`/`alacritty_terminal` convention. `@vue/language-server@3.3.8` is the version
       # `crate::language`'s module docs were written against.
       #
@@ -440,7 +440,7 @@ jobs:
       - name: Cache cargo/target
         uses: Swatinem/rust-cache@v2
 
-      # Same reason as the Linux job's identical step: `wt-core`'s submodule-commit test
+      # Same reason as the Linux job's identical step: `jerry-git`'s submodule-commit test
       # needs a global git identity a fresh runner does not have.
       - name: Configure git identity
         run: |

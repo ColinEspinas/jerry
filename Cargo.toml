@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/wt-core",
-    "crates/pty-core",
-    "crates/lsp-core",
-    "crates/app",
+    "crates/jerry-git",
+    "crates/jerry-pty",
+    "crates/jerry-lsp",
+    "crates/jerry-app",
     # Dev-dependency only, and deliberately gpui-free so the core crates can use it too
     # (docs/architecture/decisions.md §1, docs/testing.md).
     "crates/test-support",
@@ -44,7 +44,7 @@ thiserror = "1"
 # Real config-file (de)serialization for `crate::settings_store::Settings`. Pinned to
 # the exact major versions `vendor/zed/Cargo.toml` itself pins (`serde = "1.0.221"`,
 # `toml = "0.8"`), matching this project's established "same versions Zed verified against"
-# convention for shared dependencies (see `crates/app/Cargo.toml`'s own `tree-sitter`/
+# convention for shared dependencies (see `crates/jerry-app/Cargo.toml`'s own `tree-sitter`/
 # `alacritty_terminal` comments for precedent). `serde_json` has no equivalent vendor/zed pin
 # to match (Zed's own `Cargo.toml` doesn't depend on it at the workspace level), so it's a
 # plain, unpinned-beyond-major-version dependency instead.

@@ -2,7 +2,7 @@
 
 Scope / Owns / Does not own, for every crate in the workspace today, plus the one planned addition.
 
-## `wt-core`
+## `jerry-git`
 
 **Scope.** Git operations against a worktree: enumerate, diff, merge, rebase, undo/redo, blame,
 stage, remote sync. Reads go through `gix`; writes go through the real `git` CLI with explicit argv
@@ -15,7 +15,7 @@ expected to offload it to a background executor.
 **Does not own.** Any UI concern, any process/PTY concern, any LSP concern. Zero `gpui` dependency,
 verified — the only two mentions of `gpui` in this crate are comments explaining why one isn't taken.
 
-## `pty-core`
+## `jerry-pty`
 
 **Scope.** Spawning and driving a PTY-backed child process (`portable-pty`), and nothing about what
 happens to the bytes that come out of it — plus the workspace's "how children are spawned on this
@@ -26,10 +26,10 @@ Output is exposed as a plain `std::sync::mpsc::Receiver<Vec<u8>>`. Also `new_std
 sanctioned constructor for every non-PTY `std::process::Command` in the workspace — it suppresses
 the per-spawn console window on Windows GUI-subsystem release builds (decisions.md §10).
 
-**Does not own.** ANSI/terminal-grid parsing (that's `crates/app/src/terminal/`), any git concern,
+**Does not own.** ANSI/terminal-grid parsing (that's `crates/jerry-app/src/terminal/`), any git concern,
 any gpui dependency.
 
-## `lsp-core`
+## `jerry-lsp`
 
 **Scope.** A Language Server Protocol client: spawn, initialize, request/notify, diagnostics.
 
@@ -38,9 +38,9 @@ any gpui dependency.
 — currently the only dependency-injection seam in the workspace.
 
 **Does not own.** Process resolution beyond `resolve_on_path`, for which it takes a path dependency
-on `pty-core`. Zero gpui dependency.
+on `jerry-pty`. Zero gpui dependency.
 
-## `app`
+## `jerry-app`
 
 **Scope.** The GPUI desktop application: rendering, window/focus/keymap management, and
 orchestration of the three core crates. The only crate with a `[[bin]]` target (`src/main.rs`,
@@ -53,7 +53,7 @@ more. See [`overview.md`](./overview.md) for why this is debt rather than design
 plan for `hooks/`.
 
 **Does not own.** Nothing is currently off-limits, which is exactly the problem: `render.rs` files
-call into `wt-core` directly (109 times in `graph_view/render.rs` alone) and one even shells out to
+call into `jerry-git` directly (109 times in `graph_view/render.rs` alone) and one even shells out to
 `git` itself (`sidebar/render.rs:6534`) instead of going through a Command. Fixing this is tracked
 work, not done in this pass.
 

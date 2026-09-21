@@ -3,9 +3,9 @@
 msrv = "1.95.0"
 
 # GitHub issue #465: the release binary is a GUI-subsystem process on Windows
-# (`windows_subsystem = "windows"` in `crates/app/src/main.rs`), where a console-subsystem
+# (`windows_subsystem = "windows"` in `crates/jerry-app/src/main.rs`), where a console-subsystem
 # child spawned with default creation flags allocates its own *visible* console window per
-# spawn. `pty_core::new_std_command` is the one constructor that sets CREATE_NO_WINDOW there
+# spawn. `jerry_pty::new_std_command` is the one constructor that sets CREATE_NO_WINDOW there
 # (and is the identity elsewhere); it carries the workspace's only sanctioned bare
 # `Command::new`, behind a scoped `#[allow]`. This ban used to be impossible - legitimate call
 # sites (the OS open handler, the updater relaunch) would have been flagged with no way to
@@ -18,5 +18,5 @@ msrv = "1.95.0"
 # type-aware lint can express it, and `.claude/hooks/check-conventions.sh` keeps enforcing its
 # coarser textual ratchet (plus the `use super::*` one) in pre-commit and CI.
 disallowed-methods = [
-    { path = "std::process::Command::new", reason = "flashes a visible console window per spawn in the windows_subsystem=\"windows\" release build (GitHub issue #465) - construct through `pty_core::new_std_command` instead" },
+    { path = "std::process::Command::new", reason = "flashes a visible console window per spawn in the windows_subsystem=\"windows\" release build (GitHub issue #465) - construct through `jerry_pty::new_std_command` instead" },
 ]
