@@ -4,8 +4,8 @@ Type=Application
 Name=Jerry
 GenericName=AI Agent Supervisor
 Comment=Supervise several AI coding agents at once, each in its own real git worktree
-TryExec=$APP_CLI
-Exec=$APP_CLI %f
+TryExec=$APP_EXECUTABLE
+Exec=$APP_EXECUTABLE %f
 Icon=jerry
 # GitHub issue #447 bullet 1 ("Terminal opens in background"): explicit rather than relying on
 # the spec's own `false` default, since this key existing at all is half the fix for that bullet

@@ -7,8 +7,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 readonly APP_NAME="Jerry"
+readonly APP_EXECUTABLE="jerry-app"
+export APP_EXECUTABLE
 readonly APP_CLI="jerry"
-export APP_CLI
 readonly BIN_NAME="jerry-app"
 readonly RESOURCES_DIR="crates/jerry-app/resources/linux"
 readonly DIST_DIR="dist"
@@ -32,6 +33,7 @@ if ! command -v envsubst >/dev/null 2>&1; then
 fi
 
 readonly RELEASE_BIN="target/release/${BIN_NAME}"
+readonly RELEASE_CLI="target/release/${APP_CLI}"
 if [[ -f "$RELEASE_BIN" && -n "${SKIP_BUILD:-}" ]]; then
     echo "==> SKIP_BUILD set and ${RELEASE_BIN} exists - reusing it"
 else
@@ -39,7 +41,7 @@ else
         echo "==> ${RELEASE_BIN} already exists - reusing it (set SKIP_BUILD=1 to make this explicit, or remove it to force a rebuild)"
     else
         echo "==> Building ${RELEASE_BIN}"
-        cargo build --release -p jerry-app
+        cargo build --release -p jerry-app -p jerry-cli
     fi
 fi
 
@@ -47,12 +49,19 @@ if [[ ! -f "$RELEASE_BIN" ]]; then
     echo "error: ${RELEASE_BIN} not found after build step" >&2
     exit 1
 fi
+if [[ ! -f "$RELEASE_CLI" ]]; then
+    echo "error: ${RELEASE_CLI} not found after build step" >&2
+    exit 1
+fi
 
 echo "==> Assembling ${STAGE_DIR}"
 rm -rf "$STAGE_DIR"
 mkdir -p "${STAGE_DIR}/bin" "${STAGE_DIR}/share/applications"
 
-cp "$RELEASE_BIN" "${STAGE_DIR}/bin/${APP_CLI}"
+cp "$RELEASE_BIN" "${STAGE_DIR}/bin/${APP_EXECUTABLE}"
+chmod +x "${STAGE_DIR}/bin/${APP_EXECUTABLE}"
+# The `jerry` command ships beside the app so `jerry-app` finds it as a sibling (decisions §17).
+cp "$RELEASE_CLI" "${STAGE_DIR}/bin/${APP_CLI}"
 chmod +x "${STAGE_DIR}/bin/${APP_CLI}"
 
 echo "==> Icons"
@@ -63,7 +72,7 @@ for size in 128 256 512 1024; do
 done
 
 echo "==> Desktop entry"
-envsubst '$APP_CLI' \
+envsubst '$APP_EXECUTABLE' \
     < "${RESOURCES_DIR}/jerry.desktop.in" \
     > "${STAGE_DIR}/share/applications/jerry.desktop"
 chmod +x "${STAGE_DIR}/share/applications/jerry.desktop"
@@ -83,6 +92,8 @@ readonly APPLICATIONS_DIR="${PREFIX}/share/applications"
 readonly ICONS_DIR="${PREFIX}/share/icons/hicolor"
 
 mkdir -p "$BIN_DIR" "$APPLICATIONS_DIR"
+install -m 755 bin/jerry-app "${BIN_DIR}/jerry-app"
+echo "installed ${BIN_DIR}/jerry-app"
 install -m 755 bin/jerry "${BIN_DIR}/jerry"
 echo "installed ${BIN_DIR}/jerry"
 

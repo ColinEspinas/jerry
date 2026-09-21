@@ -487,6 +487,30 @@ producer is a thread in this process or, at stage 3, a socket. The one cost is t
 must be given its channel rather than polled, which is why `jerry-core` exposes no threads and
 `jerry-host` owns the only ones.
 
+## 17. `jerry` is the CLI; the GUI binary is `jerry-app`
+
+**Status:** Accepted (2026-09-22, issue #499; decisions Q6 and Q8 of the UI-optional plan).
+
+**Context:** Until now the GUI shipped under the product name `jerry` in every bundle. The command
+agents and humans type, `jerry wt new --agent`, `jerry status`, must own that name, and cargo
+refuses two `jerry` bin targets in one workspace anyway.
+
+**Decision:** `crates/jerry-cli` builds the `jerry` binary; the GUI's bin target and bundled
+executable are `jerry-app`, displayed as "Jerry" (the `Code.exe` / `code` pattern). Every bundle
+ships both side by side: `Contents/MacOS/{jerry-app,jerry}` on macOS, `bin/{jerry-app,jerry}` on
+Linux, and `Jerry.exe` next to `bin\jerry.exe` on Windows, where a case-insensitive filesystem
+cannot hold `Jerry.exe` and `jerry.exe` in one directory. The CLI is bi-mode: it connects to the
+Jerry serving the repository when one is published, and runs Git-locality requests itself
+otherwise, choosing by `JERRY_HOST_SOCKET`, then `--instance`, then the registry. Its exit codes
+are a contract, two codes distinct only when the caller must do two different things: 0 done,
+1 done but action required, 2 usage, 3 refused (nothing happened), 4 no instance reachable when
+one was required, 5 execution failed. `--json` is explicit, never inferred from the terminal.
+
+**Consequences:** `jerry-app` finds `jerry` for hook and skill injection as a sibling, then under
+`bin/`, then on `PATH`, and otherwise shows a visible error state rather than injecting nothing
+silently; that locator arrives with `jerry hook` (#500), its first caller. Until then the CLI ships
+in the bundles unused by the app.
+
 ## 18. The merge pilot: index mutations are Commands, disk edits and reads stay local
 
 **Status:** Accepted (2026-09-22, issue #498; decisions Q1 and Q11 of the UI-optional plan).

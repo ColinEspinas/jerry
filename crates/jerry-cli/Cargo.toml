@@ -1,0 +1,24 @@
+[package]
+name = "jerry-cli"
+version = { workspace = true }
+edition = { workspace = true }
+publish = { workspace = true }
+license = { workspace = true }
+description = "The `jerry` command: a thin client that finds the Jerry serving this repository and dispatches Commands and Queries to it, or runs the git-only ones itself"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "jerry"
+path = "src/main.rs"
+
+[dependencies]
+jerry-core = { path = "../jerry-core" }
+clap = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+jerry-host = { path = "../jerry-host" }
+tempfile = "3"
+test-support = { path = "../test-support" }

@@ -7,7 +7,7 @@
 	<key>CFBundleDisplayName</key>
 	<string>Jerry</string>
 	<key>CFBundleExecutable</key>
-	<string>jerry</string>
+	<string>jerry-app</string>
 	<key>CFBundleIconFile</key>
 	<string>Jerry</string>
 	<key>CFBundleIdentifier</key>

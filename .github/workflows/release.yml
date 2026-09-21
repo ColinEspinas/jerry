@@ -88,8 +88,8 @@ jobs:
       - name: Cache cargo/target
         uses: Swatinem/rust-cache@v2
 
-      - name: cargo build --release -p jerry-app
-        run: cargo build --release -p jerry-app
+      - name: cargo build --release -p jerry-app -p jerry-cli
+        run: cargo build --release -p jerry-app -p jerry-cli
 
       # Each script assembles the real launchable bundle for its OS - a `.app` + DMG on
       # macOS, a tarball with a `.desktop` launcher entry on Linux, a zip carrying

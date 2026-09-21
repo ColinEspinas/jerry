@@ -17,6 +17,7 @@ Set-Location $RepoRoot
 
 $AppName = "Jerry"
 $BinName = "jerry-app.exe"
+$CliName = "jerry.exe"
 $ExecutableName = "Jerry.exe"
 $DistDir = Join-Path $RepoRoot "dist"
 $ArchivePath = Join-Path $DistDir "Jerry-windows.zip"
@@ -40,9 +41,9 @@ if ((Test-Path $ReleaseBin) -and $env:SKIP_BUILD) {
     Write-Host "==> $ReleaseBin already exists - reusing it (set SKIP_BUILD=1 to make this explicit, or remove it to force a rebuild)"
 } else {
     Write-Host "==> Building $ReleaseBin"
-    cargo build --release -p jerry-app
+    cargo build --release -p jerry-app -p jerry-cli
     if ($LASTEXITCODE -ne 0) {
-        Write-Error "cargo build --release -p jerry-app failed with exit code $LASTEXITCODE"
+        Write-Error "cargo build --release -p jerry-app -p jerry-cli failed with exit code $LASTEXITCODE"
         exit $LASTEXITCODE
     }
 }
@@ -51,19 +52,29 @@ if (-not (Test-Path $ReleaseBin)) {
     Write-Error "$ReleaseBin not found after build step"
     exit 1
 }
+if (-not (Test-Path $ReleaseCli)) {
+    Write-Error "$ReleaseCli not found after build step"
+    exit 1
+}
 
-Write-Host "==> Staging $ExecutableName"
-New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
-$StagedExe = Join-Path $DistDir $ExecutableName
-Copy-Item -Path $ReleaseBin -Destination $StagedExe -Force
+# A case-insensitive filesystem cannot hold Jerry.exe and jerry.exe side by side, so the
+# `jerry` command lives under bin (decisions section 17), where jerry-app looks for it.
+Write-Host "==> Staging $ExecutableName and bin\$CliName"
+$StageDir = Join-Path $DistDir "Jerry-windows"
+if (Test-Path $StageDir) {
+    Remove-Item $StageDir -Recurse -Force
+}
+New-Item -ItemType Directory -Force -Path (Join-Path $StageDir "bin") | Out-Null
+Copy-Item -Path $ReleaseBin -Destination (Join-Path $StageDir $ExecutableName) -Force
+Copy-Item -Path $ReleaseCli -Destination (Join-Path $StageDir "bin\$CliName") -Force
 
 Write-Host "==> Creating $ArchivePath"
 if (Test-Path $ArchivePath) {
     Remove-Item $ArchivePath -Force
 }
-Compress-Archive -Path $StagedExe -DestinationPath $ArchivePath
+Compress-Archive -Path (Join-Path $StageDir "*") -DestinationPath $ArchivePath
 
-Remove-Item $StagedExe -Force
+Remove-Item $StageDir -Recurse -Force
 
 Write-Host "==> Done"
 Write-Host "    $ArchivePath"
