@@ -1,7 +1,7 @@
 //! The session host: the one place a `Call` is authorized and executed. Owns the dispatch
 //! thread, the socket listener, the table of agents it spawned, and the notification fan-out.
-//! Every task here wakes on a channel, never on a timer. Agent sessions and the hook store
-//! move in at stage 2 (#505). Zero `gpui`.
+//! Every task here wakes on a channel, never on a timer. Sessions and the hook store are not
+//! here yet; a request needing them is answered `NEEDS_HOST`. Zero `gpui`.
 
 // Only production code is held to `unwrap_used`/`expect_used` (`CLAUDE.md`).
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
@@ -11,14 +11,16 @@ mod fanout;
 mod listener;
 
 use futures::channel::{mpsc, oneshot};
+use jerry_core::client::Stream;
 use jerry_core::wire::rpc_code;
 use jerry_core::{AgentId, Call, Message, Report, RpcError};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io;
+use std::net::Shutdown;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 
 #[derive(Debug, thiserror::Error)]
@@ -47,28 +49,28 @@ pub struct AgentTable(Arc<Mutex<HashMap<AgentId, PathBuf>>>);
 
 impl AgentTable {
     pub fn register(&self, id: AgentId, worktree: PathBuf) {
-        self.lock().insert(id, worktree);
+        lock(&self.0).insert(id, worktree);
     }
 
     pub fn forget(&self, id: &AgentId) {
-        self.lock().remove(id);
+        lock(&self.0).remove(id);
     }
 
     pub fn worktree_of(&self, id: &AgentId) -> Option<PathBuf> {
-        self.lock().get(id).cloned()
+        lock(&self.0).get(id).cloned()
     }
 
     pub fn len(&self) -> usize {
-        self.lock().len()
+        lock(&self.0).len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.lock().is_empty()
+        lock(&self.0).is_empty()
     }
+}
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<AgentId, PathBuf>> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
-    }
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// One call waiting for the dispatcher, and where its answer goes.
@@ -81,6 +83,8 @@ pub(crate) struct Inner {
     jobs: Mutex<Option<mpsc::UnboundedSender<Job>>>,
     agents: AgentTable,
     fanout: fanout::Fanout,
+    /// One handle per live socket connection, so shutdown can close them under their threads.
+    connections: Mutex<Vec<Stream>>,
     shutting_down: AtomicBool,
 }
 
@@ -89,17 +93,14 @@ impl Inner {
     /// `SHUTTING_DOWN` instead of hanging.
     pub(crate) fn submit(&self, call: Call) -> oneshot::Receiver<Result<Value, RpcError>> {
         let (reply, receiver) = oneshot::channel();
-        let sent = match &*self.jobs.lock().unwrap_or_else(PoisonError::into_inner) {
+        let sent = match &*lock(&self.jobs) {
             Some(jobs) => jobs.unbounded_send(Job { call, reply }).is_ok(),
             None => false,
         };
         if !sent {
             let (reply, receiver) = oneshot::channel();
             // A oneshot's receiver cannot have gone away between these two lines.
-            let _ = reply.send(Err(RpcError::new(
-                rpc_code::SHUTTING_DOWN,
-                "the host is shutting down",
-            )));
+            let _ = reply.send(Err(shutting_down()));
             return receiver;
         }
         receiver
@@ -116,9 +117,26 @@ impl Inner {
     pub(crate) fn is_shutting_down(&self) -> bool {
         self.shutting_down.load(Ordering::SeqCst)
     }
+
+    pub(crate) fn track_connection(&self, stream: Stream) {
+        lock(&self.connections).push(stream);
+    }
+
+    /// Closes every live connection's socket, which ends its reader and, through the fanout,
+    /// its writer. Never blocks.
+    fn close_connections(&self) {
+        for stream in lock(&self.connections).drain(..) {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+        self.fanout.clear();
+    }
 }
 
-/// The in-process handle. Dropping it shuts the host down.
+fn shutting_down() -> RpcError {
+    RpcError::new(rpc_code::SHUTTING_DOWN, "the host is shutting down")
+}
+
+/// The in-process handle. Dropping it shuts the host down without waiting for its threads.
 pub struct Host {
     inner: Arc<Inner>,
     dispatcher: Mutex<Option<JoinHandle<()>>>,
@@ -133,6 +151,7 @@ impl Host {
             jobs: Mutex::new(Some(jobs)),
             agents: AgentTable::default(),
             fanout: fanout::Fanout::default(),
+            connections: Mutex::new(Vec::new()),
             shutting_down: AtomicBool::new(false),
         });
         let worker = Arc::clone(&inner);
@@ -142,7 +161,11 @@ impl Host {
                 use futures::StreamExt;
                 futures::executor::block_on(async move {
                     while let Some(job) = receiver.next().await {
-                        let result = dispatch::handle(&worker, job.call);
+                        let result = if worker.is_shutting_down() {
+                            Err(shutting_down())
+                        } else {
+                            dispatch::handle(&worker, job.call)
+                        };
                         // The caller may have given up waiting; nothing to do about that here.
                         let _ = job.reply.send(result);
                     }
@@ -172,10 +195,7 @@ impl Host {
     /// Accepts socket clients at `socket`. The registry descriptor should be published only
     /// after this returns, so a discoverable entry always has a listener behind it.
     pub fn listen(&self, socket: &Path) -> Result<(), HostError> {
-        let mut listening = self
-            .listening
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut listening = lock(&self.listening);
         if let Some(existing) = &*listening {
             return Err(HostError::AlreadyListening {
                 path: existing.socket().to_path_buf(),
@@ -185,42 +205,50 @@ impl Host {
         Ok(())
     }
 
-    /// Stops accepting, drains nothing: calls still queued resolve with `SHUTTING_DOWN`, the
-    /// socket file is removed, and the dispatch thread exits. Idempotent.
-    pub fn shutdown(&self) {
+    /// Stops the host without waiting for its threads: queued and future calls answer
+    /// `SHUTTING_DOWN`, the socket file is removed, every connection is closed, and the accept
+    /// and dispatch threads exit on their own. Safe on a UI thread. Idempotent.
+    pub fn shutdown(&self) -> ShutdownHandles {
         self.inner.shutting_down.store(true, Ordering::SeqCst);
-        if let Some(listening) = self
-            .listening
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-        {
-            listening.stop();
-        }
-        self.inner
-            .jobs
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        if let Some(dispatcher) = self
-            .dispatcher
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-        {
-            let _ = dispatcher.join();
-        }
+        lock(&self.inner.jobs).take();
+        let accept = lock(&self.listening)
+            .as_mut()
+            .and_then(listener::Listening::stop);
+        self.inner.close_connections();
+        let dispatcher = lock(&self.dispatcher).take();
+        ShutdownHandles { accept, dispatcher }
+    }
+
+    /// `shutdown`, then waits for the accept and dispatch threads. For tests and for a cleanup
+    /// thread; never for a UI thread.
+    pub fn shutdown_and_join(&self) {
+        self.shutdown().join();
     }
 }
 
 impl Drop for Host {
     fn drop(&mut self) {
-        self.shutdown();
+        // The threads finish on their own; a drop must never block.
+        let _ = self.shutdown();
+    }
+}
+
+/// The threads `Host::shutdown` left to finish on their own; `join` waits for them.
+#[must_use = "drop it to let the threads finish on their own, or join it to wait"]
+pub struct ShutdownHandles {
+    accept: Option<JoinHandle<()>>,
+    dispatcher: Option<JoinHandle<()>>,
+}
+
+impl ShutdownHandles {
+    pub fn join(self) {
+        for handle in [self.accept, self.dispatcher].into_iter().flatten() {
+            let _ = handle.join();
+        }
     }
 }
 
 /// The app's own client: the same dispatch path a socket client takes, minus the socket.
-/// Stage 3 replaces this with a socket client to a separate process.
 #[derive(Clone)]
 pub struct LocalClient {
     inner: Arc<Inner>,
@@ -257,12 +285,12 @@ impl LocalClient {
 mod host_dispatch_tests {
     use super::Host;
     use futures::executor::block_on;
-    use futures::StreamExt;
     use jerry_core::request::HookEvent;
     use jerry_core::wire::rpc_code;
     use jerry_core::{AgentId, AppQuery, Call, Message, Report, Request};
     use std::path::Path;
-    use test_support::seed_empty_repo;
+    use std::time::Duration;
+    use test_support::{seed_empty_repo, wait_until};
 
     fn status() -> Request {
         Request::Query(AppQuery::Status(Default::default()))
@@ -291,6 +319,7 @@ mod host_dispatch_tests {
             std::fs::canonicalize(Path::new(&worktree)).expect("canonical"),
             std::fs::canonicalize(repo.path()).expect("canonical")
         );
+        host.shutdown_and_join();
     }
 
     #[test]
@@ -319,6 +348,7 @@ mod host_dispatch_tests {
         let forgotten =
             block_on(client.call(Call::agent(repo.path(), id, status()))).expect_err("forgotten");
         assert_eq!(forgotten.code, rpc_code::FORBIDDEN);
+        host.shutdown_and_join();
     }
 
     #[test]
@@ -339,8 +369,15 @@ mod host_dispatch_tests {
             block_on(client.request(Call::agent(repo.path(), id.clone(), hook))).expect("ok");
         assert!(report.is_ok(), "{report:?}");
 
-        let message = block_on(events.next()).expect("one notification");
-        match message {
+        let mut received = None;
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                received = events.try_recv().ok();
+                received.is_some()
+            }),
+            "one notification arrives"
+        );
+        match received.expect("received") {
             Message::Notification { method, params } => {
                 assert_eq!(method, "event/hook");
                 assert_eq!(params["agent"], serde_json::json!("agent-2"));
@@ -359,16 +396,17 @@ mod host_dispatch_tests {
         )))
         .expect_err("a hook without an agent identity is refused");
         assert_eq!(anonymous.code, rpc_code::FORBIDDEN);
+        host.shutdown_and_join();
     }
 
     #[test]
-    fn after_shutdown_every_call_fails_fast() {
+    fn after_shutdown_every_call_fails_fast_and_shutdown_is_idempotent() {
         let repo = seed_empty_repo();
         let host = Host::start().expect("host");
         let client = host.client();
-        host.shutdown();
+        host.shutdown_and_join();
         let err = block_on(client.call(Call::human(repo.path(), status()))).expect_err("down");
         assert_eq!(err.code, rpc_code::SHUTTING_DOWN);
-        host.shutdown();
+        host.shutdown_and_join();
     }
 }

@@ -1,7 +1,6 @@
 //! The app's side of the session host: brings `jerry_host::Host` up in this process, publishes
 //! one registry descriptor listing every open repository, hands agents to the host's table, and
-//! is the one path a Command or Query is dispatched through. Stage 3 swaps the in-process client
-//! for a socket client to a separate process; nothing above this module changes.
+//! dispatches Commands and Queries through it.
 
 use crate::root::AdeApp;
 use gpui::{AppContext, Context, Task};
@@ -10,6 +9,7 @@ use jerry_core::wire::rpc_code;
 use jerry_core::{Call, Report, Request, RpcError};
 use jerry_host::{AgentTable, Host, HostError, LocalClient};
 use std::path::{Path, PathBuf};
+use std::thread;
 
 #[derive(Debug, thiserror::Error)]
 pub enum HostStartError {
@@ -20,7 +20,8 @@ pub enum HostStartError {
 }
 
 pub struct HostRuntime {
-    host: Host,
+    /// `None` only while `Drop` hands the host to its cleanup thread.
+    host: Option<Host>,
     registry_dir: PathBuf,
     instance: Instance,
     /// Common git dirs published so far; republished as a whole when one is added.
@@ -35,7 +36,7 @@ impl HostRuntime {
         let host = Host::start()?;
         host.listen(&instance.socket)?;
         Ok(HostRuntime {
-            host,
+            host: Some(host),
             registry_dir,
             instance,
             repos: Vec::new(),
@@ -59,12 +60,12 @@ impl HostRuntime {
         )
     }
 
-    pub fn client(&self) -> LocalClient {
-        self.host.client()
+    pub fn client(&self) -> Option<LocalClient> {
+        self.host.as_ref().map(Host::client)
     }
 
-    pub fn agents(&self) -> AgentTable {
-        self.host.agents()
+    pub fn agents(&self) -> Option<AgentTable> {
+        self.host.as_ref().map(Host::agents)
     }
 
     pub fn socket(&self) -> &Path {
@@ -73,10 +74,26 @@ impl HostRuntime {
 }
 
 impl Drop for HostRuntime {
+    /// The joins and the registry unlink happen on a cleanup thread: a `HostRuntime` is an
+    /// `AdeApp` field and drops on the UI thread.
     fn drop(&mut self) {
-        self.host.shutdown();
-        if let Ok(registry) = Registry::open(self.registry_dir.clone()) {
-            let _ = registry.remove(&self.instance);
+        let Some(host) = self.host.take() else {
+            return;
+        };
+        let registry_dir = self.registry_dir.clone();
+        let instance = self.instance.clone();
+        let spawned = thread::Builder::new()
+            .name("jerry-host-cleanup".into())
+            .spawn(move || {
+                host.shutdown_and_join();
+                if let Ok(registry) = Registry::open(registry_dir) {
+                    let _ = registry.remove(&instance);
+                }
+            });
+        if spawned.is_err() {
+            // No thread to hand it to: the non-blocking shutdown still runs when `host` drops
+            // here, leaving only the descriptor for the next discovery to sweep.
+            log::warn!("jerry-host: could not spawn the cleanup thread; shutting down inline");
         }
     }
 }
@@ -93,37 +110,17 @@ fn publish(
 }
 
 impl AdeApp {
-    /// Brings the host up off the UI thread and publishes every repository open right now.
-    /// Called once at startup; a failure is logged and every dispatch then answers
-    /// `NEEDS_HOST`, so nothing pretends a host exists.
+    /// Brings the host up off the UI thread. Every repository open once it is up is published
+    /// then; a failure is logged and every dispatch answers `NEEDS_HOST`, so nothing pretends
+    /// a host exists.
     pub(crate) fn start_host(&mut self, cx: &mut Context<Self>) {
-        let repo_paths: Vec<PathBuf> = self.repos.iter().map(|repo| repo.path.clone()).collect();
         cx.spawn(async move |this, cx| {
             let started = cx
-                .background_spawn(async move {
-                    let mut runtime = HostRuntime::start_default()?;
-                    for path in repo_paths {
-                        match jerry_git::git_common_dir(&path) {
-                            Ok(common) => {
-                                let (dir, instance, repos) = runtime.serve(common);
-                                if let Err(error) = publish(dir, instance, repos) {
-                                    log::warn!(
-                                        "jerry-host: could not publish {}: {error}",
-                                        path.display()
-                                    );
-                                }
-                            }
-                            Err(error) => {
-                                log::warn!("jerry-host: {} is not served: {error}", path.display())
-                            }
-                        }
-                    }
-                    Ok::<HostRuntime, HostStartError>(runtime)
-                })
+                .background_spawn(async move { HostRuntime::start_default() })
                 .await;
             match started {
                 Ok(runtime) => {
-                    let _ = this.update(cx, |this, _cx| this.adopt_host(runtime));
+                    let _ = this.update(cx, |this, cx| this.adopt_host(runtime, cx));
                 }
                 Err(error) => log::warn!(
                     "jerry-host could not start; `jerry` cannot reach this instance: {error}"
@@ -133,13 +130,21 @@ impl AdeApp {
         .detach();
     }
 
-    /// Installs a started runtime and hands the host every agent already open.
-    pub(crate) fn adopt_host(&mut self, runtime: HostRuntime) {
-        self.agents.attach_host(runtime.agents());
+    /// Installs a started runtime, hands the host every agent already open, and publishes
+    /// every repository open right now, including any added while the host was starting.
+    pub(crate) fn adopt_host(&mut self, runtime: HostRuntime, cx: &mut Context<Self>) {
+        if let Some(agents) = runtime.agents() {
+            self.agents.attach_host(agents);
+        }
         self.host_runtime = Some(runtime);
+        let repo_paths: Vec<PathBuf> = self.repos.iter().map(|repo| repo.path.clone()).collect();
+        for path in repo_paths {
+            self.serve_repo_from_host(path, cx);
+        }
     }
 
-    /// Adds a newly opened repository to the descriptor, off the UI thread.
+    /// Adds a repository to the descriptor, off the UI thread. A no-op before the host is up:
+    /// `adopt_host` publishes everything open at that moment.
     pub(crate) fn serve_repo_from_host(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if self.host_runtime.is_none() {
             return;
@@ -176,15 +181,15 @@ impl AdeApp {
         .detach();
     }
 
-    /// The only execution path for a Command or Query from the GUI. `cwd` is the worktree the
-    /// action is requested from; the host derives the repository from it.
+    /// Dispatches through the host. `cwd` is the worktree the action is requested from; the
+    /// host derives the repository from it.
     pub fn dispatch(
         &self,
         cwd: PathBuf,
         request: Request,
         cx: &mut Context<Self>,
     ) -> Task<Result<Report, RpcError>> {
-        let Some(client) = self.host_runtime.as_ref().map(HostRuntime::client) else {
+        let Some(client) = self.host_runtime.as_ref().and_then(HostRuntime::client) else {
             return Task::ready(Err(RpcError::new(
                 rpc_code::NEEDS_HOST,
                 "the session host is not running in this instance",
@@ -202,18 +207,34 @@ mod app_dispatch_tests {
     use jerry_core::wire::rpc_code;
     use jerry_core::{AppQuery, Report, Request};
     use std::path::PathBuf;
-    use test_support::seed_empty_repo;
+    use std::time::Duration;
+    use test_support::{seed_empty_repo, wait_until};
 
-    /// A registry directory of this test's own, short enough for every platform's `sun_path`.
-    fn registry_dir(tag: &str) -> (PathBuf, Option<tempfile::TempDir>) {
+    /// A registry directory of this test's own, short enough for every platform's `sun_path`,
+    /// removed on drop even when the test fails.
+    struct RegistryDir {
+        path: PathBuf,
+        _temp: Option<tempfile::TempDir>,
+    }
+
+    impl Drop for RegistryDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn registry_dir(tag: &str) -> RegistryDir {
         if cfg!(windows) {
-            let dir = jerry_core::registry::runtime_dir()
+            let path = jerry_core::registry::runtime_dir()
                 .expect("runtime dir")
                 .join(format!("a-{:x}-{tag}", std::process::id()));
-            (dir, None)
+            RegistryDir { path, _temp: None }
         } else {
             let temp = tempfile::TempDir::new().expect("tempdir");
-            (temp.path().join("r"), Some(temp))
+            RegistryDir {
+                path: temp.path().join("r"),
+                _temp: Some(temp),
+            }
         }
     }
 
@@ -226,10 +247,10 @@ mod app_dispatch_tests {
         cx.executor().allow_parking();
         let repo = seed_empty_repo();
         let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
-        let (dir, _keep) = registry_dir("dispatch");
-        let runtime = HostRuntime::start(dir.clone()).expect("host");
+        let dir = registry_dir("dispatch");
+        let runtime = HostRuntime::start(dir.path.clone()).expect("host");
         let socket = runtime.socket().to_path_buf();
-        app.update(cx, |app, _cx| app.adopt_host(runtime));
+        app.update(cx, |app, cx| app.adopt_host(runtime, cx));
 
         let report = app
             .update(cx, |app, cx| {
@@ -253,8 +274,10 @@ mod app_dispatch_tests {
         }
 
         app.update(cx, |app, _cx| app.host_runtime = None);
-        assert!(!socket.exists(), "dropping the runtime removes its socket");
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            wait_until(Duration::from_secs(5), || !socket.exists()),
+            "dropping the runtime removes its socket from a cleanup thread"
+        );
     }
 
     #[gpui::test]

@@ -229,9 +229,9 @@ pub struct Agents {
     /// apart from "has a real tab to restore" by nothing more than `HashMap::get`.
     active_by_cwd: HashMap<PathBuf, AgentId>,
     next_id: AgentId,
-    /// The host's table of agents it may be asked about, once the host is up. Every spawn
-    /// registers here and every close forgets, so `jerry` calls from an agent classify as that
-    /// agent and stay confined to its worktree.
+    /// The host's table of agents, once the host is up. Every agent spawn registers here and
+    /// every close forgets, so `jerry` calls from an agent classify as that agent and stay
+    /// confined to its worktree. Plain shells carry no `JERRY_AGENT_ID` and are never entered.
     host_agents: Option<jerry_host::AgentTable>,
 }
 
@@ -249,7 +249,9 @@ impl Agents {
     /// Hands the host every agent already open and every one spawned from now on.
     pub fn attach_host(&mut self, table: jerry_host::AgentTable) {
         for agent in &self.agents {
-            table.register(host_agent_id(agent.id), agent.cwd.clone());
+            if agent.kind.is_agent_session() {
+                table.register(host_agent_id(agent.id), agent.cwd.clone());
+            }
         }
         self.host_agents = Some(table);
     }
@@ -425,7 +427,9 @@ impl Agents {
         let id = self.next_id;
         self.next_id += 1;
         if let Some(table) = &self.host_agents {
-            table.register(host_agent_id(id), cwd.clone());
+            if kind.is_agent_session() {
+                table.register(host_agent_id(id), cwd.clone());
+            }
         }
 
         let hook_extras = hook_extras_for(kind, hooks, id);

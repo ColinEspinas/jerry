@@ -1,5 +1,11 @@
 //! Authorizes and executes one `Call`: who is asking, may they, are they where they claim, then
-//! run it. Runs on the dispatch thread, so blocking git work is fine here.
+//! run it. One dispatch thread serves every client in turn, so a slow git operation delays the
+//! next caller; that is the accepted shape while every Command is short.
+//!
+//! The trust boundary is the user, not the process: the socket is reachable only by the user's
+//! own uid, and an agent's identity is what its environment says. `Invocability` and cwd
+//! confinement keep an agent from acting outside its lane by accident; they are guardrails, not
+//! a sandbox against a process that chooses to lie about who it is.
 
 use crate::Inner;
 use jerry_core::wire::rpc_code;
@@ -55,8 +61,8 @@ pub(crate) fn handle(inner: &Inner, call: Call) -> Result<Value, RpcError> {
                     format!("{method} is not invocable by this caller"),
                 )),
                 Err(LocalDispatchError::NeedsHost(method)) => Err(RpcError::new(
-                    rpc_code::INTERNAL_ERROR,
-                    format!("{method} needs the session table, which this host gains in #505"),
+                    rpc_code::NEEDS_HOST,
+                    format!("{method} needs a session table, and this host has none yet"),
                 )),
             }
         }

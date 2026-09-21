@@ -38,14 +38,18 @@ impl AdeApp {
     ) -> Self {
         let settings_path = settings_store::settings_toml_path();
         let settings = settings_store::Settings::load_or_init();
-        Self::new_with_settings(
+        let mut app = Self::new_with_settings(
             repo_path,
             use_remembered_repo,
             settings,
             settings_path,
             window,
             cx,
-        )
+        );
+        // Only a real instance publishes itself; test apps build through `new_with_settings`
+        // and must never leave sockets in the registry.
+        app.start_host(cx);
+        app
     }
 
     /// The real constructor - takes an already-resolved [`Settings`] and its optional source
@@ -937,12 +941,6 @@ impl AdeApp {
         // flipped while the app was closed. Unconditional for the same reason the update check
         // above is: it has nothing to do with which (if any) repo is focused.
         this.reconcile_cursor_hooks(cx);
-        // The session host every `jerry` invocation reaches (#496); off the UI thread, and a
-        // failure only means the CLI cannot find this instance. Only a real instance publishes
-        // itself: a test app has no settings path and must not leave sockets in the registry.
-        if this.settings_path.is_some() {
-            this.start_host(cx);
-        }
         // GitHub issue #294: the per-provider rate-limit budget poll. Unconditional like the
         // update check above, and for the same reason - it has nothing to do with which (if any)
         // repo is focused. It polls nothing at all until there is a real agent session to show a

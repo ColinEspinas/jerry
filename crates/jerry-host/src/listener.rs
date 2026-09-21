@@ -1,13 +1,14 @@
 //! The socket side: an accept thread, and per connection a reader that hands requests to the
-//! dispatcher and a writer that drains the connection's outbox, responses and notifications
-//! alike. A frame that is not JSON-RPC closes the connection; a null-id error reply is not
-//! attempted, since a malformed frame cannot be trusted to carry an id at all.
+//! dispatcher and a writer that drains the connection's bounded outbox, responses and
+//! notifications alike. A frame that is not JSON-RPC closes the connection; a null-id error
+//! reply is not attempted, since a malformed frame cannot be trusted to carry an id at all.
 
+use crate::fanout::SOCKET_BACKLOG;
 use crate::{HostError, Inner};
 use futures::executor::block_on;
 use jerry_core::client::{Listener, Stream};
-use jerry_core::wire::{read_frame, write_frame, FrameError};
-use jerry_core::{Call, Message};
+use jerry_core::wire::{read_frame, rpc_code, write_frame, FrameError};
+use jerry_core::{Call, Message, RpcError};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
@@ -23,14 +24,13 @@ impl Listening {
         &self.socket
     }
 
-    /// Unblocks the accept thread by connecting once, joins it, and removes the socket file.
-    /// The host has already raised its shutting-down flag, so the accept loop exits on wake.
-    pub(crate) fn stop(mut self) {
+    /// Wakes the accept loop by connecting once and removes the socket file. Never blocks:
+    /// the accept thread exits on its own once woken, and every connection thread ends when
+    /// `Inner::close_connections` shuts its socket.
+    pub(crate) fn stop(&mut self) -> Option<JoinHandle<()>> {
         let _ = Stream::connect(&self.socket);
-        if let Some(accept) = self.accept.take() {
-            let _ = accept.join();
-        }
         let _ = fs::remove_file(&self.socket);
+        self.accept.take()
     }
 }
 
@@ -63,15 +63,17 @@ pub(crate) fn listen(inner: Arc<Inner>, socket: &Path) -> Result<Listening, Host
 }
 
 fn serve(inner: Arc<Inner>, stream: Stream) {
-    let mut writer_stream = match stream.try_clone() {
-        Ok(clone) => clone,
-        Err(error) => {
+    let (mut writer_stream, tracked) = match (stream.try_clone(), stream.try_clone()) {
+        (Ok(writer), Ok(tracked)) => (writer, tracked),
+        (Err(error), _) | (_, Err(error)) => {
             log::warn!("jerry-host: could not clone a connection: {error}");
             return;
         }
     };
-    let (outbox, inbox) = mpsc::channel::<Message>();
-    inner.fanout().subscribe_socket(outbox.clone());
+    // The host keeps a handle so shutdown can close the socket under both threads.
+    inner.track_connection(tracked);
+    let (outbox, inbox) = mpsc::sync_channel::<Message>(SOCKET_BACKLOG);
+    let sink = inner.fanout().subscribe_socket(outbox.clone());
 
     let writer = thread::Builder::new()
         .name("jerry-host-writer".into())
@@ -84,13 +86,16 @@ fn serve(inner: Arc<Inner>, stream: Stream) {
             }
         });
     if let Err(error) = writer {
+        inner.fanout().unsubscribe(sink);
         log::warn!("jerry-host: could not spawn a writer thread: {error}");
         return;
     }
 
+    let reader_inner = Arc::clone(&inner);
     let reader = thread::Builder::new()
         .name("jerry-host-reader".into())
         .spawn(move || {
+            let inner = reader_inner;
             let mut stream = stream;
             loop {
                 let message = match read_frame(&mut stream) {
@@ -108,20 +113,24 @@ fn serve(inner: Arc<Inner>, stream: Stream) {
                 let result = match Call::from_wire(&method, params) {
                     Ok(call) => match block_on(inner.submit(call)) {
                         Ok(result) => result,
-                        Err(_cancelled) => Err(jerry_core::RpcError::new(
-                            jerry_core::wire::rpc_code::SHUTTING_DOWN,
+                        Err(_cancelled) => Err(RpcError::new(
+                            rpc_code::SHUTTING_DOWN,
                             "the host dropped the request",
                         )),
                     },
                     Err(error) => Err(error),
                 };
+                // A response is never dropped for a full backlog: block until the writer
+                // takes it, or stop if the writer is gone.
                 if outbox.send(Message::Response { id, result }).is_err() {
                     break;
                 }
             }
-            // Dropping the outbox ends the writer once it has drained.
+            // Both senders must go for the writer to end: this one, and the fanout's.
+            inner.fanout().unsubscribe(sink);
         });
     if let Err(error) = reader {
+        inner.fanout().unsubscribe(sink);
         log::warn!("jerry-host: could not spawn a reader thread: {error}");
     }
 }
@@ -206,11 +215,15 @@ mod socket_tests {
             "{pushed:?}"
         );
 
-        host.shutdown();
+        host.shutdown_and_join();
         assert!(!socket.path.exists(), "shutdown removes the socket file");
         assert!(
             Client::connect(&socket.path, Duration::from_millis(100)).is_err(),
             "nothing listens after shutdown"
+        );
+        assert!(
+            read_frame(&mut watcher).is_err(),
+            "shutdown closes the connections that were still open"
         );
     }
 }
