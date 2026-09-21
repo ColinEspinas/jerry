@@ -44,7 +44,11 @@ pub fn adopt_this_process() {
 
 /// [`adopt_this_process`]'s fallible core, returning the job handle so a test can query
 /// membership against it. The caller must keep the handle open for the life of the process.
-fn adopt_this_process_returning_job() -> io::Result<HANDLE> {
+///
+/// `pub(crate)`: the Windows host-survival spike (`crate::windows_host_survival_spike`, GitHub
+/// issue #494) reuses this exact function to give its own "host" role the same kind of
+/// kill-on-close job the real app gives itself, rather than duplicating the FFI.
+pub(crate) fn adopt_this_process_returning_job() -> io::Result<HANDLE> {
     let job = create_kill_on_close_job()?;
     // SAFETY: `GetCurrentProcess` takes nothing and returns the process's own pseudo-handle,
     // which is valid for the whole call and needs no closing.
@@ -63,6 +67,18 @@ fn adopt_this_process_returning_job() -> io::Result<HANDLE> {
 /// (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`), with breakaway permitted
 /// (`JOB_OBJECT_LIMIT_BREAKAWAY_OK`) so the updater's relaunch can escape it deliberately.
 fn create_kill_on_close_job() -> io::Result<HANDLE> {
+    create_job_object_with_limits(
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+    )
+}
+
+/// A fresh, unnamed job object with `limit_flags` as its only basic limits.
+///
+/// `pub(crate)`: split out of [`create_kill_on_close_job`] so the Windows host-survival spike
+/// (`crate::windows_host_survival_spike`, GitHub issue #494) can build the *same* kind of job
+/// but without `JOB_OBJECT_LIMIT_BREAKAWAY_OK`, to prove breakaway failure is detected rather
+/// than silently swallowed - without a second copy of this FFI.
+pub(crate) fn create_job_object_with_limits(limit_flags: u32) -> io::Result<HANDLE> {
     // SAFETY: both parameters are null by contract - default security, which also makes the
     // handle non-inheritable (load-bearing: an inherited copy in a child would keep the job
     // alive past this process's death), and no name. Reads nothing from this process; returns
@@ -74,7 +90,7 @@ fn create_kill_on_close_job() -> io::Result<HANDLE> {
 
     let limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
         BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION {
-            LimitFlags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+            LimitFlags: limit_flags,
             ..Default::default()
         },
         ..Default::default()
@@ -103,7 +119,10 @@ fn create_kill_on_close_job() -> io::Result<HANDLE> {
 }
 
 /// Assigns `process` to `job`. Members it spawns afterwards join automatically.
-fn assign_process(job: HANDLE, process: HANDLE) -> io::Result<()> {
+///
+/// `pub(crate)`: see [`create_job_object_with_limits`] - the spike reuses this rather than
+/// duplicating the FFI to self-assign its "parent" role into a breakaway-forbidding job.
+pub(crate) fn assign_process(job: HANDLE, process: HANDLE) -> io::Result<()> {
     // SAFETY: takes two handles the caller owns for the whole call and borrows no memory from
     // this process, so there is nothing for it to invalidate.
     let ok = unsafe { AssignProcessToJobObject(job, process) };

@@ -78,6 +78,12 @@ pub(crate) mod title_bar;
 pub(crate) mod updater;
 pub mod work_surface;
 pub mod worktree_history;
+// GitHub issue #494: a throwaway spike proving Windows job-object breakaway survival and a
+// ConPTY session outliving its spawning process - see docs/architecture/decisions.md §14. Never
+// compiled outside test builds, and never part of the PR gate (`docs/testing.md`'s `external`
+// tier).
+#[cfg(all(windows, test))]
+mod windows_host_survival_spike;
 
 use std::path::PathBuf;
 
