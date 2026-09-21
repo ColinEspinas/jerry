@@ -6453,7 +6453,7 @@ mod graph_focus_tests {
 mod graph_remote_action_tests {
     use crate::root::AdeApp;
     use crate::test_support::open_test_app;
-    use gpui::{Entity, TestAppContext};
+    use gpui::{Entity, EntityInputHandler, TestAppContext};
     use jerry_git::remote::PushForce;
     use test_support::{commit, git, git_output, seed_empty_repo_at};
 
@@ -6917,6 +6917,103 @@ mod graph_remote_action_tests {
         assert!(
             app.read_with(cx, |app, _| app.graph_state.rebase.is_none()),
             "aborting must leave rebase mode"
+        );
+    }
+
+    /// GitHub issue #497: the diff-view rebase resolver has no dedicated hunk UI of its own (see
+    /// `crate::graph_view::rebase::AdeApp::resolve_rebase_conflict_in_diff_view`'s own docs) - it
+    /// opens the real conflicted file in the ordinary File view, so the write-through and
+    /// external-change rules it needs are exactly the ones that view's own real save pipeline
+    /// (`AdeApp::save_active_file`/`AdeApp::file_external_conflict`) already enforces for any
+    /// file. This exercises that real pipeline against a real conflicted file reached through the
+    /// real `resolve_rebase_conflict_in_diff_view` entry point, rather than trusting that the two
+    /// resolvers are equivalent by inspection alone.
+    #[gpui::test]
+    async fn resolving_a_rebase_conflict_in_the_diff_view_writes_through_and_refuses_to_clobber_an_external_change(
+        cx: &mut TestAppContext,
+    ) {
+        let (local, app, cx) = open_seeded_local_repo(cx);
+        git(local.path(), &["checkout", "-b", "target-branch"]);
+        commit(local.path(), "a.txt", "target change", "target advances");
+        let target_sha = git_output(local.path(), &["rev-parse", "HEAD"]);
+        git(local.path(), &["checkout", "main"]);
+        commit(local.path(), "a.txt", "conflicting own change", "own work");
+
+        let target_row = graph_row_index_of(&app, cx, &target_sha);
+        app.update_in(cx, |app, _window, cx| {
+            app.enter_rebase_mode(target_row, cx);
+        });
+        cx.run_until_parked();
+        app.update_in(cx, |app, _window, cx| {
+            app.start_rebase(cx);
+        });
+        cx.run_until_parked();
+
+        app.update_in(cx, |app, window, cx| {
+            app.resolve_rebase_conflict_in_diff_view(window, cx);
+        });
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+
+        let relative = std::path::PathBuf::from("a.txt");
+        assert!(
+            app.read_with(cx, |app, _| app.edit_buffer(&relative).is_some()),
+            "the real conflicted file, markers and all, must already be a real editable buffer"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.replace_text_in_range(None, "resolved content ", window, cx);
+        });
+        app.update(cx, |app, cx| {
+            app.save_active_file(cx);
+        });
+        cx.run_until_parked();
+
+        let on_disk = std::fs::read_to_string(local.path().join("a.txt")).expect("read a.txt");
+        assert!(
+            on_disk.starts_with("resolved content "),
+            "a hand-edited resolution must land on disk immediately - the same write-through \
+             rule the merge resolver follows - not exist only in this buffer's memory: \
+             {on_disk:?}"
+        );
+
+        // Another writer (an agent, a manual `git checkout --theirs`) changes the file again -
+        // the still-open buffer must not be able to silently clobber it on the next save.
+        std::fs::write(local.path().join("a.txt"), "someone else's edit").expect("write");
+        app.update(cx, |app, _| {
+            app.file_view_last_freshness_check = None;
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.replace_text_in_range(None, "more typing ", window, cx);
+        });
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.render_center_pane(cx);
+        });
+
+        app.update(cx, |app, cx| {
+            app.save_active_file(cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            std::fs::read_to_string(local.path().join("a.txt")).expect("read a.txt"),
+            "someone else's edit",
+            "the same write-through rule applies to a conflicted file as to any other: a save \
+             must refuse rather than silently overwrite a real external change"
+        );
+        assert!(
+            app.read_with(cx, |app, _| app.file_external_conflict.contains(&relative)),
+            "the real external change must be detected rather than trusted-away, exactly as it \
+             would be for a non-conflicted file"
         );
     }
 
