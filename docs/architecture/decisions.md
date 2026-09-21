@@ -413,3 +413,47 @@ until `jerry-cli` (#499) claims that name and the GUI ships as `jerry-app`. The 
 greps `jerry_git::`/`jerry_pty::`/`jerry_lsp::` and its baseline counts are unchanged, since the
 rename moves no call. Older entries in this file were rewritten to the new names in the same PR;
 `CHANGELOG.md` keeps the names each release shipped with, and the table above is the map.
+
+## 15. `jerry-core` is a contract crate: JSON-RPC 2.0 on the wire, `Locality` on every action, no threads
+
+**Status:** Accepted (2026-09-22, issue #495; decisions Q3, Q4 and Q10 of the UI-optional plan).
+
+**Context:** The application layer described in §2 had no crate. The plan's first pass drew a
+`jerry-core` that also owned the socket listener and a "tight pump", and a bespoke
+length-prefixed frame with an `id` field reserved for later server push. Three things needed
+settling before the first client existed: what travels on the wire, which process may execute a
+given action, and where I/O lives.
+
+**Decision:**
+
+- **JSON-RPC 2.0** over a big-endian `u32` length-prefixed frame. Requests carry an `id`,
+  notifications do not, so server push and fire-and-forget hook events exist from day one. Methods
+  are namespaced `command/<name>`, `validate/<name>`, `query/<name>`, `event/<name>`, plus `hook`.
+  A Command's own outcome is always a `result` carrying a `Report` (`ok` / `denied` / `error`);
+  JSON-RPC errors are reserved for transport and policy failures (unknown method, bad params,
+  unsupported version, forbidden by `Invocability`, cwd outside the agent's worktree, needs a
+  host). `hook` is a request with a short deadline rather than a notification, so a future `Stop`
+  steering reply needs no framing change. Rejected: gRPC/tonic (tokio and protobuf for a local
+  socket), Cap'n Proto (fd passing we do not need yet), MessagePack-RPC (not inspectable from a
+  shell), tarpc (ties the wire to Rust types, and MCP would still need JSON-RPC beside it).
+- **`Locality { Git, Session }`** is a required method on both traits, so adding an action forces the
+  classification (unlike `Invocability`, which a Query may leave at its `Allowed` default). Git-locality Queries run locally in any process.
+  Session-locality anything reaches the host. Git-locality Commands go to the host when one exists
+  and run locally only in standalone mode, because the host owns the worktree-to-session coupling
+  (`DiscardWorktree` must kill the agent living there).
+- **`jerry-core` owns no threads.** Types, codec, stable error codes, the registry and a blocking
+  client connect, plus the Git-locality implementations. The listener, dispatch task and session
+  table are `jerry-host`'s. Every method carries the same envelope, `{cwd, agent?, params}`, so a host classifies and
+  confines every caller the same way. The wire contract is verified mechanically: one JSON
+  fixture per catalogued example under `crates/jerry-core/fixtures/`, compared and round-tripped
+  by a table-driven test, and an exhaustive match that gives every `jerry-git` failure a stable
+  kebab-case code. The client refuses a descriptor of another protocol version before connecting,
+  bounds every call as a whole, and poisons itself after a mid-frame failure rather than reading
+  stale bytes on the next call.
+
+**Consequences:** The GUI consumes `Report`s only (plan decision Q1), so it re-derives detail
+through local Queries and nothing in it changes when the host becomes a process. The codec is
+duplicated from `jerry-lsp`'s JSON-RPC client rather than shared, since `jerry-lsp` cannot depend
+on this crate without a cycle. Which executor a Git-locality Command reaches is the transport
+choice `jerry-cli` makes (#499), not something this crate decides. `jerry-git` gained `worktree_root` so a `Ctx` can be built from any
+directory inside a worktree.

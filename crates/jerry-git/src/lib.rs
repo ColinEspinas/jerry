@@ -268,6 +268,15 @@ pub fn git_common_dir(repo_path: &Path) -> Result<PathBuf, Error> {
     Ok(absolutize(Path::new(trimmed), repo_path))
 }
 
+/// Resolves the worktree root (`git rev-parse --show-toplevel`) from any directory inside it.
+pub fn worktree_root(path: &Path) -> Result<PathBuf, Error> {
+    let args: Vec<OsString> = vec!["rev-parse".into(), "--show-toplevel".into()];
+    let output = run_git(path, &args)?;
+    check_success(&args, &output)?;
+    let raw = String::from_utf8_lossy(&output.stdout);
+    Ok(absolutize(Path::new(raw.trim()), path))
+}
+
 /// Resolves a relative `path` against `base` rather than the process's working directory, since
 /// every `git` invocation here sets `current_dir` and must resolve paths the same way.
 fn absolutize(path: &Path, base: &Path) -> PathBuf {
@@ -1085,6 +1094,18 @@ mod tests {
             fs::canonicalize(&from_main).expect("canonicalize"),
             fs::canonicalize(&from_linked).expect("canonicalize"),
             "every worktree of the same repository shares one common dir"
+        );
+    }
+
+    #[test]
+    fn worktree_root_from_a_nested_directory_is_the_worktree_itself() {
+        let repo = seed_repo();
+        let nested = repo.path().join("src").join("deep");
+        fs::create_dir_all(&nested).expect("nested dir");
+        let root = worktree_root(&nested).expect("worktree_root");
+        assert_eq!(
+            fs::canonicalize(&root).expect("canonicalize"),
+            fs::canonicalize(repo.path()).expect("canonicalize")
         );
     }
 }

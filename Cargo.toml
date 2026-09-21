@@ -4,6 +4,7 @@ members = [
     "crates/jerry-git",
     "crates/jerry-pty",
     "crates/jerry-lsp",
+    "crates/jerry-core",
     "crates/jerry-app",
     # Dev-dependency only, and deliberately gpui-free so the core crates can use it too
     # (docs/architecture/decisions.md §1, docs/testing.md).

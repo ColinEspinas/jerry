@@ -1,0 +1,27 @@
+[package]
+name = "jerry-core"
+version = { workspace = true }
+edition = { workspace = true }
+publish = { workspace = true }
+license = { workspace = true }
+description = "The contract every Jerry client and host share: Command/Query traits, the JSON-RPC 2.0 frame codec, stable error codes, the per-repo host registry, and a blocking client"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Git-locality Commands and Queries execute here, so standalone `jerry-cli` can run them
+# without linking any host or PTY machinery (decisions.md §15).
+jerry-git = { path = "../jerry-git" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+# AF_UNIX on Windows 10 1803+. Pinned to the exact version already resolved in Cargo.lock
+# (pulled by `zbus` via gpui), so this adds no new version surface.
+[target.'cfg(windows)'.dependencies]
+uds_windows = "=1.2.1"
+
+[dev-dependencies]
+tempfile = "3"
+test-support = { path = "../test-support" }
