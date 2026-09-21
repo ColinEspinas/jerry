@@ -1,0 +1,8 @@
+{
+  "method": "hook",
+  "params": {
+    "agent": "agent-7",
+    "event": "PreToolUse",
+    "payload": { "tool_name": "Edit" }
+  }
+}

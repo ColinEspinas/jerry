@@ -29,6 +29,18 @@ the per-spawn console window on Windows GUI-subsystem release builds (decisions.
 **Does not own.** ANSI/terminal-grid parsing (that's `crates/jerry-app/src/terminal/`), any git concern,
 any gpui dependency.
 
+## `jerry-core`
+
+**Scope.** The contract every client and the host share: the `Command`/`Query` traits with
+`Invocability` and `Locality`, `Ctx`/`Caller`, the `Report` projection with stable error codes, the
+JSON-RPC 2.0 frame codec, the per-repository host registry, and a blocking socket client. The
+Git-locality Command and Query implementations live here so standalone `jerry-cli` can run them.
+
+**Owns.** No threads, no listener, no sessions. Every variant a client can send is catalogued in
+`request.rs` and pinned by a JSON fixture under `fixtures/`.
+
+**Does not own.** Dispatch, the listener and the session table (`jerry-host`); anything `gpui`.
+
 ## `jerry-lsp`
 
 **Scope.** A Language Server Protocol client: spawn, initialize, request/notify, diagnostics.

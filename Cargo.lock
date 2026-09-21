@@ -4408,6 +4408,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "jerry-core"
+version = "0.2.0"
+dependencies = [
+ "jerry-git",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "test-support",
+ "thiserror 1.0.69",
+ "uds_windows",
+]
+
+[[package]]
 name = "jerry-git"
 version = "0.2.0"
 dependencies = [
