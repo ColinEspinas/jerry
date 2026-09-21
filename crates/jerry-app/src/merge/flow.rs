@@ -182,9 +182,18 @@ impl AdeApp {
     /// Surface D's `Take left`/`Take right`/`Take both` action on the active hunk
     /// (`merge_flow.state`'s `active_file`/`active_hunk`) - mutates the in-memory
     /// [`jerry_git::merge::ConflictedFile`] via `jerry_git::merge::resolve_hunk`, then advances to
-    /// the next unresolved hunk ([`crate::merge::state::first_unresolved`]). If that resolves the
-    /// file's last conflict, the resolved content is written to disk and `git add`ed on the
-    /// background executor (`jerry_git::merge::write_resolved_file`).
+    /// the next unresolved hunk ([`crate::merge::state::first_unresolved`]). The resolution is
+    /// written straight back to disk on the background executor
+    /// (`jerry_git::merge::write_conflict_text`) whether or not the whole file is done yet - a
+    /// partially resolved file keeps its remaining markers there, git's own native unmerged
+    /// state, rather than existing only in `files[]` (GitHub issue #497). Only once
+    /// `is_resolved()` is genuinely true is the file also staged
+    /// (`jerry_git::merge::stage_conflict_resolution`).
+    ///
+    /// `write_conflict_text` refuses instead of writing if disk no longer holds what this
+    /// resolution assumed as its starting point - some other writer touched the file first. That
+    /// case (`ExternallyChanged`) re-derives `files[]`'s entry from the real on-disk content
+    /// rather than clobbering it with this click's now-stale resolution.
     pub(in crate::merge) fn resolve_active_hunk(
         &mut self,
         choice: jerry_git::merge::ConflictChoice,
@@ -207,16 +216,13 @@ impl AdeApp {
         let Some(jerry_git::merge::ConflictedPath::Text(file)) = files.get_mut(*active_file) else {
             return;
         };
+        let expected_before = file.render();
         if jerry_git::merge::resolve_hunk(file, *active_hunk, choice).is_err() {
             // A stale index (shouldn't happen) - nothing sensible to do but ignore the click
             // rather than panicking.
             return;
         }
-        let write_back = if file.is_resolved() {
-            Some((base_worktree_path.clone(), file.clone()))
-        } else {
-            None
-        };
+        let resolved_file = file.clone();
         if let Some((next_file, next_hunk)) = merge::first_unresolved(files) {
             *active_file = next_file;
             *active_hunk = next_hunk;
@@ -226,6 +232,7 @@ impl AdeApp {
         // not used again past this point, so this is the last real use of that borrow.
         let agent_id = flow.agent_id;
         let generation = flow.generation;
+        let base_worktree_path = base_worktree_path.clone();
         cx.notify();
         // The real state-transition point the newly-active hunk (if the advance above landed on
         // a different one) needs its highlight cache filled - see
@@ -238,40 +245,91 @@ impl AdeApp {
         // stale - see `Self::sync_merge_edit_to_active_file`'s own docs.
         self.sync_merge_edit_to_active_file();
 
-        let Some((worktree_path, resolved_file)) = write_back else {
-            return;
-        };
-        let worktree_path_for_check = worktree_path.clone();
+        let relative_path = resolved_file.relative_path.clone();
+        let new_content = resolved_file.render();
+        let is_now_resolved = resolved_file.is_resolved();
+        let relative_path_for_write = relative_path.clone();
+        let base_worktree_path_for_write = base_worktree_path.clone();
+        let worktree_path_for_check = base_worktree_path.clone();
         let task = cx.spawn(async move |this, cx| {
-            let result = cx
+            let result: Result<ResolveWriteOutcome, jerry_git::Error> = cx
                 .background_executor()
                 .spawn(async move {
-                    jerry_git::merge::write_resolved_file(&worktree_path, &resolved_file)
+                    match jerry_git::merge::write_conflict_text(
+                        &base_worktree_path_for_write,
+                        &relative_path_for_write,
+                        &expected_before,
+                        &new_content,
+                    )? {
+                        jerry_git::merge::ConflictWriteOutcome::Written => {
+                            if is_now_resolved {
+                                jerry_git::merge::stage_conflict_resolution(
+                                    &base_worktree_path_for_write,
+                                    &relative_path_for_write,
+                                )?;
+                            }
+                            Ok(ResolveWriteOutcome::Written)
+                        }
+                        jerry_git::merge::ConflictWriteOutcome::ExternallyChanged { on_disk } => {
+                            let fresh = jerry_git::merge::parse_conflicted_file(
+                                &relative_path_for_write,
+                                &on_disk,
+                            )?;
+                            Ok(ResolveWriteOutcome::ExternallyChanged(fresh))
+                        }
+                    }
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                if let Err(err) = result {
-                    // Real defense in depth (see `merge::MergeFlow::generation`'s own docs): a
-                    // bare `agent_id` match alone can't tell "this write's own attempt is still
-                    // the live one" apart from "the same agent started a *fresh* attempt while
-                    // this write was still in flight" - both share `agent_id`, only the newer
-                    // one shares `generation` too.
-                    let still_current = this.merge_flow.as_ref().is_some_and(|flow| {
-                        flow.agent_id == agent_id && flow.generation == generation
-                    });
-                    if still_current {
-                        // Re-check MERGE_HEAD so `Abort merge` stays offered rather than
-                        // silently vanishing - see `merge::MergeFlowState::Error`'s docs.
-                        let abortable_worktree =
-                            jerry_git::merge::merge_head_exists(&worktree_path_for_check)
-                                .ok()
-                                .filter(|present| *present)
-                                .map(|_| worktree_path_for_check.clone());
-                        if let Some(flow) = this.merge_flow.as_mut() {
-                            flow.state = merge::MergeFlowState::Error {
-                                message: format!("failed to write resolved file: {err}"),
-                                abortable_worktree,
-                            };
+                // Real defense in depth (see `merge::MergeFlow::generation`'s own docs): a
+                // bare `agent_id` match alone can't tell "this write's own attempt is still
+                // the live one" apart from "the same agent started a *fresh* attempt while
+                // this write was still in flight" - both share `agent_id`, only the newer
+                // one shares `generation` too.
+                let still_current = this
+                    .merge_flow
+                    .as_ref()
+                    .is_some_and(|flow| flow.agent_id == agent_id && flow.generation == generation);
+                if still_current {
+                    match result {
+                        Ok(ResolveWriteOutcome::Written) => {}
+                        Ok(ResolveWriteOutcome::ExternallyChanged(fresh)) => {
+                            if let Some(flow) = this.merge_flow.as_mut() {
+                                if let merge::MergeFlowState::Conflicted {
+                                    files,
+                                    active_file,
+                                    active_hunk,
+                                    ..
+                                } = &mut flow.state
+                                {
+                                    if merge::replace_conflicted_file(files, &relative_path, fresh)
+                                    {
+                                        if let Some((next_file, next_hunk)) =
+                                            merge::first_unresolved(files)
+                                        {
+                                            *active_file = next_file;
+                                            *active_hunk = next_hunk;
+                                        }
+                                    }
+                                }
+                            }
+                            this.ensure_active_merge_highlight_cache();
+                            this.sync_merge_edit_to_active_file();
+                        }
+                        Err(err) => {
+                            // Re-check MERGE_HEAD so `Abort merge` stays offered rather than
+                            // silently vanishing - see `merge::MergeFlowState::Error`'s docs.
+                            let abortable_worktree =
+                                jerry_git::merge::merge_head_exists(&worktree_path_for_check)
+                                    .ok()
+                                    .filter(|present| *present)
+                                    .map(|_| worktree_path_for_check.clone());
+                            if let Some(flow) = this.merge_flow.as_mut() {
+                                flow.state = merge::MergeFlowState::Error {
+                                    message: format!("failed to write resolved file: {err}"),
+                                    abortable_worktree,
+                                };
+                            }
                         }
                     }
                 }
@@ -610,6 +668,10 @@ impl AdeApp {
                             edit.relative_path.clone(),
                             edit.buffer.path.clone(),
                             edit.buffer.content.clone(),
+                            // What this buffer believes disk currently holds - the write-through
+                            // drift check compares real disk content against this, never the
+                            // buffer's own new `content` (see this method's own docs).
+                            edit.buffer.saved_content.clone(),
                         )),
                         None => {
                             // The hand-edit was discarded (or the whole flow torn down) while a
@@ -629,6 +691,7 @@ impl AdeApp {
                     relative_path,
                     real_path,
                     content,
+                    expected_before,
                 ))) = step
                 else {
                     break;
@@ -651,79 +714,106 @@ impl AdeApp {
 
                 let relative_path_for_write = relative_path.clone();
                 // Real, deliberate separation of the *write* outcome (`Err` only for a genuine
-                // `std::fs::write`/`std::fs::metadata` I/O failure - the write never happened, or
-                // its real mtime/len couldn't be read back) from the *re-parse* outcome
-                // (`MergeEditReparseOutcome`, always `Ok` once the write itself succeeded) - a
-                // real, live-reproduced bug an audit caught in an earlier version of this method,
-                // which used a single `?`-chained `Result` for both: a hand-edit that leaves
-                // malformed conflict markers (e.g. deleting only the real `=======` line - a
-                // real, easy real mistake in a view whose whole purpose is editing those markers)
-                // made `jerry_git::merge::load_conflicted_file`'s own real parse fail *after* the
-                // real bytes were already written to disk, which the old code then treated
-                // identically to "the write itself failed": `EditBuffer::mark_saved` never ran
-                // (so the buffer kept reporting dirty even though the real on-disk bytes were
-                // already exactly what it held), and `files[]` kept describing the pre-write
-                // content - if the user then went back to the quick-pick view (via `Self::
-                // discard_merge_hand_edit`) and resolved a hunk there, `Self::resolve_active_hunk`
-                // would `jerry_git::merge::write_resolved_file` a *stale*, pre-hand-edit render()
-                // over whatever the real hand-edit had actually just written. Fixed by always
-                // trusting the write's own real success (clearing dirty via `mark_saved`
-                // regardless of the re-parse outcome, since the real bytes genuinely are what's on
-                // disk now) and by *never* calling `Self::apply_merge_edit_save_result` (which is
-                // the only thing that ever updates `files[]` or clears `Self::merge_edit`) on a
-                // malformed re-parse - see [`MergeEditReparseOutcome::Malformed`]'s own docs for
+                // I/O failure - the write never happened, or its real mtime/len couldn't be read
+                // back) from the *re-parse* outcome (`MergeEditReparseOutcome`, always `Ok` once
+                // the write itself succeeded) - a real, live-reproduced bug an audit caught in an
+                // earlier version of this method, which used a single `?`-chained `Result` for
+                // both: a hand-edit that leaves malformed conflict markers (e.g. deleting only
+                // the real `=======` line - a real, easy real mistake in a view whose whole
+                // purpose is editing those markers) made `jerry_git::merge::load_conflicted_file`'s
+                // own real parse fail *after* the real bytes were already written to disk, which
+                // the old code then treated identically to "the write itself failed":
+                // `EditBuffer::mark_saved` never ran (so the buffer kept reporting dirty even
+                // though the real on-disk bytes were already exactly what it held), and `files[]`
+                // kept describing the pre-write content - if the user then went back to the
+                // quick-pick view (via `Self::discard_merge_hand_edit`) and resolved a hunk
+                // there, `Self::resolve_active_hunk` would write a *stale*, pre-hand-edit
+                // render() over whatever the real hand-edit had actually just written. Fixed by
+                // always trusting the write's own real success (clearing dirty via `mark_saved`
+                // regardless of the re-parse outcome, since the real bytes genuinely are what's
+                // on disk now) and by *never* calling `Self::apply_merge_edit_save_result` (which
+                // is the only thing that ever updates `files[]` or clears `Self::merge_edit`) on
+                // a malformed re-parse - see [`MergeEditReparseOutcome::Malformed`]'s own docs for
                 // why that keeps hand-edit mode structurally forced open for this file (the
                 // quick-pick view's Take-left/right/both buttons stay absent from the render tree
                 // for it - see `crate::merge::render`'s own docs) until either a clean
                 // re-parse succeeds or the user explicitly discards, closing the stale-overwrite
                 // risk at its actual source rather than papering over one symptom of it.
-                let write_result: Result<
-                    (
-                        Option<std::time::SystemTime>,
-                        u64,
-                        String,
-                        MergeEditReparseOutcome,
-                    ),
-                    jerry_git::Error,
-                > = cx
+                //
+                // `jerry_git::merge::write_conflict_text` adds the write-through drift check
+                // (GitHub issue #497): the raw `std::fs::write` this used to be would silently
+                // clobber a real external change (another writer touching the same file while
+                // this hand-edit was open) with whatever this buffer happened to hold.
+                // `MergeEditWriteOutcome::ExternallyChanged` is how that refusal reaches the
+                // foreground handler below instead.
+                let write_result: Result<MergeEditWriteOutcome, jerry_git::Error> = cx
                     .background_executor()
                     .spawn(async move {
-                        std::fs::write(&real_path, content.as_bytes())?;
-                        let metadata = std::fs::metadata(&real_path)?;
-                        let mtime = metadata.modified().ok();
-                        let len = metadata.len();
-                        let reparse = match jerry_git::merge::load_conflicted_file(
+                        match jerry_git::merge::write_conflict_text(
                             &base_worktree_path,
                             &relative_path_for_write,
-                        ) {
-                            Ok(fresh) => {
-                                // Only the real `git add` staging can fail independently here -
-                                // `fresh` itself is already a real, valid, fully-parsed
-                                // `ConflictedFile` that genuinely matches what's on disk right
-                                // now regardless of whether staging succeeds, so it's still
-                                // correct (and important - see this method's own docs) to apply
-                                // it to `files[]` even when staging fails.
-                                let stage_error = if fresh.remaining_conflicts() == 0 {
-                                    jerry_git::merge::write_resolved_file(
-                                        &base_worktree_path,
-                                        &fresh,
-                                    )
-                                    .err()
-                                    .map(|err| err.to_string())
-                                } else {
-                                    None
+                            &expected_before,
+                            &content,
+                        )? {
+                            jerry_git::merge::ConflictWriteOutcome::Written => {
+                                let metadata = std::fs::metadata(&real_path)?;
+                                let mtime = metadata.modified().ok();
+                                let len = metadata.len();
+                                let reparse = match jerry_git::merge::load_conflicted_file(
+                                    &base_worktree_path,
+                                    &relative_path_for_write,
+                                ) {
+                                    Ok(fresh) => {
+                                        // Only the real `git add` staging can fail independently
+                                        // here - `fresh` itself is already a real, valid,
+                                        // fully-parsed `ConflictedFile` that genuinely matches
+                                        // what's on disk right now regardless of whether staging
+                                        // succeeds, so it's still correct (and important - see
+                                        // this method's own docs) to apply it to `files[]` even
+                                        // when staging fails.
+                                        let stage_error = if fresh.remaining_conflicts() == 0 {
+                                            jerry_git::merge::write_resolved_file(
+                                                &base_worktree_path,
+                                                &fresh,
+                                            )
+                                            .err()
+                                            .map(|err| err.to_string())
+                                        } else {
+                                            None
+                                        };
+                                        MergeEditReparseOutcome::Parsed { fresh, stage_error }
+                                    }
+                                    Err(err) => MergeEditReparseOutcome::Malformed(err.to_string()),
                                 };
-                                MergeEditReparseOutcome::Parsed { fresh, stage_error }
+                                Ok(MergeEditWriteOutcome::Written {
+                                    mtime,
+                                    len,
+                                    written_content: content,
+                                    reparse,
+                                })
                             }
-                            Err(err) => MergeEditReparseOutcome::Malformed(err.to_string()),
-                        };
-                        Ok((mtime, len, content, reparse))
+                            jerry_git::merge::ConflictWriteOutcome::ExternallyChanged {
+                                on_disk,
+                            } => {
+                                let fresh = jerry_git::merge::parse_conflicted_file(
+                                    &relative_path_for_write,
+                                    &on_disk,
+                                )
+                                .map_err(|err| err.to_string());
+                                Ok(MergeEditWriteOutcome::ExternallyChanged(fresh))
+                            }
+                        }
                     })
                     .await;
 
                 let _ = this.update(cx, |this, cx| {
                     match write_result {
-                        Ok((mtime, len, written_content, reparse)) => {
+                        Ok(MergeEditWriteOutcome::Written {
+                            mtime,
+                            len,
+                            written_content,
+                            reparse,
+                        }) => {
                             // Real identity re-check (see `merge::MergeFlow::generation`'s and
                             // `merge::MergeEditState::buffer_id`'s own docs) - a stale save whose
                             // hand-edit was discarded, or whose whole merge attempt was
@@ -769,6 +859,45 @@ impl AdeApp {
                                         // Deliberately does NOT call
                                         // `Self::apply_merge_edit_save_result` - see this
                                         // method's own top docs.
+                                    }
+                                }
+                            }
+                        }
+                        Ok(MergeEditWriteOutcome::ExternallyChanged(fresh)) => {
+                            let still_current = this.merge_edit.as_ref().is_some_and(|edit| {
+                                edit.agent_id == agent_id
+                                    && edit.generation == generation
+                                    && edit.buffer_id == buffer_id
+                                    && edit.relative_path == relative_path
+                            });
+                            if still_current {
+                                match fresh {
+                                    Ok(fresh) => {
+                                        this.apply_merge_edit_save_result(
+                                            agent_id,
+                                            generation,
+                                            relative_path,
+                                            fresh,
+                                        );
+                                        // The buffer's own content no longer reflects reality -
+                                        // never try to reconcile a user's stale keystrokes with
+                                        // another writer's on-disk change; always discard it and
+                                        // let the quick-pick view show the real, fresh state
+                                        // (GitHub issue #497).
+                                        this.merge_edit = None;
+                                        this.merge_edit_save_error = Some(
+                                            "not saved: the file changed on disk since you \
+                                             started editing - the current conflict state was \
+                                             reloaded"
+                                                .to_string(),
+                                        );
+                                    }
+                                    Err(message) => {
+                                        this.merge_edit_save_error = Some(format!(
+                                            "not saved: the file changed on disk since you \
+                                             started editing, and its current content is not a \
+                                             valid conflicted file: {message}"
+                                        ));
                                     }
                                 }
                             }
@@ -838,6 +967,31 @@ impl AdeApp {
     pub(crate) fn set_merge_edit_save_test_delay(&mut self, delay: Option<std::time::Duration>) {
         self.merge_edit_save_test_delay = delay;
     }
+}
+
+/// The real outcome of [`AdeApp::resolve_active_hunk`]'s background write-through - see that
+/// method's own docs for why a refused write (`ExternallyChanged`) is folded into this `Ok`
+/// variant rather than treated as an `Err`: it is not a failure, just a signal to re-derive
+/// `files[]`'s entry from real disk content instead of applying this click's now-stale
+/// resolution.
+enum ResolveWriteOutcome {
+    Written,
+    ExternallyChanged(jerry_git::merge::ConflictedFile),
+}
+
+/// The real outcome of [`AdeApp::spawn_merge_edit_save_loop`]'s background write-through. As
+/// with [`ResolveWriteOutcome`], a refused write (`ExternallyChanged`) is folded into this `Ok`
+/// variant rather than treated as an `Err`: it means the buffer's own edits are now stale, not
+/// that anything failed. `Err` inside `ExternallyChanged` is the narrower case where the file's
+/// new content, whatever wrote it, doesn't even parse as a conflicted file.
+enum MergeEditWriteOutcome {
+    Written {
+        mtime: Option<std::time::SystemTime>,
+        len: u64,
+        written_content: String,
+        reparse: MergeEditReparseOutcome,
+    },
+    ExternallyChanged(Result<jerry_git::merge::ConflictedFile, String>),
 }
 
 /// The real outcome of re-parsing a hand-edit save's just-written content
@@ -1298,6 +1452,187 @@ mod merge_regression_tests {
             "the merge should have completed successfully now that both files are genuinely \
              resolved on disk"
         );
+    }
+
+    /// A real two-hunk conflict, ten unchanged lines apart - hand-verified (see
+    /// `jerry_git::merge::tests::init_repo_with_two_hunk_conflict`'s identical fixture, in
+    /// `jerry_git`'s own test module) to keep git's merge machinery from folding both changed
+    /// lines into a single conflict block.
+    ///
+    /// Owns creating the `feature` worktree itself, *after* `f.txt` is seeded in `repo` - a
+    /// worktree branches off whatever `HEAD` already is, so branching first would leave
+    /// `feature` with no history of `f.txt` at all, and the later `git commit -am` on it would
+    /// see only an untracked file rather than a real edit to commit.
+    fn seed_two_hunk_conflict(repo: &std::path::Path) -> PathBuf {
+        let base_lines: Vec<String> = (1..=14).map(|n| format!("line{n}")).collect();
+        fs::write(repo.join("f.txt"), base_lines.join("\n") + "\n").expect("write");
+        git(repo, &["add", "f.txt"]);
+        git(repo, &["commit", "-m", "seed f.txt"]);
+
+        let feature = add_worktree(repo, "feature", "feature-wt");
+
+        let mut feature_lines = base_lines.clone();
+        feature_lines[1] = "FEATURE2".to_string();
+        feature_lines[12] = "FEATURE13".to_string();
+        fs::write(feature.join("f.txt"), feature_lines.join("\n") + "\n").expect("write");
+        git(&feature, &["commit", "-am", "feature changes f.txt"]);
+
+        let mut base_changed_lines = base_lines;
+        base_changed_lines[1] = "BASE2".to_string();
+        base_changed_lines[12] = "BASE13".to_string();
+        fs::write(repo.join("f.txt"), base_changed_lines.join("\n") + "\n").expect("write");
+        git(repo, &["commit", "-am", "base changes f.txt"]);
+
+        feature
+    }
+
+    #[gpui::test]
+    fn resolving_one_of_two_hunks_writes_that_resolution_to_disk_leaving_the_other_hunks_markers_intact(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = init_repo();
+        let feature = seed_two_hunk_conflict(repo.path());
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let feature_agent_id = app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                ProcessKind::Shell,
+                feature.clone(),
+                app.settings.appearance.terminal_font_size,
+                app.settings.terminal.shell_override(),
+                None,
+                window,
+                cx,
+            )
+        });
+
+        app.update(cx, |app, cx| app.start_merge(feature_agent_id, cx));
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            let flow = app
+                .merge_flow
+                .as_ref()
+                .expect("merge_flow after start_merge");
+            let merge::MergeFlowState::Conflicted { files, .. } = &flow.state else {
+                panic!("expected a conflicted merge");
+            };
+            let ConflictedPath::Text(file) = &files[0] else {
+                panic!("expected a real text conflict for f.txt");
+            };
+            assert_eq!(
+                file.remaining_conflicts(),
+                2,
+                "both hunks must still be real conflicts"
+            );
+        });
+
+        // Resolve only the first hunk - the second must stay a real, on-disk conflict.
+        app.update(cx, |app, cx| {
+            app.resolve_active_hunk(jerry_git::merge::ConflictChoice::Right, cx);
+        });
+        cx.run_until_parked();
+
+        let on_disk = fs::read_to_string(repo.path().join("f.txt")).expect("read f.txt");
+        assert!(
+            on_disk.contains("FEATURE2") && !on_disk.contains("BASE2"),
+            "the first hunk's own resolution must already be on disk, not just in-memory: \
+             {on_disk:?}"
+        );
+        assert_eq!(
+            on_disk.matches("<<<<<<<").count(),
+            1,
+            "the second, still-unresolved hunk must keep its real markers on disk - a \
+             half-resolved file is git's own native state, not something only this app's \
+             memory knows about: {on_disk:?}"
+        );
+        assert!(
+            status(repo.path()).contains("UU f.txt"),
+            "f.txt must still be reported unmerged by real git - only a fully resolved file is \
+             ever staged: {:?}",
+            status(repo.path())
+        );
+
+        // Resolve the second (now active) hunk too - the file must become genuinely resolved
+        // and staged.
+        app.update(cx, |app, cx| {
+            app.resolve_active_hunk(jerry_git::merge::ConflictChoice::Right, cx);
+        });
+        cx.run_until_parked();
+
+        let on_disk = fs::read_to_string(repo.path().join("f.txt")).expect("read f.txt");
+        assert!(
+            !on_disk.contains("<<<<<<<"),
+            "both hunks must be genuinely resolved on disk now: {on_disk:?}"
+        );
+        assert!(
+            !status(repo.path()).contains('U'),
+            "f.txt must be genuinely staged once every hunk is resolved: {:?}",
+            status(repo.path())
+        );
+    }
+
+    #[gpui::test]
+    fn resolve_active_hunk_reloads_fresh_hunks_when_another_writer_changed_the_file_first(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = init_repo();
+        let feature = seed_two_hunk_conflict(repo.path());
+
+        let (app, cx) = palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+        let feature_agent_id = app.update_in(cx, |app, window, cx| {
+            app.agents.spawn(
+                ProcessKind::Shell,
+                feature.clone(),
+                app.settings.appearance.terminal_font_size,
+                app.settings.terminal.shell_override(),
+                None,
+                window,
+                cx,
+            )
+        });
+
+        app.update(cx, |app, cx| app.start_merge(feature_agent_id, cx));
+        cx.run_until_parked();
+
+        // A real other writer (another agent, a manual edit) changes the first hunk's own
+        // content on disk before this click's write ever runs - `resolve_active_hunk` computes
+        // its resolution from the in-memory copy loaded above, which is now stale.
+        let before_external_write =
+            fs::read_to_string(repo.path().join("f.txt")).expect("read f.txt");
+        let externally_written = before_external_write.replace("BASE2", "SOMEONE ELSE'S EDIT");
+        fs::write(repo.path().join("f.txt"), &externally_written).expect("write");
+
+        app.update(cx, |app, cx| {
+            app.resolve_active_hunk(jerry_git::merge::ConflictChoice::Left, cx);
+        });
+        cx.run_until_parked();
+
+        let on_disk = fs::read_to_string(repo.path().join("f.txt")).expect("read f.txt");
+        assert_eq!(
+            on_disk, externally_written,
+            "a refused write must never touch the file - the external writer's content must \
+             survive untouched"
+        );
+
+        app.read_with(cx, |app, _| {
+            let flow = app.merge_flow.as_ref().expect("merge_flow still present");
+            let merge::MergeFlowState::Conflicted { files, .. } = &flow.state else {
+                panic!("expected a conflicted merge");
+            };
+            let ConflictedPath::Text(file) = &files[0] else {
+                panic!("expected a real text conflict for f.txt");
+            };
+            let ConflictSegment::Conflict(hunk) = &file.segments[1] else {
+                panic!("expected the first segment to still be a real, unresolved conflict hunk");
+            };
+            assert_eq!(
+                hunk.ours,
+                vec!["SOMEONE ELSE'S EDIT".to_string()],
+                "the in-memory hunk must be re-derived from the real on-disk content, not the \
+                 stale click's own resolution nor the original pre-external-edit text"
+            );
+        });
     }
 
     #[gpui::test]

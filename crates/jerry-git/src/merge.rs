@@ -403,8 +403,15 @@ pub fn load_conflicted_file(
     let text = String::from_utf8(bytes).map_err(|_| Error::MergeConflictFileNotUtf8 {
         path: relative_path.to_path_buf(),
     })?;
+    parse_conflicted_file(relative_path, &text)
+}
+
+/// Parses `text` as a conflicted file's content - the reusable half of [`load_conflicted_file`]
+/// for a caller that already has the bytes in hand (e.g. the `on_disk` text a refused
+/// [`write_conflict_text`] hands back), so it never has to read the same file a second time.
+pub fn parse_conflicted_file(relative_path: &Path, text: &str) -> Result<ConflictedFile, Error> {
     let trailing_newline = text.ends_with('\n');
-    let segments = parse_conflict_segments(&text, relative_path)?;
+    let segments = parse_conflict_segments(text, relative_path)?;
     Ok(ConflictedFile {
         relative_path: relative_path.to_path_buf(),
         segments,
@@ -713,8 +720,9 @@ pub fn resolve_hunk(
 
 /// Writes a fully-resolved file back to disk and stages it.
 ///
-/// The only path that writes a conflicted file back, and it refuses with
-/// [`Error::MergeFileNotFullyResolved`] rather than persisting remaining markers.
+/// Refuses with [`Error::MergeFileNotFullyResolved`] rather than persisting remaining markers.
+/// Unconditional: unlike [`write_conflict_text`], this never checks disk against an expected
+/// prior state first - callers that need the write-through drift check use that instead.
 pub fn write_resolved_file(worktree_path: &Path, file: &ConflictedFile) -> Result<(), Error> {
     if !file.is_resolved() {
         return Err(Error::MergeFileNotFullyResolved {
@@ -723,11 +731,62 @@ pub fn write_resolved_file(worktree_path: &Path, file: &ConflictedFile) -> Resul
     }
     let full = worktree_path.join(&file.relative_path);
     std::fs::write(&full, file.render()).map_err(Error::WorktreeIo)?;
+    stage_conflict_resolution(worktree_path, &file.relative_path)
+}
 
+/// Whether a write-through conflict-resolution write reached disk, or was refused because
+/// another writer changed the file first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConflictWriteOutcome {
+    Written,
+    /// Disk held something other than `expected_before` when the write was attempted - refused
+    /// without touching the file. `on_disk` is what is actually there now, so a caller can
+    /// re-derive its own hunks from it (via [`parse_conflicted_file`]) instead of silently
+    /// overwriting whatever changed it.
+    ExternallyChanged {
+        on_disk: String,
+    },
+}
+
+/// Write-through counterpart to a single resolution step in either conflict resolver (the
+/// quick-pick take-left/right/both action, or a hand-edit save): writes `new_content` to
+/// `relative_path`, but only if the file's current on-disk content still equals
+/// `expected_before` - what this resolution was actually computed against. Every real
+/// resolution step lands on disk immediately this way, whether or not the whole file is done -
+/// a partially resolved file keeps its remaining markers, which is git's own native unmerged
+/// state, rather than existing only in a caller's memory (GitHub issue #497).
+///
+/// Refuses without touching the file if disk no longer matches: another writer (an agent, a
+/// manual `git checkout --theirs`, a concurrent save) changed it first, and blindly overwriting
+/// would silently discard that change. Never stages - [`stage_conflict_resolution`] is a
+/// separate, explicit step a caller runs only once it knows the file is genuinely fully
+/// resolved.
+pub fn write_conflict_text(
+    worktree_path: &Path,
+    relative_path: &Path,
+    expected_before: &str,
+    new_content: &str,
+) -> Result<ConflictWriteOutcome, Error> {
+    let full = worktree_path.join(relative_path);
+    let on_disk_bytes = std::fs::read(&full).map_err(Error::WorktreeIo)?;
+    let on_disk =
+        String::from_utf8(on_disk_bytes).map_err(|_| Error::MergeConflictFileNotUtf8 {
+            path: relative_path.to_path_buf(),
+        })?;
+    if on_disk != expected_before {
+        return Ok(ConflictWriteOutcome::ExternallyChanged { on_disk });
+    }
+    std::fs::write(&full, new_content).map_err(Error::WorktreeIo)?;
+    Ok(ConflictWriteOutcome::Written)
+}
+
+/// Stages `relative_path` with `git add` - kept as its own step so a caller only ever runs it
+/// once a file's hunks are all genuinely resolved, never bundled into every write-through step.
+pub fn stage_conflict_resolution(worktree_path: &Path, relative_path: &Path) -> Result<(), Error> {
     let args: Vec<OsString> = vec![
         "add".into(),
         "--".into(),
-        file.relative_path.clone().into_os_string(),
+        relative_path.to_path_buf().into_os_string(),
     ];
     let output = git_command(worktree_path, &args)
         .output()
@@ -1892,6 +1951,206 @@ line4\n";
             find_in_progress_merge(repo.path()).expect("find_in_progress_merge"),
             None,
             "no merge is in progress any more after a real abort"
+        );
+    }
+
+    // --- write_conflict_text / stage_conflict_resolution / parse_conflicted_file -------------
+
+    /// A real two-hunk conflict: `f.txt` diverges on line 2 and line 13, with ten unchanged
+    /// lines between - close enough together to be one file, far enough apart that git's own
+    /// merge machinery keeps them as two separate conflict blocks rather than folding them into
+    /// one (hand-verified: anything closer than ~10 lines of shared context collapses into a
+    /// single hunk).
+    fn init_repo_with_two_hunk_conflict() -> (TempDir, PathBuf) {
+        let repo = init_repo();
+        let base_lines: Vec<String> = (1..=14).map(|n| format!("line{n}")).collect();
+        fs::write(repo.path().join("f.txt"), base_lines.join("\n") + "\n").expect("write");
+        git(repo.path(), &["add", "f.txt"]);
+        git(repo.path(), &["commit", "-m", "seed f.txt"]);
+
+        let feature = add_worktree(repo.path(), "feature", "feature-wt");
+        let mut feature_lines = base_lines.clone();
+        feature_lines[1] = "FEATURE2".to_string();
+        feature_lines[12] = "FEATURE13".to_string();
+        fs::write(feature.join("f.txt"), feature_lines.join("\n") + "\n").expect("write");
+        git(&feature, &["commit", "-am", "feature changes f.txt"]);
+
+        let mut base_changed_lines = base_lines;
+        base_changed_lines[1] = "BASE2".to_string();
+        base_changed_lines[12] = "BASE13".to_string();
+        fs::write(
+            repo.path().join("f.txt"),
+            base_changed_lines.join("\n") + "\n",
+        )
+        .expect("write");
+        git(repo.path(), &["commit", "-am", "base changes f.txt"]);
+
+        (repo, feature)
+    }
+
+    #[test]
+    fn write_conflict_text_writes_through_a_partial_resolution_leaving_the_other_hunks_markers_intact(
+    ) {
+        let (repo, feature) = init_repo_with_two_hunk_conflict();
+        let (_start, outcome) = attempt_merge(repo.path(), &feature).expect("attempt_merge");
+        let MergeOutcome::Conflicted {
+            conflicted_files, ..
+        } = outcome
+        else {
+            panic!("expected a conflicted merge");
+        };
+        assert_eq!(conflicted_files, vec![PathBuf::from("f.txt")]);
+
+        let mut file =
+            load_conflicted_file(repo.path(), &conflicted_files[0]).expect("load_conflicted_file");
+        assert_eq!(
+            file.remaining_conflicts(),
+            2,
+            "both hunks must still be real conflicts"
+        );
+        let expected_before = file.render();
+        // Segment 1 is the first hunk (segment 0 is the "line1" common prefix) - see
+        // `init_repo_with_two_hunk_conflict`'s own docs for the real line layout. `Right` keeps
+        // "theirs" (FEATURE2), so its presence unmarked on disk is real, checkable evidence the
+        // write actually landed - `Left` would keep "BASE2", indistinguishable from a no-op.
+        resolve_hunk(&mut file, 1, ConflictChoice::Right).expect("resolve_hunk");
+        assert!(!file.is_resolved(), "the second hunk is still unresolved");
+        let new_content = file.render();
+
+        let outcome = write_conflict_text(
+            repo.path(),
+            &file.relative_path,
+            &expected_before,
+            &new_content,
+        )
+        .expect("write_conflict_text");
+        assert_eq!(outcome, ConflictWriteOutcome::Written);
+
+        let on_disk = fs::read_to_string(repo.path().join("f.txt")).expect("read");
+        assert!(
+            on_disk.contains("FEATURE2") && !on_disk.contains("BASE2"),
+            "the first hunk must be genuinely resolved to theirs, not a no-op: {on_disk:?}"
+        );
+        assert_eq!(
+            on_disk, new_content,
+            "the partially-resolved render must be exactly what landed on disk"
+        );
+        assert!(
+            on_disk.contains("<<<<<<< HEAD") && on_disk.contains(">>>>>>> feature"),
+            "the second, still-unresolved hunk must keep its real markers on disk: {on_disk:?}"
+        );
+        assert!(
+            !on_disk.contains("<<<<<<<\n") && on_disk.matches("<<<<<<<").count() == 1,
+            "only the still-unresolved hunk's markers may remain: {on_disk:?}"
+        );
+        assert!(
+            status(repo.path()).contains("UU f.txt"),
+            "f.txt must still be reported unmerged - only a fully resolved file is ever staged"
+        );
+
+        // Reloading from disk must see exactly this partial state, never the pre-write markers.
+        let reloaded = load_conflicted_file(repo.path(), Path::new("f.txt")).expect("reload");
+        assert_eq!(reloaded.remaining_conflicts(), 1);
+    }
+
+    #[test]
+    fn write_conflict_text_refuses_and_returns_the_real_on_disk_content_when_another_writer_changed_it_first(
+    ) {
+        let (repo, feature) = init_repo_with_two_hunk_conflict();
+        let (_start, outcome) = attempt_merge(repo.path(), &feature).expect("attempt_merge");
+        let MergeOutcome::Conflicted {
+            conflicted_files, ..
+        } = outcome
+        else {
+            panic!("expected a conflicted merge");
+        };
+        let mut file =
+            load_conflicted_file(repo.path(), &conflicted_files[0]).expect("load_conflicted_file");
+        let stale_expected_before = file.render();
+        resolve_hunk(&mut file, 1, ConflictChoice::Left).expect("resolve_hunk");
+        let attempted_write = file.render();
+
+        // A real other writer (an agent, a manual edit) changes the first hunk's own content
+        // on disk before this resolution's write runs.
+        let externally_written = stale_expected_before.replace("BASE2", "SOMEONE ELSE'S EDIT");
+        fs::write(repo.path().join("f.txt"), &externally_written).expect("write");
+
+        let outcome = write_conflict_text(
+            repo.path(),
+            &file.relative_path,
+            &stale_expected_before,
+            &attempted_write,
+        )
+        .expect("write_conflict_text");
+        assert_eq!(
+            outcome,
+            ConflictWriteOutcome::ExternallyChanged {
+                on_disk: externally_written.clone()
+            }
+        );
+
+        let on_disk = fs::read_to_string(repo.path().join("f.txt")).expect("read");
+        assert_eq!(
+            on_disk, externally_written,
+            "a refused write must never touch the file - the external writer's content stays"
+        );
+        assert!(
+            !on_disk.contains(&attempted_write),
+            "the stale resolution must never have been written"
+        );
+    }
+
+    #[test]
+    fn parse_conflicted_file_matches_load_conflicted_file_for_the_same_real_bytes() {
+        let (repo, feature) = init_repo_with_two_hunk_conflict();
+        attempt_merge(repo.path(), &feature).expect("attempt_merge");
+        let relative_path = Path::new("f.txt");
+        let text = fs::read_to_string(repo.path().join(relative_path)).expect("read");
+
+        let from_disk = load_conflicted_file(repo.path(), relative_path).expect("load");
+        let from_text = parse_conflicted_file(relative_path, &text).expect("parse");
+        assert_eq!(from_disk, from_text);
+    }
+
+    #[test]
+    fn stage_conflict_resolution_stages_a_file_write_conflict_text_already_wrote() {
+        let (repo, feature) = init_repo_with_two_hunk_conflict();
+        let (_start, outcome) = attempt_merge(repo.path(), &feature).expect("attempt_merge");
+        let MergeOutcome::Conflicted {
+            conflicted_files, ..
+        } = outcome
+        else {
+            panic!("expected a conflicted merge");
+        };
+        let mut file =
+            load_conflicted_file(repo.path(), &conflicted_files[0]).expect("load_conflicted_file");
+        let expected_before = file.render();
+        resolve_hunk(&mut file, 1, ConflictChoice::Left).expect("resolve_hunk");
+        resolve_hunk(&mut file, 3, ConflictChoice::Right).expect("resolve_hunk");
+        assert!(file.is_resolved());
+        let new_content = file.render();
+        let outcome = write_conflict_text(
+            repo.path(),
+            &file.relative_path,
+            &expected_before,
+            &new_content,
+        )
+        .expect("write_conflict_text");
+        assert_eq!(outcome, ConflictWriteOutcome::Written);
+
+        assert!(
+            status(repo.path()).contains("UU f.txt"),
+            "not staged yet - writing through never stages on its own"
+        );
+
+        stage_conflict_resolution(repo.path(), &file.relative_path)
+            .expect("stage_conflict_resolution");
+
+        assert!(
+            !status(repo.path()).contains('U'),
+            "f.txt must be genuinely staged (no remaining unmerged marker) once resolved and \
+             staged: {:?}",
+            status(repo.path())
         );
     }
 }
