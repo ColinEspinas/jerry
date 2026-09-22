@@ -149,6 +149,7 @@ pub fn run(
             WtAction::New(new_args) => wt_new(&mut session, new_args, cli.json, out, err),
         },
         Command::Agents => agents(&mut session, cli.json, out, err),
+        Command::Sessions => sessions(&mut session, cli.json, out, err),
         Command::Hook(args) => hook(&mut session, args, stdin, err),
         Command::Mcp => mcp::run(&mut session, &caller, stdin, out, err),
         // Already handled and returned above, before any `Ctx`/transport existed to build a
@@ -742,6 +743,36 @@ fn agents(session: &mut Session, json: bool, out: &mut dyn Write, err: &mut dyn 
     exit::for_report(&report)
 }
 
+/// Lists every session the connected Jerry is tracking, one per line as `<id>\t<kind>\t<agent>\t
+/// <worktree>` (`<agent>` is `-` for a plain shell), or a JSON array with `--json`.
+/// `Locality::Session`, so this always needs a running Jerry, exactly like [`agents`].
+fn sessions(session: &mut Session, json: bool, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
+    let report = match session.call(Request::Query(AppQuery::Sessions(Default::default())), err) {
+        Ok(report) => report,
+        Err(code) => return code,
+    };
+    if json {
+        return emit_json(&report, out);
+    }
+    match &report {
+        Report::Ok { outcome } => {
+            let Some(entries) = outcome.as_array() else {
+                let _ = writeln!(err, "jerry: unreadable session list: {outcome}");
+                return exit::FAILED;
+            };
+            for entry in entries {
+                let id = entry["id"].as_str().unwrap_or("?");
+                let kind = entry["kind"].as_str().unwrap_or("?");
+                let agent = entry["agent"]["kind"].as_str().unwrap_or("-");
+                let worktree = entry["worktree"].as_str().unwrap_or("?");
+                let _ = writeln!(out, "{id}\t{kind}\t{agent}\t{worktree}");
+            }
+        }
+        other => explain(other, err),
+    }
+    exit::for_report(&report)
+}
+
 fn emit_json(report: &Report, out: &mut dyn Write) -> u8 {
     if serde_json::to_writer(&mut *out, report).is_err() {
         return exit::FAILED;
@@ -1312,6 +1343,73 @@ mod run_tests {
         let runtime = tempfile::TempDir::new().expect("runtime");
         let env = env(&[(runtime_env_key(), runtime.path())]);
         let (code, out, err) = invoke(&["agents"], &env, repo.path());
+        assert_eq!(code, 4, "{err}");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn sessions_lists_a_real_spawned_session_plain_and_json() {
+        let repo = seed_empty_repo();
+        let runtime = tempfile::TempDir::new().expect("runtime");
+        let env = env(&[(runtime_env_key(), runtime.path())]);
+        let registry_dir =
+            jerry_core::registry::runtime_dir_for(Os::host(), &env).expect("runtime dir");
+        let registry = Registry::open(registry_dir).expect("registry");
+        let instance = registry.allocate().expect("instance");
+        let host = jerry_host::Host::start().expect("host");
+        host.listen(&instance.socket).expect("listen");
+        let common = jerry_core::Ctx::from_cwd(repo.path(), jerry_core::Caller::Human)
+            .expect("a repo")
+            .repo_path;
+        registry.publish(&instance, &[common]).expect("publish");
+
+        // Spawned through a real `command/session-spawn` dispatch, at the same seam a real
+        // client would use - not by reaching past it into `jerry-pty` directly.
+        let program = if cfg!(windows) { "cmd" } else { "sh" };
+        let args = if cfg!(windows) {
+            vec!["/c".to_owned(), "echo hi".to_owned()]
+        } else {
+            vec!["-c".to_owned(), "echo hi".to_owned()]
+        };
+        let spawn = jerry_core::Request::Command(jerry_core::AppCommand::SessionSpawn(
+            jerry_core::SessionSpawn {
+                program: program.into(),
+                args,
+                env: Vec::new(),
+                rows: 24,
+                cols: 80,
+            },
+        ));
+        let report = futures::executor::block_on(
+            host.client()
+                .request(jerry_core::Call::human(repo.path(), spawn)),
+        )
+        .expect("spawn dispatched");
+        let jerry_core::Report::Ok { outcome } = report else {
+            panic!("expected ok, got {report:?}")
+        };
+        let id = outcome["id"].as_str().expect("id").to_owned();
+
+        let (code, out, err) = invoke(&["sessions"], &env, repo.path());
+        assert_eq!(code, 0, "stderr: {err}");
+        assert!(out.contains(&format!("{id}\tpty\t-\t")), "{out}");
+
+        let (code, out, err) = invoke(&["sessions", "--json"], &env, repo.path());
+        assert_eq!(code, 0, "stderr: {err}");
+        let report: serde_json::Value = serde_json::from_str(out.trim()).expect("json");
+        assert_eq!(report["outcome"][0]["id"], serde_json::json!(id));
+        assert_eq!(report["outcome"][0]["kind"], serde_json::json!("pty"));
+
+        host.shutdown_and_join();
+        registry.remove(&instance).expect("remove");
+    }
+
+    #[test]
+    fn sessions_needs_a_running_jerry_standalone() {
+        let repo = seed_empty_repo();
+        let runtime = tempfile::TempDir::new().expect("runtime");
+        let env = env(&[(runtime_env_key(), runtime.path())]);
+        let (code, out, err) = invoke(&["sessions"], &env, repo.path());
         assert_eq!(code, 4, "{err}");
         assert!(out.is_empty());
     }
