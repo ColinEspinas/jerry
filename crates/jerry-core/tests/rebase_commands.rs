@@ -125,8 +125,10 @@ fn a_real_conflict_stops_the_rebase_and_a_second_start_is_denied_while_it_is_in_
         other => panic!("expected StoppedForConflict, got {other:?}"),
     }
 
+    let second_start = validate_command(&start, &ctx);
     assert!(
-        matches!(validate_command(&start, &ctx), Report::Denied { ref code, .. } if code == "rebase-already-in-progress")
+        matches!(second_start, Report::Denied { ref code, .. } if code == "rebase-already-in-progress"),
+        "got {second_start:?}"
     );
 
     std::fs::write(repo.path().join("file.txt"), "resolved\n").expect("resolve");
@@ -175,10 +177,11 @@ fn skip_genuinely_skips_the_stopped_commit_and_continues() {
             },
         ],
     };
-    assert!(matches!(
-        outcome(run_command(start, &ctx)),
-        RebaseOutcomeReport::StoppedForConflict { .. }
-    ));
+    let started = outcome(run_command(start, &ctx));
+    assert!(
+        matches!(started, RebaseOutcomeReport::StoppedForConflict { .. }),
+        "got {started:?}"
+    );
 
     assert_eq!(
         outcome(run_command(RebaseSkip::default(), &ctx)),
@@ -204,10 +207,11 @@ fn abort_restores_head_to_exactly_its_pre_rebase_state() {
             action: RebaseActionWire::Pick,
         }],
     };
-    assert!(matches!(
-        outcome(run_command(start, &ctx)),
-        RebaseOutcomeReport::StoppedForConflict { .. }
-    ));
+    let started = outcome(run_command(start, &ctx));
+    assert!(
+        matches!(started, RebaseOutcomeReport::StoppedForConflict { .. }),
+        "got {started:?}"
+    );
 
     assert!(run_command(RebaseAbort::default(), &ctx).is_ok());
     assert_eq!(head(repo.path()), before_head);
@@ -267,8 +271,10 @@ fn amend_head_message_is_denied_with_no_rebase_stopped() {
     let amend = AmendHeadMessage {
         message: "x".into(),
     };
+    let denied = validate_command(&amend, &ctx);
     assert!(
-        matches!(validate_command(&amend, &ctx), Report::Denied { ref code, .. } if code == "rebase-not-stopped")
+        matches!(denied, Report::Denied { ref code, .. } if code == "rebase-not-stopped"),
+        "got {denied:?}"
     );
 }
 
@@ -289,10 +295,11 @@ fn the_status_query_reflects_a_real_stop_and_clears_once_completed() {
             action: RebaseActionWire::Edit,
         }],
     };
-    assert!(matches!(
-        outcome(run_command(start, &ctx)),
-        RebaseOutcomeReport::StoppedForEdit { .. }
-    ));
+    let started = outcome(run_command(start, &ctx));
+    assert!(
+        matches!(started, RebaseOutcomeReport::StoppedForEdit { .. }),
+        "got {started:?}"
+    );
 
     let mid_flight = status(run_query(&RebaseStatusQuery::default(), &ctx))
         .expect("a rebase is really in progress");

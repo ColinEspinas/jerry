@@ -294,7 +294,10 @@ fn resolving_a_real_conflict_for_real_and_continuing_completes_the_rebase() {
 
     let outcome = start_interactive_rebase(repo.path(), &base, &plan, &jerry_binary())
         .expect("start_interactive_rebase");
-    assert!(matches!(outcome, RebaseOutcome::StoppedForConflict { .. }));
+    assert!(
+        matches!(outcome, RebaseOutcome::StoppedForConflict { .. }),
+        "got {outcome:?}"
+    );
 
     std::fs::write(repo.path().join("file.txt"), "resolved").expect("write resolution");
     git(repo.path(), &["add", "file.txt"]);
@@ -324,7 +327,10 @@ fn skip_rebase_commit_genuinely_skips_the_stopped_commit_and_continues() {
 
     let outcome = start_interactive_rebase(repo.path(), &base, &plan, &jerry_binary())
         .expect("start_interactive_rebase");
-    assert!(matches!(outcome, RebaseOutcome::StoppedForConflict { .. }));
+    assert!(
+        matches!(outcome, RebaseOutcome::StoppedForConflict { .. }),
+        "got {outcome:?}"
+    );
 
     let outcome = skip_rebase_commit(repo.path()).expect("skip_rebase_commit");
     assert_eq!(outcome, RebaseOutcome::Completed);
@@ -432,7 +438,10 @@ fn cascading_conflicts_before_a_reword_do_not_misalign_the_message_queue() {
 
     let outcome = start_interactive_rebase(repo.path(), &base, &plan, &jerry_binary())
         .expect("start_interactive_rebase");
-    assert!(matches!(outcome, RebaseOutcome::StoppedForConflict { .. }));
+    assert!(
+        matches!(outcome, RebaseOutcome::StoppedForConflict { .. }),
+        "got {outcome:?}"
+    );
     std::fs::write(repo.path().join("file.txt"), "resolved-1").expect("write");
     git(repo.path(), &["add", "file.txt"]);
     let outcome = continue_rebase(repo.path()).expect("continue after first conflict");
@@ -477,7 +486,10 @@ fn rebase_status_reports_real_state_when_stopped_mid_flight() {
     ];
     let outcome = start_interactive_rebase(repo.path(), &base, &plan, &jerry_binary())
         .expect("start_interactive_rebase");
-    assert!(matches!(outcome, RebaseOutcome::StoppedForEdit { .. }));
+    assert!(
+        matches!(outcome, RebaseOutcome::StoppedForEdit { .. }),
+        "got {outcome:?}"
+    );
 
     let status = rebase_status(repo.path())
         .expect("rebase_status")
@@ -505,7 +517,10 @@ fn rebase_status_reports_conflicted_files_and_no_stop_reason_for_a_real_conflict
     }];
     let outcome = start_interactive_rebase(repo.path(), &base, &plan, &jerry_binary())
         .expect("start_interactive_rebase");
-    assert!(matches!(outcome, RebaseOutcome::StoppedForConflict { .. }));
+    assert!(
+        matches!(outcome, RebaseOutcome::StoppedForConflict { .. }),
+        "got {outcome:?}"
+    );
 
     let status = rebase_status(repo.path())
         .expect("rebase_status")
@@ -528,7 +543,10 @@ fn rebase_preflight_refuses_while_a_rebase_is_already_in_progress() {
     }];
     let outcome = start_interactive_rebase(repo.path(), &base, &plan, &jerry_binary())
         .expect("start_interactive_rebase");
-    assert!(matches!(outcome, RebaseOutcome::StoppedForConflict { .. }));
+    assert!(
+        matches!(outcome, RebaseOutcome::StoppedForConflict { .. }),
+        "got {outcome:?}"
+    );
 
     let err = rebase_preflight(repo.path()).expect_err("already in progress");
     assert!(
