@@ -6,11 +6,12 @@ use crate::command::{
     permits, run_command, run_query, validate_command, Command, Invocability, Locality, Query,
 };
 use crate::commands::{
-    MergeAbort, MergeAttempt, MergeBranchIntoCurrent, MergeComplete, StageResolved,
+    AmendHeadMessage, MergeAbort, MergeAttempt, MergeBranchIntoCurrent, MergeComplete, RebaseAbort,
+    RebaseActionWire, RebaseContinue, RebasePlanEntryWire, RebaseSkip, RebaseStart, StageResolved,
 };
 use crate::ctx::Ctx;
 use crate::method::Method;
-use crate::queries::{MergeStatusQuery, StatusQuery};
+use crate::queries::{MergeStatusQuery, RebaseStatusQuery, StatusQuery};
 use crate::report::Report;
 use crate::wire::{rpc_code, RpcError};
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,11 @@ pub enum AppCommand {
     MergeComplete(MergeComplete),
     MergeAbort(MergeAbort),
     StageResolved(StageResolved),
+    RebaseStart(RebaseStart),
+    RebaseContinue(RebaseContinue),
+    RebaseSkip(RebaseSkip),
+    RebaseAbort(RebaseAbort),
+    AmendHeadMessage(AmendHeadMessage),
 }
 
 /// Every Query a client can send.
@@ -43,19 +49,25 @@ pub enum AppCommand {
 pub enum AppQuery {
     Status(StatusQuery),
     MergeStatus(MergeStatusQuery),
+    RebaseStatus(RebaseStatusQuery),
 }
 
 /// The kebab-case names of every `AppCommand` variant, for method lookup and tool listing.
 pub const COMMAND_NAMES: &[&str] = &[
+    "amend-head-message",
     "merge-abort",
     "merge-attempt",
     "merge-branch-into-current",
     "merge-complete",
+    "rebase-abort",
+    "rebase-continue",
+    "rebase-skip",
+    "rebase-start",
     "stage-resolved",
 ];
 
 /// The kebab-case names of every `AppQuery` variant.
-pub const QUERY_NAMES: &[&str] = &["merge-status", "status"];
+pub const QUERY_NAMES: &[&str] = &["merge-status", "rebase-status", "status"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Request {
@@ -85,6 +97,11 @@ macro_rules! each_command {
             AppCommand::MergeComplete($c) => $body,
             AppCommand::MergeAbort($c) => $body,
             AppCommand::StageResolved($c) => $body,
+            AppCommand::RebaseStart($c) => $body,
+            AppCommand::RebaseContinue($c) => $body,
+            AppCommand::RebaseSkip($c) => $body,
+            AppCommand::RebaseAbort($c) => $body,
+            AppCommand::AmendHeadMessage($c) => $body,
         }
     };
 }
@@ -97,6 +114,11 @@ impl AppCommand {
             AppCommand::MergeComplete(_) => MergeComplete::NAME,
             AppCommand::MergeAbort(_) => MergeAbort::NAME,
             AppCommand::StageResolved(_) => StageResolved::NAME,
+            AppCommand::RebaseStart(_) => RebaseStart::NAME,
+            AppCommand::RebaseContinue(_) => RebaseContinue::NAME,
+            AppCommand::RebaseSkip(_) => RebaseSkip::NAME,
+            AppCommand::RebaseAbort(_) => RebaseAbort::NAME,
+            AppCommand::AmendHeadMessage(_) => AmendHeadMessage::NAME,
         }
     }
 
@@ -123,6 +145,7 @@ macro_rules! each_query {
         match $self {
             AppQuery::Status($q) => $body,
             AppQuery::MergeStatus($q) => $body,
+            AppQuery::RebaseStatus($q) => $body,
         }
     };
 }
@@ -132,6 +155,7 @@ impl AppQuery {
         match self {
             AppQuery::Status(_) => StatusQuery::NAME,
             AppQuery::MergeStatus(_) => MergeStatusQuery::NAME,
+            AppQuery::RebaseStatus(_) => RebaseStatusQuery::NAME,
         }
     }
 
@@ -264,6 +288,38 @@ impl Request {
                 Request::Command(AppCommand::StageResolved(StageResolved {
                     worktree_path: "/repo".into(),
                     path: "src/a.rs".into(),
+                })),
+            ),
+            (
+                "request-query-rebase-status",
+                Request::Query(AppQuery::RebaseStatus(RebaseStatusQuery::default())),
+            ),
+            (
+                "request-command-rebase-start",
+                Request::Command(AppCommand::RebaseStart(RebaseStart {
+                    onto: "0123456789abcdef0123456789abcdef01234567".into(),
+                    plan: vec![RebasePlanEntryWire {
+                        commit: "89abcdef0123456789abcdef0123456789abcdef".into(),
+                        action: RebaseActionWire::Pick,
+                    }],
+                })),
+            ),
+            (
+                "request-command-rebase-continue",
+                Request::Command(AppCommand::RebaseContinue(RebaseContinue::default())),
+            ),
+            (
+                "request-command-rebase-skip",
+                Request::Command(AppCommand::RebaseSkip(RebaseSkip::default())),
+            ),
+            (
+                "request-command-rebase-abort",
+                Request::Command(AppCommand::RebaseAbort(RebaseAbort::default())),
+            ),
+            (
+                "request-command-amend-head-message",
+                Request::Command(AppCommand::AmendHeadMessage(AmendHeadMessage {
+                    message: "a real new message".into(),
                 })),
             ),
         ]

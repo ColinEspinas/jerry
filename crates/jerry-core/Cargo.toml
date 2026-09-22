@@ -22,6 +22,15 @@ thiserror = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 uds_windows = "=1.2.1"
 
+[[bin]]
+# A minimal, real executable standing in for `jerry` itself, so `RebaseStart`'s own integration
+# tests (`tests/rebase_commands.rs`) can make `jerry_binary::locate` find a genuinely executable
+# file - `CARGO_BIN_EXE_<name>` is only reliable for a `[[bin]]` of the *same* package inside an
+# integration test, verified against this workspace's own build (a cross-crate dev-dependency, or
+# any `--lib` unit test, could not see it at all). See `src/bin/test_jerry.rs`.
+name = "jerry_core_test_jerry"
+path = "src/bin/test_jerry.rs"
+
 [dev-dependencies]
 tempfile = "3"
 test-support = { path = "../test-support" }

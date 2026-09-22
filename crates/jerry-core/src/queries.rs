@@ -2,6 +2,7 @@
 //! in whatever process holds it.
 
 use crate::command::{Locality, Query};
+use crate::commands::StopReasonWire;
 use crate::ctx::Ctx;
 use crate::error::Error;
 use serde::{Deserialize, Serialize};
@@ -67,5 +68,48 @@ impl Query for MergeStatusQuery {
             in_progress_at,
             unmerged,
         })
+    }
+}
+
+/// Is a rebase stopped at the caller's worktree, and where. What the graph pane's rebase mode
+/// reconstructs its `Stopped`/`Planning` phase from after dispatching a mutation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebaseStatusQuery {}
+
+/// `jerry_git::rebase::RebaseStatus`, mirrored: paths and names only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebaseStatusOutcome {
+    pub onto: Option<String>,
+    pub current_step: Option<usize>,
+    pub total_steps: Option<usize>,
+    pub stopped_commit: Option<String>,
+    pub conflicted_files: Vec<PathBuf>,
+    pub stop_reason: Option<StopReasonWire>,
+}
+
+impl From<jerry_git::rebase::RebaseStatus> for RebaseStatusOutcome {
+    fn from(status: jerry_git::rebase::RebaseStatus) -> Self {
+        RebaseStatusOutcome {
+            onto: status.onto,
+            current_step: status.current_step,
+            total_steps: status.total_steps,
+            stopped_commit: status.stopped_commit,
+            conflicted_files: status.conflicted_files,
+            stop_reason: status.stop_reason.map(Into::into),
+        }
+    }
+}
+
+impl Query for RebaseStatusQuery {
+    type Outcome = Option<RebaseStatusOutcome>;
+    const NAME: &'static str = "rebase-status";
+
+    fn locality(&self) -> Locality {
+        Locality::Git
+    }
+
+    fn run(&self, ctx: &Ctx) -> Result<Option<RebaseStatusOutcome>, Error> {
+        let status = jerry_git::rebase::rebase_status(&ctx.worktree_path)?;
+        Ok(status.map(Into::into))
     }
 }

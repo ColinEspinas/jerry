@@ -235,6 +235,361 @@ impl Command for StageResolved {
     }
 }
 
+/// One rebase todo row on the wire, mirroring `jerry_git::rebase::RebasePlanEntry` - never
+/// deriving `Serialize` on the domain type itself (which would put a wire-format contract on a
+/// pure-domain crate that has no `serde` dependency at all), so the wire shape and jerry-git's own
+/// verb names can't silently diverge. Mirrors `ConflictKind`'s identical reasoning for merge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebasePlanEntryWire {
+    /// A full object id, not abbreviated - `jerry_git::rebase::RebasePlanEntry::commit`'s own
+    /// contract.
+    pub commit: String,
+    pub action: RebaseActionWire,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum RebaseActionWire {
+    Pick,
+    Reword {
+        #[serde(default)]
+        message: Option<String>,
+    },
+    Edit,
+    Squash,
+    Fixup,
+    Drop,
+}
+
+impl From<RebasePlanEntryWire> for jerry_git::rebase::RebasePlanEntry {
+    fn from(wire: RebasePlanEntryWire) -> Self {
+        jerry_git::rebase::RebasePlanEntry {
+            commit: wire.commit,
+            action: wire.action.into(),
+        }
+    }
+}
+
+impl From<RebaseActionWire> for jerry_git::rebase::RebaseAction {
+    fn from(wire: RebaseActionWire) -> Self {
+        use jerry_git::rebase::RebaseAction as A;
+        match wire {
+            RebaseActionWire::Pick => A::Pick,
+            RebaseActionWire::Reword { message } => A::Reword(message),
+            RebaseActionWire::Edit => A::Edit,
+            RebaseActionWire::Squash => A::Squash,
+            RebaseActionWire::Fixup => A::Fixup,
+            RebaseActionWire::Drop => A::Drop,
+        }
+    }
+}
+
+/// The other direction - the app builds a plan in memory as `jerry_git::rebase` types (they are
+/// plain data, so it already has them) and wires it up only to dispatch `RebaseStart`.
+impl From<jerry_git::rebase::RebasePlanEntry> for RebasePlanEntryWire {
+    fn from(entry: jerry_git::rebase::RebasePlanEntry) -> Self {
+        RebasePlanEntryWire {
+            commit: entry.commit,
+            action: entry.action.into(),
+        }
+    }
+}
+
+impl From<jerry_git::rebase::RebaseAction> for RebaseActionWire {
+    fn from(action: jerry_git::rebase::RebaseAction) -> Self {
+        use jerry_git::rebase::RebaseAction as A;
+        match action {
+            A::Pick => RebaseActionWire::Pick,
+            A::Reword(message) => RebaseActionWire::Reword { message },
+            A::Edit => RebaseActionWire::Edit,
+            A::Squash => RebaseActionWire::Squash,
+            A::Fixup => RebaseActionWire::Fixup,
+            A::Drop => RebaseActionWire::Drop,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StopReasonWire {
+    Edit,
+    RewordNeedsMessage,
+}
+
+impl From<jerry_git::rebase::StopReason> for StopReasonWire {
+    fn from(reason: jerry_git::rebase::StopReason) -> Self {
+        match reason {
+            jerry_git::rebase::StopReason::Edit => StopReasonWire::Edit,
+            jerry_git::rebase::StopReason::RewordNeedsMessage => StopReasonWire::RewordNeedsMessage,
+        }
+    }
+}
+
+impl From<StopReasonWire> for jerry_git::rebase::StopReason {
+    fn from(reason: StopReasonWire) -> Self {
+        match reason {
+            StopReasonWire::Edit => jerry_git::rebase::StopReason::Edit,
+            StopReasonWire::RewordNeedsMessage => jerry_git::rebase::StopReason::RewordNeedsMessage,
+        }
+    }
+}
+
+/// `jerry_git::rebase::RebaseOutcome`, mirrored: paths and names only, never file contents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "kebab-case")]
+pub enum RebaseOutcomeReport {
+    Completed,
+    StoppedForEdit {
+        commit: String,
+        reason: Option<StopReasonWire>,
+    },
+    StoppedForConflict {
+        commit: String,
+        conflicted_files: Vec<PathBuf>,
+    },
+}
+
+impl From<jerry_git::rebase::RebaseOutcome> for RebaseOutcomeReport {
+    fn from(outcome: jerry_git::rebase::RebaseOutcome) -> Self {
+        match outcome {
+            jerry_git::rebase::RebaseOutcome::Completed => RebaseOutcomeReport::Completed,
+            jerry_git::rebase::RebaseOutcome::StoppedForEdit { commit, reason } => {
+                RebaseOutcomeReport::StoppedForEdit {
+                    commit,
+                    reason: reason.map(Into::into),
+                }
+            }
+            jerry_git::rebase::RebaseOutcome::StoppedForConflict {
+                commit,
+                conflicted_files,
+            } => RebaseOutcomeReport::StoppedForConflict {
+                commit,
+                conflicted_files,
+            },
+        }
+    }
+}
+
+/// The other direction - the app's rebase mode keeps its `RebasePhase` in terms of
+/// `jerry_git::rebase::RebaseOutcome` (plain data it already has, reused rather than growing a
+/// second local mirror), reconstructed from the wire `Report` every dispatch returns.
+impl From<RebaseOutcomeReport> for jerry_git::rebase::RebaseOutcome {
+    fn from(outcome: RebaseOutcomeReport) -> Self {
+        match outcome {
+            RebaseOutcomeReport::Completed => jerry_git::rebase::RebaseOutcome::Completed,
+            RebaseOutcomeReport::StoppedForEdit { commit, reason } => {
+                jerry_git::rebase::RebaseOutcome::StoppedForEdit {
+                    commit,
+                    reason: reason.map(Into::into),
+                }
+            }
+            RebaseOutcomeReport::StoppedForConflict {
+                commit,
+                conflicted_files,
+            } => jerry_git::rebase::RebaseOutcome::StoppedForConflict {
+                commit,
+                conflicted_files,
+            },
+        }
+    }
+}
+
+/// Starts a real interactive rebase onto `onto`, driving `plan` to completion or the first stop.
+/// `Denied` to agents: git already gives an agent a rebase.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebaseStart {
+    pub onto: String,
+    pub plan: Vec<RebasePlanEntryWire>,
+}
+
+/// Resumes a stopped rebase, driving it to completion or the next stop.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebaseContinue {}
+
+/// Skips the commit a stopped rebase is at, driving it to completion or the next stop.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebaseSkip {}
+
+/// Aborts an in-progress rebase, restoring the pre-rebase state.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebaseAbort {}
+
+/// Amends the message of the commit a rebase is stopped at - applying a message obtained *after*
+/// a message-less `reword` stop, which `jerry_git::rebase::start_interactive_rebase`'s own reword
+/// queue can never pick up retroactively.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AmendHeadMessage {
+    pub message: String,
+}
+
+impl Command for RebaseStart {
+    type Outcome = RebaseOutcomeReport;
+    const NAME: &'static str = "rebase-start";
+
+    fn invocability(&self) -> Invocability {
+        Invocability::Denied
+    }
+
+    fn locality(&self) -> Locality {
+        Locality::Git
+    }
+
+    fn validate(&self, ctx: &Ctx) -> Result<(), Denied> {
+        jerry_git::rebase::rebase_preflight(&ctx.worktree_path).map_err(denied_by_git)?;
+        require_jerry_binary()?;
+        Ok(())
+    }
+
+    fn execute(self, ctx: &Ctx) -> Result<RebaseOutcomeReport, Error> {
+        let jerry_binary = crate::jerry_binary::locate().ok_or_else(jerry_binary_not_found)?;
+        let plan: Vec<jerry_git::rebase::RebasePlanEntry> =
+            self.plan.into_iter().map(Into::into).collect();
+        let outcome = jerry_git::rebase::start_interactive_rebase(
+            &ctx.worktree_path,
+            &self.onto,
+            &plan,
+            &jerry_binary,
+        )?;
+        Ok(outcome.into())
+    }
+}
+
+impl Command for RebaseContinue {
+    type Outcome = RebaseOutcomeReport;
+    const NAME: &'static str = "rebase-continue";
+
+    fn invocability(&self) -> Invocability {
+        Invocability::Denied
+    }
+
+    fn locality(&self) -> Locality {
+        Locality::Git
+    }
+
+    fn validate(&self, ctx: &Ctx) -> Result<(), Denied> {
+        require_rebase_in_progress(&ctx.worktree_path)
+    }
+
+    fn execute(self, ctx: &Ctx) -> Result<RebaseOutcomeReport, Error> {
+        let outcome = jerry_git::rebase::continue_rebase(&ctx.worktree_path)?;
+        Ok(outcome.into())
+    }
+}
+
+impl Command for RebaseSkip {
+    type Outcome = RebaseOutcomeReport;
+    const NAME: &'static str = "rebase-skip";
+
+    fn invocability(&self) -> Invocability {
+        Invocability::Denied
+    }
+
+    fn locality(&self) -> Locality {
+        Locality::Git
+    }
+
+    fn validate(&self, ctx: &Ctx) -> Result<(), Denied> {
+        require_rebase_in_progress(&ctx.worktree_path)
+    }
+
+    fn execute(self, ctx: &Ctx) -> Result<RebaseOutcomeReport, Error> {
+        let outcome = jerry_git::rebase::skip_rebase_commit(&ctx.worktree_path)?;
+        Ok(outcome.into())
+    }
+}
+
+impl Command for RebaseAbort {
+    type Outcome = ();
+    const NAME: &'static str = "rebase-abort";
+
+    fn invocability(&self) -> Invocability {
+        Invocability::Denied
+    }
+
+    fn locality(&self) -> Locality {
+        Locality::Git
+    }
+
+    fn validate(&self, ctx: &Ctx) -> Result<(), Denied> {
+        require_rebase_in_progress(&ctx.worktree_path)
+    }
+
+    fn execute(self, ctx: &Ctx) -> Result<(), Error> {
+        jerry_git::rebase::abort_rebase(&ctx.worktree_path)?;
+        Ok(())
+    }
+}
+
+impl Command for AmendHeadMessage {
+    type Outcome = ();
+    const NAME: &'static str = "amend-head-message";
+
+    fn invocability(&self) -> Invocability {
+        Invocability::Denied
+    }
+
+    fn locality(&self) -> Locality {
+        Locality::Git
+    }
+
+    fn validate(&self, ctx: &Ctx) -> Result<(), Denied> {
+        require_rebase_stopped(&ctx.worktree_path)
+    }
+
+    fn execute(self, ctx: &Ctx) -> Result<(), Error> {
+        let status = jerry_git::rebase::rebase_status(&ctx.worktree_path)?;
+        let stopped_commit = status
+            .and_then(|status| status.stopped_commit)
+            .ok_or_else(|| {
+                Error::new(
+                    "rebase-not-stopped",
+                    format!("no rebase is stopped at {}", ctx.worktree_path.display()),
+                )
+            })?;
+        jerry_git::rebase::amend_head_message(&ctx.worktree_path, &stopped_commit, &self.message)?;
+        Ok(())
+    }
+}
+
+fn require_rebase_in_progress(worktree_path: &Path) -> Result<(), Denied> {
+    match jerry_git::rebase::rebase_status(worktree_path) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(Denied::new(
+            "rebase-not-in-progress",
+            format!("no rebase is in progress at {}", worktree_path.display()),
+        )),
+        Err(error) => Err(denied_by_git(error)),
+    }
+}
+
+fn require_rebase_stopped(worktree_path: &Path) -> Result<(), Denied> {
+    match jerry_git::rebase::rebase_status(worktree_path) {
+        Ok(Some(status)) if status.stopped_commit.is_some() => Ok(()),
+        Ok(_) => Err(Denied::new(
+            "rebase-not-stopped",
+            format!("no rebase is stopped at {}", worktree_path.display()),
+        )),
+        Err(error) => Err(denied_by_git(error)),
+    }
+}
+
+fn require_jerry_binary() -> Result<(), Denied> {
+    if crate::jerry_binary::locate().is_some() {
+        return Ok(());
+    }
+    Err(Denied::new(
+        "jerry-binary-not-found",
+        "could not locate the jerry binary needed to drive git's rebase editor hooks",
+    ))
+}
+
+fn jerry_binary_not_found() -> Error {
+    Error::new(
+        "jerry-binary-not-found",
+        "could not locate the jerry binary needed to drive git's rebase editor hooks",
+    )
+}
+
 fn require_merge_in_progress(base_worktree_path: &Path) -> Result<(), Denied> {
     match merge::merge_head_exists(base_worktree_path) {
         Ok(true) => Ok(()),

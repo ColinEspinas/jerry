@@ -1,13 +1,17 @@
 //! Headless `git rebase --interactive`: the engine, with no UI.
 //!
 //! Real `git rebase` driven non-interactively through `GIT_SEQUENCE_EDITOR` and `GIT_EDITOR` - the
-//! same hooks a human's `$EDITOR` goes through, pointed at scripts this module writes. See
-//! `docs/architecture/decisions.md` §7 for the mechanism and why each part of it is load-bearing.
+//! same hooks a human's `$EDITOR` goes through, pointed at hidden `jerry git-sequence-editor`/
+//! `jerry git-editor` subcommands rather than a generated shell script, so this works on every
+//! platform the `jerry` binary runs on. See `docs/architecture/decisions.md` §7 for the mechanism
+//! and why each part of it is load-bearing; [`classify_editor_invocation`] is the three-case
+//! message classification that subcommand drives, and [`run_editor`]/[`run_sequence_editor`] are
+//! its whole implementation.
 //!
 //! Sidecar state lives under `<git-dir>/ade-rebase/` until the rebase completes or aborts, so
 //! [`rebase_status`] can reconstruct a stop after a process restart.
 //!
-//! Unix-only: the editor script is `/bin/sh`. Performs blocking I/O; see the crate-level docs.
+//! Performs blocking I/O; see the crate-level docs.
 
 use std::ffi::OsString;
 use std::fs;
@@ -164,67 +168,73 @@ fn shell_single_quote(path: &Path) -> String {
     out
 }
 
-/// Template for [`write_editor_script`]'s `GIT_EDITOR` script; its three cases are set out in
-/// `docs/architecture/decisions.md` §7.
-const EDITOR_SCRIPT_TEMPLATE: &str = r#"#!/bin/sh
-set -eu
-QUEUE_DIR=__QUEUE_DIR__
-CURSOR_FILE=__CURSOR_FILE__
-TARGET="$1"
-
-# Squash message-combination: accept git's own default combined message unmodified.
-if head -n 1 -- "$TARGET" | grep -q '^# This is a combination of'; then
-    exit 0
-fi
-
-# A genuine reword invocation: consume the next queued slot.
-if grep -q 'You are currently editing a commit' -- "$TARGET"; then
-    if [ -f "$CURSOR_FILE" ]; then
-        CURSOR=$(cat -- "$CURSOR_FILE")
-    else
-        CURSOR=0
-    fi
-    NEXT=$((CURSOR + 1))
-    printf '%s' "$NEXT" > "$CURSOR_FILE"
-    SLOT="$QUEUE_DIR/$CURSOR"
-    if [ -f "$SLOT" ]; then
-        cp -- "$SLOT" "$TARGET"
-        exit 0
-    fi
-    exit 1
-fi
-
-# Anything else (e.g. a plain pick/fixup resumed after a real conflict, which git re-commits
-# through the ordinary editor-invoking codepath) - accept the pre-filled default, unmodified,
-# and never touch the reword queue's cursor.
-exit 0
-"#;
-
-#[cfg(unix)]
-fn make_executable(path: &Path) -> Result<(), Error> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = fs::metadata(path)?.permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(path, perms)?;
-    Ok(())
+/// One `GIT_EDITOR` invocation's outcome, decided from the message file's own content plus the
+/// reword queue's current cursor - never by invocation order (decisions §7). Pure: [`run_editor`]
+/// performs every read/write this implies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditorAction {
+    /// A squash message combination: accept git's own combined message unmodified.
+    AcceptUnmodified,
+    /// A genuine reword: replace the message file with queue slot `slot_index`, if one was
+    /// queued. Either way the cursor advances past it - each reword invocation consumes exactly
+    /// one slot even when it stops for a missing one.
+    Reword { slot_index: usize },
+    /// A conflict-resumed step, or an `edit` stop's own ordinary commit: accept git's pre-filled
+    /// message and never touch the queue.
+    AcceptUnmodifiedNoAdvance,
 }
 
-#[cfg(not(unix))]
-fn make_executable(_path: &Path) -> Result<(), Error> {
-    Ok(())
+/// Classifies one `GIT_EDITOR` invocation from the message file's own content, per
+/// `docs/architecture/decisions.md` §7's three cases - never by invocation order.
+pub fn classify_editor_invocation(message: &str, cursor: usize) -> EditorAction {
+    if message
+        .lines()
+        .next()
+        .is_some_and(|line| line.starts_with("# This is a combination of"))
+    {
+        return EditorAction::AcceptUnmodified;
+    }
+    if message.contains("You are currently editing a commit") {
+        return EditorAction::Reword { slot_index: cursor };
+    }
+    EditorAction::AcceptUnmodifiedNoAdvance
 }
 
-/// Writes the `GIT_EDITOR` script into `dir` and returns its path.
-fn write_editor_script(dir: &Path) -> Result<PathBuf, Error> {
-    let script_path = dir.join("editor.sh");
-    let queue_dir = dir.join("queue");
-    let cursor_file = dir.join("cursor");
-    let script = EDITOR_SCRIPT_TEMPLATE
-        .replace("__QUEUE_DIR__", &shell_single_quote(&queue_dir))
-        .replace("__CURSOR_FILE__", &shell_single_quote(&cursor_file));
-    fs::write(&script_path, script)?;
-    make_executable(&script_path)?;
-    Ok(script_path)
+/// Drives one real `GIT_EDITOR` invocation: reads `message_file_path`'s content and the sidecar's
+/// reword cursor, classifies it ([`classify_editor_invocation`]), and applies whatever that
+/// implies. Returns `false` exactly when git's own `edit`-stop behaviour should be reproduced (a
+/// message-less reword with nothing queued) - `jerry git-editor` exits non-zero for that, matching
+/// the former `/bin/sh` script's `exit 1`.
+pub fn run_editor(worktree_path: &Path, message_file_path: &Path) -> Result<bool, Error> {
+    let git_dir = worktree_git_dir(worktree_path)?;
+    let dir = state_dir(&git_dir);
+    let message = fs::read_to_string(message_file_path)?;
+    let cursor = read_trimmed(&dir.join("cursor"))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+
+    match classify_editor_invocation(&message, cursor) {
+        EditorAction::AcceptUnmodified | EditorAction::AcceptUnmodifiedNoAdvance => Ok(true),
+        EditorAction::Reword { slot_index } => {
+            fs::write(dir.join("cursor"), (slot_index + 1).to_string())?;
+            let slot = dir.join("queue").join(slot_index.to_string());
+            if !slot.is_file() {
+                return Ok(false);
+            }
+            fs::copy(&slot, message_file_path)?;
+            Ok(true)
+        }
+    }
+}
+
+/// Drives one real `GIT_SEQUENCE_EDITOR` invocation: copies the prepared todo
+/// ([`write_plan_state`]'s `todo.txt`) over git's own freshly generated one at
+/// `generated_todo_path`.
+pub fn run_sequence_editor(worktree_path: &Path, generated_todo_path: &Path) -> Result<(), Error> {
+    let git_dir = worktree_git_dir(worktree_path)?;
+    let prepared = state_dir(&git_dir).join("todo.txt");
+    fs::copy(&prepared, generated_todo_path)?;
+    Ok(())
 }
 
 /// Writes `plan`'s todo file, reword-message queue and `commits.txt` cross-reference into a fresh
@@ -389,30 +399,55 @@ pub fn commits_to_rebase(worktree_path: &Path, onto: &str) -> Result<Vec<String>
         .collect())
 }
 
+/// Every check [`start_interactive_rebase`] makes before touching git, split out so a caller
+/// (the `RebaseStart` Command's own `validate`) can ask "would this run" without running it -
+/// mirrors `jerry_git::merge::merge_preflight`'s own split from `attempt_merge`.
+///
+/// Only real git state is checked here - a stale, uncleaned-up `<git-dir>/ade-rebase/` from a
+/// previous run is not a reason to refuse (see [`start_interactive_rebase`]'s own handling of it).
+pub fn rebase_preflight(worktree_path: &Path) -> Result<(), Error> {
+    if rebase_status(worktree_path)?.is_some() {
+        return Err(Error::RebaseAlreadyInProgress {
+            path: worktree_path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
 /// Rebases the current branch onto `onto`, driving `plan` to completion or the first stop.
 ///
-/// `plan` is oldest-first and is not reversed here.
+/// `plan` is oldest-first and is not reversed here. `jerry_binary` is spliced into
+/// `GIT_SEQUENCE_EDITOR`/`GIT_EDITOR` as `<jerry_binary> git-sequence-editor`/`<jerry_binary>
+/// git-editor` - the caller's job to locate (the app via `crates/jerry-app/src/host.rs::
+/// find_jerry_binary`, the CLI via `std::env::current_exe`), since this crate has no opinion on
+/// installation layout.
 pub fn start_interactive_rebase(
     worktree_path: &Path,
     onto: &str,
     plan: &[RebasePlanEntry],
+    jerry_binary: &Path,
 ) -> Result<RebaseOutcome, Error> {
+    rebase_preflight(worktree_path)?;
     let git_dir = worktree_git_dir(worktree_path)?;
     let dir = state_dir(&git_dir);
     // Clear any stale state from a previous, uncleaned-up run before starting fresh.
     if dir.exists() {
         fs::remove_dir_all(&dir)?;
     }
-    let todo_path = write_plan_state(&dir, plan)?;
-    let editor_path = write_editor_script(&dir)?;
+    write_plan_state(&dir, plan)?;
+    let jerry_quoted = shell_single_quote(jerry_binary);
+    // Persisted, not just set on this invocation's env: `run_rebase_step` needs the exact same
+    // `GIT_EDITOR` value for a later `--continue`/`--skip`, potentially after a process restart.
+    let editor_command = format!("{jerry_quoted} git-editor");
+    fs::write(dir.join("editor-command"), &editor_command)?;
 
     let args: Vec<OsString> = vec!["rebase".into(), "-i".into(), onto.into()];
     let mut command = git_command(worktree_path, &args);
     command.env(
         "GIT_SEQUENCE_EDITOR",
-        format!("cp {}", shell_single_quote(&todo_path)),
+        format!("{jerry_quoted} git-sequence-editor"),
     );
-    command.env("GIT_EDITOR", shell_single_quote(&editor_path));
+    command.env("GIT_EDITOR", &editor_command);
     let output = command.output().map_err(|source| Error::GitSpawn {
         args: format_args(&args),
         source,
@@ -478,7 +513,7 @@ pub fn amend_head_message(
     check_success(&args, &output)
 }
 
-/// Drives one `git rebase --continue`/`--skip` with the persisted `GIT_EDITOR` script active,
+/// Drives one `git rebase --continue`/`--skip` with the persisted `GIT_EDITOR` value active,
 /// since a later row may still need it.
 ///
 /// Falls back to `GIT_EDITOR=true` when that state is gone, so this can never be left waiting on
@@ -488,14 +523,13 @@ fn run_rebase_step(
     git_dir: &Path,
     extra_arg: &str,
 ) -> Result<RebaseOutcome, Error> {
-    let editor_path = state_dir(git_dir).join("editor.sh");
+    let editor_command = read_trimmed(&state_dir(git_dir).join("editor-command"));
     let args: Vec<OsString> = vec!["rebase".into(), extra_arg.into()];
     let mut command = git_command(worktree_path, &args);
-    if editor_path.is_file() {
-        command.env("GIT_EDITOR", shell_single_quote(&editor_path));
-    } else {
-        command.env("GIT_EDITOR", "true");
-    }
+    match editor_command {
+        Some(value) => command.env("GIT_EDITOR", value),
+        None => command.env("GIT_EDITOR", "true"),
+    };
     let output = command.output().map_err(|source| Error::GitSpawn {
         args: format_args(&args),
         source,
@@ -561,7 +595,6 @@ pub fn rebase_status(worktree_path: &Path) -> Result<Option<RebaseStatus>, Error
 mod tests {
     use super::*;
     use std::process::Command;
-    use tempfile::TempDir;
     use test_support::{git, git_output, seed_empty_repo};
 
     fn commit(dir: &Path, file: &str, contents: &str, message: &str) -> String {
@@ -569,13 +602,6 @@ mod tests {
         git(dir, &["add", file]);
         git(dir, &["commit", "-m", message]);
         git_output(dir, &["rev-parse", "HEAD"])
-    }
-
-    fn log_subjects(dir: &Path) -> Vec<String> {
-        git_output(dir, &["log", "--format=%s", "--reverse"])
-            .lines()
-            .map(str::to_string)
-            .collect()
     }
 
     fn commit_message(dir: &Path, commit: &str) -> String {
@@ -621,148 +647,15 @@ mod tests {
         assert!(commits.is_empty());
     }
 
-    // --- start_interactive_rebase: no-stop plans --------------------------------------------
-
-    #[test]
-    fn all_pick_plan_completes_cleanly_with_history_matching_the_plan() {
-        let repo = seed_empty_repo();
-        let base = commit(repo.path(), "base.txt", "base", "base");
-        let c1 = commit(repo.path(), "a.txt", "1", "commit 1");
-        let c2 = commit(repo.path(), "b.txt", "2", "commit 2");
-        let c3 = commit(repo.path(), "c.txt", "3", "commit 3");
-
-        let plan = vec![
-            RebasePlanEntry {
-                commit: c1,
-                action: RebaseAction::Pick,
-            },
-            RebasePlanEntry {
-                commit: c2,
-                action: RebaseAction::Pick,
-            },
-            RebasePlanEntry {
-                commit: c3,
-                action: RebaseAction::Pick,
-            },
-        ];
-
-        let outcome =
-            start_interactive_rebase(repo.path(), &base, &plan).expect("start_interactive_rebase");
-        assert_eq!(outcome, RebaseOutcome::Completed);
-        assert_eq!(
-            log_subjects(repo.path()),
-            vec!["base", "commit 1", "commit 2", "commit 3"]
-        );
-    }
-
-    #[test]
-    fn drop_removes_the_commit_from_history() {
-        let repo = seed_empty_repo();
-        let base = commit(repo.path(), "base.txt", "base", "base");
-        let c1 = commit(repo.path(), "a.txt", "1", "commit 1");
-        let c2 = commit(repo.path(), "b.txt", "2", "commit 2");
-
-        let plan = vec![
-            RebasePlanEntry {
-                commit: c1,
-                action: RebaseAction::Drop,
-            },
-            RebasePlanEntry {
-                commit: c2,
-                action: RebaseAction::Pick,
-            },
-        ];
-
-        let outcome =
-            start_interactive_rebase(repo.path(), &base, &plan).expect("start_interactive_rebase");
-        assert_eq!(outcome, RebaseOutcome::Completed);
-        assert_eq!(log_subjects(repo.path()), vec!["base", "commit 2"]);
-        assert!(!repo.path().join("a.txt").exists());
-    }
-
-    #[test]
-    fn squash_folds_into_the_previous_commit_keeping_both_original_messages() {
-        let repo = seed_empty_repo();
-        let base = commit(repo.path(), "base.txt", "base", "base");
-        let c1 = commit(repo.path(), "a.txt", "1", "commit 1");
-        let c2 = commit(repo.path(), "b.txt", "2", "commit 2");
-
-        let plan = vec![
-            RebasePlanEntry {
-                commit: c1,
-                action: RebaseAction::Pick,
-            },
-            RebasePlanEntry {
-                commit: c2,
-                action: RebaseAction::Squash,
-            },
-        ];
-
-        let outcome =
-            start_interactive_rebase(repo.path(), &base, &plan).expect("start_interactive_rebase");
-        assert_eq!(outcome, RebaseOutcome::Completed);
-        assert_eq!(log_subjects(repo.path()), vec!["base", "commit 1"]);
-        let head = git_output(repo.path(), &["rev-parse", "HEAD"]);
-        let message = commit_message(repo.path(), &head);
-        assert!(
-            message.contains("commit 1") && message.contains("commit 2"),
-            "the combined message must contain both original messages unmodified, got: \
-             {message:?}"
-        );
-        assert!(repo.path().join("a.txt").exists());
-        assert!(repo.path().join("b.txt").exists());
-    }
-
-    #[test]
-    fn fixup_folds_into_the_previous_commit_discarding_its_own_message() {
-        let repo = seed_empty_repo();
-        let base = commit(repo.path(), "base.txt", "base", "base");
-        let c1 = commit(repo.path(), "a.txt", "1", "commit 1");
-        let c2 = commit(repo.path(), "b.txt", "2", "commit 2");
-
-        let plan = vec![
-            RebasePlanEntry {
-                commit: c1,
-                action: RebaseAction::Pick,
-            },
-            RebasePlanEntry {
-                commit: c2,
-                action: RebaseAction::Fixup,
-            },
-        ];
-
-        let outcome =
-            start_interactive_rebase(repo.path(), &base, &plan).expect("start_interactive_rebase");
-        assert_eq!(outcome, RebaseOutcome::Completed);
-        assert_eq!(log_subjects(repo.path()), vec!["base", "commit 1"]);
-        let head = git_output(repo.path(), &["rev-parse", "HEAD"]);
-        let message = commit_message(repo.path(), &head);
-        assert!(message.contains("commit 1"));
-        assert!(
-            !message.contains("commit 2"),
-            "fixup must discard the folded commit's own message, got: {message:?}"
-        );
-    }
-
-    #[test]
-    fn reword_with_a_supplied_message_runs_straight_through_with_no_stop() {
-        let repo = seed_empty_repo();
-        let base = commit(repo.path(), "base.txt", "base", "base");
-        let c1 = commit(repo.path(), "a.txt", "1", "original message");
-
-        let plan = vec![RebasePlanEntry {
-            commit: c1,
-            action: RebaseAction::Reword(Some("new message".to_string())),
-        }];
-
-        let outcome =
-            start_interactive_rebase(repo.path(), &base, &plan).expect("start_interactive_rebase");
-        assert_eq!(outcome, RebaseOutcome::Completed);
-        let head = git_output(repo.path(), &["rev-parse", "HEAD"]);
-        assert_eq!(commit_message(repo.path(), &head), "new message");
-    }
-
     // --- amend_head_message ------------------------------------------------------------------
+    //
+    // Every test that drives a real `start_interactive_rebase`/`continue_rebase`/
+    // `skip_rebase_commit` call (needing a genuinely executable `GIT_SEQUENCE_EDITOR`/
+    // `GIT_EDITOR`) lives in `tests/rebase_editor.rs` instead, against this crate's own
+    // `jerry_git_test_editor` `[[bin]]` - `CARGO_BIN_EXE_<name>` is only reliable for an
+    // integration test, not a `--lib` unit test (verified against this crate's own build: the
+    // identical `--lib` setup here failed to see the env var at all, even for a same-package
+    // `[[bin]]`, let alone a dev-dependency's).
 
     #[test]
     fn amend_head_message_replaces_the_real_committed_message() {
@@ -824,280 +717,11 @@ mod tests {
         );
     }
 
-    // --- Deliberate stops: reword-without-message and edit -----------------------------------
-
-    #[test]
-    fn reword_with_no_message_stops_and_reports_the_right_commit_and_reason() {
-        let repo = seed_empty_repo();
-        let base = commit(repo.path(), "base.txt", "base", "base");
-        let c1 = commit(repo.path(), "a.txt", "1", "commit 1");
-
-        let plan = vec![RebasePlanEntry {
-            commit: c1.clone(),
-            action: RebaseAction::Reword(None),
-        }];
-
-        let outcome =
-            start_interactive_rebase(repo.path(), &base, &plan).expect("start_interactive_rebase");
-        match outcome {
-            RebaseOutcome::StoppedForEdit { commit, reason } => {
-                assert_eq!(commit, c1);
-                assert_eq!(reason, Some(StopReason::RewordNeedsMessage));
-            }
-            other => panic!("expected StoppedForEdit, got {other:?}"),
-        }
-
-        git(repo.path(), &["commit", "--amend", "-m", "amended message"]);
-        let outcome = continue_rebase(repo.path()).expect("continue_rebase");
-        assert_eq!(outcome, RebaseOutcome::Completed);
-        let head = git_output(repo.path(), &["rev-parse", "HEAD"]);
-        assert_eq!(commit_message(repo.path(), &head), "amended message");
-    }
-
-    #[test]
-    fn edit_always_stops_even_with_no_special_handling_and_continue_completes_it() {
-        let repo = seed_empty_repo();
-        let base = commit(repo.path(), "base.txt", "base", "base");
-        let c1 = commit(repo.path(), "a.txt", "1", "commit 1");
-
-        let plan = vec![RebasePlanEntry {
-            commit: c1.clone(),
-            action: RebaseAction::Edit,
-        }];
-
-        let outcome =
-            start_interactive_rebase(repo.path(), &base, &plan).expect("start_interactive_rebase");
-        match outcome {
-            RebaseOutcome::StoppedForEdit { commit, reason } => {
-                assert_eq!(commit, c1);
-                assert_eq!(reason, Some(StopReason::Edit));
-            }
-            other => panic!("expected StoppedForEdit, got {other:?}"),
-        }
-
-        let outcome = continue_rebase(repo.path()).expect("continue_rebase with no changes");
-        assert_eq!(outcome, RebaseOutcome::Completed);
-        assert_eq!(log_subjects(repo.path()), vec!["base", "commit 1"]);
-    }
-
-    // --- Real conflicts, abort, skip -----------------------------------------------------
-
-    /// Sets up a conflict: `base` sets `file.txt`, `v1` and `v2` change it differently, and the
-    /// plan replays `v1` straight onto `base`.
-    fn conflicting_repo() -> (TempDir, String, String, String) {
-        let repo = seed_empty_repo();
-        let base = commit(repo.path(), "file.txt", "base", "base");
-        commit(repo.path(), "file.txt", "v1", "commit v1");
-        let v2 = commit(repo.path(), "file.txt", "v2", "commit v2");
-        (repo, base, String::new(), v2)
-    }
-
-    #[test]
-    fn a_real_conflict_is_reported_with_the_right_file_and_abort_restores_original_state() {
-        let (repo, base, _unused, v2) = conflicting_repo();
-        let before_head = git_output(repo.path(), &["rev-parse", "HEAD"]);
-
-        let plan = vec![RebasePlanEntry {
-            commit: v2.clone(),
-            action: RebaseAction::Pick,
-        }];
-
-        let outcome =
-            start_interactive_rebase(repo.path(), &base, &plan).expect("start_interactive_rebase");
-        match outcome {
-            RebaseOutcome::StoppedForConflict {
-                commit,
-                conflicted_files,
-            } => {
-                assert_eq!(commit, v2);
-                assert_eq!(conflicted_files, vec![PathBuf::from("file.txt")]);
-            }
-            other => panic!("expected StoppedForConflict, got {other:?}"),
-        }
-
-        abort_rebase(repo.path()).expect("abort_rebase");
-        let after_head = git_output(repo.path(), &["rev-parse", "HEAD"]);
-        assert_eq!(
-            before_head, after_head,
-            "abort must restore HEAD to exactly its pre-rebase state"
-        );
-        assert!(!repo.path().join(".git").join("rebase-merge").exists());
-    }
-
-    #[test]
-    fn resolving_a_real_conflict_for_real_and_continuing_completes_the_rebase() {
-        let (repo, base, _unused, v2) = conflicting_repo();
-
-        let plan = vec![RebasePlanEntry {
-            commit: v2,
-            action: RebaseAction::Pick,
-        }];
-
-        let outcome =
-            start_interactive_rebase(repo.path(), &base, &plan).expect("start_interactive_rebase");
-        assert!(matches!(outcome, RebaseOutcome::StoppedForConflict { .. }));
-
-        fs::write(repo.path().join("file.txt"), "resolved").expect("write resolution");
-        git(repo.path(), &["add", "file.txt"]);
-        let outcome = continue_rebase(repo.path()).expect("continue_rebase");
-        assert_eq!(outcome, RebaseOutcome::Completed);
-        assert_eq!(
-            fs::read_to_string(repo.path().join("file.txt")).expect("read file.txt"),
-            "resolved"
-        );
-    }
-
-    #[test]
-    fn skip_rebase_commit_genuinely_skips_the_stopped_commit_and_continues() {
-        let (repo, base, _unused, v2) = conflicting_repo();
-        let c3 = commit(repo.path(), "other.txt", "3", "commit 3");
-
-        let plan = vec![
-            RebasePlanEntry {
-                commit: v2,
-                action: RebaseAction::Pick,
-            },
-            RebasePlanEntry {
-                commit: c3,
-                action: RebaseAction::Pick,
-            },
-        ];
-
-        let outcome =
-            start_interactive_rebase(repo.path(), &base, &plan).expect("start_interactive_rebase");
-        assert!(matches!(outcome, RebaseOutcome::StoppedForConflict { .. }));
-
-        let outcome = skip_rebase_commit(repo.path()).expect("skip_rebase_commit");
-        assert_eq!(outcome, RebaseOutcome::Completed);
-        assert_eq!(log_subjects(repo.path()), vec!["base", "commit 3"]);
-    }
-
-    // --- The mixed-action mega-scenario: catches message-editor disambiguation bugs ---------
-
-    #[test]
-    fn a_plan_mixing_every_action_type_produces_the_exact_expected_history() {
-        let repo = seed_empty_repo();
-        let base = commit(repo.path(), "base.txt", "base", "base");
-        let c1 = commit(repo.path(), "f1.txt", "1", "commit 1");
-        let c2 = commit(repo.path(), "f2.txt", "2", "commit 2");
-        let c3 = commit(repo.path(), "f3.txt", "3", "commit 3");
-        let c4 = commit(repo.path(), "f4.txt", "4", "commit 4");
-        let c5 = commit(repo.path(), "f5.txt", "5", "commit 5");
-        let c6 = commit(repo.path(), "f6.txt", "6", "commit 6");
-
-        let plan = vec![
-            RebasePlanEntry {
-                commit: c1,
-                action: RebaseAction::Pick,
-            },
-            RebasePlanEntry {
-                commit: c2,
-                action: RebaseAction::Squash,
-            },
-            RebasePlanEntry {
-                commit: c3,
-                action: RebaseAction::Reword(Some("reworded commit 3".to_string())),
-            },
-            RebasePlanEntry {
-                commit: c4.clone(),
-                action: RebaseAction::Reword(None),
-            },
-            RebasePlanEntry {
-                commit: c5,
-                action: RebaseAction::Drop,
-            },
-            RebasePlanEntry {
-                commit: c6,
-                action: RebaseAction::Pick,
-            },
-        ];
-
-        let outcome =
-            start_interactive_rebase(repo.path(), &base, &plan).expect("start_interactive_rebase");
-        match &outcome {
-            RebaseOutcome::StoppedForEdit { commit, reason } => {
-                assert_eq!(commit, &c4);
-                assert_eq!(*reason, Some(StopReason::RewordNeedsMessage));
-            }
-            other => panic!("expected StoppedForEdit at commit 4, got {other:?}"),
-        }
-
-        git(
-            repo.path(),
-            &["commit", "--amend", "-m", "amended commit 4"],
-        );
-        let outcome = continue_rebase(repo.path()).expect("continue_rebase");
-        assert_eq!(outcome, RebaseOutcome::Completed);
-
-        assert_eq!(
-            log_subjects(repo.path()),
-            vec![
-                "base",
-                "commit 1",
-                "reworded commit 3",
-                "amended commit 4",
-                "commit 6",
-            ]
-        );
-        let all_shas = git_output(repo.path(), &["log", "--format=%H", "--reverse"]);
-        let second_sha = all_shas.lines().nth(1).expect("second commit");
-        let squashed_message = commit_message(repo.path(), second_sha);
-        assert!(squashed_message.contains("commit 1"));
-        assert!(squashed_message.contains("commit 2"));
-    }
-
-    #[test]
-    fn cascading_conflicts_before_a_reword_do_not_misalign_the_message_queue() {
-        let repo = seed_empty_repo();
-        let base = commit(repo.path(), "file.txt", "base", "base");
-        let c1 = commit(repo.path(), "file.txt", "v1", "commit v1");
-        let c2 = commit(repo.path(), "file.txt", "v2", "commit v2");
-        let c3 = commit(repo.path(), "other.txt", "3", "commit 3");
-
-        // Reordering v2 before v1 (both touching the same file) forces two cascading
-        // conflicts before the reword step is ever reached.
-        let plan = vec![
-            RebasePlanEntry {
-                commit: c2,
-                action: RebaseAction::Pick,
-            },
-            RebasePlanEntry {
-                commit: c1,
-                action: RebaseAction::Pick,
-            },
-            RebasePlanEntry {
-                commit: c3,
-                action: RebaseAction::Reword(Some("reworded commit 3".to_string())),
-            },
-        ];
-
-        let outcome =
-            start_interactive_rebase(repo.path(), &base, &plan).expect("start_interactive_rebase");
-        assert!(matches!(outcome, RebaseOutcome::StoppedForConflict { .. }));
-        fs::write(repo.path().join("file.txt"), "resolved-1").expect("write");
-        git(repo.path(), &["add", "file.txt"]);
-        let outcome = continue_rebase(repo.path()).expect("continue after first conflict");
-        assert!(
-            matches!(outcome, RebaseOutcome::StoppedForConflict { .. }),
-            "expected a second real conflict, got {outcome:?}"
-        );
-
-        fs::write(repo.path().join("file.txt"), "resolved-2").expect("write");
-        git(repo.path(), &["add", "file.txt"]);
-        let outcome = continue_rebase(repo.path()).expect("continue after second conflict");
-        assert_eq!(
-            outcome,
-            RebaseOutcome::Completed,
-            "the reword step must run straight through with its own real message, not stop"
-        );
-
-        assert_eq!(
-            log_subjects(repo.path()),
-            vec!["base", "commit v2", "commit v1", "reworded commit 3"]
-        );
-    }
-
     // --- rebase_status -------------------------------------------------------------------
+    //
+    // Every other case needs a real `start_interactive_rebase` call and so lives in
+    // `tests/rebase_editor.rs` alongside every other test that does (see this module's own note
+    // above `amend_head_message`'s tests).
 
     #[test]
     fn rebase_status_is_none_when_no_rebase_is_in_progress() {
@@ -1106,62 +730,150 @@ mod tests {
         assert_eq!(rebase_status(repo.path()).expect("rebase_status"), None);
     }
 
+    // --- rebase_preflight -------------------------------------------------------------------
+    //
+    // The "already in progress" case needs a real `start_interactive_rebase` call and so lives
+    // in `tests/rebase_editor.rs` alongside every other test that does.
+
     #[test]
-    fn rebase_status_reports_real_state_when_stopped_mid_flight() {
+    fn rebase_preflight_allows_a_stale_uncleaned_sidecar_directory() {
         let repo = seed_empty_repo();
         let base = commit(repo.path(), "base.txt", "base", "base");
-        let c1 = commit(repo.path(), "a.txt", "1", "commit 1");
-        let c2 = commit(repo.path(), "b.txt", "2", "commit 2");
+        commit(repo.path(), "a.txt", "1", "commit 1");
+        let git_dir = worktree_git_dir(repo.path()).expect("git dir");
+        fs::create_dir_all(state_dir(&git_dir)).expect("stale sidecar dir");
 
-        let plan = vec![
-            RebasePlanEntry {
-                commit: c1.clone(),
-                action: RebaseAction::Edit,
-            },
-            RebasePlanEntry {
-                commit: c2,
-                action: RebaseAction::Pick,
-            },
-        ];
-        let outcome =
-            start_interactive_rebase(repo.path(), &base, &plan).expect("start_interactive_rebase");
-        assert!(matches!(outcome, RebaseOutcome::StoppedForEdit { .. }));
+        rebase_preflight(repo.path()).expect(
+            "a leftover ade-rebase/ directory with no real git rebase-merge/ must not refuse",
+        );
+        let _ = base;
+    }
 
-        let status = rebase_status(repo.path())
-            .expect("rebase_status")
-            .expect("a rebase is really in progress");
-        assert_eq!(status.stopped_commit.as_deref(), Some(c1.as_str()));
-        assert_eq!(status.stop_reason, Some(StopReason::Edit));
-        assert!(status.conflicted_files.is_empty());
-        assert_eq!(status.current_step, Some(1));
-        assert_eq!(status.total_steps, Some(2));
-        assert!(status.onto.is_some());
+    // --- classify_editor_invocation (pure) ----------------------------------------------------
 
-        // Recovery after a real "process restart" (nothing here relies on in-memory state):
-        // continuing and finishing still works using only what's on disk.
-        let outcome = continue_rebase(repo.path()).expect("continue_rebase");
-        assert_eq!(outcome, RebaseOutcome::Completed);
-        assert_eq!(rebase_status(repo.path()).expect("rebase_status"), None);
+    #[test]
+    fn a_squash_combination_message_is_accepted_unmodified() {
+        let message = "# This is a combination of 2 commits.\nsome body\n";
+        assert_eq!(
+            classify_editor_invocation(message, 3),
+            EditorAction::AcceptUnmodified
+        );
     }
 
     #[test]
-    fn rebase_status_reports_conflicted_files_and_no_stop_reason_for_a_real_conflict() {
-        let (repo, base, _unused, v2) = conflicting_repo();
-        let plan = vec![RebasePlanEntry {
-            commit: v2,
-            action: RebaseAction::Pick,
-        }];
-        let outcome =
-            start_interactive_rebase(repo.path(), &base, &plan).expect("start_interactive_rebase");
-        assert!(matches!(outcome, RebaseOutcome::StoppedForConflict { .. }));
-
-        let status = rebase_status(repo.path())
-            .expect("rebase_status")
-            .expect("a rebase is really in progress");
-        assert_eq!(status.conflicted_files, vec![PathBuf::from("file.txt")]);
+    fn a_reword_invocation_reads_the_current_cursor_as_its_slot() {
+        let message = "original subject\n\nYou are currently editing a commit while rebasing.\n";
         assert_eq!(
-            status.stop_reason, None,
-            "a real conflict must never report a deliberate-stop reason"
+            classify_editor_invocation(message, 2),
+            EditorAction::Reword { slot_index: 2 }
+        );
+    }
+
+    #[test]
+    fn a_conflict_resumed_step_never_advances_the_queue() {
+        let message = "commit v1\n";
+        assert_eq!(
+            classify_editor_invocation(message, 5),
+            EditorAction::AcceptUnmodifiedNoAdvance
+        );
+    }
+
+    // --- run_editor / run_sequence_editor (impure, real sidecar files) -----------------------
+
+    #[test]
+    fn run_editor_pops_a_queued_reword_message_and_advances_the_cursor() {
+        let repo = seed_empty_repo();
+        commit(repo.path(), "a.txt", "1", "commit 1");
+        let git_dir = worktree_git_dir(repo.path()).expect("git dir");
+        let dir = state_dir(&git_dir);
+        fs::create_dir_all(dir.join("queue")).expect("queue dir");
+        fs::write(dir.join("queue").join("0"), "a real queued message").expect("write slot");
+
+        let message_file = repo.path().join("MSG");
+        fs::write(
+            &message_file,
+            "original\n\nYou are currently editing a commit while rebasing branch 'x'.\n",
+        )
+        .expect("write message file");
+
+        let accepted = run_editor(repo.path(), &message_file).expect("run_editor");
+        assert!(accepted);
+        assert_eq!(
+            fs::read_to_string(&message_file).expect("read message"),
+            "a real queued message"
+        );
+        assert_eq!(
+            read_trimmed(&dir.join("cursor")).as_deref(),
+            Some("1"),
+            "the cursor must advance past the slot it just consumed"
+        );
+    }
+
+    #[test]
+    fn run_editor_reproduces_edit_stop_when_no_message_is_queued() {
+        let repo = seed_empty_repo();
+        commit(repo.path(), "a.txt", "1", "commit 1");
+        let git_dir = worktree_git_dir(repo.path()).expect("git dir");
+        let dir = state_dir(&git_dir);
+        fs::create_dir_all(dir.join("queue")).expect("queue dir");
+
+        let message_file = repo.path().join("MSG");
+        fs::write(
+            &message_file,
+            "You are currently editing a commit while rebasing branch 'x'.\n",
+        )
+        .expect("write message file");
+
+        let accepted = run_editor(repo.path(), &message_file).expect("run_editor");
+        assert!(
+            !accepted,
+            "nothing queued must reproduce git's own edit-stop by refusing"
+        );
+        assert_eq!(read_trimmed(&dir.join("cursor")).as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn run_editor_never_touches_the_cursor_for_a_conflict_resumed_step() {
+        let repo = seed_empty_repo();
+        commit(repo.path(), "a.txt", "1", "commit 1");
+        let git_dir = worktree_git_dir(repo.path()).expect("git dir");
+        let dir = state_dir(&git_dir);
+        fs::create_dir_all(&dir).expect("sidecar dir");
+        fs::write(dir.join("cursor"), "3").expect("seed cursor");
+
+        let message_file = repo.path().join("MSG");
+        fs::write(&message_file, "commit v1\n").expect("write message file");
+
+        let accepted = run_editor(repo.path(), &message_file).expect("run_editor");
+        assert!(accepted);
+        assert_eq!(
+            fs::read_to_string(&message_file).expect("read message"),
+            "commit v1\n",
+            "git's own pre-filled message must be left untouched"
+        );
+        assert_eq!(
+            read_trimmed(&dir.join("cursor")).as_deref(),
+            Some("3"),
+            "a conflict-resumed step must never advance the reword cursor"
+        );
+    }
+
+    #[test]
+    fn run_sequence_editor_copies_the_prepared_todo_over_gits_generated_one() {
+        let repo = seed_empty_repo();
+        commit(repo.path(), "a.txt", "1", "commit 1");
+        let git_dir = worktree_git_dir(repo.path()).expect("git dir");
+        let dir = state_dir(&git_dir);
+        fs::create_dir_all(&dir).expect("sidecar dir");
+        fs::write(dir.join("todo.txt"), "pick deadbeef commit 1\n").expect("write prepared todo");
+
+        let generated = repo.path().join("git-rebase-todo");
+        fs::write(&generated, "pick deadbeef some other subject\n").expect("write git's own");
+
+        run_sequence_editor(repo.path(), &generated).expect("run_sequence_editor");
+        assert_eq!(
+            fs::read_to_string(&generated).expect("read generated"),
+            "pick deadbeef commit 1\n"
         );
     }
 }

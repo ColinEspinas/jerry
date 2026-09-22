@@ -1,0 +1,7 @@
+{
+  "method": "command/rebase-continue",
+  "params": {
+    "cwd": "/repo",
+    "params": {}
+  }
+}

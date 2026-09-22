@@ -36,6 +36,28 @@ pub enum Command {
     /// `--help` accordingly.
     #[command(hide = true)]
     Hook(HookArgs),
+    /// `GIT_SEQUENCE_EDITOR`'s real target during a rebase this Jerry started
+    /// (`jerry_git::rebase::start_interactive_rebase`) - copies the prepared todo over git's own
+    /// generated one. Never invoked by a human; hidden accordingly.
+    #[command(hide = true)]
+    GitSequenceEditor(GitSequenceEditorArgs),
+    /// `GIT_EDITOR`'s real target during the same rebase - classifies the message file git hands
+    /// it (`docs/architecture/decisions.md` §7's three cases) and rewrites or accepts it. Never
+    /// invoked by a human; hidden accordingly.
+    #[command(hide = true)]
+    GitEditor(GitEditorArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct GitSequenceEditorArgs {
+    /// The todo file git generated, to overwrite with the prepared plan.
+    pub todo_file: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct GitEditorArgs {
+    /// The commit message file git generated, to classify and possibly rewrite.
+    pub message_file: PathBuf,
 }
 
 #[derive(Debug, Args)]
