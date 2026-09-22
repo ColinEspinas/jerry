@@ -4,9 +4,10 @@
 //! `tests/rebase_editor.rs`.
 //!
 //! An integration test, not `src/commands.rs`'s own `#[cfg(test)]` module, so `RebaseStart::
-//! execute`'s `jerry_binary::locate` call finds a real, executable file - see this crate's
-//! `Cargo.toml` and `docs/architecture/decisions.md` §20 for why. `ensure_jerry_binary()` copies
-//! this crate's own `jerry_core_test_jerry` `[[bin]]` next to this test binary's own executable.
+//! execute`'s `jerry_binary::locate` call finds the real `jerry` binary `cargo build -p
+//! jerry-cli` produces, via `locate`'s third tier (`docs/architecture/decisions.md` §20) - never
+//! a test-only stand-in copied into a shared path, which once collided with cargo's own unhashed
+//! Windows `deps/jerry.exe` layout and corrupted the real CLI binary.
 
 // An integration test file is its own crate root - `src/lib.rs`'s crate-level
 // `cfg_attr(test, allow(...))` does not reach here, so it is repeated (CLAUDE.md's
@@ -22,56 +23,16 @@ use jerry_core::{
     RebasePlanEntryWire, RebaseSkip, RebaseStart, StopReasonWire,
 };
 use std::path::{Path, PathBuf};
-use std::sync::Once;
 use test_support::{commit, git, git_output, seed_empty_repo, TempDir};
 
-/// Every one of this file's `#[test]` fns runs in its own nextest process but shares the same
-/// compiled test binary, so `current_exe()` - and the destination this copies to - is identical
-/// across all of them; a bare `fs::copy` straight to that shared path let one process's `git
-/// rebase` exec the file while another was still overwriting it (`ETXTBSY` on Linux; a silently
-/// incomplete todo rewrite on macOS - both observed for real in CI). Copying to a per-process
-/// temp name first and renaming into place is atomic on POSIX, so a concurrent exec only ever
-/// sees the old, complete file or the new, complete file - never a partial one.
-fn ensure_jerry_binary() {
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        let real = env!("CARGO_BIN_EXE_jerry_core_test_jerry");
-        let current_exe = std::env::current_exe().expect("current_exe");
-        let dir = current_exe.parent().expect("current_exe has a parent");
-        let name = if cfg!(windows) { "jerry.exe" } else { "jerry" };
-        let destination = dir.join(name);
-
-        let real_len = std::fs::metadata(real)
-            .expect("stat the real test jerry binary")
-            .len();
-        let destination_len = std::fs::metadata(&destination).ok().map(|meta| meta.len());
-        if destination_len == Some(real_len) {
-            // Another process already landed an identical copy - nothing left to do.
-            return;
-        }
-
-        let temp = dir.join(format!("{name}.{}.tmp", std::process::id()));
-        std::fs::copy(real, &temp).expect("copy the test jerry binary into a temp file");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&temp)
-                .expect("stat the temp copy")
-                .permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&temp, perms).expect("make the temp copy executable");
-        }
-        if let Err(error) = std::fs::rename(&temp, &destination) {
-            // On Windows a rename over a destination another process is currently executing
-            // fails - that process's own copy is equally valid (the exact same source), so keep
-            // it and just clean up this process's own temp file.
-            let _ = std::fs::remove_file(&temp);
-            assert!(
-                destination.is_file(),
-                "rename into place failed and no destination exists: {error}"
-            );
-        }
-    });
+/// `RebaseStart::execute`'s own `jerry_binary::locate` call needs a real, executable `jerry` -
+/// asserted up front so a missing binary fails right here with an actionable cause, not as a
+/// downstream state assertion. Mirrors `jerry-app`'s own `assert_real_jerry_binary_available`.
+fn assert_real_jerry_binary_available() {
+    assert!(
+        jerry_core::jerry_binary::locate().is_some(),
+        "no real `jerry` binary found - run `cargo build -p jerry-cli` first"
+    );
 }
 
 fn ctx_for(worktree: &Path) -> Ctx {
@@ -111,7 +72,7 @@ fn conflicting_repo() -> (TempDir, String, String) {
 
 #[test]
 fn a_clean_plan_completes_and_the_status_query_shows_nothing_in_progress() {
-    ensure_jerry_binary();
+    assert_real_jerry_binary_available();
     let repo = seed_empty_repo();
     commit(repo.path(), "base.txt", "base\n", "base");
     let base = head(repo.path());
@@ -141,7 +102,7 @@ fn a_clean_plan_completes_and_the_status_query_shows_nothing_in_progress() {
 
 #[test]
 fn a_real_conflict_stops_the_rebase_and_a_second_start_is_denied_while_it_is_in_progress() {
-    ensure_jerry_binary();
+    assert_real_jerry_binary_available();
     let (repo, base, v2) = conflicting_repo();
     let ctx = ctx_for(repo.path());
 
@@ -196,7 +157,7 @@ fn continue_skip_and_abort_are_all_denied_with_no_rebase_in_progress() {
 
 #[test]
 fn skip_genuinely_skips_the_stopped_commit_and_continues() {
-    ensure_jerry_binary();
+    assert_real_jerry_binary_available();
     let (repo, base, v2) = conflicting_repo();
     commit(repo.path(), "other.txt", "3\n", "commit 3");
     let c3 = head(repo.path());
@@ -233,7 +194,7 @@ fn skip_genuinely_skips_the_stopped_commit_and_continues() {
 
 #[test]
 fn abort_restores_head_to_exactly_its_pre_rebase_state() {
-    ensure_jerry_binary();
+    assert_real_jerry_binary_available();
     let (repo, base, v2) = conflicting_repo();
     let before_head = head(repo.path());
     let ctx = ctx_for(repo.path());
@@ -257,7 +218,7 @@ fn abort_restores_head_to_exactly_its_pre_rebase_state() {
 
 #[test]
 fn amend_head_message_applies_after_a_message_less_reword_stop_then_continue_completes() {
-    ensure_jerry_binary();
+    assert_real_jerry_binary_available();
     let repo = seed_empty_repo();
     commit(repo.path(), "base.txt", "base\n", "base");
     let base = head(repo.path());
@@ -318,7 +279,7 @@ fn amend_head_message_is_denied_with_no_rebase_stopped() {
 
 #[test]
 fn the_status_query_reflects_a_real_stop_and_clears_once_completed() {
-    ensure_jerry_binary();
+    assert_real_jerry_binary_available();
     let repo = seed_empty_repo();
     commit(repo.path(), "base.txt", "base\n", "base");
     let base = head(repo.path());
