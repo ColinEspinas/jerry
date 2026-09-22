@@ -7,6 +7,10 @@ use super::*;
 use crate::text_history::TextField;
 use crate::work_surface::agents::AgentId;
 use gpui::{FocusHandle, KeyDownEvent, Task};
+use jerry_core::{
+    AmendHeadMessage, AppCommand, RebaseAbort, RebaseContinue, RebaseOutcomeReport, RebaseSkip,
+    RebaseStart, Report, Request, RpcError,
+};
 use jerry_git::rebase::{RebaseAction, RebaseOutcome, RebasePlanEntry};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -155,6 +159,13 @@ pub(crate) enum RebasePhase {
     /// entirely rather than being representable here).
     Stopped {
         outcome: RebaseOutcome,
+    },
+    /// A dispatched mutation was refused or failed - the same real-error-state role
+    /// `merge::MergeFlowState::Error` plays for merge, so a `Report` failure is a visible banner
+    /// state, not silently dropped. The mode stays open (`Cancel` recovers it); the plan itself
+    /// is untouched, since nothing on disk actually changed.
+    Error {
+        message: String,
     },
 }
 
@@ -895,11 +906,10 @@ impl AdeApp {
         cleared_insertion || cleared_dragging
     }
 
-    // ------------------------------------------------------------ real jerry_git::rebase driving
+    // ------------------------------------------------------------ dispatching through the host
 
-    /// The Planning-phase banner's `Start rebase` (design spec §1.2) - builds the real
-    /// `RebasePlanEntry` plan from the in-memory rows and calls
-    /// `jerry_git::rebase::start_interactive_rebase` for real, applying whatever real
+    /// The Planning-phase banner's `Start rebase` (design spec §1.2) - builds the wire plan from
+    /// the in-memory rows and dispatches `RebaseStart` through the host, applying whatever real
     /// `RebaseOutcome` comes back.
     pub(crate) fn start_rebase(&mut self, cx: &mut Context<Self>) {
         let Some(rebase_state) = self.graph_state.rebase.as_ref() else {
@@ -911,28 +921,26 @@ impl AdeApp {
         let Some(root) = self.rebase_worktree_root() else {
             return;
         };
-        #[allow(clippy::expect_used)]
-        let rebase_state = self.graph_state.rebase.as_ref().expect("checked above");
-        let entries: Vec<RebasePlanEntry> = rebase_state
+        let plan = rebase_state
             .plan
             .iter()
-            .map(RebasePlanRow::to_plan_entry)
+            .map(|row| row.to_plan_entry().into())
             .collect();
         let onto = rebase_state.onto.clone();
-        self.run_rebase_op(cx, move || {
-            jerry_git::rebase::start_interactive_rebase(&root, &onto, &entries)
-        });
+        self.run_rebase_op(
+            cx,
+            root,
+            Request::Command(AppCommand::RebaseStart(RebaseStart { onto, plan })),
+        );
     }
 
     /// The Stopped-phase banner's `Continue` (design spec §1.2). Guarded on
     /// [`RebaseModeState::op_in_flight`] - GitHub issue #242 phase B fix: an independent review
-    /// reproduced a real double-click bug here. `run_rebase_op` itself now refuses a second
-    /// overlapping call (see that method's own docs), but the *message* this function reads for
-    /// the amend below is captured from `rebase_state.phase` *before* that guard would matter -
-    /// without this function's own early check, two rapid clicks could each capture the message
-    /// visible at that instant and both proceed to spawn their own real `amend_head_message` +
-    /// `continue_rebase` pair, with the second one racing to amend whatever commit the *first*
-    /// call's own `continue_rebase` had, by then, already advanced `HEAD` to.
+    /// reproduced a real double-click bug here; the *message* this function reads for the amend
+    /// below is captured from `rebase_state.phase` before that guard would matter, so two rapid
+    /// clicks can't each dispatch their own `AmendHeadMessage`/`RebaseContinue` pair racing to
+    /// amend whatever commit the first call's own continue had, by then, already advanced `HEAD`
+    /// to.
     pub(crate) fn continue_rebase(&mut self, cx: &mut Context<Self>) {
         let Some(rebase_state) = self.graph_state.rebase.as_ref() else {
             return;
@@ -943,19 +951,14 @@ impl AdeApp {
         let Some(root) = self.rebase_worktree_root() else {
             return;
         };
-        #[allow(clippy::expect_used)]
-        let rebase_state = self.graph_state.rebase.as_ref().expect("checked above");
         // Real, load-bearing gap `jerry_git::rebase`'s own module docs call out: the reword-message
-        // queue its `GIT_EDITOR` script reads from is fixed at `start_interactive_rebase` time -
-        // a message obtained only *after* a message-less-reword stop can never be picked up by
-        // that queue retroactively. The real fix, matching this module's own test precedent
+        // queue `RebaseStart` fixes is set at that dispatch's own time - a message obtained only
+        // *after* a message-less-reword stop can never be picked up by that queue retroactively.
+        // The real fix, matching this module's own test precedent
         // (`reword_with_no_message_stops_and_reports_the_right_commit_and_reason`), is a real
-        // `git commit --amend` against the stopped commit before `git rebase --continue` runs -
-        // exactly what a command-line user would do by hand. `amend_head_message` is handed the
-        // real stopped commit id as `expected_head_original` - a real, on-disk identity check
-        // (`git rev-parse HEAD` must still match it) that refuses rather than amending whatever
-        // commit `HEAD` happens to be by the time this real background call actually runs.
-        let amend = if let RebasePhase::Stopped {
+        // `AmendHeadMessage` dispatch against the stopped commit before `RebaseContinue` runs -
+        // exactly what a command-line user would do by hand with `git commit --amend`.
+        let amend_message = if let RebasePhase::Stopped {
             outcome:
                 RebaseOutcome::StoppedForEdit {
                     commit,
@@ -968,16 +971,54 @@ impl AdeApp {
                 .iter()
                 .find(|row| &row.commit == commit)
                 .filter(|row| row.has_supplied_reword_message())
-                .map(|row| (commit.clone(), row.reword_message.as_str().to_string()))
+                .map(|row| row.reword_message.as_str().to_string())
         } else {
             None
         };
-        self.run_rebase_op(cx, move || {
-            if let Some((expected_head, message)) = amend {
-                jerry_git::rebase::amend_head_message(&root, &expected_head, &message)?;
+
+        if let Some(rs) = self.graph_state.rebase.as_mut() {
+            rs.op_in_flight = true;
+        }
+        cx.notify();
+        let task = cx.spawn(async move |this, cx| {
+            if let Some(message) = amend_message {
+                let amend = this.update(cx, |this, cx| {
+                    this.dispatch(
+                        root.clone(),
+                        Request::Command(AppCommand::AmendHeadMessage(AmendHeadMessage {
+                            message,
+                        })),
+                        cx,
+                    )
+                });
+                let Ok(amend) = amend else {
+                    return;
+                };
+                if let Err(reason) = command_result(amend.await) {
+                    let _ = this.update(cx, |this, cx| {
+                        this.rebase_op_failed(reason, cx);
+                    });
+                    return;
+                }
             }
-            jerry_git::rebase::continue_rebase(&root)
+            let continue_call = this.update(cx, |this, cx| {
+                this.dispatch(
+                    root,
+                    Request::Command(AppCommand::RebaseContinue(RebaseContinue::default())),
+                    cx,
+                )
+            });
+            let Ok(continue_call) = continue_call else {
+                return;
+            };
+            let result = rebase_outcome_from_report(continue_call.await);
+            let _ = this.update(cx, |this, cx| {
+                this.apply_rebase_outcome(result, cx);
+            });
         });
+        if let Some(rs) = self.graph_state.rebase.as_mut() {
+            rs._task = Some(task);
+        }
     }
 
     /// The Stopped-phase banner's `Skip` (design spec §1.2). Guarded on [`RebaseModeState::
@@ -993,13 +1034,17 @@ impl AdeApp {
         let Some(root) = self.rebase_worktree_root() else {
             return;
         };
-        self.run_rebase_op(cx, move || jerry_git::rebase::skip_rebase_commit(&root));
+        self.run_rebase_op(
+            cx,
+            root,
+            Request::Command(AppCommand::RebaseSkip(RebaseSkip::default())),
+        );
     }
 
-    /// The Stopped-phase banner's `Abort` (design spec §1.2) - real `jerry_git::rebase::
-    /// abort_rebase`, returning to the normal commit list exactly like [`Self::cancel_rebase_mode`]
-    /// (real agent resume included, via [`Self::leave_rebase_mode`]), reloading the graph since
-    /// `abort_rebase` really moves `HEAD` back.
+    /// The Stopped-phase banner's `Abort` (design spec §1.2) - dispatches `RebaseAbort`,
+    /// returning to the normal commit list exactly like [`Self::cancel_rebase_mode`] (real agent
+    /// resume included, via [`Self::leave_rebase_mode`]), reloading the graph since abort really
+    /// moves `HEAD` back.
     pub(crate) fn abort_rebase(&mut self, cx: &mut Context<Self>) {
         let Some(rebase_state) = self.graph_state.rebase.as_ref() else {
             return;
@@ -1014,23 +1059,20 @@ impl AdeApp {
             rs.op_in_flight = true;
         }
         cx.notify();
+        let dispatch = self.dispatch(
+            root,
+            Request::Command(AppCommand::RebaseAbort(RebaseAbort::default())),
+            cx,
+        );
         let task = cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { jerry_git::rebase::abort_rebase(&root) })
-                .await;
+            let result = command_result(dispatch.await);
             let _ = this.update(cx, |this, cx| {
                 match result {
                     Ok(()) => {
                         this.leave_rebase_mode(cx);
                         this.load_graph(cx);
                     }
-                    Err(err) => {
-                        if let Some(rs) = this.graph_state.rebase.as_mut() {
-                            rs.op_in_flight = false;
-                        }
-                        this.graph_state.status_message = Some(format!("Abort failed: {err}"));
-                    }
+                    Err(message) => this.rebase_op_failed(format!("Abort failed: {message}"), cx),
                 }
                 cx.notify();
             });
@@ -1040,18 +1082,11 @@ impl AdeApp {
         }
     }
 
-    /// Shared real-git-driving plumbing for [`Self::start_rebase`]/[`Self::continue_rebase`]/
-    /// [`Self::skip_rebase`] - each hands this a closure that performs exactly one real
-    /// `jerry_git::rebase` call on the background executor, and this applies whatever real
-    /// `RebaseOutcome` (or error) comes back via [`Self::apply_rebase_outcome`]. Mirrors
-    /// `Self::run_graph_remote_op`'s own background-spawn/repaint shape (see that method's docs),
-    /// but returns a real `RebaseOutcome` rather than `Result<(), Error>`, so it's a distinct
-    /// function rather than a reuse of that one.
-    fn run_rebase_op(
-        &mut self,
-        cx: &mut Context<Self>,
-        op: impl FnOnce() -> Result<RebaseOutcome, jerry_git::Error> + Send + 'static,
-    ) {
+    /// Shared dispatch-and-apply plumbing for [`Self::start_rebase`]/[`Self::skip_rebase`] (
+    /// [`Self::continue_rebase`] dispatches an extra `AmendHeadMessage` step first, so it drives
+    /// its own `cx.spawn`) - dispatches `request` through the host and applies whatever real
+    /// `RebaseOutcome` (or refusal) comes back via [`Self::apply_rebase_outcome`].
+    fn run_rebase_op(&mut self, cx: &mut Context<Self>, cwd: PathBuf, request: Request) {
         let Some(rs) = self.graph_state.rebase.as_mut() else {
             return;
         };
@@ -1060,8 +1095,9 @@ impl AdeApp {
         }
         rs.op_in_flight = true;
         cx.notify();
+        let dispatch = self.dispatch(cwd, request, cx);
         let task = cx.spawn(async move |this, cx| {
-            let result = cx.background_executor().spawn(async move { op() }).await;
+            let result = rebase_outcome_from_report(dispatch.await);
             let _ = this.update(cx, |this, cx| {
                 this.apply_rebase_outcome(result, cx);
             });
@@ -1071,15 +1107,16 @@ impl AdeApp {
         }
     }
 
-    /// Applies a real `Result<RebaseOutcome, Error>` from `Self::run_rebase_op` - a real
-    /// `Completed` leaves rebase mode entirely (via [`Self::leave_rebase_mode`], real agent
-    /// resume included) and reloads the graph (the freshly rewritten history); a real stop
-    /// transitions to [`RebasePhase::Stopped`]; a genuine error is surfaced as a status message
-    /// with the mode left exactly as it was (never silently discarded - the user can retry
-    /// `Continue`/`Skip`/`Abort`).
+    /// Applies a real `Result<RebaseOutcome, String>` from [`Self::run_rebase_op`]/
+    /// [`Self::continue_rebase`] - a real `Completed` leaves rebase mode entirely (via
+    /// [`Self::leave_rebase_mode`], real agent resume included) and reloads the graph (the
+    /// freshly rewritten history); a real stop transitions to [`RebasePhase::Stopped`]; a genuine
+    /// refusal or failure transitions to [`RebasePhase::Error`] - the same visible-banner role
+    /// `merge::MergeFlowState::Error` plays, never silently discarded - the user can dismiss
+    /// (`Cancel`) or retry.
     fn apply_rebase_outcome(
         &mut self,
-        result: Result<RebaseOutcome, jerry_git::Error>,
+        result: Result<RebaseOutcome, String>,
         cx: &mut Context<Self>,
     ) {
         match result {
@@ -1094,14 +1131,19 @@ impl AdeApp {
                 }
                 cx.notify();
             }
-            Err(err) => {
-                if let Some(rs) = self.graph_state.rebase.as_mut() {
-                    rs.op_in_flight = false;
-                }
-                self.graph_state.status_message = Some(format!("Interactive rebase failed: {err}"));
-                cx.notify();
-            }
+            Err(message) => self.rebase_op_failed(message, cx),
         }
+    }
+
+    /// The shared failure path for a dispatched rebase mutation - clears
+    /// [`RebaseModeState::op_in_flight`] and transitions to [`RebasePhase::Error`], leaving the
+    /// plan itself untouched (nothing on disk changed) so the user can retry.
+    fn rebase_op_failed(&mut self, message: String, cx: &mut Context<Self>) {
+        if let Some(rs) = self.graph_state.rebase.as_mut() {
+            rs.op_in_flight = false;
+            rs.phase = RebasePhase::Error { message };
+        }
+        cx.notify();
     }
 
     /// Design spec §1.7's `Resolve in the diff view` link - routes the user to this app's
@@ -1139,6 +1181,33 @@ impl AdeApp {
         let absolute = root.join(first);
         self.open_file_view(absolute, window, cx);
     }
+}
+
+/// A rebase mutation's answer as [`AdeApp::run_rebase_op`]/[`AdeApp::continue_rebase`] read it:
+/// `Ok` for an `ok` `Report`, the refusal or failure reason otherwise. Mirrors
+/// `crate::merge::flow::report_result`'s identical shape for the merge pilot.
+fn command_result(report: Result<Report, RpcError>) -> Result<(), String> {
+    match report {
+        Ok(Report::Ok { .. }) => Ok(()),
+        Ok(Report::Denied { reason, .. }) => Err(reason),
+        Ok(Report::Error { error }) => Err(error.message),
+        Err(error) => Err(error.message),
+    }
+}
+
+/// Turns a rebase-mutation dispatch's `Report` into the real `jerry_git::rebase::RebaseOutcome`
+/// this module's own state (`RebasePhase::Stopped`) is expressed in - the wire mirror
+/// (`RebaseOutcomeReport`) only exists in transit.
+fn rebase_outcome_from_report(report: Result<Report, RpcError>) -> Result<RebaseOutcome, String> {
+    let outcome = match report {
+        Ok(Report::Ok { outcome }) => outcome,
+        Ok(Report::Denied { reason, .. }) => return Err(reason),
+        Ok(Report::Error { error }) => return Err(error.message),
+        Err(error) => return Err(error.message),
+    };
+    let outcome: RebaseOutcomeReport = serde_json::from_value(outcome)
+        .map_err(|error| format!("the host answered with an unreadable rebase outcome: {error}"))?;
+    Ok(outcome.into())
 }
 
 #[cfg(test)]

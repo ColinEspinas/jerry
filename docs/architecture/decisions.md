@@ -181,7 +181,9 @@ there rather than an empty list.
 
 ## 7. Interactive rebase is driven through git's own editor hooks, not reimplemented
 
-**Status:** Accepted.
+**Status:** Accepted; amended 2026-09-22 (issue #501) to point `GIT_SEQUENCE_EDITOR`/`GIT_EDITOR`
+at the `jerry` binary instead of a generated `/bin/sh` script, making this Unix-restriction gone.
+Rebase's own Commands are §20.
 
 **Context:** Jerry needs `git rebase --interactive`'s six todo verbs without an interactive
 terminal. The alternative to driving real git is reimplementing the todo machinery on plumbing
@@ -190,10 +192,12 @@ message combination, `REBASE_HEAD`/`stopped-sha` bookkeeping, and resume-after-r
 from scratch.
 
 **Decision:** Drive the real `git rebase -i` non-interactively through the same environment hooks
-a human's `$EDITOR` is invoked through. `GIT_SEQUENCE_EDITOR` is set to a `cp` of a
-Jerry-written todo file, replacing git's generated one. `GIT_EDITOR` is a `/bin/sh` script that
-classifies each invocation *by the content of the message file git hands it*, never by invocation
-order:
+a human's `$EDITOR` is invoked through — `GIT_SEQUENCE_EDITOR` and `GIT_EDITOR` point at hidden
+`jerry git-sequence-editor <todo-file>` and `jerry git-editor <message-file>` subcommands
+(`crates/jerry-cli/src/lib.rs`), never a generated shell script. `git-sequence-editor` copies the
+prepared todo (`jerry_git::rebase::write_plan_state`'s `todo.txt`) over the one git generated;
+`git-editor` classifies each invocation *by the content of the message file git hands it*, never
+by invocation order, via a pure function (`jerry_git::rebase::classify_editor_invocation`):
 
 1. First line `# This is a combination of ...` → a `squash` combination; accept unmodified.
 2. Contains `You are currently editing a commit` → a `reword`; pop the next slot from a persisted
@@ -203,16 +207,25 @@ order:
 
 Case 3 is not optional. A conflict-resumed `pick` goes through git's ordinary `commit` codepath and
 does open the editor; treating that as a `reword` consumes a message meant for a later row.
+`jerry_git::rebase::start_interactive_rebase` takes the `jerry` binary's path as a parameter — its
+own caller locates it (`crates/jerry-app/src/host.rs::find_jerry_binary` in the app,
+`std::env::current_exe` in the CLI) — and persists the exact `GIT_EDITOR` value it built into the
+sidecar (`editor-command`), so a later `--continue`/`--skip` (`run_rebase_step`) reconstructs the
+same value without needing that path again, including after a process restart.
 
-**Consequences:** Sidecar state (todo file, editor script, message queue, cursor, and a plan
-cross-reference) lives under `<git-dir>/ade-rebase/`, resolved per-worktree rather than in the
-shared common dir, and survives until the rebase completes or aborts — so a stop can be
-reconstructed after a process restart, including whether a row was `edit` or a message-less
-`reword`, which git alone cannot distinguish once stopped. The queue is plain files, not JSON, so
-the `sh` script needs no parser. Env var values are spliced unquoted into a shell command line by
-git, so every embedded path must be POSIX-single-quoted. The editor script is `/bin/sh`, making
-this path Unix-only; elsewhere it surfaces as an ordinary spawn failure. Conflicts are never
-auto-resolved or rolled back, matching `crate::rewrite`.
+**Consequences:** Sidecar state (todo file, reword-message queue, cursor, the persisted
+`editor-command` value, and a plan cross-reference) lives under `<git-dir>/ade-rebase/`, resolved
+per-worktree rather than in the shared common dir, and survives until the rebase completes or
+aborts — so a stop can be reconstructed after a process restart, including whether a row was
+`edit` or a message-less `reword`, which git alone cannot distinguish once stopped. The queue is
+plain files, not JSON, so `git-editor` needs no parser beyond what it already has. Env var values
+are spliced unquoted into a shell command line by git — confirmed still true with `jerry` as the
+target, including on Windows, where Git for Windows' own bundled `sh` runs the same `sh -c`
+dance — so every embedded path is still POSIX-single-quoted
+(`jerry_git::rebase::shell_single_quote`), for both `sh` and Windows. This mechanism now runs on
+every platform the `jerry` binary does; the rebase tests that exercise it (`jerry-git`'s
+`tests/rebase_editor.rs`, `jerry-core`'s `tests/rebase_commands.rs`) are no longer Unix-only.
+Conflicts are never auto-resolved or rolled back, matching `crate::rewrite`.
 
 ## 8. `jerry-pty` owns spawning only; `alacritty_terminal` stays in `crates/jerry-app`
 
@@ -609,3 +622,74 @@ directly, exactly as a socket client's request would dispatch) - never both at o
 test. `gpui::TestAppContext::executor().allow_parking()` exists as an escape hatch for exactly
 this (verified against `gpui`'s own `scheduler` crate), and is the fallback if a future test
 genuinely needs both in one place, but every hook test here is expressible without it.
+
+## 20. Rebase joins the pilot: `RebaseStart`/`RebaseContinue`/`RebaseSkip`/`RebaseAbort`/
+`AmendHeadMessage`, `RebaseStatus`
+
+**Status:** Accepted (2026-09-22, issue #501; decisions Q18 and Q19 of the UI-optional plan).
+
+**Context:** Rebase was the second flow migrated to the Command model, after merge (§18). Unlike
+merge, every mutation happens in one worktree — there is no second, base-worktree path to reason
+about — but `RebaseStart` alone needs something no other Git-locality Command has needed yet: a
+real, executable path (§7's `jerry` binary) to hand `jerry-git`, so `GIT_SEQUENCE_EDITOR`/
+`GIT_EDITOR` have something real to spawn.
+
+**Decision:** `RebaseStart { onto, plan }`, `RebaseContinue {}`, `RebaseSkip {}`, `RebaseAbort {}`,
+and `AmendHeadMessage { message }` are Git-locality Commands, all `Invocability::Denied` to
+agents (git already gives an agent a rebase); `RebaseStatus` is a Query mirroring
+`jerry_git::rebase::rebase_status`. `RebaseStart::validate` splits a real `rebase_preflight` out
+of `start_interactive_rebase` (refusing `rebase-already-in-progress` and `rebase-worktree-dirty`
+without touching git, mirroring `merge_preflight`'s split from `attempt_merge`), and
+`RebaseContinue`/`RebaseSkip`/`RebaseAbort`/
+`AmendHeadMessage` all validate against `rebase_status`'s real on-disk state
+(`rebase-not-in-progress`/`rebase-not-stopped`) rather than in-memory assumptions. Every outcome
+and plan row is mirrored onto the wire (`RebaseOutcomeReport`, `RebasePlanEntryWire`,
+`RebaseActionWire`, `StopReasonWire`) rather than deriving `Serialize` on `jerry-git`'s own types
+directly — the same reasoning §18 already gives for `ConflictKind` — with `From` conversions both
+ways so the app can keep building its in-memory plan and reading `RebasePhase` in terms of
+`jerry_git::rebase`'s own plain-data types, converting only at the dispatch boundary.
+`RebaseStart::execute` locates the `jerry` binary itself (`jerry_core::jerry_binary::locate`, a
+sibling of `std::env::current_exe`, then `bin/jerry` next to it, then `jerry` one directory up —
+no `PATH` fallback, unlike `crate::host::find_jerry_binary` in `jerry-app`, so this crate adds no
+`jerry-pty` dependency), refusing `jerry-binary-not-found` rather than guessing when none exist.
+
+`graph_view/rebase.rs` dispatches every mutation through `AdeApp::dispatch`, the same idiom
+`merge/flow.rs` established: `start_rebase`/`skip_rebase` share `run_rebase_op` (dispatch, apply
+the wire outcome); `continue_rebase` drives its own two-dispatch sequence (`AmendHeadMessage` when
+a message-less reword was resolved, then `RebaseContinue`) since `run_rebase_op` is one dispatch
+only; `abort_rebase` dispatches inline since its success path (leave the mode, reload the graph)
+differs from the other three's (transition to `RebasePhase::Stopped`). The read-only calls
+(`commits_to_rebase`, `commit_changed_files`, `commits_already_on_upstream`, `resolve_commit`)
+stay local per §15's `Locality` rule, exactly as merge's resolver reads do.
+
+**Consequences:** `CARGO_BIN_EXE_<name>` — needed to hand `start_interactive_rebase` a real,
+spawnable `jerry` for a test — turned out reliable only for a `[[bin]]` of the *same* package
+referenced from an integration test (`tests/*.rs`), not from a `--lib` unit test referencing it,
+and not across a dev-dependency cycle back through `jerry-core`/`jerry-cli` either (both were
+tried and both failed to see the environment variable at compile time, verified against this
+issue's own build). `jerry-git` grew a minimal, same-package `[[bin]]` purely for this
+(`jerry_git_test_editor`) and moved every test that needs a real spawn into
+`tests/rebase_editor.rs`; what stayed in `--lib` is what never spawns anything (pure
+classification, and sidecar-file tests that call `run_editor`/`run_sequence_editor` directly).
+`jerry-core` tried the identical shape (`jerry_core_test_jerry`) first and hit a real, worse bug:
+on Windows, cargo places a `[[bin]]`'s own unhashed `target/debug/deps/` copy under the *same
+name* the top-level uplifted binary gets, so a helper copied to
+`current_exe().parent().join("jerry.exe")` from inside an integration test (whose own executable
+already lives in that same `deps/` directory) silently overwrote `jerry-cli`'s real
+`deps/jerry.exe` — and the next build then uplifted that corruption to `target/debug/jerry.exe`,
+breaking the real CLI for every other consumer, not just this test. `jerry-core`'s own `[[bin]]`
+and its copy mechanism were deleted outright; `jerry_binary::locate` instead gained a third tier
+(one directory up from `current_exe`, the layout an integration test's own executable — nested
+one level under wherever a `[[bin]]` gets uplifted to — actually has), so `jerry-core`'s tests
+find the real `jerry` `cargo build -p jerry-cli` produces directly, asserting that up front
+(`assert_real_jerry_binary_available`, the same shape `jerry-app`'s own helper of that name
+uses) rather than copying anything. This mechanism runs on every platform `jerry` does —
+verified directly against this Windows checkout, both the quoted-path editor-hook spawn (§7) and
+every one of `jerry-git`'s 15 real-rebase integration tests, previously Unix-only.
+`jerry-cli`'s hidden `git-sequence-editor`/`git-editor` subcommands are the only part of this
+issue's CLI surface; `jerry rebase` itself is out of scope; `jerry-git` promotes from a
+`jerry-cli` dev-dependency to a normal one so those two subcommands can call
+`jerry_git::rebase::run_sequence_editor`/`run_editor` directly - they are pure local sidecar-file
+mechanics git itself spawns, not part of the Command/Query wire model, so they run before any
+`Ctx`/transport is built and answer with git's own exit-code contract (0 accept, non-zero stop),
+never `jerry-cli`'s own.

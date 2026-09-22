@@ -187,6 +187,12 @@ pub enum Error {
     )]
     RebaseAmendIndexDirty { path: PathBuf },
 
+    #[error("a rebase is already in progress at {path}; finish or abort it first")]
+    RebaseAlreadyInProgress { path: PathBuf },
+
+    #[error("worktree at {path} has uncommitted changes; commit or stash them before rebasing")]
+    RebaseWorktreeDirty { path: PathBuf },
+
     #[error(
         "cannot undo the first commit on a detached-HEAD worktree at {path}: no branch ref to \
          unmake"

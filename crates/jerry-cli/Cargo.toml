@@ -15,13 +15,16 @@ path = "src/main.rs"
 
 [dependencies]
 jerry-core = { path = "../jerry-core" }
+# The hidden `git-sequence-editor`/`git-editor` subcommands (decisions.md §7) call
+# `jerry_git::rebase` directly - they are pure local sidecar-file mechanics git itself spawns as
+# `GIT_SEQUENCE_EDITOR`/`GIT_EDITOR`, not part of the Command/Query wire model.
+jerry-git = { path = "../jerry-git" }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
 jerry-host = { path = "../jerry-host" }
-jerry-git = { path = "../jerry-git" }
 tempfile = "3"
 test-support = { path = "../test-support" }
 # `LocalClient::subscribe`'s `mpsc::UnboundedReceiver`, polled with `try_next` - see

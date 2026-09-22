@@ -10,7 +10,7 @@ pub mod cli;
 pub mod exit;
 pub mod transport;
 
-use crate::cli::{Cli, Command, HookArgs, MergeArgs};
+use crate::cli::{Cli, Command, GitEditorArgs, GitSequenceEditorArgs, HookArgs, MergeArgs};
 use crate::transport::{ChooseError, Transport};
 use clap::Parser;
 use jerry_core::client::{Client, ClientError};
@@ -71,6 +71,14 @@ pub fn run(
         Ok(cli) => cli,
         Err(error) => return usage(error, out, err),
     };
+    // Pure local sidecar-file mechanics git itself spawns as `GIT_SEQUENCE_EDITOR`/`GIT_EDITOR`
+    // (decisions.md §7) - never part of the Command/Query wire model, so this returns before any
+    // `Ctx`/transport is built. Their exit codes are git's own contract, not jerry's.
+    match &cli.command {
+        Command::GitSequenceEditor(args) => return git_sequence_editor(cwd, args, err),
+        Command::GitEditor(args) => return git_editor(cwd, args, err),
+        _ => {}
+    }
     let caller = match env(AGENT_ENV) {
         Some(id) => Caller::Agent {
             id: AgentId(id.to_string_lossy().into_owned()),
@@ -121,7 +129,16 @@ pub fn run(
         Command::Status => status(&mut session, cli.json, out, err),
         Command::Merge(args) => merge(&mut session, args, cli.json, out, err),
         Command::Hook(args) => hook(&mut session, args, stdin, err),
+        // Already handled and returned above, before any `Ctx`/transport existed to build a
+        // `Session` from.
+        Command::GitSequenceEditor(_) | Command::GitEditor(_) => unreachable_editor_hook(),
     }
+}
+
+/// The two arms [`run`] always returns before reaching, matched here only so the exhaustive
+/// match above compiles without guessing at a `Report`/exit code neither ever needs.
+fn unreachable_editor_hook() -> u8 {
+    exit::FAILED
 }
 
 /// One invocation's way of reaching the executor: connected lazily on the first call, or the
@@ -271,6 +288,35 @@ fn read_hook_stdin(
         return None;
     }
     receiver.recv_timeout(deadline).ok()
+}
+
+/// `GIT_SEQUENCE_EDITOR`'s real target (decisions.md §7): copies the prepared todo
+/// (`jerry_git::rebase::run_sequence_editor`) over the todo file git generated. `cwd` is the
+/// worktree the rebase is running in - git invokes the sequence editor with the same cwd
+/// `start_interactive_rebase` spawned it from. Exit 0 accepts, non-zero aborts the whole rebase
+/// startup - git's own contract for this hook, not jerry's [`exit`] module.
+fn git_sequence_editor(cwd: &Path, args: &GitSequenceEditorArgs, err: &mut dyn Write) -> u8 {
+    match jerry_git::rebase::run_sequence_editor(cwd, &args.todo_file) {
+        Ok(()) => 0,
+        Err(error) => {
+            let _ = writeln!(err, "jerry: git-sequence-editor failed: {error}");
+            1
+        }
+    }
+}
+
+/// `GIT_EDITOR`'s real target (decisions.md §7): classifies and possibly rewrites the message
+/// file (`jerry_git::rebase::run_editor`). `Ok(false)` reproduces git's own `edit`-stop by
+/// exiting non-zero - a message-less `reword` with nothing queued.
+fn git_editor(cwd: &Path, args: &GitEditorArgs, err: &mut dyn Write) -> u8 {
+    match jerry_git::rebase::run_editor(cwd, &args.message_file) {
+        Ok(true) => 0,
+        Ok(false) => 1,
+        Err(error) => {
+            let _ = writeln!(err, "jerry: git-editor failed: {error}");
+            1
+        }
+    }
 }
 
 fn status(session: &mut Session, json: bool, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
@@ -872,6 +918,80 @@ mod run_tests {
         let (code, _, err) = invoke(&["merge", "--dry-run"], &env, &feature);
         assert_eq!(code, 3, "{err}");
         assert!(err.contains("merge-target-dirty"), "{err}");
+    }
+
+    #[test]
+    fn git_sequence_editor_copies_the_prepared_todo_and_git_editor_classifies_a_real_message() {
+        let repo = seed_empty_repo();
+        commit(repo.path(), "a.txt", "1\n", "commit 1");
+        let env = env(&[]);
+
+        // The sidecar directory `jerry_git::rebase::start_interactive_rebase` would have
+        // prepared, built by hand here so this test exercises the subcommand alone.
+        let git_dir = jerry_git::git_common_dir(repo.path()).expect("git dir");
+        let sidecar = git_dir.join("ade-rebase");
+        fs::create_dir_all(sidecar.join("queue")).expect("sidecar dirs");
+        fs::write(sidecar.join("todo.txt"), "pick deadbeef commit 1\n").expect("write prepared");
+
+        let generated = repo.path().join("git-rebase-todo");
+        fs::write(&generated, "pick deadbeef some other subject\n").expect("write git's own");
+        let (code, out, err) = invoke(
+            &["git-sequence-editor", generated.to_str().expect("utf8")],
+            &env,
+            repo.path(),
+        );
+        assert_eq!(code, 0, "stderr: {err}");
+        assert!(out.is_empty());
+        assert_eq!(
+            fs::read_to_string(&generated).expect("read generated"),
+            "pick deadbeef commit 1\n"
+        );
+
+        let message_file = repo.path().join("MSG");
+        fs::write(&message_file, "commit v1\n").expect("write message");
+        let (code, out, err) = invoke(
+            &["git-editor", message_file.to_str().expect("utf8")],
+            &env,
+            repo.path(),
+        );
+        assert_eq!(code, 0, "stderr: {err}");
+        assert!(out.is_empty());
+        assert_eq!(
+            fs::read_to_string(&message_file).expect("read message"),
+            "commit v1\n",
+            "a conflict-resumed step's pre-filled message must be left untouched"
+        );
+    }
+
+    #[test]
+    fn git_editor_exits_non_zero_to_reproduce_an_edit_stop_when_nothing_is_queued() {
+        let repo = seed_empty_repo();
+        commit(repo.path(), "a.txt", "1\n", "commit 1");
+        let env = env(&[]);
+
+        let message_file = repo.path().join("MSG");
+        fs::write(
+            &message_file,
+            "You are currently editing a commit while rebasing branch 'x'.\n",
+        )
+        .expect("write message");
+        let (code, out, _err) = invoke(
+            &["git-editor", message_file.to_str().expect("utf8")],
+            &env,
+            repo.path(),
+        );
+        assert_eq!(code, 1);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn the_hidden_editor_subcommands_are_hidden_from_help_but_still_real() {
+        let repo = seed_empty_repo();
+        let env = env(&[]);
+        let (code, out, _) = invoke(&["--help"], &env, repo.path());
+        assert_eq!(code, 0);
+        assert!(!out.contains("git-sequence-editor"), "{out}");
+        assert!(!out.contains("git-editor"), "{out}");
     }
 
     #[test]
