@@ -275,6 +275,20 @@ impl AdeApp {
             } else {
                 Ok(())
             };
+            // MERGE_HEAD is re-checked off the UI thread so `Abort merge` stays offered after a
+            // failure; the update below must never spawn git itself.
+            let abortable_worktree = if result.is_err() || staged.is_err() {
+                let path = worktree_path_for_check.clone();
+                cx.background_spawn(async move {
+                    jerry_git::merge::merge_head_exists(&path)
+                        .ok()
+                        .filter(|present| *present)
+                        .map(|_| path)
+                })
+                .await
+            } else {
+                None
+            };
             let _ = this.update(cx, |this, cx| {
                 // Real defense in depth (see `merge::MergeFlow::generation`'s own docs): a
                 // bare `agent_id` match alone can't tell "this write's own attempt is still
@@ -289,11 +303,7 @@ impl AdeApp {
                     match result {
                         Ok(ResolveWriteOutcome::Written) => {
                             if let Err(err) = &staged {
-                                let abortable_worktree =
-                                    jerry_git::merge::merge_head_exists(&worktree_path_for_check)
-                                        .ok()
-                                        .filter(|present| *present)
-                                        .map(|_| worktree_path_for_check.clone());
+                                let abortable_worktree = abortable_worktree.clone();
                                 if let Some(flow) = this.merge_flow.as_mut() {
                                     flow.state = merge::MergeFlowState::Error {
                                         message: format!(
@@ -328,13 +338,7 @@ impl AdeApp {
                             this.sync_merge_edit_to_active_file();
                         }
                         Err(err) => {
-                            // Re-check MERGE_HEAD so `Abort merge` stays offered rather than
-                            // silently vanishing - see `merge::MergeFlowState::Error`'s docs.
-                            let abortable_worktree =
-                                jerry_git::merge::merge_head_exists(&worktree_path_for_check)
-                                    .ok()
-                                    .filter(|present| *present)
-                                    .map(|_| worktree_path_for_check.clone());
+                            let abortable_worktree = abortable_worktree.clone();
                             if let Some(flow) = this.merge_flow.as_mut() {
                                 flow.state = merge::MergeFlowState::Error {
                                     message: format!("failed to write resolved file: {err}"),
@@ -424,6 +428,10 @@ impl AdeApp {
         );
         let task = cx.spawn(async move |this, cx| {
             let result = report_result(completion.await);
+            let abortable_worktree = match in_progress_merge_after(&result, &this, cx).await {
+                Some(found) => found,
+                None => return,
+            };
             let _ = this.update(cx, |this, cx| {
                 this.merge_op_in_flight = false;
                 match result {
@@ -438,12 +446,6 @@ impl AdeApp {
                     }
                     Err(err) => {
                         if this.merge_flow.as_ref().map(|flow| flow.agent_id) == Some(agent_id) {
-                            // MERGE_HEAD is still present when `complete_merge`'s defense in
-                            // depth is what failed, so `Abort merge` stays offered.
-                            let abortable_worktree =
-                                jerry_git::merge::find_in_progress_merge(&this.focused_repo_path())
-                                    .ok()
-                                    .flatten();
                             if let Some(flow) = this.merge_flow.as_mut() {
                                 flow.state = merge::MergeFlowState::Error {
                                     message: format!("commit failed: {err}"),
@@ -503,6 +505,10 @@ impl AdeApp {
         );
         let task = cx.spawn(async move |this, cx| {
             let result = report_result(abort.await);
+            let abortable_worktree = match in_progress_merge_after(&result, &this, cx).await {
+                Some(found) => found,
+                None => return,
+            };
             let _ = this.update(cx, |this, cx| {
                 this.merge_op_in_flight = false;
                 if this.merge_flow.as_ref().map(|flow| flow.agent_id) == Some(agent_id) {
@@ -512,11 +518,6 @@ impl AdeApp {
                             this.clear_merge_edit_state();
                         }
                         Err(err) => {
-                            let abortable_worktree = jerry_git::merge::find_in_progress_merge(
-                                &this.focused_repo_path(),
-                            )
-                            .ok()
-                            .flatten();
                             if let Some(flow) = this.merge_flow.as_mut() {
                                 flow.state = merge::MergeFlowState::Error {
                                     message: format!(
@@ -769,32 +770,10 @@ impl AdeApp {
                 let relative_path_for_write = relative_path.clone();
                 let base_for_stage = base_worktree_path.clone();
                 let relative_for_stage = relative_path.clone();
-                // Real, deliberate separation of the *write* outcome (`Err` only for a genuine
-                // I/O failure - the write never happened, or its real mtime/len couldn't be read
-                // back) from the *re-parse* outcome (`MergeEditReparseOutcome`, always `Ok` once
-                // the write itself succeeded) - a real, live-reproduced bug an audit caught in an
-                // earlier version of this method, which used a single `?`-chained `Result` for
-                // both: a hand-edit that leaves malformed conflict markers (e.g. deleting only
-                // the real `=======` line - a real, easy real mistake in a view whose whole
-                // purpose is editing those markers) made `jerry_git::merge::load_conflicted_file`'s
-                // own real parse fail *after* the real bytes were already written to disk, which
-                // the old code then treated identically to "the write itself failed":
-                // `EditBuffer::mark_saved` never ran (so the buffer kept reporting dirty even
-                // though the real on-disk bytes were already exactly what it held), and `files[]`
-                // kept describing the pre-write content - if the user then went back to the
-                // quick-pick view (via `Self::discard_merge_hand_edit`) and resolved a hunk
-                // there, `Self::resolve_active_hunk` would write a *stale*, pre-hand-edit
-                // render() over whatever the real hand-edit had actually just written. Fixed by
-                // always trusting the write's own real success (clearing dirty via `mark_saved`
-                // regardless of the re-parse outcome, since the real bytes genuinely are what's
-                // on disk now) and by *never* calling `Self::apply_merge_edit_save_result` (which
-                // is the only thing that ever updates `files[]` or clears `Self::merge_edit`) on
-                // a malformed re-parse - see [`MergeEditReparseOutcome::Malformed`]'s own docs for
-                // why that keeps hand-edit mode structurally forced open for this file (the
-                // quick-pick view's Take-left/right/both buttons stay absent from the render tree
-                // for it - see `crate::merge::render`'s own docs) until either a clean
-                // re-parse succeeds or the user explicitly discards, closing the stale-overwrite
-                // risk at its actual source rather than papering over one symptom of it.
+                // The write's own success is trusted regardless of the re-parse below: the bytes
+                // on disk are exactly the buffer, so `mark_saved` must run even when the markers
+                // came out malformed. A malformed re-parse never touches `files[]`, which keeps
+                // hand-edit mode open for the file until a clean save or an explicit discard.
                 //
                 // `jerry_git::merge::write_conflict_text` adds the write-through drift check
                 // (GitHub issue #497): the raw `std::fs::write` this used to be would silently
@@ -1092,6 +1071,28 @@ enum MergeEditReparseOutcome {
 /// merge is or isn't in progress just because this call failed. If that lookup itself fails,
 /// `abortable_worktree` is `None`.
 #[allow(dead_code)]
+/// After a failed complete or abort, which worktree still holds `MERGE_HEAD`, found off the UI
+/// thread so `Abort merge` stays offered. `None` when the app is gone; `Some(None)` when the
+/// result was a success and nothing needs checking.
+async fn in_progress_merge_after(
+    result: &Result<(), String>,
+    this: &gpui::WeakEntity<AdeApp>,
+    cx: &mut gpui::AsyncApp,
+) -> Option<Option<PathBuf>> {
+    if result.is_ok() {
+        return Some(None);
+    }
+    let repo_path = this.update(cx, |this, _cx| this.focused_repo_path()).ok()?;
+    Some(
+        cx.background_spawn(async move {
+            jerry_git::merge::find_in_progress_merge(&repo_path)
+                .ok()
+                .flatten()
+        })
+        .await,
+    )
+}
+
 pub(in crate::merge) fn merge_error_state(
     repo_path: &std::path::Path,
     message: String,
@@ -1105,14 +1106,6 @@ pub(in crate::merge) fn merge_error_state(
     }
 }
 
-/// Runs `jerry_git::merge::attempt_merge` and folds its result into a [`merge::MergeFlowState`] -
-/// a free function (not an `AdeApp` method) so it can run entirely inside
-/// `cx.background_executor().spawn`, matching this crate's `load_diff`/`load_worktrees`
-/// convention of doing blocking I/O and result-shaping together, off the GPUI foreground
-/// thread. For a [`jerry_git::merge::MergeOutcome::Conflicted`], this also classifies every
-/// conflicted path (`jerry_git::merge::classify_conflicted_file`) here, still off-thread, rather
-/// than leaving that as a second round-trip.
-#[allow(dead_code)]
 /// A Command's answer as the flows read it: `Ok` for an `ok` Report, the reason otherwise.
 fn report_result(report: Result<Report, RpcError>) -> Result<(), String> {
     match report {
