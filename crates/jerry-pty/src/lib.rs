@@ -1346,7 +1346,13 @@ mod pty_session_tests {
                         std::thread::sleep(Duration::from_millis(5));
                     }
                 }
-                Some(PtyOutput::Exited(_)) | None => break,
+                // `run_wait_loop`'s `Exited` and the reader thread's own trailing bytes are sent
+                // by two independent threads with no ordering between them - `Exited` arriving
+                // does not mean every `Bytes` item is already in hand, so keep draining rather
+                // than treating it as "nothing more will ever arrive" (`None` still does, since
+                // that means the channel is genuinely closed or `remaining` ran out).
+                Some(PtyOutput::Exited(_)) => {}
+                None => break,
             }
         }
 
