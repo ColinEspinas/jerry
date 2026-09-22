@@ -744,6 +744,27 @@ impl TerminalGrid {
     }
 }
 
+/// Drains `output` into `grid` until the child exits, the channel closes, or `timeout` elapses -
+/// shared by this module's end-to-end real-pty tests below. `test_support::wait_until` over a
+/// non-blocking `try_recv`, standing in for `std::sync::mpsc::Receiver::recv_timeout` - the async
+/// channel has no blocking-with-timeout receive of its own.
+#[cfg(test)]
+fn drain_into(
+    output: &mut futures::channel::mpsc::Receiver<jerry_pty::PtyOutput>,
+    grid: &mut TerminalGrid,
+    timeout: std::time::Duration,
+) {
+    test_support::wait_until(timeout, || match output.try_recv() {
+        Ok(jerry_pty::PtyOutput::Bytes(chunk)) => {
+            grid.append_bytes(&chunk);
+            false
+        }
+        Ok(jerry_pty::PtyOutput::Exited(_)) => true,
+        Err(err) if err.is_closed() => true,
+        Err(_empty) => false,
+    });
+}
+
 #[cfg(test)]
 mod grid_emulation_tests {
     use super::*;
@@ -1369,17 +1390,16 @@ mod grid_emulation_tests {
 
     #[test]
     fn end_to_end_real_pty_cursor_positioning_lands_correctly() {
-        let session = jerry_pty::spawn(jerry_pty::SpawnOptions::new("printf").arg("\\033[2;3HOK"))
-            .expect("spawning `printf` should succeed - this environment must have printf on PATH");
+        let mut session = jerry_pty::spawn(
+            jerry_pty::SpawnOptions::new("printf").arg("\\033[2;3HOK"),
+        )
+        .expect("spawning `printf` should succeed - this environment must have printf on PATH");
+        let mut output = session
+            .take_output()
+            .expect("a freshly spawned session must have its output stream");
 
         let mut grid = TerminalGrid::new(5, 20);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while let Ok(chunk) = session
-            .output()
-            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-        {
-            grid.append_bytes(&chunk);
-        }
+        drain_into(&mut output, &mut grid, std::time::Duration::from_secs(5));
 
         let rows = grid.visible_rows(&TerminalPalette::default());
         assert_eq!(
@@ -1472,17 +1492,16 @@ mod wide_char_tests {
 
     #[test]
     fn end_to_end_real_pty_utf8_output_lands_as_wide_cells() {
-        let session = jerry_pty::spawn(jerry_pty::SpawnOptions::new("printf").arg("日本語 🎉 ok"))
-            .expect("spawning `printf` should succeed - this environment must have printf on PATH");
+        let mut session = jerry_pty::spawn(
+            jerry_pty::SpawnOptions::new("printf").arg("日本語 🎉 ok"),
+        )
+        .expect("spawning `printf` should succeed - this environment must have printf on PATH");
+        let mut output = session
+            .take_output()
+            .expect("a freshly spawned session must have its output stream");
 
         let mut grid = TerminalGrid::new(5, 40);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while let Ok(chunk) = session
-            .output()
-            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-        {
-            grid.append_bytes(&chunk);
-        }
+        drain_into(&mut output, &mut grid, std::time::Duration::from_secs(5));
 
         let rows = grid.visible_rows(&TerminalPalette::default());
         let painted: String = rows[0]

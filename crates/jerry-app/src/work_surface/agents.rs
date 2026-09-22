@@ -574,7 +574,6 @@ impl Agents {
         });
         self.active = Some(id);
         self.active_by_cwd.insert(cwd, id);
-        self.sync_pane_cadence(cx);
         id
     }
 
@@ -640,25 +639,6 @@ impl Agents {
         }
     }
 
-    /// Re-derives every open pane's poll cadence from [`Self::active`]: exactly the active
-    /// agent's pane is foreground (`TerminalPane::set_foreground`), every other pane is
-    /// background. Called at the end of **every** mutator that can change which agent is
-    /// active ([`Self::spawn`], [`Self::set_active`], [`Self::activate_for_worktree`],
-    /// [`Self::close`]) - a full re-derivation over all panes rather than a delta update at
-    /// each site, so no future mutator can leave a pane's cadence stale by forgetting the
-    /// "demote the old one" half (this codebase's recurring stale-state bug class; a pane
-    /// wrongly left background would lag visibly, one wrongly left foreground would quietly
-    /// re-grow the multi-pane drain cost this flag exists to bound). Cheap enough for that:
-    /// one flag write per open agent.
-    fn sync_pane_cadence(&self, cx: &mut Context<AdeApp>) {
-        for agent in &self.agents {
-            let foreground = Some(agent.id) == self.active;
-            agent
-                .pane
-                .update(cx, |pane, _| pane.set_foreground(foreground));
-        }
-    }
-
     /// Applies a Settings › Appearance "Terminal font size" edit to every currently open
     /// agent's pane, not just newly spawned ones. `TerminalPane::set_font_size` is a no-op
     /// for a pane already at that size, so calling this on every edit is cheap.
@@ -671,14 +651,11 @@ impl Agents {
     }
 
     /// Makes `id` the globally active agent, and remembers it as its own worktree's active
-    /// tab too - a no-op if `id` doesn't name a currently open agent. Takes `cx` (unlike a
-    /// plain setter) because the active agent is what drives every pane's poll cadence -
-    /// see [`Self::sync_pane_cadence`].
-    pub fn set_active(&mut self, id: AgentId, cx: &mut Context<AdeApp>) {
+    /// tab too - a no-op if `id` doesn't name a currently open agent.
+    pub fn set_active(&mut self, id: AgentId) {
         if let Some(agent) = self.agents.iter().find(|agent| agent.id == id) {
             self.active = Some(id);
             self.active_by_cwd.insert(agent.cwd.clone(), id);
-            self.sync_pane_cadence(cx);
         }
     }
 
@@ -686,13 +663,12 @@ impl Agents {
     /// agent - or, if `cwd` has never had one recorded (a worktree just visited for the
     /// first time this window), its first open agent in creation order. `None` if `cwd`
     /// currently has no open agents at all.
-    pub fn activate_for_worktree(&mut self, cwd: &Path, cx: &mut Context<AdeApp>) {
+    pub fn activate_for_worktree(&mut self, cwd: &Path) {
         let id = self.primary_for_cwd(cwd).map(|agent| agent.id);
         self.active = id;
         if let Some(id) = id {
             self.active_by_cwd.insert(cwd.to_path_buf(), id);
         }
-        self.sync_pane_cadence(cx);
     }
 
     /// The other half of [`Self::activate_for_worktree`]'s own worktree-scoping fix: clears
@@ -708,9 +684,8 @@ impl Agents {
     /// inconsistency than the one this exists to fix. `active_by_cwd`'s own remembered-tab
     /// entries are untouched, so a later real worktree-row click still lands on the same agent
     /// [`Self::activate_for_worktree`] would have picked before this call ever ran.
-    pub fn clear_active(&mut self, cx: &mut Context<AdeApp>) {
+    pub fn clear_active(&mut self) {
         self.active = None;
-        self.sync_pane_cadence(cx);
     }
 
     /// Moves keyboard focus onto the currently active agent's terminal pane, if there is
@@ -775,7 +750,6 @@ impl Agents {
                 self.focus_active(window, cx);
             }
         }
-        self.sync_pane_cadence(cx);
     }
 }
 

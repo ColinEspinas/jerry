@@ -44,6 +44,12 @@ dbg_macro = "warn"
 gpui = { git = "https://github.com/zed-industries/zed", rev = "7b030b500810b04cf5fb4aa5973be99a502d9f36" }
 anyhow = "1"
 thiserror = "1"
+# `jerry-pty`'s awaitable output channel (`futures::channel::mpsc`), the `crates/jerry-app`
+# terminal pane task that awaits it (`futures::StreamExt::next`), and the host/app channel-woken
+# tasks (decisions.md §16) - matching `vendor/zed/Cargo.toml`'s own `futures = "0.3.32"` pin
+# (already resolved to 0.3.33 transitively via `gpui` itself, so this adds no new version to the
+# lock file).
+futures = "0.3"
 # Real config-file (de)serialization for `crate::settings_store::Settings`. Pinned to
 # the exact major versions `vendor/zed/Cargo.toml` itself pins (`serde = "1.0.221"`,
 # `toml = "0.8"`), matching this project's established "same versions Zed verified against"
@@ -54,9 +60,6 @@ thiserror = "1"
 serde = { version = "1.0.221", features = ["derive"] }
 toml = "0.8"
 serde_json = "1"
-# Channel and oneshot primitives the host and app share for channel-woken tasks
-# (decisions.md §16); the same 0.3 line Zed pins, already resolved through gpui.
-futures = "0.3"
 # The `jerry` command line; the same 4.4 line Zed pins.
 clap = { version = "4.4", features = ["derive", "wrap_help"] }
 # JSON Schema derivation for `jerry mcp`'s generated tool list (decisions.md §22). Pinned to the

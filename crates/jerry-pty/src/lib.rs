@@ -16,6 +16,11 @@
     allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)
 )]
 
+use futures::channel::mpsc as futures_mpsc;
+use futures::executor::block_on;
+use futures::SinkExt;
+#[cfg(windows)]
+use portable_pty::ChildKiller;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 #[cfg(unix)]
 use std::collections::HashSet;
@@ -25,12 +30,10 @@ use std::io::{Read, Write};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
-#[cfg(unix)]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 // A GUI-launched process (Finder's `.app`, a `.desktop` entry) inherits a minimal PATH that
@@ -51,9 +54,21 @@ pub use portable_pty::ExitStatus;
 ///
 /// **Also the dominant control on throughput**, which the memory framing hides. A consumer
 /// draining on an interval can only take what the channel buffered in between, so against a pty
-/// firehose drained every 8ms: capacity 16 gives 4.3 MB/s, capacity 256 gives 36.2 MB/s. Do not
-/// lower it without measuring under a *slow* consumer - both reach ~42 MB/s when drained in a
-/// tight loop, so a fast-consumer benchmark cannot see this at all.
+/// firehose drained every 8ms: capacity 16 gives 4.3 MB/s, capacity 256 gives 36.2 MB/s (measured
+/// against the earlier `std::sync::mpsc::sync_channel` design - a consumer that instead awaits
+/// every item, as [`PtySession::take_output`]'s callers do, is woken per chunk rather than per
+/// tick, so throughput is no longer interval-gated at all). Do not lower it without measuring
+/// under a *slow* consumer - both reach ~42 MB/s when drained in a tight loop, so a
+/// fast-consumer benchmark cannot see this at all.
+///
+/// `futures::channel::mpsc::channel`'s own capacity is `buffer + num-senders` - each live
+/// `Sender` reserves one guaranteed slot on top of these shared ones - so the real bound is this
+/// constant plus one slot per sender ever alive on the channel. On unix that is the reader thread
+/// alone - [`run_wait_loop`] hands its exit status to the reader instead of sending on this
+/// channel itself, which is what lets the reader guarantee `Exited` arrives last (see
+/// `docs/architecture/decisions.md` §8). Windows has no way to interrupt a blocked read (see that
+/// entry's Windows paragraph), so its `run_wait_loop` still sends independently - two senders
+/// there.
 const OUTPUT_CHANNEL_CAPACITY: usize = 256;
 /// Size of each read from the pty master.
 ///
@@ -68,6 +83,21 @@ const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_millis(200);
 /// Poll interval while waiting out [`SHUTDOWN_GRACE_PERIOD`].
 #[cfg(unix)]
 const SHUTDOWN_GRACE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// Windows post-exit grace: how long [`run_wait_loop`] requires the reader to have stayed idle
+/// (not mid-delivery) before treating "nothing more is coming" as settled - see that function's
+/// Windows docs. Never used in the steady state, only in the brief window after `Child::wait`
+/// returns.
+#[cfg(windows)]
+const WINDOWS_EXIT_QUIET_WINDOW: Duration = Duration::from_millis(150);
+/// Windows post-exit grace: the absolute cap on how long [`run_wait_loop`] waits for
+/// [`WINDOWS_EXIT_QUIET_WINDOW`] to be satisfied before sending `Exited` regardless - covers a
+/// descendant that keeps writing to the console indefinitely, which would otherwise stall exit
+/// reporting forever.
+#[cfg(windows)]
+const WINDOWS_EXIT_GRACE_DEADLINE: Duration = Duration::from_millis(2000);
+/// Poll interval while waiting out the Windows post-exit grace window.
+#[cfg(windows)]
+const WINDOWS_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(1);
 /// Depth cap for the `/proc` descendant walk, defensive against a pathological process tree.
 #[cfg(unix)]
 const TREE_WALK_MAX_DEPTH: usize = 8;
@@ -91,6 +121,8 @@ pub enum PtyError {
     Resize(String),
     #[error("failed to create pty shutdown pipe: {0}")]
     ShutdownPipe(String),
+    #[error("failed to create pty exit-signal pipe: {0}")]
+    ExitPipe(String),
     #[error("pty input writer is closed")]
     WriterClosed,
     #[error("failed to wait on child process: {0}")]
@@ -107,6 +139,22 @@ pub enum PtyError {
     CaptureTimeout(String),
     #[error("`{0}` printed no usable line")]
     CaptureEmpty(String),
+}
+
+/// One item from [`PtySession::take_output`]'s stream: either a chunk of raw bytes, or the
+/// child's real exit status once [`run_wait_loop`]'s dedicated thread has reaped it. Putting
+/// exit on the same channel as bytes is what lets a consumer simply await the stream to
+/// completion instead of separately polling [`PtySession::try_wait`] after an inferred pty EOF.
+#[derive(Debug)]
+pub enum PtyOutput {
+    /// Raw output, neither line-buffered nor UTF-8-validated, in read order.
+    Bytes(Vec<u8>),
+    /// The child process exited with this status. At most one per session. On unix this is a hard
+    /// guarantee: the last item on the stream, after every `Bytes` chunk the child wrote before
+    /// exiting - see [`run_wait_loop`]'s unix docs. On Windows it is a strong heuristic rather than
+    /// a guarantee (see that function's Windows docs and `docs/architecture/decisions.md` §8): a
+    /// trailing `Bytes` chunk can still, rarely, arrive after `Exited`.
+    Exited(ExitStatus),
 }
 
 /// Describes a process to spawn on a new PTY, plus the PTY's initial size.
@@ -309,10 +357,26 @@ pub struct PtySession {
     // `Option` so `shutdown`'s Windows twin can drop this before joining the reader thread:
     // that is what closes the ConPTY and unblocks the reader's `read`.
     master: Option<Box<dyn MasterPty + Send>>,
-    child: Option<Box<dyn Child + Send + Sync>>,
+    /// Cached once at spawn, before `child` moves into [`run_wait_loop`]'s dedicated thread - a
+    /// pid never changes, so reading the cache back needs no further synchronization.
+    pid: Option<u32>,
+    /// Signals the child without needing the `Child` handle itself, which
+    /// [`Self::wait_thread`] owns exclusively for the rest of the session's life. Windows-only:
+    /// unix's [`kill`](Self::kill)/[`shutdown`](Self::shutdown)/`Drop` all signal by pid
+    /// (`terminate_process_tree`) instead, so this would otherwise be write-only there.
+    #[cfg(windows)]
+    killer: Option<Box<dyn ChildKiller + Send + Sync>>,
     exited: Option<ExitStatus>,
-    output_rx: Receiver<Vec<u8>>,
+    /// `None` once [`Self::take_output`] has been called - a session's output stream is claimed
+    /// exactly once, by whichever caller is going to hold and await it independently of every
+    /// other `PtySession` method (see that method's docs for why it must be owned, not borrowed).
+    output_rx: Option<futures_mpsc::Receiver<PtyOutput>>,
     reader_thread: Option<JoinHandle<()>>,
+    /// The one thread that ever calls [`Child::wait`] for this session - see [`run_wait_loop`]'s
+    /// docs for why a second, independent poll of the same child would race it. Its `JoinHandle`
+    /// carries the real exit status back, so [`Self::try_wait`]/[`Self::shutdown`] read it via
+    /// `is_finished`/`join` instead of a separate shared cell.
+    wait_thread: Option<JoinHandle<ExitStatus>>,
     writer_tx: Option<mpsc::Sender<Vec<u8>>>,
     /// Raised when a write fails, so [`PtySession::write_input`] stops reporting success into a
     /// broken pipe.
@@ -353,6 +417,13 @@ pub fn spawn(options: SpawnOptions) -> Result<PtySession, PtyError> {
     // Load-bearing for EOF delivery, not cleanup - see the doc comment above.
     drop(pair.slave);
 
+    // Cached/cloned before `child` moves into `run_wait_loop`'s thread below - see
+    // `PtySession::pid`/`PtySession::killer`'s own field docs for why each exists independently
+    // of the `Child` handle itself.
+    let pid = child.process_id();
+    #[cfg(windows)]
+    let killer = child.clone_killer();
+
     let reader = pair
         .master
         .try_clone_reader()
@@ -362,12 +433,16 @@ pub fn spawn(options: SpawnOptions) -> Result<PtySession, PtyError> {
         .take_writer()
         .map_err(|err| PtyError::Writer(err.to_string()))?;
 
-    let (output_tx, output_rx) = mpsc::sync_channel::<Vec<u8>>(OUTPUT_CHANNEL_CAPACITY);
+    let (output_tx, output_rx) = futures_mpsc::channel::<PtyOutput>(OUTPUT_CHANNEL_CAPACITY);
 
-    // Unix polls a self-pipe alongside the pty fd for deterministic shutdown; Windows has no safe
-    // equivalent, so its reader blocks in `read` until the pty closes.
+    // Unix polls a self-pipe alongside the pty fd for deterministic shutdown, plus a second one
+    // `run_wait_loop` uses to hand the reader its exit status and wake it for a final bounded
+    // drain - see that function's docs. Windows has no self-pipe equivalent (`WSAPoll` accepts
+    // only sockets, not a ConPTY named pipe) and no way to inspect the pipe's contents from outside
+    // it either, so its wait thread still sends `Exited` on its own, timed against the reader's
+    // `delivering` state instead - see `run_wait_loop`'s Windows docs.
     #[cfg(unix)]
-    let (reader_thread, shutdown_write) = {
+    let (reader_thread, shutdown_write, wait_thread) = {
         let master_fd = pair.master.as_raw_fd().ok_or_else(|| {
             PtyError::Open("pty master exposed no raw file descriptor".to_string())
         })?;
@@ -375,17 +450,44 @@ pub fn spawn(options: SpawnOptions) -> Result<PtySession, PtyError> {
             read: shutdown_read,
             write: shutdown_write,
         } = filedescriptor::Pipe::new().map_err(|err| PtyError::ShutdownPipe(err.to_string()))?;
+        let filedescriptor::Pipe {
+            read: exit_read,
+            write: exit_write,
+        } = filedescriptor::Pipe::new().map_err(|err| PtyError::ExitPipe(err.to_string()))?;
+        let (exit_status_tx, exit_status_rx) = mpsc::channel::<ExitStatus>();
+        // Only the reader sends on `output_tx` here - it owns the whole `Sender`, not a clone -
+        // which is what makes `Exited` arriving last a real guarantee rather than a race.
         let reader_thread = std::thread::spawn(move || {
-            run_reader_loop(reader, master_fd, shutdown_read, output_tx);
+            run_reader_loop(
+                reader,
+                master_fd,
+                shutdown_read,
+                exit_read,
+                exit_status_rx,
+                output_tx,
+            )
         });
-        (reader_thread, Some(shutdown_write))
+        let wait_thread =
+            std::thread::spawn(move || run_wait_loop(child, exit_status_tx, exit_write));
+        (reader_thread, Some(shutdown_write), wait_thread)
     };
     #[cfg(windows)]
-    let (reader_thread, shutdown_write) = {
-        let reader_thread = std::thread::spawn(move || {
-            run_reader_loop(reader, output_tx);
+    let (reader_thread, shutdown_write, wait_thread) = {
+        // `false` ("Reading"): the reader is idle or blocked in `read`, not holding a chunk it
+        // hasn't sent yet. `true` ("Delivering"): between `read` returning and the chunk actually
+        // reaching `output_tx` - see `run_wait_loop`'s Windows docs for why this is what the wait
+        // thread watches.
+        let delivering = Arc::new(AtomicBool::new(false));
+        let reader_thread = std::thread::spawn({
+            let output_tx = output_tx.clone();
+            let delivering = Arc::clone(&delivering);
+            move || run_reader_loop(reader, output_tx, delivering)
         });
-        (reader_thread, None)
+        // Takes the original sender (the reader thread above holds a clone) so it survives
+        // independently of the reader - see `run_wait_loop`'s Windows docs for why this platform
+        // cannot instead guarantee `Exited` as the reader's own final item.
+        let wait_thread = std::thread::spawn(move || run_wait_loop(child, output_tx, delivering));
+        (reader_thread, None, wait_thread)
     };
 
     let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>();
@@ -399,10 +501,13 @@ pub fn spawn(options: SpawnOptions) -> Result<PtySession, PtyError> {
 
     Ok(PtySession {
         master: Some(pair.master),
-        child: Some(child),
+        pid,
+        #[cfg(windows)]
+        killer: Some(killer),
         exited: None,
-        output_rx,
+        output_rx: Some(output_rx),
         reader_thread: Some(reader_thread),
+        wait_thread: Some(wait_thread),
         writer_tx: Some(writer_tx),
         writer_failed,
         writer_thread: Some(writer_thread),
@@ -423,17 +528,34 @@ fn resolve_cwd(cwd: Option<PathBuf>) -> Result<PathBuf, PtyError> {
     }
 }
 
-/// The reader thread: polls `[master_fd, shutdown_read]` with no timeout, forwards a chunk when
-/// the master is readable, and exits the moment the shutdown pipe is - independent of echo state
-/// or whether `master`/`writer` were dropped elsewhere.
+/// The reader thread: polls `[master_fd, shutdown_read, exit_read]` with no timeout, forwards a
+/// chunk when the master is readable, exits immediately if the shutdown pipe fires (an explicit
+/// [`PtySession::shutdown`]/kill in progress - the caller already has the status directly and
+/// does not need it repeated on the channel), and otherwise, once `exit_read` fires, hands off to
+/// [`drain_final_output`] for a bounded final drain and the `Exited` item - see that function's
+/// docs for why this is what makes `Exited` a real "nothing more is coming" guarantee.
+///
+/// The master fd reaching real EOF/hangup - Linux reports this as an `EIO` read error, macOS as an
+/// `Ok(0)` read (`filedescriptor::poll` itself differs too: macOS's `poll` is `select`-backed and
+/// reports the fd as read-ready rather than `POLLHUP`, see `filedescriptor::unix::macos`) - is
+/// *not* treated as the stream ending: the direct child closes its last fd to the slave (hence the
+/// master hangs up) as part of exiting, which routinely happens before [`run_wait_loop`]'s
+/// `Child::wait()` call returns and wakes `exit_read`. Stopping here would drop `Exited` on
+/// exactly the common case this crate exists to get right - see the "a quiet child" scenario in
+/// `docs/architecture/decisions.md` §8. Once the master is confirmed closed this way, the loop
+/// stops polling/reading it (avoiding a busy-spin on Linux, where `POLLHUP` stays set) and waits
+/// out `shutdown_read`/`exit_read` instead via [`await_exit_after_master_closed`].
 #[cfg(unix)]
 fn run_reader_loop(
     mut reader: Box<dyn Read + Send>,
     master_fd: RawFd,
     shutdown_read: filedescriptor::FileDescriptor,
-    output_tx: mpsc::SyncSender<Vec<u8>>,
+    exit_read: filedescriptor::FileDescriptor,
+    exit_status_rx: mpsc::Receiver<ExitStatus>,
+    mut output_tx: futures_mpsc::Sender<PtyOutput>,
 ) {
     let shutdown_fd = shutdown_read.as_raw_fd();
+    let exit_fd = exit_read.as_raw_fd();
     let mut buf = [0u8; READ_BUF_SIZE];
     loop {
         let mut pfds = [
@@ -447,6 +569,11 @@ fn run_reader_loop(
                 events: filedescriptor::POLLIN,
                 revents: 0,
             },
+            filedescriptor::pollfd {
+                fd: exit_fd,
+                events: filedescriptor::POLLIN,
+                revents: 0,
+            },
         ];
 
         if filedescriptor::poll(&mut pfds, None).is_err() {
@@ -455,20 +582,137 @@ fn run_reader_loop(
         if pfds[1].revents != 0 {
             break;
         }
+        if pfds[2].revents != 0 {
+            drain_final_output(&mut reader, master_fd, &exit_status_rx, &mut output_tx);
+            break;
+        }
         if pfds[0].revents == 0 {
             continue;
         }
 
         match reader.read(&mut buf) {
+            Ok(0) => {
+                await_exit_after_master_closed(
+                    shutdown_fd,
+                    exit_fd,
+                    &mut reader,
+                    master_fd,
+                    &exit_status_rx,
+                    &mut output_tx,
+                );
+                break;
+            }
+            Ok(n) => {
+                let chunk = PtyOutput::Bytes(buf[..n].to_vec());
+                // Blocks this thread - and so, transitively, `read`, the kernel pty buffer, and
+                // the child's own `write` - exactly like the `sync_channel` this replaces (see
+                // `OUTPUT_CHANNEL_CAPACITY`'s docs and `docs/architecture/decisions.md` §8).
+                if block_on(output_tx.send(chunk)).is_err() {
+                    break; // the receiver was dropped; nobody is left to read further output
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                // Linux's `EIO` on a hungup pty master lands here.
+                await_exit_after_master_closed(
+                    shutdown_fd,
+                    exit_fd,
+                    &mut reader,
+                    master_fd,
+                    &exit_status_rx,
+                    &mut output_tx,
+                );
+                break;
+            }
+        }
+    }
+}
+
+/// Waits for whichever of `shutdown_fd`/`exit_fd` fires once the master fd has already gone away -
+/// reached from [`run_reader_loop`] on `EIO`/`Ok(0)`. Only these two fds remain, so there is
+/// nothing to busy-spin on; `exit_fd` firing still routes through the ordinary
+/// [`drain_final_output`] (which itself tolerates an already-closed master, finding nothing to
+/// drain and going straight to the exit status), and `shutdown_fd` firing still skips `Exited`,
+/// matching [`run_reader_loop`]'s own priority between the two.
+#[cfg(unix)]
+fn await_exit_after_master_closed(
+    shutdown_fd: RawFd,
+    exit_fd: RawFd,
+    reader: &mut Box<dyn Read + Send>,
+    master_fd: RawFd,
+    exit_status_rx: &mpsc::Receiver<ExitStatus>,
+    output_tx: &mut futures_mpsc::Sender<PtyOutput>,
+) {
+    loop {
+        let mut pfds = [
+            filedescriptor::pollfd {
+                fd: shutdown_fd,
+                events: filedescriptor::POLLIN,
+                revents: 0,
+            },
+            filedescriptor::pollfd {
+                fd: exit_fd,
+                events: filedescriptor::POLLIN,
+                revents: 0,
+            },
+        ];
+        if filedescriptor::poll(&mut pfds, None).is_err() {
+            return;
+        }
+        if pfds[0].revents != 0 {
+            return;
+        }
+        if pfds[1].revents != 0 {
+            drain_final_output(reader, master_fd, exit_status_rx, output_tx);
+            return;
+        }
+    }
+}
+
+/// Drains whatever the child already wrote before exiting, then sends its exit status as the
+/// stream's final item - called once [`run_wait_loop`] has reaped the child and woken this thread
+/// via `exit_read`.
+///
+/// The drain is bounded by real readiness (`poll` with a zero timeout - a genuine non-blocking
+/// check, not a real EOF wait) rather than the master fd's own EOF, which may never arrive: an
+/// orphaned descendant that escaped the process group can keep the slave open indefinitely after
+/// the direct child is gone. Stopping as soon as nothing is immediately available - rather than
+/// waiting out whatever such a descendant might still write - is what lets `Exited` be reported
+/// promptly instead of hanging on it.
+#[cfg(unix)]
+fn drain_final_output(
+    reader: &mut Box<dyn Read + Send>,
+    master_fd: RawFd,
+    exit_status_rx: &mpsc::Receiver<ExitStatus>,
+    output_tx: &mut futures_mpsc::Sender<PtyOutput>,
+) {
+    let mut buf = [0u8; READ_BUF_SIZE];
+    loop {
+        let mut pfds = [filedescriptor::pollfd {
+            fd: master_fd,
+            events: filedescriptor::POLLIN,
+            revents: 0,
+        }];
+        match filedescriptor::poll(&mut pfds, Some(Duration::ZERO)) {
+            Ok(ready) if ready > 0 && pfds[0].revents != 0 => {}
+            _ => break, // nothing immediately available, or the poll itself failed
+        }
+
+        match reader.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                if output_tx.send(buf[..n].to_vec()).is_err() {
-                    break;
+                if block_on(output_tx.send(PtyOutput::Bytes(buf[..n].to_vec()))).is_err() {
+                    return; // the receiver was dropped; nobody is left to report the exit to
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         }
+    }
+
+    // `run_wait_loop` sends this before waking `exit_read`, so it is already here.
+    if let Ok(status) = exit_status_rx.recv() {
+        let _ = block_on(output_tx.send(PtyOutput::Exited(status)));
     }
 }
 
@@ -483,21 +727,108 @@ fn run_reader_loop(
 /// That happens explicitly in [`PtySession::shutdown`], or on `Drop` only because `master` is
 /// declared *before* `reader_thread` in the struct and so drops first - field order is
 /// load-bearing here, not `Drop`'s own body.
+///
+/// `delivering` is `false` ("Reading") before every blocking `read` call, and `true`
+/// ("Delivering") from the moment `read` returns a chunk until it has actually reached
+/// `output_tx` - [`run_wait_loop`]'s Windows twin watches this to decide when `Exited` is safe to
+/// send.
 #[cfg(windows)]
-fn run_reader_loop(mut reader: Box<dyn Read + Send>, output_tx: mpsc::SyncSender<Vec<u8>>) {
+fn run_reader_loop(
+    mut reader: Box<dyn Read + Send>,
+    mut output_tx: futures_mpsc::Sender<PtyOutput>,
+    delivering: Arc<AtomicBool>,
+) {
     let mut buf = [0u8; READ_BUF_SIZE];
     loop {
+        delivering.store(false, Ordering::SeqCst);
         match reader.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                if output_tx.send(buf[..n].to_vec()).is_err() {
-                    break;
+                delivering.store(true, Ordering::SeqCst);
+                let chunk = PtyOutput::Bytes(buf[..n].to_vec());
+                if block_on(output_tx.send(chunk)).is_err() {
+                    break; // the receiver was dropped; nobody is left to read further output
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         }
     }
+}
+
+/// The one thread that ever calls [`Child::wait`] for a session: blocks until the child is really
+/// reaped, hands its status to the reader thread, and returns it too so
+/// [`PtySession::try_wait`]/[`PtySession::shutdown`] can read it straight off this thread's
+/// `JoinHandle` instead of a second shared cell.
+///
+/// Sends the status over `exit_status_tx` *before* writing `exit_write`, so by the time the reader
+/// wakes on that pipe the status is already there waiting - see [`drain_final_output`]. This is
+/// what removes the race the reader/wait-thread split otherwise has between pty EOF and reaping
+/// (`docs/architecture/decisions.md` §8's amendment): `Child::wait` is the process's own
+/// authoritative exit signal, independent of pty state, and only this thread ever sends on
+/// `output_tx` (via the reader), so nothing else can interleave `Exited` ahead of a `Bytes` chunk
+/// the child wrote first.
+#[cfg(unix)]
+fn run_wait_loop(
+    mut child: Box<dyn Child + Send + Sync>,
+    exit_status_tx: mpsc::Sender<ExitStatus>,
+    mut exit_write: filedescriptor::FileDescriptor,
+) -> ExitStatus {
+    let status = child
+        .wait()
+        .unwrap_or_else(|err| ExitStatus::with_signal(&format!("wait() failed: {err}")));
+    let _ = exit_status_tx.send(status.clone());
+    let _ = exit_write.write_all(&[1u8]);
+    status
+}
+
+/// Windows twin of [`run_wait_loop`]: sends `Exited` on `output_tx` directly rather than handing
+/// it to the reader thread, because nothing can wake that thread's blocked `read` early on this
+/// platform (see this function's crate-level docs) and there is no handle to inspect the pipe's
+/// contents from outside it either - `MasterPty::try_clone_reader` erases to `Box<dyn Read +
+/// Send>`, and neither it nor the master (downcast to the concrete `ConPtyMasterPty`, whose fields
+/// are private) exposes a raw handle a `PeekNamedPipe` call could use (verified against
+/// `portable-pty-0.9.0/src/win/{conpty,psuedocon}.rs`). Even a real handle would only buy a
+/// heuristic, not a hard guarantee: ConPTY translates the child's console output to VT on its own
+/// thread and writes to the pipe asynchronously, so a non-empty-pipe reading race exists inside
+/// ConPTY's own pipeline regardless of what jerry-pty can observe from outside it.
+///
+/// So this waits for the reader-idle signal that is actually observable: once `Child::wait`
+/// returns, `Exited` is sent only after `delivering` has read `false` ("Reading", not mid-delivery
+/// of a chunk) continuously for [`WINDOWS_EXIT_QUIET_WINDOW`] - any `true` read during that window
+/// restarts it, since a chunk was in flight to `output_tx`. A reader still idle several
+/// milliseconds after the child was reaped is not certain proof nothing more is coming (a
+/// descendant could still be writing), which is why this is a heuristic and not the same guarantee
+/// unix has, but a `ReadFile` on data already sitting in the kernel pipe buffer returns near
+/// instantly, so an idle window this short is strong real evidence in the common case.
+/// [`WINDOWS_EXIT_GRACE_DEADLINE`] bounds the wait so a descendant that never goes quiet cannot
+/// stall exit reporting forever - past it, `Exited` is sent regardless.
+#[cfg(windows)]
+fn run_wait_loop(
+    mut child: Box<dyn Child + Send + Sync>,
+    mut output_tx: futures_mpsc::Sender<PtyOutput>,
+    delivering: Arc<AtomicBool>,
+) -> ExitStatus {
+    let status = child
+        .wait()
+        .unwrap_or_else(|err| ExitStatus::with_signal(&format!("wait() failed: {err}")));
+
+    let grace_deadline = Instant::now() + WINDOWS_EXIT_GRACE_DEADLINE;
+    let mut quiet_since: Option<Instant> = None;
+    while Instant::now() < grace_deadline {
+        if delivering.load(Ordering::SeqCst) {
+            quiet_since = None; // a chunk is in flight; the window restarts once it clears
+        } else {
+            let quiet_start = *quiet_since.get_or_insert_with(Instant::now);
+            if quiet_start.elapsed() >= WINDOWS_EXIT_QUIET_WINDOW {
+                break;
+            }
+        }
+        std::thread::sleep(WINDOWS_EXIT_POLL_INTERVAL);
+    }
+
+    let _ = block_on(output_tx.send(PtyOutput::Exited(status.clone())));
+    status
 }
 
 /// The writer thread, so the pty's possibly-blocking `write` never happens on a caller's thread.
@@ -516,10 +847,17 @@ fn run_writer_loop(
 }
 
 impl PtySession {
-    /// Raw output chunks in read order, neither line-buffered nor UTF-8-validated. Bounded, so an
-    /// undrained receiver backpressures the pty instead of growing memory.
-    pub fn output(&self) -> &Receiver<Vec<u8>> {
-        &self.output_rx
+    /// Hands over this session's output stream - raw bytes plus the child's exit status as the
+    /// final item (see [`PtyOutput`]) - for the caller to hold and await independently of every
+    /// other `PtySession` method. Ownership, not a borrow, because the whole point is to
+    /// `.await` it across suspension points a `&mut PtySession` could never survive (a GPUI
+    /// entity update closure, for one - see `crate::terminal::pane` in `crates/jerry-app`).
+    ///
+    /// Bounded, so an undrained receiver backpressures the pty instead of growing memory - see
+    /// `OUTPUT_CHANNEL_CAPACITY`'s docs. `None` if already taken; a session's stream is claimed
+    /// exactly once, immediately after [`spawn`].
+    pub fn take_output(&mut self) -> Option<futures_mpsc::Receiver<PtyOutput>> {
+        self.output_rx.take()
     }
 
     /// Enqueues `data` for the pty's input side, as if typed. The write happens on a background
@@ -559,26 +897,37 @@ impl PtySession {
             .map_err(|err| PtyError::Resize(err.to_string()))
     }
 
-    /// The child's OS pid, if the platform exposes one and the session is not shut down.
+    /// The child's OS pid, if the platform exposes one and one was cached at spawn time.
     pub fn process_id(&self) -> Option<u32> {
-        self.child.as_ref().and_then(|child| child.process_id())
+        self.pid
     }
 
     /// Polls the child's exit status without blocking; `Ok(None)` while it is still running.
+    ///
+    /// Non-blocking because [`run_wait_loop`]'s dedicated thread, not this call, is what
+    /// actually blocks in [`Child::wait`] - this only checks (via `JoinHandle::is_finished`)
+    /// whether that thread has finished yet, and claims its result the first time it has.
     pub fn try_wait(&mut self) -> Result<Option<ExitStatus>, PtyError> {
-        let child = self.child.as_mut().ok_or(PtyError::AlreadyShutDown)?;
-        let status = child.try_wait().map_err(PtyError::Wait)?;
-        if let Some(status) = &status {
-            self.exited = Some(status.clone());
+        if self.exited.is_none()
+            && self
+                .wait_thread
+                .as_ref()
+                .is_some_and(JoinHandle::is_finished)
+        {
+            if let Some(handle) = self.wait_thread.take() {
+                self.exited = handle.join().ok();
+            }
         }
-        Ok(status)
+        Ok(self.exited.clone())
     }
 
     /// Signals the child's process group and any escaped descendants with `SIGHUP` then `SIGKILL`,
-    /// no grace between, and reaps the direct child if it has already exited.
+    /// no grace between.
     ///
-    /// Non-blocking: does not wait for termination or join the threads. Use
-    /// [`shutdown`](PtySession::shutdown) for that.
+    /// Non-blocking: does not wait for termination or join the threads (the real exit status
+    /// still arrives, asynchronously, as a [`PtyOutput::Exited`] item once
+    /// [`run_wait_loop`]'s thread reaps it). Use [`shutdown`](PtySession::shutdown) to block for
+    /// that.
     #[cfg(unix)]
     pub fn kill(&mut self) -> Result<(), PtyError> {
         if self.exited.is_some() {
@@ -587,16 +936,11 @@ impl PtySession {
         if let Some(pid) = self.process_id() {
             terminate_process_tree(pid, Duration::ZERO);
         }
-        if let Some(child) = self.child.as_mut() {
-            if let Ok(Some(status)) = child.try_wait() {
-                self.exited = Some(status);
-            }
-        }
         Ok(())
     }
 
     /// Terminates the child's whole process tree via [`windows_terminate_process_tree`], then
-    /// the direct child itself as the backstop.
+    /// the direct child itself (via [`Self::killer`]) as the backstop.
     #[cfg(windows)]
     pub fn kill(&mut self) -> Result<(), PtyError> {
         if self.exited.is_some() {
@@ -605,11 +949,8 @@ impl PtySession {
         if let Some(pid) = self.process_id() {
             windows_terminate_process_tree(pid);
         }
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
-            if let Ok(Some(status)) = child.try_wait() {
-                self.exited = Some(status);
-            }
+        if let Some(killer) = self.killer.as_mut() {
+            let _ = killer.kill();
         }
         Ok(())
     }
@@ -697,9 +1038,12 @@ impl PtySession {
             if let Some(pid) = self.process_id() {
                 terminate_process_tree(pid, SHUTDOWN_GRACE_PERIOD);
             }
-            if let Some(child) = self.child.as_mut() {
-                let status = child.wait().map_err(PtyError::Wait)?;
-                self.exited = Some(status);
+            // The wait thread's only job is one blocking `Child::wait` call - joining it *is*
+            // "block until reaped, then know the status", this method's whole contract.
+            if let Some(handle) = self.wait_thread.take() {
+                self.exited = Some(handle.join().map_err(|_| {
+                    PtyError::Wait(std::io::Error::other("the pty exit-wait thread panicked"))
+                })?);
             }
         }
 
@@ -733,10 +1077,15 @@ impl PtySession {
             if let Some(pid) = self.process_id() {
                 windows_terminate_process_tree(pid);
             }
-            if let Some(child) = self.child.as_mut() {
-                let _ = child.kill();
-                let status = child.wait().map_err(PtyError::Wait)?;
-                self.exited = Some(status);
+            if let Some(killer) = self.killer.as_mut() {
+                let _ = killer.kill();
+            }
+            // The wait thread's only job is one blocking `Child::wait` call - joining it *is*
+            // "block until reaped, then know the status", this method's whole contract.
+            if let Some(handle) = self.wait_thread.take() {
+                self.exited = Some(handle.join().map_err(|_| {
+                    PtyError::Wait(std::io::Error::other("the pty exit-wait thread panicked"))
+                })?);
             }
         }
 
@@ -803,28 +1152,16 @@ impl Drop for PtySession {
                         .stderr(std::process::Stdio::null())
                         .spawn();
                 }
-                if let Some(child) = self.child.as_mut() {
-                    let _ = child.kill();
+                if let Some(killer) = self.killer.as_mut() {
+                    let _ = killer.kill();
                 }
             }
 
-            let reaped_immediately = self
-                .child
-                .as_mut()
-                .and_then(|child| child.try_wait().ok().flatten());
-
-            match reaped_immediately {
-                Some(status) => self.exited = Some(status),
-                None => {
-                    // `try_wait` may have run a moment before the just-SIGKILLed child died, so a
-                    // detached thread finishes the `wait()` - reaped, without blocking here.
-                    if let Some(mut child) = self.child.take() {
-                        std::thread::spawn(move || {
-                            let _ = child.wait();
-                        });
-                    }
-                }
-            }
+            // `self.wait_thread` (if not already claimed by `try_wait`/`shutdown`) still owns
+            // `child` and is blocked in exactly one `Child::wait` call - dropping the handle here
+            // without joining detaches that thread rather than blocking `Drop` on it, the same
+            // "reap on a thread nobody waits for" outcome the old `child.take()` fallback below
+            // used to build by hand.
         }
 
         if let Some(mut write) = self.shutdown_write.take() {
@@ -986,7 +1323,6 @@ fn terminate_process_tree(root_pid: u32, grace: Duration) {
 #[cfg(test)]
 mod pty_session_tests {
     use super::*;
-    use std::sync::mpsc::RecvTimeoutError;
     use std::time::{Duration, Instant};
 
     /// How long a real child process is given to reach a state before a test calls it a
@@ -1116,11 +1452,36 @@ mod pty_session_tests {
         out
     }
 
-    /// Reads from `session.output()` until `needle` appears in the accumulated (lossy
-    /// UTF-8) output or `timeout` elapses, returning whatever was collected either way.
-    /// Returns as soon as the needle is found rather than always waiting out the full
-    /// timeout, so tests aren't needlessly slow.
-    fn drain_until_contains(session: &PtySession, needle: &str, timeout: Duration) -> Vec<u8> {
+    /// `test_support::wait_until` over a non-blocking `try_recv`, standing in for
+    /// `std::sync::mpsc::Receiver::recv_timeout` - the async channel has no blocking-with-timeout
+    /// receive of its own.
+    fn recv_timeout(
+        rx: &mut futures_mpsc::Receiver<PtyOutput>,
+        timeout: Duration,
+    ) -> Option<PtyOutput> {
+        let mut item = None;
+        test_support::wait_until(timeout, || match rx.try_recv() {
+            Ok(value) => {
+                item = Some(value);
+                true
+            }
+            Err(err) if err.is_closed() => true, // channel closed with nothing left; give up
+            Err(_empty) => false,
+        });
+        item
+    }
+
+    /// Reads from `rx` until `needle` appears in the accumulated (lossy UTF-8) output or
+    /// `timeout` elapses, returning whatever was collected either way. Returns as soon as the
+    /// needle is found rather than always waiting out the full timeout, so tests aren't
+    /// needlessly slow. A trailing [`PtyOutput::Exited`] or a closed channel ends the drain the
+    /// same way a timeout would - there is nothing further to collect either way.
+    fn drain_until_contains(
+        session: &PtySession,
+        rx: &mut futures_mpsc::Receiver<PtyOutput>,
+        needle: &str,
+        timeout: Duration,
+    ) -> Vec<u8> {
         let mut collected = Vec::new();
         let mut answered = false;
         let deadline = Instant::now() + timeout;
@@ -1133,10 +1494,9 @@ mod pty_session_tests {
             if remaining.is_zero() {
                 return collected;
             }
-            match session.output().recv_timeout(remaining) {
-                Ok(chunk) => collected.extend_from_slice(&chunk),
-                Err(RecvTimeoutError::Timeout) => return collected,
-                Err(RecvTimeoutError::Disconnected) => return collected,
+            match recv_timeout(rx, remaining) {
+                Some(PtyOutput::Bytes(chunk)) => collected.extend_from_slice(&chunk),
+                Some(PtyOutput::Exited(_)) | None => return collected,
             }
         }
     }
@@ -1145,7 +1505,7 @@ mod pty_session_tests {
     /// report a background job's pid deterministically instead of racing `/proc` to find it.
     #[cfg(unix)]
     fn read_line_after_prefix(
-        session: &PtySession,
+        rx: &mut futures_mpsc::Receiver<PtyOutput>,
         prefix: &str,
         timeout: Duration,
     ) -> Option<String> {
@@ -1162,19 +1522,25 @@ mod pty_session_tests {
             if remaining.is_zero() {
                 return None;
             }
-            match session.output().recv_timeout(remaining) {
-                Ok(chunk) => collected.push_str(&String::from_utf8_lossy(&chunk)),
-                Err(_) => return None,
+            match recv_timeout(rx, remaining) {
+                Some(PtyOutput::Bytes(chunk)) => {
+                    collected.push_str(&String::from_utf8_lossy(&chunk))
+                }
+                Some(PtyOutput::Exited(_)) | None => return None,
             }
         }
     }
 
     #[test]
     fn spawns_and_reads_short_process_output() {
-        let session = spawn(echo_command("hello-jerry-pty"))
+        let mut session = spawn(echo_command("hello-jerry-pty"))
             .expect("spawning an echo command should succeed");
+        let mut rx = session
+            .take_output()
+            .expect("a freshly spawned session must still have its output stream");
 
-        let output = drain_until_contains(&session, "hello-jerry-pty", Duration::from_secs(5));
+        let output =
+            drain_until_contains(&session, &mut rx, "hello-jerry-pty", Duration::from_secs(5));
         let text = String::from_utf8_lossy(&output);
         assert!(
             text.contains("hello-jerry-pty"),
@@ -1189,8 +1555,11 @@ mod pty_session_tests {
         // gets a smaller count rather than a longer timeout.
         const LINES: usize = if cfg!(windows) { 20_000 } else { 200_000 };
 
-        let session =
+        let mut session =
             spawn(counting_command(LINES)).expect("spawning a counting command should succeed");
+        let mut rx = session
+            .take_output()
+            .expect("a freshly spawned session must still have its output stream");
 
         let mut collected = Vec::new();
         let mut received = 0usize;
@@ -1209,8 +1578,8 @@ mod pty_session_tests {
             if remaining.is_zero() {
                 break;
             }
-            match session.output().recv_timeout(remaining) {
-                Ok(chunk) => {
+            match recv_timeout(&mut rx, remaining) {
+                Some(PtyOutput::Bytes(chunk)) => {
                     newlines += chunk.iter().filter(|byte| **byte == b'\n').count();
                     collected.extend_from_slice(&chunk);
                     received += 1;
@@ -1218,7 +1587,15 @@ mod pty_session_tests {
                         std::thread::sleep(Duration::from_millis(5));
                     }
                 }
-                Err(RecvTimeoutError::Disconnected | RecvTimeoutError::Timeout) => break,
+                // Guaranteed the stream's last item on unix (see `PtyOutput::Exited`'s docs), so
+                // ending the drain here is a real assertion that nothing was still in flight -
+                // Windows has no such guarantee, so it keeps draining past this item instead.
+                Some(PtyOutput::Exited(_)) => {
+                    if cfg!(unix) {
+                        break;
+                    }
+                }
+                None => break,
             }
         }
 
@@ -1310,21 +1687,23 @@ mod pty_session_tests {
     fn drop_terminates_entire_process_tree_including_escaped_grandchild() {
         // A process that escapes the group via its own `setsid()` is unreachable by `killpg`
         // alone. The shell reports its pid over the pty rather than us racing `/proc` for it.
-        let session = spawn(
+        let mut session = spawn(
             SpawnOptions::new("sh")
                 .arg("-c")
                 .arg("set -m; sleep 100 & echo GRANDCHILD:$!; exec sleep 300"),
         )
         .expect("spawning the shell pipeline should succeed");
+        let mut rx = session
+            .take_output()
+            .expect("a freshly spawned session must still have its output stream");
 
         let direct_pid = session
             .process_id()
             .expect("a spawned unix child should report a pid");
 
-        let grandchild_pid =
-            read_line_after_prefix(&session, "GRANDCHILD:", Duration::from_secs(5))
-                .and_then(|line| line.trim().parse::<u32>().ok())
-                .expect("shell should report the detached grandchild's pid over the pty");
+        let grandchild_pid = read_line_after_prefix(&mut rx, "GRANDCHILD:", Duration::from_secs(5))
+            .and_then(|line| line.trim().parse::<u32>().ok())
+            .expect("shell should report the detached grandchild's pid over the pty");
 
         assert!(
             pid_exists(direct_pid),
@@ -1440,17 +1819,19 @@ mod pty_session_tests {
             );
         }
 
-        let session = spawn(
+        let mut session = spawn(
             SpawnOptions::new("sh")
                 .arg("-c")
                 .arg("setsid sleep 100 & echo GRANDCHILD:$!; exec sleep 300"),
         )
         .expect("spawning the shell pipeline should succeed");
+        let mut rx = session
+            .take_output()
+            .expect("a freshly spawned session must still have its output stream");
 
-        let grandchild_pid =
-            read_line_after_prefix(&session, "GRANDCHILD:", Duration::from_secs(5))
-                .and_then(|line| line.trim().parse::<u32>().ok())
-                .expect("shell should report the detached grandchild's pid over the pty");
+        let grandchild_pid = read_line_after_prefix(&mut rx, "GRANDCHILD:", Duration::from_secs(5))
+            .and_then(|line| line.trim().parse::<u32>().ok())
+            .expect("shell should report the detached grandchild's pid over the pty");
 
         wait_for_state(
             grandchild_pid,
@@ -1492,6 +1873,130 @@ mod pty_session_tests {
         session
             .resume()
             .expect("resume on an already-exited child must be a harmless no-op");
+    }
+
+    /// The channel-native replacement for the old EOF-then-poll `try_wait` dance: a quick child's
+    /// real exit status must arrive as a [`PtyOutput::Exited`] item on the same stream as its
+    /// bytes, on every platform - this is what lets a consumer simply await the stream instead of
+    /// separately polling `try_wait` after inferring EOF (`docs/architecture/decisions.md` §8's
+    /// amendment).
+    #[test]
+    fn a_quick_exit_is_delivered_as_an_exited_item_on_the_output_channel() {
+        let mut session =
+            spawn(quick_exit_command()).expect("spawning a quick-exit command should succeed");
+        let mut rx = session
+            .take_output()
+            .expect("a freshly spawned session must still have its output stream");
+
+        // On Windows, ConPTY's own startup cursor-position query blocks the child's entire
+        // output (and, transitively, its exit) until something answers it - see
+        // `answer_cursor_position_query`'s docs. A bare consumer that only drains bytes without
+        // answering would make this test hang for the same reason a real, un-instrumented
+        // caller would need to answer it via a real terminal emulator.
+        let mut collected = Vec::new();
+        let mut answered = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let exited = loop {
+            answer_cursor_position_query(&session, &collected, &mut answered);
+            match recv_timeout(&mut rx, deadline.saturating_duration_since(Instant::now())) {
+                Some(PtyOutput::Exited(status)) => break Some(status),
+                Some(PtyOutput::Bytes(chunk)) => {
+                    collected.extend_from_slice(&chunk);
+                    continue;
+                }
+                None => break None,
+            }
+        };
+
+        assert!(
+            exited.is_some(),
+            "the child's real exit status must arrive on the output channel, not just be \
+             inferable from the channel closing"
+        );
+        assert!(
+            exited.expect("checked above").success(),
+            "a clean `exit 0`/`true` must report success"
+        );
+    }
+
+    // Pins the ordering guarantee `PtyOutput::Exited`'s docs make: a hard guarantee on unix, a
+    // strong heuristic on Windows (see `run_wait_loop`'s docs on each platform) - both platforms
+    // are expected to hold it here, so the assertions below are identical; only the spawned
+    // command and the ConPTY cursor-query handshake (a no-op off Windows) differ.
+    #[test]
+    fn exited_is_always_the_last_item_after_every_byte_the_child_wrote() {
+        // The race this guards against (when it existed) was probabilistic - a single spawn
+        // reliably passed even on the old, racy design, so this repeats many independent spawns
+        // rather than trusting one to catch it.
+        const ITERATIONS: usize = 50;
+        const MARKER: &str = "jerry-pty-exit-ordering-marker";
+        // How long to keep watching for a stray `Bytes` chunk after `Exited` arrives. Real time,
+        // not `deadline`'s remaining budget: on Windows the reader thread stays alive and
+        // `output_tx` open well past `Exited` (nothing unblocks its `read` early - see
+        // `run_wait_loop`'s Windows docs), so reusing the full per-iteration deadline here would
+        // just wait out a channel close that was never coming, rather than actually watching for
+        // a violation.
+        const POST_EXIT_WATCH: Duration = Duration::from_millis(300);
+
+        for iteration in 0..ITERATIONS {
+            let mut session = spawn(if cfg!(windows) {
+                SpawnOptions::new("cmd.exe")
+                    .arg("/c")
+                    .arg(format!("echo {MARKER}"))
+            } else {
+                SpawnOptions::new("sh")
+                    .arg("-c")
+                    .arg(format!("printf '%s' '{MARKER}'"))
+            })
+            .expect("spawning a printing command should succeed");
+            let mut rx = session
+                .take_output()
+                .expect("a freshly spawned session must still have its output stream");
+
+            let mut collected = Vec::new();
+            let mut exited_status = None;
+            let mut answered = false;
+            // Generous relative to `WINDOWS_EXIT_GRACE_DEADLINE`'s own worst case, so a run under
+            // heavy machine load fails on a real ordering violation, not on exhausting a tight
+            // per-iteration budget before the (already-bounded) exit signal had a chance to land.
+            let mut deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                answer_cursor_position_query(&session, &collected, &mut answered);
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match recv_timeout(&mut rx, remaining) {
+                    Some(PtyOutput::Bytes(chunk)) => {
+                        assert!(
+                            exited_status.is_none(),
+                            "iteration {iteration}: a `Bytes` chunk arrived after `Exited`"
+                        );
+                        collected.extend_from_slice(&chunk);
+                    }
+                    Some(PtyOutput::Exited(status)) => {
+                        assert!(
+                            exited_status.is_none(),
+                            "iteration {iteration}: more than one `Exited` item arrived"
+                        );
+                        exited_status = Some(status);
+                        deadline = deadline.min(Instant::now() + POST_EXIT_WATCH);
+                    }
+                    None => break,
+                }
+            }
+
+            assert!(
+                exited_status.is_some(),
+                "iteration {iteration}: the child's exit status never arrived"
+            );
+            let text = String::from_utf8_lossy(&collected);
+            assert!(
+                text.contains(MARKER),
+                "iteration {iteration}: expected the marker to have arrived before `Exited`, \
+                 got: {text:?}"
+            );
+        }
     }
 
     // Unix-only by subject, not just by binary: the mechanism under test is the self-pipe that
@@ -1541,13 +2046,12 @@ mod pty_session_tests {
         let _session = spawn(SpawnOptions::new("yes")).expect("spawning `yes` should succeed");
 
         let rss_before = read_self_rss_kb();
-        // Deliberately don't drain `session.output()` while `yes` floods the pty as
-        // fast as it can. With an unbounded channel this measurably grows RSS (an
-        // earlier version of this crate measured ~3.4MB -> ~127MB in 3s against a
-        // comparable undrained producer); with the bounded `sync_channel`, the reader
-        // thread blocks in `send` once the channel fills, which backpressures its
-        // `read`, which fills the kernel pty buffer, which blocks `yes`'s `write` - so
-        // growth should stay small and bounded.
+        // Deliberately never call `take_output` while `yes` floods the pty as fast as it can, so
+        // nothing ever drains the channel. With an unbounded channel this measurably grows RSS
+        // (an earlier version of this crate measured ~3.4MB -> ~127MB in 3s against a comparable
+        // undrained producer); with the bounded async channel, the reader thread blocks in
+        // `send` once the channel fills, which backpressures its `read`, which fills the kernel
+        // pty buffer, which blocks `yes`'s `write` - so growth should stay small and bounded.
         //
         // `stays_false` rather than a bare sleep-then-measure: it holds the same 500ms window
         // open while asserting the bound *continuously*, so a transient spike is caught too.
@@ -1564,8 +2068,11 @@ mod pty_session_tests {
 
     #[test]
     fn a_live_session_reports_a_healthy_writer_and_keeps_accepting_writes() {
-        let session =
+        let mut session =
             spawn(stdin_echoing_command()).expect("spawning an echoing shell should succeed");
+        let mut rx = session
+            .take_output()
+            .expect("a freshly spawned session must still have its output stream");
         assert!(!session.writer_failed());
         for _ in 0..3 {
             session
@@ -1573,7 +2080,8 @@ mod pty_session_tests {
                 .expect("a healthy writer must keep accepting writes");
         }
         assert!(!session.writer_failed());
-        let output = drain_until_contains(&session, "still-writing", Duration::from_secs(5));
+        let output =
+            drain_until_contains(&session, &mut rx, "still-writing", Duration::from_secs(5));
         assert!(String::from_utf8_lossy(&output).contains("still-writing"));
     }
 
@@ -1592,14 +2100,18 @@ mod pty_session_tests {
     fn write_input_is_echoed_back_by_the_pty_line_discipline() {
         // A cooked-mode pty echoes writes back through the reader regardless of the child; `cat`
         // just keeps the session alive long enough to see it.
-        let session =
+        let mut session =
             spawn(stdin_echoing_command()).expect("spawning an echoing shell should succeed");
+        let mut rx = session
+            .take_output()
+            .expect("a freshly spawned session must still have its output stream");
 
         session
             .write_input(b"ping-jerry-pty\n")
             .expect("writing input to a live pty should succeed");
 
-        let output = drain_until_contains(&session, "ping-jerry-pty", Duration::from_secs(5));
+        let output =
+            drain_until_contains(&session, &mut rx, "ping-jerry-pty", Duration::from_secs(5));
         let text = String::from_utf8_lossy(&output);
         assert!(
             text.contains("ping-jerry-pty"),
@@ -1658,13 +2170,16 @@ mod pty_session_tests {
             .into_owned();
 
         let (options, pwd_line) = pwd_shell_command();
-        let session = spawn(options.cwd(requested.clone()))
+        let mut session = spawn(options.cwd(requested.clone()))
             .expect("spawning a shell in a real directory should succeed");
+        let mut rx = session
+            .take_output()
+            .expect("a freshly spawned session must still have its output stream");
         session
             .write_input(pwd_line.as_bytes())
             .expect("writing to a freshly spawned shell should succeed");
 
-        let output = drain_until_contains(&session, &leaf, Duration::from_secs(15));
+        let output = drain_until_contains(&session, &mut rx, &leaf, Duration::from_secs(15));
         let text = strip_ansi(&String::from_utf8_lossy(&output));
 
         // Substring, not line-splitting: ConPTY runs the prompt and the command's output together

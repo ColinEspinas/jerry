@@ -207,7 +207,7 @@ impl AdeApp {
         // agent always belongs to the selected worktree" and put real keyboard focus somewhere
         // that is genuinely in the rendered tree, the same pair `Agents::activate_for_worktree`'s
         // own docs require of every caller.
-        self.agents.activate_for_worktree(&cwd, cx);
+        self.agents.activate_for_worktree(&cwd);
         self.focus_newly_spawned_agent(window, cx);
         // What was just restored *is* the session now - written straight back so a tab that could
         // not be reopened (a deleted file, an unresumable agent) stops being retried on every
