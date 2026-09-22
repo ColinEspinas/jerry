@@ -49,6 +49,18 @@ pub fn attempt_merge(
     repo_path: &Path,
     session_worktree_path: &Path,
 ) -> Result<(MergeStart, MergeOutcome), Error> {
+    let start = merge_preflight(repo_path, session_worktree_path)?;
+    let outcome = run_merge(&start.base_worktree_path, &start.session_branch)?;
+    Ok((start, outcome))
+}
+
+/// Every check [`attempt_merge`] makes before touching git, as one answer: which branch merges
+/// into which worktree, or the structured refusal. Lets a caller say "would this merge run"
+/// without running it.
+pub fn merge_preflight(
+    repo_path: &Path,
+    session_worktree_path: &Path,
+) -> Result<MergeStart, Error> {
     let Some(session_branch) = checked_out_branch(session_worktree_path)? else {
         return Err(Error::MergeSourceDetached {
             path: session_worktree_path.to_path_buf(),
@@ -78,14 +90,11 @@ pub fn attempt_merge(
             path: base_worktree_path,
         });
     }
-
-    let outcome = run_merge(&base_worktree_path, &session_branch)?;
-    let start = MergeStart {
+    Ok(MergeStart {
         base_branch,
         base_worktree_path,
         session_branch,
-    };
-    Ok((start, outcome))
+    })
 }
 
 /// Merges `source_branch` into whatever is checked out in `target_worktree_path` - the opposite
@@ -103,6 +112,17 @@ pub fn attempt_merge_into_current(
     target_worktree_path: &Path,
     source_branch: &str,
 ) -> Result<(MergeStart, MergeOutcome), Error> {
+    let start = merge_into_current_preflight(target_worktree_path, source_branch)?;
+    let outcome = run_merge(&start.base_worktree_path, &start.session_branch)?;
+    Ok((start, outcome))
+}
+
+/// [`attempt_merge_into_current`]'s checks without the merge, as [`merge_preflight`] is to
+/// [`attempt_merge`].
+pub fn merge_into_current_preflight(
+    target_worktree_path: &Path,
+    source_branch: &str,
+) -> Result<MergeStart, Error> {
     let Some(target_branch) = checked_out_branch(target_worktree_path)? else {
         return Err(Error::MergeTargetDetached {
             path: target_worktree_path.to_path_buf(),
@@ -120,14 +140,11 @@ pub fn attempt_merge_into_current(
             path: target_worktree_path.to_path_buf(),
         });
     }
-
-    let outcome = run_merge(target_worktree_path, source_branch)?;
-    let start = MergeStart {
+    Ok(MergeStart {
         base_branch: target_branch,
         base_worktree_path: target_worktree_path.to_path_buf(),
         session_branch: source_branch.to_string(),
-    };
-    Ok((start, outcome))
+    })
 }
 
 /// `worktree_path` must already have the branch being merged *into* checked out, be clean, and not
@@ -261,6 +278,12 @@ pub fn merge_head_exists(worktree_path: &Path) -> Result<bool, Error> {
 
 /// The paths git reports as unmerged, with `core.quotePath=false` pinned: otherwise a non-ASCII
 /// path comes back octal-escaped and the load and write act on a wrongly-named file.
+/// The paths git still holds as unmerged in `worktree_path`'s index: what [`complete_merge`]
+/// will refuse over, and what a caller resolves next.
+pub fn unmerged_files(worktree_path: &Path) -> Result<Vec<PathBuf>, Error> {
+    conflicted_files(worktree_path)
+}
+
 fn conflicted_files(worktree_path: &Path) -> Result<Vec<PathBuf>, Error> {
     let args: Vec<OsString> = vec![
         "-c".into(),

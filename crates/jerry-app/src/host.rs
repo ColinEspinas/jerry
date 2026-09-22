@@ -7,7 +7,7 @@ use gpui::{AppContext, Context, Task};
 use jerry_core::registry::{Instance, Registry, RegistryError};
 use jerry_core::wire::rpc_code;
 use jerry_core::{Call, Report, Request, RpcError};
-use jerry_host::{AgentTable, Host, HostError, LocalClient};
+use jerry_host::{AgentTable, DispatchFuture, Host, HostError, LocalClient};
 use std::path::{Path, PathBuf};
 use std::thread;
 
@@ -22,6 +22,9 @@ pub enum HostStartError {
 pub struct HostRuntime {
     /// `None` only while `Drop` hands the host to its cleanup thread.
     host: Option<Host>,
+    /// An unpublished host's dispatch loop, spawned on the first dispatch rather than at
+    /// construction, so a test app that never dispatches has no extra task in flight.
+    pending_dispatch: Option<DispatchFuture>,
     registry_dir: PathBuf,
     instance: Instance,
     /// Common git dirs published so far; republished as a whole when one is added.
@@ -29,22 +32,48 @@ pub struct HostRuntime {
 }
 
 impl HostRuntime {
-    /// Blocking (registry I/O and a socket bind): call from a background task.
-    pub fn start(registry_dir: PathBuf) -> Result<HostRuntime, HostStartError> {
+    /// Blocking (registry I/O and a socket bind): call from a background task. The returned
+    /// dispatch loop must be spawned by the caller, on GPUI's background executor in the app,
+    /// so blocking git work never runs on the UI thread and a test drives it deterministically.
+    pub fn start(registry_dir: PathBuf) -> Result<(HostRuntime, DispatchFuture), HostStartError> {
         let registry = Registry::open(registry_dir.clone())?;
         let instance = registry.allocate()?;
-        let host = Host::start()?;
+        let (host, dispatch) = Host::start_detached();
         host.listen(&instance.socket)?;
-        Ok(HostRuntime {
+        let runtime = HostRuntime {
             host: Some(host),
+            pending_dispatch: None,
             registry_dir,
             instance,
             repos: Vec::new(),
-        })
+        };
+        Ok((runtime, dispatch))
     }
 
-    pub fn start_default() -> Result<HostRuntime, HostStartError> {
+    pub fn start_default() -> Result<(HostRuntime, DispatchFuture), HostStartError> {
         Self::start(jerry_core::registry::runtime_dir()?)
+    }
+
+    /// A host with no socket and no registry entry: the same dispatch path, reachable only from
+    /// this process. What a test app runs on, so `jerry` never finds a test instance. Its
+    /// dispatch loop starts with the first dispatch.
+    pub fn in_process() -> HostRuntime {
+        let (host, dispatch) = Host::start_detached();
+        HostRuntime {
+            host: Some(host),
+            pending_dispatch: Some(dispatch),
+            registry_dir: PathBuf::new(),
+            instance: Instance {
+                name: String::new(),
+                socket: PathBuf::new(),
+                descriptor: PathBuf::new(),
+            },
+            repos: Vec::new(),
+        }
+    }
+
+    fn is_published(&self) -> bool {
+        !self.instance.name.is_empty()
     }
 
     /// Records `repo_common_dir` as served and returns what a background task needs to write
@@ -58,6 +87,11 @@ impl HostRuntime {
             self.instance.clone(),
             self.repos.clone(),
         )
+    }
+
+    /// The dispatch loop still to be spawned, if this host was built unpublished.
+    pub fn take_pending_dispatch(&mut self) -> Option<DispatchFuture> {
+        self.pending_dispatch.take()
     }
 
     pub fn client(&self) -> Option<LocalClient> {
@@ -80,6 +114,10 @@ impl Drop for HostRuntime {
         let Some(host) = self.host.take() else {
             return;
         };
+        if !self.is_published() {
+            let _ = host.shutdown();
+            return;
+        }
         let registry_dir = self.registry_dir.clone();
         let instance = self.instance.clone();
         let spawned = thread::Builder::new()
@@ -119,7 +157,8 @@ impl AdeApp {
                 .background_spawn(async move { HostRuntime::start_default() })
                 .await;
             match started {
-                Ok(runtime) => {
+                Ok((runtime, dispatch)) => {
+                    cx.background_spawn(dispatch).detach();
                     let _ = this.update(cx, |this, cx| this.adopt_host(runtime, cx));
                 }
                 Err(error) => log::warn!(
@@ -143,10 +182,14 @@ impl AdeApp {
         }
     }
 
-    /// Adds a repository to the descriptor, off the UI thread. A no-op before the host is up:
-    /// `adopt_host` publishes everything open at that moment.
+    /// Adds a repository to the descriptor, off the UI thread. A no-op before the host is up
+    /// (`adopt_host` publishes everything open at that moment) and for an unpublished host.
     pub(crate) fn serve_repo_from_host(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if self.host_runtime.is_none() {
+        if !self
+            .host_runtime
+            .as_ref()
+            .is_some_and(HostRuntime::is_published)
+        {
             return;
         }
         cx.spawn(async move |this, cx| {
@@ -184,11 +227,18 @@ impl AdeApp {
     /// Dispatches through the host. `cwd` is the worktree the action is requested from; the
     /// host derives the repository from it.
     pub fn dispatch(
-        &self,
+        &mut self,
         cwd: PathBuf,
         request: Request,
         cx: &mut Context<Self>,
     ) -> Task<Result<Report, RpcError>> {
+        if let Some(dispatch) = self
+            .host_runtime
+            .as_mut()
+            .and_then(HostRuntime::take_pending_dispatch)
+        {
+            cx.background_spawn(dispatch).detach();
+        }
         let Some(client) = self.host_runtime.as_ref().and_then(HostRuntime::client) else {
             return Task::ready(Err(RpcError::new(
                 rpc_code::NEEDS_HOST,
@@ -203,7 +253,7 @@ impl AdeApp {
 mod app_dispatch_tests {
     use super::HostRuntime;
     use crate::test_support::open_test_app;
-    use gpui::TestAppContext;
+    use gpui::{AppContext, TestAppContext};
     use jerry_core::wire::rpc_code;
     use jerry_core::{AppQuery, Report, Request};
     use std::path::PathBuf;
@@ -242,15 +292,8 @@ mod app_dispatch_tests {
     async fn the_app_dispatches_a_query_through_its_host_and_reads_the_report(
         cx: &mut TestAppContext,
     ) {
-        // The host answers from a real thread, which the deterministic test scheduler must be
-        // allowed to wait for.
-        cx.executor().allow_parking();
         let repo = seed_empty_repo();
         let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
-        let dir = registry_dir("dispatch");
-        let runtime = HostRuntime::start(dir.path.clone()).expect("host");
-        let socket = runtime.socket().to_path_buf();
-        app.update(cx, |app, cx| app.adopt_host(runtime, cx));
 
         let report = app
             .update(cx, |app, cx| {
@@ -261,7 +304,7 @@ mod app_dispatch_tests {
                 )
             })
             .await
-            .expect("the host answers");
+            .expect("the in-process host answers");
         match report {
             Report::Ok { outcome } => {
                 let worktree = PathBuf::from(outcome["worktree_path"].as_str().expect("path"));
@@ -272,6 +315,22 @@ mod app_dispatch_tests {
             }
             other => panic!("expected ok, got {other:?}"),
         }
+    }
+
+    #[gpui::test]
+    async fn a_published_host_removes_its_socket_when_the_runtime_is_dropped(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = seed_empty_repo();
+        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
+        let dir = registry_dir("dispatch");
+        let (runtime, dispatch) = HostRuntime::start(dir.path.clone()).expect("host");
+        let socket = runtime.socket().to_path_buf();
+        app.update(cx, |app, cx| {
+            cx.background_spawn(dispatch).detach();
+            app.adopt_host(runtime, cx);
+        });
+        assert!(socket.exists());
 
         app.update(cx, |app, _cx| app.host_runtime = None);
         assert!(
@@ -284,6 +343,7 @@ mod app_dispatch_tests {
     async fn without_a_host_a_dispatch_says_so_instead_of_pretending(cx: &mut TestAppContext) {
         let repo = seed_empty_repo();
         let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
+        app.update(cx, |app, _cx| app.host_runtime = None);
         let err = app
             .update(cx, |app, cx| {
                 app.dispatch(

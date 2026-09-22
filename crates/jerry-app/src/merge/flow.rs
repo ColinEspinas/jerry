@@ -1,6 +1,11 @@
 use super::*;
 #[cfg(test)]
 use crate::root::focus::palette_focus_tests;
+use gpui::{AppContext, Task};
+use jerry_core::{
+    AppCommand, MergeAbort, MergeAttempt, MergeAttemptOutcome, MergeBranchIntoCurrent,
+    MergeComplete, Report, Request, RpcError, StageResolved,
+};
 
 impl AdeApp {
     /// Cleanup for [`Self::close_agent`] closing the agent whose `Merge` click started
@@ -37,15 +42,15 @@ impl AdeApp {
         let Some(base_worktree_path) = base_worktree_path else {
             return;
         };
-        let task = cx.spawn(async move |_this, cx| {
-            // Fire-and-forget: the agent tab is already gone, so there's no UI left to
-            // report a failure to. Best-effort is the honest ceiling here - on failure the
-            // repository is left in whatever state `git merge --abort` left it in,
-            // inspectable/recoverable via a terminal.
-            let _ = cx
-                .background_executor()
-                .spawn(async move { jerry_git::merge::abort_merge(&base_worktree_path) })
-                .await;
+        let abort = self.dispatch(
+            base_worktree_path.clone(),
+            Request::Command(AppCommand::MergeAbort(MergeAbort { base_worktree_path })),
+            cx,
+        );
+        let task = cx.spawn(async move |_this, _cx| {
+            // Fire-and-forget: the agent tab is already gone, so there is no UI left to report
+            // a failure to; on failure the repository is left as `git merge --abort` left it.
+            let _ = abort.await;
         });
         self._merge_cleanup_task = Some(task);
     }
@@ -78,27 +83,15 @@ impl AdeApp {
         self.prune_confirm_armed = false;
         cx.notify();
 
-        let task = cx.spawn(async move |this, cx| {
-            let state = cx
-                .background_executor()
-                .spawn(async move { run_merge_attempt(&repo_path, &worktree_path) })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                if this.merge_flow.as_ref().map(|flow| flow.agent_id) == Some(id) {
-                    this.merge_flow = Some(merge::MergeFlow {
-                        agent_id: id,
-                        generation,
-                        state,
-                    });
-                    // The real state-transition point a fresh `Conflicted` state's active hunk
-                    // (if any) needs its highlight cache filled - see
-                    // `Self::ensure_active_merge_highlight_cache`'s docs for why this must never
-                    // happen from `render()` instead.
-                    this.ensure_active_merge_highlight_cache();
-                }
-                cx.notify();
-            });
-        });
+        let task = self.run_merge_request(
+            id,
+            generation,
+            repo_path,
+            worktree_path,
+            Request::Command(AppCommand::MergeAttempt(MergeAttempt::default())),
+            |_this| {},
+            cx,
+        );
         self._merge_task = Some(task);
     }
 
@@ -150,32 +143,20 @@ impl AdeApp {
         self.select_agent(agent_id, window, cx);
         cx.notify();
 
-        let task = cx.spawn(async move |this, cx| {
-            let state = cx
-                .background_executor()
-                .spawn(async move {
-                    run_merge_attempt_into_current(&target_worktree_path, &source_branch)
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                if this.merge_flow.as_ref().map(|flow| flow.agent_id) == Some(agent_id) {
-                    this.merge_flow = Some(merge::MergeFlow {
-                        agent_id,
-                        generation,
-                        state,
-                    });
-                    // See `Self::start_merge`'s own comment: the real state-transition point a
-                    // fresh `Conflicted` state's active hunk needs its highlight cache filled.
-                    this.ensure_active_merge_highlight_cache();
-                    // The graph tab's "Merging <branch>…" line is no longer true the moment this
-                    // lands, and the outcome itself belongs to the resolver that is now showing
-                    // it - leaving the pending message behind would read as still-in-progress the
-                    // next time the user opens the graph tab.
-                    this.graph_state.status_message = None;
-                }
-                cx.notify();
-            });
-        });
+        let repo_path = self.focused_repo_path();
+        let task = self.run_merge_request(
+            agent_id,
+            generation,
+            repo_path,
+            target_worktree_path,
+            Request::Command(AppCommand::MergeBranchIntoCurrent(MergeBranchIntoCurrent {
+                source_branch,
+            })),
+            // The graph tab's "Merging <branch>…" line is no longer true once the outcome
+            // lands; the resolver shows it from here on.
+            |this| this.graph_state.status_message = None,
+            cx,
+        );
         self._merge_task = Some(task);
     }
 
@@ -262,12 +243,6 @@ impl AdeApp {
                         &new_content,
                     )? {
                         jerry_git::merge::ConflictWriteOutcome::Written => {
-                            if is_now_resolved {
-                                jerry_git::merge::stage_conflict_resolution(
-                                    &base_worktree_path_for_write,
-                                    &relative_path_for_write,
-                                )?;
-                            }
                             Ok(ResolveWriteOutcome::Written)
                         }
                         jerry_git::merge::ConflictWriteOutcome::ExternallyChanged { on_disk } => {
@@ -280,6 +255,26 @@ impl AdeApp {
                     }
                 })
                 .await;
+            // Only staging touches the index, so only staging is a Command; the write above is
+            // a plain disk edit under write-through.
+            let staged = if is_now_resolved && matches!(result, Ok(ResolveWriteOutcome::Written)) {
+                let stage = this.update(cx, |this, cx| {
+                    this.dispatch(
+                        worktree_path_for_check.clone(),
+                        Request::Command(AppCommand::StageResolved(StageResolved {
+                            worktree_path: worktree_path_for_check.clone(),
+                            path: relative_path.clone(),
+                        })),
+                        cx,
+                    )
+                });
+                match stage {
+                    Ok(task) => report_result(task.await),
+                    Err(_) => return,
+                }
+            } else {
+                Ok(())
+            };
             let _ = this.update(cx, |this, cx| {
                 // Real defense in depth (see `merge::MergeFlow::generation`'s own docs): a
                 // bare `agent_id` match alone can't tell "this write's own attempt is still
@@ -292,7 +287,23 @@ impl AdeApp {
                     .is_some_and(|flow| flow.agent_id == agent_id && flow.generation == generation);
                 if still_current {
                     match result {
-                        Ok(ResolveWriteOutcome::Written) => {}
+                        Ok(ResolveWriteOutcome::Written) => {
+                            if let Err(err) = &staged {
+                                let abortable_worktree =
+                                    jerry_git::merge::merge_head_exists(&worktree_path_for_check)
+                                        .ok()
+                                        .filter(|present| *present)
+                                        .map(|_| worktree_path_for_check.clone());
+                                if let Some(flow) = this.merge_flow.as_mut() {
+                                    flow.state = merge::MergeFlowState::Error {
+                                        message: format!(
+                                            "failed to stage the resolved file: {err}"
+                                        ),
+                                        abortable_worktree,
+                                    };
+                                }
+                            }
+                        }
                         Ok(ResolveWriteOutcome::ExternallyChanged(fresh)) => {
                             if let Some(flow) = this.merge_flow.as_mut() {
                                 if let merge::MergeFlowState::Conflicted {
@@ -345,6 +356,43 @@ impl AdeApp {
     /// (`jerry_git::merge::complete_merge`), valid once a clean merge is staged or every
     /// conflicted file is resolved ([`crate::merge::state::all_resolved`]). On success, clears the flow
     /// and refreshes worktree/diff state to reflect the merge that just happened.
+    /// Dispatches a merge attempt through the host and installs the resulting flow state,
+    /// unless a newer attempt superseded this one meanwhile. `settle` runs once the state is
+    /// in, for whatever the caller's surface has to tidy.
+    #[allow(clippy::too_many_arguments)]
+    fn run_merge_request(
+        &mut self,
+        agent_id: AgentId,
+        generation: u64,
+        repo_path: PathBuf,
+        cwd: PathBuf,
+        request: Request,
+        settle: impl FnOnce(&mut Self) + 'static,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        let report = self.dispatch(cwd, request, cx);
+        cx.spawn(async move |this, cx| {
+            let report = report.await;
+            let state = cx
+                .background_spawn(async move { merge_state_from_report(&repo_path, report) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.merge_flow.as_ref().map(|flow| flow.agent_id) == Some(agent_id) {
+                    this.merge_flow = Some(merge::MergeFlow {
+                        agent_id,
+                        generation,
+                        state,
+                    });
+                    // A fresh `Conflicted` state's active hunk needs its highlight cache filled
+                    // here, never from `render()`.
+                    this.ensure_active_merge_highlight_cache();
+                    settle(this);
+                }
+                cx.notify();
+            });
+        })
+    }
+
     pub(in crate::merge) fn complete_merge_flow(&mut self, cx: &mut Context<Self>) {
         self.prune_confirm_armed = false;
         if self.merge_op_in_flight {
@@ -367,11 +415,15 @@ impl AdeApp {
         self.merge_op_in_flight = true;
         cx.notify();
         let agent_id = flow.agent_id;
+        let completion = self.dispatch(
+            base_worktree_path.clone(),
+            Request::Command(AppCommand::MergeComplete(MergeComplete {
+                base_worktree_path,
+            })),
+            cx,
+        );
         let task = cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { jerry_git::merge::complete_merge(&base_worktree_path) })
-                .await;
+            let result = report_result(completion.await);
             let _ = this.update(cx, |this, cx| {
                 this.merge_op_in_flight = false;
                 match result {
@@ -444,11 +496,13 @@ impl AdeApp {
         self.merge_op_in_flight = true;
         cx.notify();
         let agent_id = flow.agent_id;
+        let abort = self.dispatch(
+            base_worktree_path.clone(),
+            Request::Command(AppCommand::MergeAbort(MergeAbort { base_worktree_path })),
+            cx,
+        );
         let task = cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { jerry_git::merge::abort_merge(&base_worktree_path) })
-                .await;
+            let result = report_result(abort.await);
             let _ = this.update(cx, |this, cx| {
                 this.merge_op_in_flight = false;
                 if this.merge_flow.as_ref().map(|flow| flow.agent_id) == Some(agent_id) {
@@ -713,6 +767,8 @@ impl AdeApp {
                 }
 
                 let relative_path_for_write = relative_path.clone();
+                let base_for_stage = base_worktree_path.clone();
+                let relative_for_stage = relative_path.clone();
                 // Real, deliberate separation of the *write* outcome (`Err` only for a genuine
                 // I/O failure - the write never happened, or its real mtime/len couldn't be read
                 // back) from the *re-parse* outcome (`MergeEditReparseOutcome`, always `Ok` once
@@ -771,17 +827,8 @@ impl AdeApp {
                                         // succeeds, so it's still correct (and important - see
                                         // this method's own docs) to apply it to `files[]` even
                                         // when staging fails.
-                                        let stage_error = if fresh.remaining_conflicts() == 0 {
-                                            jerry_git::merge::write_resolved_file(
-                                                &base_worktree_path,
-                                                &fresh,
-                                            )
-                                            .err()
-                                            .map(|err| err.to_string())
-                                        } else {
-                                            None
-                                        };
-                                        MergeEditReparseOutcome::Parsed { fresh, stage_error }
+                                        let needs_stage = fresh.remaining_conflicts() == 0;
+                                        MergeEditReparseOutcome::Parsed { fresh, needs_stage }
                                     }
                                     Err(err) => MergeEditReparseOutcome::Malformed(err.to_string()),
                                 };
@@ -806,6 +853,7 @@ impl AdeApp {
                     })
                     .await;
 
+                let mut stage_after = false;
                 let _ = this.update(cx, |this, cx| {
                     match write_result {
                         Ok(MergeEditWriteOutcome::Written {
@@ -837,13 +885,9 @@ impl AdeApp {
                                     edit.buffer.mark_saved(written_content, mtime, len);
                                 }
                                 match reparse {
-                                    MergeEditReparseOutcome::Parsed { fresh, stage_error } => {
-                                        this.merge_edit_save_error = stage_error.map(|err| {
-                                            format!(
-                                                "saved, but staging the resolved file with git \
-                                                 failed: {err}"
-                                            )
-                                        });
+                                    MergeEditReparseOutcome::Parsed { fresh, needs_stage } => {
+                                        this.merge_edit_save_error = None;
+                                        stage_after = needs_stage;
                                         this.apply_merge_edit_save_result(
                                             agent_id,
                                             generation,
@@ -914,6 +958,28 @@ impl AdeApp {
                     }
                     cx.notify();
                 });
+                if stage_after {
+                    let stage = this.update(cx, |this, cx| {
+                        this.dispatch(
+                            base_for_stage.clone(),
+                            Request::Command(AppCommand::StageResolved(StageResolved {
+                                worktree_path: base_for_stage.clone(),
+                                path: relative_for_stage.clone(),
+                            })),
+                            cx,
+                        )
+                    });
+                    if let Ok(task) = stage {
+                        if let Err(err) = report_result(task.await) {
+                            let _ = this.update(cx, |this, cx| {
+                                this.merge_edit_save_error = Some(format!(
+                                    "saved, but staging the resolved file with git failed: {err}"
+                                ));
+                                cx.notify();
+                            });
+                        }
+                    }
+                }
             }
         });
         self._merge_edit_save_task = Some(task);
@@ -1010,7 +1076,8 @@ enum MergeEditReparseOutcome {
     /// commit while a path stays genuinely unstaged, regardless of what this warning says.
     Parsed {
         fresh: jerry_git::merge::ConflictedFile,
-        stage_error: Option<String>,
+        /// Every hunk is resolved, so the caller stages the file through the host next.
+        needs_stage: bool,
     },
     /// The written content's own conflict markers are genuinely malformed (e.g. a real
     /// `Error::MergeMalformedConflictMarkers` - deleting only a hunk's `=======` line while
@@ -1046,78 +1113,72 @@ pub(in crate::merge) fn merge_error_state(
 /// conflicted path (`jerry_git::merge::classify_conflicted_file`) here, still off-thread, rather
 /// than leaving that as a second round-trip.
 #[allow(dead_code)]
-pub(in crate::merge) fn run_merge_attempt(
+/// A Command's answer as the flows read it: `Ok` for an `ok` Report, the reason otherwise.
+fn report_result(report: Result<Report, RpcError>) -> Result<(), String> {
+    match report {
+        Ok(Report::Ok { .. }) => Ok(()),
+        Ok(Report::Denied { reason, .. }) => Err(reason),
+        Ok(Report::Error { error }) => Err(error.message),
+        Err(error) => Err(error.message),
+    }
+}
+
+/// Turns a merge attempt's Report into flow state. The Report names paths; the resolver needs
+/// their contents, so conflicted files are re-read from the base worktree here. Blocking.
+fn merge_state_from_report(
     repo_path: &std::path::Path,
-    worktree_path: &std::path::Path,
+    report: Result<Report, RpcError>,
 ) -> merge::MergeFlowState {
-    fold_merge_result(
-        jerry_git::merge::attempt_merge(repo_path, worktree_path),
-        |message| merge_error_state(repo_path, message),
-    )
-}
-
-/// [`run_merge_attempt`]'s twin for the graph Branches panel's "Merge into current branch…"
-/// (GitHub issue #241): runs `jerry_git::merge::attempt_merge_into_current` and folds its result
-/// into the very same [`merge::MergeFlowState`] via the very same [`fold_merge_result`], so the
-/// existing conflict resolver cannot tell the two directions apart - which is the whole point of
-/// routing this through the existing flow rather than building a second one.
-pub(in crate::merge) fn run_merge_attempt_into_current(
-    target_worktree_path: &std::path::Path,
-    source_branch: &str,
-) -> merge::MergeFlowState {
-    fold_merge_result(
-        jerry_git::merge::attempt_merge_into_current(target_worktree_path, source_branch),
-        |message| {
-            let abortable_worktree = jerry_git::merge::merge_head_exists(target_worktree_path)
-                .ok()
-                .and_then(|in_progress| in_progress.then(|| target_worktree_path.to_path_buf()));
-            merge::MergeFlowState::Error {
-                message,
-                abortable_worktree,
+    let outcome = match report {
+        Ok(Report::Ok { outcome }) => outcome,
+        Ok(Report::Denied { reason, .. }) => {
+            return merge::MergeFlowState::Error {
+                message: reason,
+                abortable_worktree: None,
             }
-        },
-    )
-}
-
-/// Folds one already-run `jerry_git::merge` attempt's real result into a
-/// [`merge::MergeFlowState`] - shared by both directions ([`run_merge_attempt`] and
-/// [`run_merge_attempt_into_current`]) so the `MergeOutcome` → UI-state mapping, including the
-/// off-thread classification of every conflicted path, exists exactly once.
-fn fold_merge_result(
-    result: Result<
-        (jerry_git::merge::MergeStart, jerry_git::merge::MergeOutcome),
-        jerry_git::Error,
-    >,
-    error_state: impl Fn(String) -> merge::MergeFlowState,
-) -> merge::MergeFlowState {
-    let (start, outcome) = match result {
-        Ok(result) => result,
-        Err(err) => return error_state(err.to_string()),
+        }
+        Ok(Report::Error { error }) => return merge_error_state(repo_path, error.message),
+        Err(error) => return merge_error_state(repo_path, error.message),
+    };
+    let outcome: MergeAttemptOutcome = match serde_json::from_value(outcome) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return merge_error_state(
+                repo_path,
+                format!("the host answered with an unreadable merge outcome: {error}"),
+            )
+        }
     };
     match outcome {
-        jerry_git::merge::MergeOutcome::AlreadyUpToDate => merge::MergeFlowState::AlreadyUpToDate {
-            base_branch: start.base_branch,
-        },
-        jerry_git::merge::MergeOutcome::Clean { files } => merge::MergeFlowState::Clean {
-            base_branch: start.base_branch,
-            base_worktree_path: start.base_worktree_path,
+        MergeAttemptOutcome::AlreadyUpToDate { base_branch } => {
+            merge::MergeFlowState::AlreadyUpToDate { base_branch }
+        }
+        MergeAttemptOutcome::Clean {
+            base_branch,
+            base_worktree_path,
+            files,
+        } => merge::MergeFlowState::Clean {
+            base_branch,
+            base_worktree_path,
             files,
         },
-        jerry_git::merge::MergeOutcome::Conflicted {
-            conflicted_files,
+        MergeAttemptOutcome::Conflicted {
+            base_branch,
+            base_worktree_path,
             clean_files,
+            conflicted,
         } => {
-            let mut files = Vec::with_capacity(conflicted_files.len());
-            for path in &conflicted_files {
-                match jerry_git::merge::classify_conflicted_file(&start.base_worktree_path, path) {
+            let mut files = Vec::with_capacity(conflicted.len());
+            for entry in conflicted {
+                match jerry_git::merge::classify_conflicted_file(&base_worktree_path, &entry.path) {
                     Ok(classified) => files.push(classified),
-                    Err(err) => return error_state(err.to_string()),
+                    Err(err) => return merge_error_state(repo_path, err.to_string()),
                 }
             }
             let (active_file, active_hunk) = merge::first_unresolved(&files).unwrap_or((0, 0));
             merge::MergeFlowState::Conflicted {
-                base_branch: start.base_branch,
-                base_worktree_path: start.base_worktree_path,
+                base_branch,
+                base_worktree_path,
                 clean_files,
                 files,
                 active_file,

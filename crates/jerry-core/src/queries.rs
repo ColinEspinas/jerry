@@ -35,3 +35,37 @@ impl Query for StatusQuery {
         })
     }
 }
+
+/// Is a merge in progress for this repository, and what is still unmerged in it. What
+/// `jerry merge --continue` and `--abort` read before acting.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeStatusQuery {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeStatusOutcome {
+    /// The base worktree holding `MERGE_HEAD`, if any.
+    pub in_progress_at: Option<PathBuf>,
+    /// Paths git still holds as unmerged there; empty when nothing is in progress.
+    pub unmerged: Vec<PathBuf>,
+}
+
+impl Query for MergeStatusQuery {
+    type Outcome = MergeStatusOutcome;
+    const NAME: &'static str = "merge-status";
+
+    fn locality(&self) -> Locality {
+        Locality::Git
+    }
+
+    fn run(&self, ctx: &Ctx) -> Result<MergeStatusOutcome, Error> {
+        let in_progress_at = jerry_git::merge::find_in_progress_merge(&ctx.repo_path)?;
+        let unmerged = match &in_progress_at {
+            Some(base) => jerry_git::merge::unmerged_files(base)?,
+            None => Vec::new(),
+        };
+        Ok(MergeStatusOutcome {
+            in_progress_at,
+            unmerged,
+        })
+    }
+}
