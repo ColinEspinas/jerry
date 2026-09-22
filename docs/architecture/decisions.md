@@ -253,9 +253,11 @@ real hardware — see issues #465–#468). `kill()`/`shutdown()` terminate the w
 descendants, with the direct kill as backstop (an orphaned tree was how npm `.cmd`-shim agents'
 real `node.exe` survived, #468). There is no self-pipe either: `WSAPoll` accepts only sockets
 and a ConPTY master is a named pipe, so the reader blocks until `master` itself drops, *not* when
-the child is reaped. Callers must therefore poll `try_wait` rather than wait for the output channel
-to disconnect. These paths are `#[cfg(windows)]`, never `#[cfg(not(unix))]`, so an unsupported
-non-unix target fails to compile instead of silently inheriting Windows semantics.
+the child is reaped - the reader's own EOF must never be read as "the child exited" on this
+platform. Callers instead await `PtyOutput::Exited` on the output channel (see this entry's
+2026-09-22 amendment below), a real signal independent of the reader. These paths are
+`#[cfg(windows)]`, never `#[cfg(not(unix))]`, so an unsupported non-unix target fails to compile
+instead of silently inheriting Windows semantics.
 
 **Amended 2026-09-22 (#504):** The output channel is now `futures::channel::mpsc` rather than
 `std::sync::mpsc::sync_channel`, so a GPUI task can `.await` it instead of `crates/jerry-app`

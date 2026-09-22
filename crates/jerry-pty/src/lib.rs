@@ -19,7 +19,9 @@
 use futures::channel::mpsc as futures_mpsc;
 use futures::executor::block_on;
 use futures::SinkExt;
-use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
+#[cfg(windows)]
+use portable_pty::ChildKiller;
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 #[cfg(unix)]
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -337,7 +339,10 @@ pub struct PtySession {
     /// pid never changes, so reading the cache back needs no further synchronization.
     pid: Option<u32>,
     /// Signals the child without needing the `Child` handle itself, which
-    /// [`Self::wait_thread`] owns exclusively for the rest of the session's life.
+    /// [`Self::wait_thread`] owns exclusively for the rest of the session's life. Windows-only:
+    /// unix's [`kill`](Self::kill)/[`shutdown`](Self::shutdown)/`Drop` all signal by pid
+    /// (`terminate_process_tree`) instead, so this would otherwise be write-only there.
+    #[cfg(windows)]
     killer: Option<Box<dyn ChildKiller + Send + Sync>>,
     exited: Option<ExitStatus>,
     /// `None` once [`Self::take_output`] has been called - a session's output stream is claimed
@@ -394,6 +399,7 @@ pub fn spawn(options: SpawnOptions) -> Result<PtySession, PtyError> {
     // `PtySession::pid`/`PtySession::killer`'s own field docs for why each exists independently
     // of the `Child` handle itself.
     let pid = child.process_id();
+    #[cfg(windows)]
     let killer = child.clone_killer();
 
     let reader = pair
@@ -449,6 +455,7 @@ pub fn spawn(options: SpawnOptions) -> Result<PtySession, PtyError> {
     Ok(PtySession {
         master: Some(pair.master),
         pid,
+        #[cfg(windows)]
         killer: Some(killer),
         exited: None,
         output_rx: Some(output_rx),
@@ -1204,27 +1211,23 @@ mod pty_session_tests {
         out
     }
 
-    /// Non-blocking `try_recv` in a short retry loop until an item appears, the channel closes,
-    /// or `timeout` elapses - the async channel has no blocking-with-timeout receive the way
-    /// `std::sync::mpsc::Receiver::recv_timeout` does, and pulling in a full async runtime for
-    /// test code alone isn't worth it.
+    /// `test_support::wait_until` over a non-blocking `try_recv`, standing in for
+    /// `std::sync::mpsc::Receiver::recv_timeout` - the async channel has no blocking-with-timeout
+    /// receive of its own.
     fn recv_timeout(
         rx: &mut futures_mpsc::Receiver<PtyOutput>,
         timeout: Duration,
     ) -> Option<PtyOutput> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            match rx.try_recv() {
-                Ok(item) => return Some(item),
-                Err(err) if err.is_closed() => return None,
-                Err(_empty) => {
-                    if Instant::now() >= deadline {
-                        return None;
-                    }
-                    std::thread::sleep(Duration::from_millis(1));
-                }
+        let mut item = None;
+        test_support::wait_until(timeout, || match rx.try_recv() {
+            Ok(value) => {
+                item = Some(value);
+                true
             }
-        }
+            Err(err) if err.is_closed() => true, // channel closed with nothing left; give up
+            Err(_empty) => false,
+        });
+        item
     }
 
     /// Reads from `rx` until `needle` appears in the accumulated (lossy UTF-8) output or

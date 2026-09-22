@@ -745,29 +745,24 @@ impl TerminalGrid {
 }
 
 /// Drains `output` into `grid` until the child exits, the channel closes, or `timeout` elapses -
-/// shared by this module's end-to-end real-pty tests below. Non-blocking `try_recv` in a short
-/// retry loop rather than a blocking receive: `futures::channel::mpsc::Receiver` has no
-/// `recv_timeout` the way `std::sync::mpsc::Receiver` does.
+/// shared by this module's end-to-end real-pty tests below. `test_support::wait_until` over a
+/// non-blocking `try_recv`, standing in for `std::sync::mpsc::Receiver::recv_timeout` - the async
+/// channel has no blocking-with-timeout receive of its own.
 #[cfg(test)]
 fn drain_into(
     output: &mut futures::channel::mpsc::Receiver<jerry_pty::PtyOutput>,
     grid: &mut TerminalGrid,
     timeout: std::time::Duration,
 ) {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        match output.try_recv() {
-            Ok(jerry_pty::PtyOutput::Bytes(chunk)) => grid.append_bytes(&chunk),
-            Ok(jerry_pty::PtyOutput::Exited(_)) => return,
-            Err(err) if err.is_closed() => return,
-            Err(_empty) => {
-                if std::time::Instant::now() >= deadline {
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
+    test_support::wait_until(timeout, || match output.try_recv() {
+        Ok(jerry_pty::PtyOutput::Bytes(chunk)) => {
+            grid.append_bytes(&chunk);
+            false
         }
-    }
+        Ok(jerry_pty::PtyOutput::Exited(_)) => true,
+        Err(err) if err.is_closed() => true,
+        Err(_empty) => false,
+    });
 }
 
 #[cfg(test)]
