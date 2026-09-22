@@ -10,15 +10,15 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
+use futures::StreamExt;
 use gpui::{
     canvas, div, font, prelude::*, px, rgb, BorderStyle, Bounds, ClickEvent, Context, EventEmitter,
     FocusHandle, Focusable, FontWeight, KeyDownEvent, Keystroke, Modifiers, Pixels,
     ScrollWheelEvent, Size, Task, Window,
 };
-use jerry_pty::{ExitStatus, PtyError, PtySession, SpawnOptions};
+use jerry_pty::{ExitStatus, PtyError, PtyOutput, PtySession, SpawnOptions};
 
 use crate::root::scrollbar::{self, ScrollableHandle};
 use crate::root::widgets::text_tooltip;
@@ -32,79 +32,10 @@ use crate::terminal::mouse::{
 use crate::terminal::osc::Progress;
 use crate::theme;
 
-/// How often the poll task of the *globally active* agent's pane (see
-/// [`TerminalPane::set_foreground`]; every other pane uses [`BACKGROUND_POLL_INTERVAL`]) wakes
-/// up to drain any pty output that has arrived and, if there was any, re-render.
-const POLL_INTERVAL: Duration = Duration::from_millis(8);
-
-/// [`POLL_INTERVAL`]'s counterpart for a pane whose agent is *not* the globally active tab
-/// (see [`TerminalPane::set_foreground`]) - nobody can see a background pane's output live, so
-/// polling it twice per frame buys nothing. 33ms (the pre-tightening interval, ~30 drains/s)
-/// keeps a background agent's status/activity signal fresh to within a frame or two while
-/// capping how much foreground-thread work each background pane can generate.
-const BACKGROUND_POLL_INTERVAL: Duration = Duration::from_millis(33);
-
-/// Defensive cap on how many output *bytes* a single poll tick will drain and decode on the
-/// GPUI foreground thread. Without a cap, a firehose child (`yes`, a chatty build tool) could
-/// hand the poll loop the full contents of `jerry-pty`'s bounded output channel (~1MB) to
-/// decode in a single tick, on the same thread responsible for input handling and
-/// re-rendering. Capping the per-tick budget spreads that cost across ticks instead - whatever
-/// isn't drained is still sitting in the channel (jerry-pty's reader thread backpressures) and
-/// gets picked up next tick.
-const MAX_BYTES_PER_TICK: usize = 256 * 1024;
-
-/// [`MAX_BYTES_PER_TICK`]'s counterpart for a background pane (see
-/// [`BACKGROUND_POLL_INTERVAL`]'s docs for the measured multi-pane regression this split
-/// fixes). 32KiB per 33ms tick caps a background pane's *delivered* throughput at ~1MB/s -
-/// deliberately about what the pre-tightening cadence delivered (the old 64-chunk cap measured
-/// ~0.8MB/s against a real firehose), so a wall of background agents can never generate more
-/// aggregate foreground decode work than the app handled before the tightening. The child
-/// isn't harmed: `jerry-pty`'s bounded channel backpressures it, exactly as it did for every
-/// pane pre-tightening, and the pane returns to the full [`MAX_BYTES_PER_TICK`] budget the
-/// moment its tab becomes active again.
-const BACKGROUND_MAX_BYTES_PER_TICK: usize = 32 * 1024;
-
-/// The poll cadence - (sleep interval, per-tick drain byte budget) - for one tick of
-/// [`TerminalPane::spawn_process`]'s loop, given whether this pane's agent is the globally
-/// active tab and whether pty EOF is already pending.
-fn tick_cadence(is_foreground: bool, eof_pending: bool) -> (Duration, usize) {
-    if is_foreground || eof_pending {
-        (POLL_INTERVAL, MAX_BYTES_PER_TICK)
-    } else {
-        (BACKGROUND_POLL_INTERVAL, BACKGROUND_MAX_BYTES_PER_TICK)
-    }
-}
-
 /// Initial pty size used for the spawned shell, before the first real resize (see
 /// `maybe_resize_pty`) has a chance to run during the first render.
 const TERMINAL_ROWS: u16 = 48;
 const TERMINAL_COLS: u16 = 160;
-
-/// How many [`POLL_INTERVAL`] ticks (~10s total) [`TerminalPane`]'s poll loop keeps retrying
-/// `PtySession::try_wait` after observing pty EOF before giving up - see
-/// [`eof_poll_decision`]'s docs for the race this bounds.
-const MAX_EOF_POLL_TICKS: u32 = (10_000 / POLL_INTERVAL.as_millis()) as u32;
-
-/// Decides what a poll tick should do once pty EOF has been observed (the output channel's
-/// `TryRecvError::Disconnected`) but the child's exit status hasn't been confirmed yet, given
-/// this tick's own non-blocking `PtySession::try_wait` result.
-fn eof_poll_decision(
-    try_wait_result: Result<Option<ExitStatus>, ()>,
-    ticks_pending: u32,
-) -> Option<ExitStatus> {
-    match try_wait_result {
-        Ok(Some(status)) => Some(status),
-        Ok(None) | Err(()) => {
-            if ticks_pending >= MAX_EOF_POLL_TICKS {
-                Some(ExitStatus::with_signal(
-                    "gave up waiting for exit status after EOF",
-                ))
-            } else {
-                None
-            }
-        }
-    }
-}
 
 /// The terminal body's default/fallback font size and line height - the designed 12px/19 mono.
 /// Set
@@ -645,13 +576,13 @@ pub struct TerminalPane {
     grid: TerminalGrid,
     session: Option<PtySession>,
     spawn_error: Option<String>,
-    /// The process's exit status, once it has exited - captured via a non-blocking
-    /// `PtySession::try_wait` the moment the poll loop notices the process ended: on unix, when
-    /// the output channel disconnects (real pty EOF); on Windows, from an independent
-    /// `try_wait` poll every tick, since pty EOF can't be relied on there (see the module docs'
-    /// "Windows: process-exit detection can't rely on pty EOF" section). `None` while running,
-    /// before ever spawned, or if a spawn attempt itself failed (see [`Self::spawn_error`] for
-    /// that case - a process that never started has no `ExitStatus` to report).
+    /// The process's exit status, once it has exited - captured the moment a
+    /// [`jerry_pty::PtyOutput::Exited`] item arrives on [`Self::session`]'s output stream, real
+    /// on every platform (`run_wait_loop`'s dedicated thread in `jerry-pty` blocks on the
+    /// child's own `Child::wait`, independent of pty EOF timing - see
+    /// `docs/architecture/decisions.md` §8's amendment). `None` while running, before ever
+    /// spawned, or if a spawn attempt itself failed (see [`Self::spawn_error`] for that case - a
+    /// process that never started has no `ExitStatus` to report).
     exit_status: Option<ExitStatus>,
     /// The last time this pane's process is known to have produced output, or - if it hasn't
     /// produced any yet - the moment it started. `None` only before any process has ever
@@ -663,14 +594,6 @@ pub struct TerminalPane {
     /// human has not yet answered, or `None` if it never has or the human has since answered
     /// (GitHub issue #239).
     attention_ping_at: Option<Instant>,
-    /// `true` from the moment pty EOF is observed until the child's exit status is either
-    /// confirmed or given up on - see [`eof_poll_decision`]'s docs for the bug this state
-    /// exists to fix. While `true`, [`Self::session`] is deliberately not yet cleared: the
-    /// process may genuinely still be alive.
-    eof_pending: bool,
-    /// How many poll ticks [`Self::eof_pending`] has been `true` for - fed into
-    /// [`eof_poll_decision`] each tick; reset whenever a fresh EOF is observed.
-    eof_poll_ticks: u32,
     focus_handle: FocusHandle,
     /// This pane's rendered content-area bounds - captured every frame via a measuring
     /// `canvas()` child in `render` (see that method's docs for why this exists instead of
@@ -691,15 +614,10 @@ pub struct TerminalPane {
     /// Tracks which `(rows, cols)` the grid and the child pty are each actually in sync with -
     /// see [`ResizeLatch`]'s docs for the bug this decomposition exists to prevent.
     resize_latch: ResizeLatch,
-    /// Owns the in-flight "spawn the process, then poll its output" task. Dropping/replacing
-    /// this cancels whatever the previous task was doing, stopping an old session's poll loop
+    /// Owns the in-flight "spawn the process, then await its output" task. Dropping/replacing
+    /// this cancels whatever the previous task was doing, stopping an old session's output loop
     /// from racing a new one over the same struct fields.
     _task: Option<Task<()>>,
-    /// Whether this pane's agent is the *globally active* tab
-    /// (`crate::work_surface::agents::Agents::active`). Drives [`tick_cadence`]: only the active
-    /// agent's pane gets the frame-accurate [`POLL_INTERVAL`]/[`MAX_BYTES_PER_TICK`]
-    /// cadence; every other pane polls at the coarser background cadence.
-    is_foreground: bool,
     /// `true` between a real left mouse-down inside the grid and the matching mouse-up - i.e.
     /// while a text-selection drag is genuinely in progress (GitHub issue #158). Gates
     /// [`Self::handle_mouse_move`] so an ordinary hover never extends a selection; the
@@ -750,6 +668,20 @@ pub struct TerminalPane {
     settled_real_size: bool,
 }
 
+impl Drop for TerminalPane {
+    /// Cancels [`Self::_task`] - dropping its captured output receiver - before the automatic
+    /// field drops below reach [`Self::session`]. Ordering matters: `PtySession::drop` only
+    /// *signals* the child and returns, so its reader/wait threads (`jerry-pty`) can keep running
+    /// briefly afterward; if the receiver were still alive when one of them next sends, that send
+    /// wakes this pane's task on whatever executor scheduled it. In a `#[gpui::test]` that can
+    /// mean waking a scheduler the test harness already tore down, which panics
+    /// (`assert_correct_thread`, "Your test is not deterministic"). Dropping the receiver first
+    /// makes any such send observe a closed channel and return before it ever touches a waker.
+    fn drop(&mut self) {
+        self._task = None;
+    }
+}
+
 impl TerminalPane {
     /// `font_size_px` is the caller-supplied starting font size - every production caller
     /// (`crate::work_surface::agents::Agents::spawn`) passes the live
@@ -759,6 +691,17 @@ impl TerminalPane {
     /// later edit, so an already out-of-range persisted value (a hand-edited settings file)
     /// can never reach font-metrics measurement.
     pub fn new(spec: TerminalSpec, font_size_px: f32, cx: &mut Context<Self>) -> Self {
+        // `jerry-pty`'s reader/wait threads wake this pane's output task through a real
+        // `futures::channel::mpsc` waker (`docs/architecture/decisions.md` §8's amendment).
+        // GPUI's test scheduler treats any wake from a thread other than the test's own as
+        // non-deterministic unless this has been called once; every real-pty test constructs a
+        // pane through here (directly or via `AdeApp`), so this is the one place that needs it.
+        // `cfg(test)`, not a feature: `gpui`'s own `allow_parking` only exists at all under its
+        // dev-only `test-support` feature, which cargo unifies in automatically for this crate's
+        // own `#[cfg(test)]` builds.
+        #[cfg(test)]
+        cx.background_executor().allow_parking();
+
         let mut this = Self {
             spec,
             grid: TerminalGrid::new(TERMINAL_ROWS, TERMINAL_COLS),
@@ -767,15 +710,12 @@ impl TerminalPane {
             exit_status: None,
             activity_at: None,
             attention_ping_at: None,
-            eof_pending: false,
-            eof_poll_ticks: 0,
             focus_handle: cx.focus_handle(),
             content_bounds: None,
             font_size_px: sanitized_font_size_px(font_size_px),
             cell_width_px: None,
             resize_latch: ResizeLatch::default(),
             _task: None,
-            is_foreground: true,
             selecting: false,
             last_reported_cell: None,
             reported_presses: [false; 3],
@@ -896,25 +836,6 @@ impl TerminalPane {
     /// takes the pane over. See [`Self::attention_ping_at`]'s field docs.
     fn clear_attention_ping(&mut self) {
         self.attention_ping_at = None;
-    }
-
-    /// Tells this pane whether its agent is the globally active tab - see
-    /// [`Self::is_foreground`]'s field docs. Called (only) by
-    /// `crate::work_surface::agents::Agents::sync_pane_cadence` on every active-agent change; the poll
-    /// loop reads the flag afresh each tick, so a change takes effect within one tick of
-    /// whichever cadence the pane was on. Deliberately no `cx.notify()`: the flag changes
-    /// polling cadence, never anything rendered.
-    pub fn set_foreground(&mut self, foreground: bool) {
-        self.is_foreground = foreground;
-    }
-
-    /// Whether this pane currently polls at the foreground cadence - see
-    /// [`Self::is_foreground`]'s field docs. Test-only observation point (this crate's
-    /// cadence tests); no production reader exists - the poll loop reads the field directly -
-    /// so this is `#[cfg(test)]` rather than shipping dead code.
-    #[cfg(test)]
-    pub(crate) fn is_foreground(&self) -> bool {
-        self.is_foreground
     }
 
     /// The error from the most recent failed spawn attempt, if any. A process that never
@@ -1064,13 +985,11 @@ impl TerminalPane {
             return false;
         }
         // A prompt is only worth claiming as delivered if there is really something running to
-        // read it. `session.is_some()` alone is not that: the poll loop only clears `session`
-        // once it has *observed* EOF, which lags the child's real exit by at least a tick plus
-        // `MAX_EOF_POLL_TICKS`' grace, and in that window a write into a dead agent would return
-        // `true`. GitHub issue #288 flips every note on the file to `sent` on that `true`, with
-        // no way back, so this checks the two facts the pane already knows about the child's
-        // liveness before it writes anything.
-        if self.exit_status.is_some() || self.eof_pending {
+        // read it. `exit_status` and `session` flip together, atomically, the moment the output
+        // task processes a `PtyOutput::Exited` item (see [`Self::spawn_process`]) - GitHub issue
+        // #288 flips every note on the file to `sent` on a write that returns `true` with no way
+        // back, so this checks the pane's own liveness fact before it writes anything.
+        if self.exit_status.is_some() {
             self.spawn_error = Some("refused to send: this agent's process has ended".to_string());
             cx.notify();
             return false;
@@ -1453,12 +1372,26 @@ impl TerminalPane {
     }
 
     /// Test-only seam: feeds bytes straight into this pane's grid, exactly as
-    /// [`Self::spawn_process`]'s poll loop does for pty output - lets a test put known,
+    /// [`Self::spawn_process`]'s output task does for pty output - lets a test put known,
     /// deterministic text on screen without synchronizing against a real child process's
     /// timing.
     #[cfg(test)]
     pub(crate) fn inject_bytes_for_test(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         self.grid.append_bytes(bytes);
+        cx.notify();
+    }
+
+    /// Test-only seam: blanks this pane's grid, independent of any real pty state - for a test
+    /// that needs its own [`Self::inject_bytes_for_test`] content to land at a known row
+    /// regardless of what a concurrently running real child (e.g. the app's own real startup
+    /// shell) may have already written. That risk is real, not theoretical: the output task now
+    /// wakes on genuine activity rather than a polling interval (see
+    /// `docs/architecture/decisions.md` §8's amendment), so it can run before a `run_until_parked`
+    /// a test calls for an unrelated reason. Call this immediately before injecting, in the same
+    /// `update`, so nothing can interleave between the two.
+    #[cfg(test)]
+    pub(crate) fn reset_grid_for_test(&mut self, cx: &mut Context<Self>) {
+        self.grid.clear();
         cx.notify();
     }
 
@@ -1591,7 +1524,7 @@ impl TerminalPane {
                 })
                 .await;
 
-            let session = match spawn_result {
+            let mut session = match spawn_result {
                 Ok(session) => session,
                 Err(err) => {
                     let message = format!("failed to start {}: {err}", program_for_error.display());
@@ -1601,6 +1534,22 @@ impl TerminalPane {
                     });
                     return;
                 }
+            };
+
+            // Claimed once, immediately, and held in this task's own scope for the rest of the
+            // pane's life - see `PtySession::take_output`'s docs for why it must be owned here
+            // rather than borrowed back through `this.session` on every item (a GPUI entity only
+            // grants `&mut Self` inside an `update` closure, which cannot survive the `.await`
+            // below).
+            let Some(mut output) = session.take_output() else {
+                let _ = this.update(cx, |this, cx| {
+                    this.spawn_error = Some(
+                        "internal error: a freshly spawned session had no output stream"
+                            .to_string(),
+                    );
+                    cx.notify();
+                });
+                return;
             };
 
             if this
@@ -1628,107 +1577,46 @@ impl TerminalPane {
                 return; // the pane was dropped before the process finished starting
             }
 
-            // The pane starts foreground (see `Self::is_foreground`'s field docs), so the first
-            // tick uses the foreground interval; every later tick re-reads the live flag via
-            // the `tick_cadence` the previous tick returned.
-            let mut next_interval = POLL_INTERVAL;
-            loop {
-                cx.background_executor().timer(next_interval).await;
-
-                let poll_result = this.update(cx, |this, cx| {
-                    // Budget from the cadence at the tick's *start*; the interval returned at
-                    // the bottom is recomputed after any EOF transition this tick made, so a
-                    // background pane that just saw EOF starts its exit-confirmation grace
-                    // countdown at the foreground interval `MAX_EOF_POLL_TICKS` is derived
-                    // from immediately, not one background tick later.
-                    let (_, drain_budget) = tick_cadence(this.is_foreground, this.eof_pending);
-                    let mut appended = false;
-                    let mut process_ended = false;
-                    // Captured inside the `this.session.as_mut()` borrow below (so it can
-                    // call `&mut self` `PtySession::try_wait`) and only written back to
-                    // `this.exit_status` once that borrow has ended.
-                    let mut newly_exited: Option<ExitStatus> = None;
-
-                    if this.eof_pending {
-                        // EOF was already observed on a previous tick but the exit status
-                        // wasn't confirmed yet - see `eof_poll_decision`'s docs for the race
-                        // this branch handles. `Self::session` is deliberately still `Some`
-                        // here: the process may genuinely still be alive.
-                        match this.session.as_mut() {
-                            Some(session) => {
-                                let wait_result = session.try_wait().map_err(|_| ());
-                                match eof_poll_decision(wait_result, this.eof_poll_ticks) {
-                                    Some(status) => {
-                                        newly_exited = Some(status);
-                                        process_ended = true;
-                                    }
-                                    None => this.eof_poll_ticks += 1,
-                                }
-                            }
-                            None => process_ended = true, // defensive; shouldn't happen
+            // Wakes exactly when jerry-pty's reader thread (or its dedicated exit-wait thread -
+            // see `docs/architecture/decisions.md` §8's amendment) has something ready, rather
+            // than draining a channel on a fixed interval. Keeps running until the stream itself
+            // ends (every sender dropped), not just until the first `Exited` item, since a
+            // `Bytes` chunk racing that item (see `jerry_pty::run_wait_loop`'s docs) must still
+            // reach the grid.
+            while let Some(item) = output.next().await {
+                let updated = this.update(cx, |this, cx| match item {
+                    PtyOutput::Bytes(chunk) => {
+                        this.grid.append_bytes(&chunk);
+                        // GitHub issue #331: real output arrived while the human was looking
+                        // at scrollback - latch the "new output" indicator for the
+                        // jump-to-bottom affordance. `Self::grid` already stays pinned to the
+                        // same historical lines on its own (see
+                        // `TerminalGrid::scroll_display`'s docs), so this is purely the UI
+                        // signal, never a scroll-position decision.
+                        if this.grid.is_scrolled_back() {
+                            this.new_output_while_scrolled = true;
                         }
-                    } else if let Some(session) = this.session.as_mut() {
-                        // Capped at this tick's cadence budget (`MAX_BYTES_PER_TICK` or its
-                        // background counterpart - see those constants' docs), not drained to
-                        // empty. Anything left in the channel is picked up next tick.
-                        let mut drained_bytes = 0usize;
-                        while drained_bytes < drain_budget {
-                            match session.output().try_recv() {
-                                Ok(chunk) => {
-                                    // `.max(1)` so the loop is bounded by its own iteration
-                                    // count too, not only by bytes: a zero-length chunk would
-                                    // otherwise never advance `drained_bytes`. `jerry-pty`
-                                    // never sends one (its reader treats `read` returning 0 as
-                                    // EOF and breaks), but a drain bound that silently becomes
-                                    // unbounded if that ever changes is not a bound.
-                                    drained_bytes += chunk.len().max(1);
-                                    this.grid.append_bytes(&chunk);
-                                    // GitHub issue #331: real output arrived while the human was
-                                    // looking at scrollback - latch the "new output" indicator
-                                    // for the jump-to-bottom affordance. `Self::grid` already
-                                    // stays pinned to the same historical lines on its own (see
-                                    // `TerminalGrid::scroll_display`'s docs), so this is purely
-                                    // the UI signal, never a scroll-position decision.
-                                    if this.grid.is_scrolled_back() {
-                                        this.new_output_while_scrolled = true;
-                                    }
-                                    this.activity_at = Some(Instant::now());
-                                    // Consume the grid's one-shot OSC 9 / 777 notification flag
-                                    // right where the bytes that could have set it were parsed,
-                                    // and latch it - see `attention_ping_at`'s field docs for
-                                    // why this must not be consumed from the render path.
-                                    if this.grid.take_attention_ping() {
-                                        this.attention_ping_at = Some(Instant::now());
-                                    }
-                                    appended = true;
-                                }
-                                Err(TryRecvError::Empty) => break,
-                                Err(TryRecvError::Disconnected) => {
-                                    this.eof_pending = true;
-                                    let wait_result = session.try_wait().map_err(|_| ());
-                                    match eof_poll_decision(wait_result, 0) {
-                                        Some(status) => {
-                                            newly_exited = Some(status);
-                                            process_ended = true;
-                                        }
-                                        None => this.eof_poll_ticks = 1,
-                                    }
-                                    break;
-                                }
-                            }
+                        this.activity_at = Some(Instant::now());
+                        // Consume the grid's one-shot OSC 9 / 777 notification flag right
+                        // where the bytes that could have set it were parsed, and latch it -
+                        // see `attention_ping_at`'s field docs for why this must not be
+                        // consumed from the render path.
+                        if this.grid.take_attention_ping() {
+                            this.attention_ping_at = Some(Instant::now());
                         }
 
-                        // Any bytes the VT parser itself generated while processing the chunks
-                        // just appended above - e.g. a cursor position report for `ESC[6n` -
-                        // must be written back to the pty's own stdin, not just left in
-                        // `this.grid`. This is never a no-op-safe skip: real Windows ConPTY
-                        // sends exactly this query as part of its own startup handshake and
-                        // blocks its entire output stream on a real answer (confirmed live -
-                        // see `TermEventSink`'s own docs), so a dropped reply here doesn't just
-                        // misrender a query response, it silently hangs the whole pane forever.
-                        if appended {
-                            let pending_writes = this.grid.take_pending_pty_writes();
-                            if !pending_writes.is_empty() {
+                        // Any bytes the VT parser itself generated while processing this
+                        // chunk - e.g. a cursor position report for `ESC[6n` - must be
+                        // written back to the pty's own stdin, not just left in `this.grid`.
+                        // This is never a no-op-safe skip: real Windows ConPTY sends exactly
+                        // this query as part of its own startup handshake and blocks its
+                        // entire output stream on a real answer (confirmed live - see
+                        // `TermEventSink`'s own docs), so a dropped reply here doesn't just
+                        // misrender a query response, it silently hangs the whole pane
+                        // forever.
+                        let pending_writes = this.grid.take_pending_pty_writes();
+                        if !pending_writes.is_empty() {
+                            if let Some(session) = this.session.as_ref() {
                                 if let Err(err) = session.write_input(&pending_writes) {
                                     log::warn!(
                                         "failed to answer a terminal query (e.g. cursor \
@@ -1738,63 +1626,20 @@ impl TerminalPane {
                             }
                         }
 
-                        // Windows has no channel-disconnect signal to react to, ever - see
-                        // `jerry_pty`'s crate-level "Platform scope" docs. On unix, a dead
-                        // child's reader thread hits real pty EOF quickly, which closes
-                        // `output_tx` and trips the `TryRecvError::Disconnected` arm above.
-                        // On Windows, `run_reader_loop`'s reader thread only observes EOF once
-                        // `PtySession::master` itself is dropped - which killing/reaping the
-                        // child does NOT do on its own (see that function's docs for the full
-                        // ConPTY/`ClosePseudoConsole` ownership chain) - so a killed Windows
-                        // process would otherwise leave `session` `Some` forever and this poll
-                        // loop would spin indefinitely believing it was still running:
-                        // `is_running()` stuck `true`, `exit_status()` stuck `None`,
-                        // `grid.mark_ended()` never called. So Windows independently polls
-                        // `PtySession::try_wait` directly, every tick, regardless of channel
-                        // state - a real, cheap, non-blocking `GetExitCodeProcess` check (see
-                        // `jerry_pty`'s docs) that works whether or not the pty's own I/O ever
-                        // signals anything. Reuses the exact same `newly_exited`/
-                        // `process_ended` transition the unix EOF path above uses, rather than
-                        // a second, parallel one.
-                        #[cfg(windows)]
-                        if !process_ended {
-                            if let Ok(Some(status)) = session.try_wait() {
-                                newly_exited = Some(status);
-                                process_ended = true;
-                            }
-                        }
-                    }
-
-                    if let Some(status) = newly_exited {
-                        let clean = status.success();
-                        this.exit_status = Some(status);
-                        cx.emit(TerminalPaneEvent::ProcessExited { clean });
-                    }
-
-                    if process_ended {
-                        this.session = None;
-                        this.eof_pending = false;
-                        this.eof_poll_ticks = 0;
-                        this.grid.mark_ended();
-                        appended = true;
-                    }
-
-                    if appended {
                         cx.notify();
                     }
-
-                    // Keep polling while there's a live session, or while still waiting on a
-                    // final exit status after EOF (`this.session` can be `Some` while
-                    // `eof_pending` is `true`, so the two conditions aren't redundant).
-                    let keep_polling = this.session.is_some() || this.eof_pending;
-                    let (interval, _) = tick_cadence(this.is_foreground, this.eof_pending);
-                    (keep_polling, interval)
+                    PtyOutput::Exited(status) => {
+                        let clean = status.success();
+                        this.exit_status = Some(status);
+                        this.session = None;
+                        this.grid.mark_ended();
+                        cx.emit(TerminalPaneEvent::ProcessExited { clean });
+                        cx.notify();
+                    }
                 });
 
-                match poll_result {
-                    Ok((true, interval)) => next_interval = interval,
-                    Ok((false, _)) => break, // the child process exited; nothing left to poll
-                    Err(_) => break,         // the pane entity was dropped
+                if updated.is_err() {
+                    break; // the pane entity was dropped
                 }
             }
         });
@@ -2771,16 +2616,17 @@ impl Render for TerminalPane {
 }
 
 /// Shared fixtures for the test modules below that drive a **real** child process on a **real**
-/// pty. Everything here exists because those two clocks are genuinely different: the poll loop's
-/// ticks are driven by GPUI's simulated executor clock, while the pty reader is an ordinary OS
-/// thread that only makes progress in real wall-clock time. A loop that advanced only the virtual
-/// clock would race ahead of the reader; a fixed `thread::sleep` would be simultaneously too
-/// short under load and dead time when idle. `test_support::wait_until`/`stays_false` are the
-/// workspace's one sanctioned wall-clock wait (`docs/testing.md`), so both clocks advance
-/// together, one poll at a time.
+/// pty. Everything here exists because the pane's own task and the pty reader are genuinely on
+/// different clocks: the task wakes the moment GPUI's executor sees a channel item ready, but
+/// that item only exists once an ordinary OS thread has made real wall-clock progress. A loop
+/// that only called `run_until_parked` in a tight spin would race ahead of the reader; a fixed
+/// `thread::sleep` would be simultaneously too short under load and dead time when idle.
+/// `test_support::wait_until`/`stays_false` are the workspace's one sanctioned wall-clock wait
+/// (`docs/testing.md`) - their own real sleep between checks is what gives the reader thread
+/// room to run, with `run_until_parked` on each check picking up whatever it produced meanwhile.
 #[cfg(test)]
 mod pty_pane_fixtures {
-    use super::{TerminalPane, TerminalSpec, POLL_INTERVAL, ROW_FONT_SIZE_PX};
+    use super::{TerminalPane, TerminalSpec, ROW_FONT_SIZE_PX};
     use gpui::{AppContext, Entity, TestAppContext};
     use std::time::Duration;
 
@@ -2810,22 +2656,21 @@ mod pty_pane_fixtures {
         pane
     }
 
-    /// Drives real poll ticks until `done` holds, or until [`PTY_ROUND_TRIP`] elapses.
+    /// Drives the executor until `done` holds, or until [`PTY_ROUND_TRIP`] elapses.
     pub(super) fn pump_until(
         cx: &mut TestAppContext,
         mut done: impl FnMut(&mut TestAppContext) -> bool,
     ) -> bool {
         cx.run_until_parked();
         test_support::wait_until(PTY_ROUND_TRIP, || {
-            cx.background_executor.advance_clock(POLL_INTERVAL);
             cx.run_until_parked();
             done(cx)
         })
     }
 
-    /// The inverse: drives real poll ticks for `window` and reports whether `unwanted` stayed
-    /// false throughout - for proving something genuinely never reaches the child, rather than
-    /// merely being slow to arrive.
+    /// The inverse: drives the executor for `window` and reports whether `unwanted` stayed false
+    /// throughout - for proving something genuinely never reaches the child, rather than merely
+    /// being slow to arrive.
     pub(super) fn stays_absent(
         cx: &mut TestAppContext,
         window: Duration,
@@ -2833,7 +2678,6 @@ mod pty_pane_fixtures {
     ) -> bool {
         cx.run_until_parked();
         test_support::stays_false(window, || {
-            cx.background_executor.advance_clock(POLL_INTERVAL);
             cx.run_until_parked();
             unwanted(cx)
         })
@@ -2882,102 +2726,6 @@ mod pty_pane_fixtures {
                 .iter()
                 .any(|line| line.contains(needle))
         })
-    }
-}
-
-#[cfg(test)]
-mod cadence_tests {
-    use super::pty_pane_fixtures::{grid_shows, pump_until, release, spawn_pane};
-    use super::*;
-    use gpui::TestAppContext;
-
-    #[gpui::test]
-    fn a_background_pane_drains_on_the_background_interval_read_fresh_each_tick(
-        cx: &mut TestAppContext,
-    ) {
-        let pane = spawn_pane(cx, "cat", &[]);
-
-        // Fire the loop's first (foreground-armed) tick, demote the pane, then fire one more
-        // tick so the demotion is picked up and a BACKGROUND_POLL_INTERVAL sleep is armed.
-        cx.background_executor.advance_clock(POLL_INTERVAL);
-        cx.run_until_parked();
-        pane.update(cx, |pane, _| pane.set_foreground(false));
-        cx.background_executor.advance_clock(POLL_INTERVAL);
-        cx.run_until_parked();
-
-        // Ctrl-L; the pty's ECHOCTL echo is "^L" (see
-        // `clear_with_a_live_session_sends_a_real_ctrl_l_the_pty_echoes_back`).
-        pane.update(cx, |pane, cx| pane.clear(cx));
-
-        // Advance one *foreground*-sized step at a time, counting how much simulated time it
-        // took for the echo to appear. A loop that hoisted `is_foreground` out and kept the
-        // spawn-time `true` would drain it on the very next 8ms tick; one that re-reads the flag
-        // cannot drain before its 33ms background timer next fires, whenever the echo arrives.
-        let mut virtual_elapsed = Duration::ZERO;
-        assert!(
-            test_support::wait_until(super::pty_pane_fixtures::PTY_ROUND_TRIP, || {
-                cx.background_executor.advance_clock(POLL_INTERVAL);
-                cx.run_until_parked();
-                virtual_elapsed += POLL_INTERVAL;
-                grid_shows(cx, &pane, "^L")
-            }),
-            "the background cadence must still drain output - coarser, not never"
-        );
-        assert!(
-            virtual_elapsed >= BACKGROUND_POLL_INTERVAL,
-            "a background pane drained pty output after only {virtual_elapsed:?} of simulated \
-             time, less than one BACKGROUND_POLL_INTERVAL ({BACKGROUND_POLL_INTERVAL:?}) - the \
-             poll loop is not reading the live foreground flag each tick"
-        );
-
-        // And a promoted pane resumes draining (which tick is not under test here - only that
-        // promotion doesn't strand it).
-        pane.update(cx, |pane, cx| {
-            pane.set_foreground(true);
-            pane.clear(cx); // wipes the grid, sends a fresh Ctrl-L
-        });
-        assert!(
-            pump_until(cx, |cx| grid_shows(cx, &pane, "^L")),
-            "a pane promoted back to foreground must keep draining output"
-        );
-        release(cx, pane);
-    }
-
-    #[test]
-    fn a_foreground_pane_gets_the_full_frame_accurate_cadence() {
-        assert_eq!(
-            tick_cadence(true, false),
-            (POLL_INTERVAL, MAX_BYTES_PER_TICK),
-            "the visible pane must keep the measured single-agent throughput fix"
-        );
-    }
-
-    #[test]
-    fn a_background_pane_gets_a_strictly_coarser_interval_and_smaller_budget() {
-        let (interval, budget) = tick_cadence(false, false);
-        assert_eq!(interval, BACKGROUND_POLL_INTERVAL);
-        assert_eq!(budget, BACKGROUND_MAX_BYTES_PER_TICK);
-        // The relationships, not just the current literals: the whole point of the split is
-        // that a background pane generates strictly less foreground-thread work per second
-        // than the visible one (see BACKGROUND_POLL_INTERVAL's docs for the measured 25-pane
-        // regression this bounds).
-        assert!(interval > POLL_INTERVAL);
-        assert!(budget < MAX_BYTES_PER_TICK);
-    }
-
-    #[test]
-    fn eof_pending_forces_the_foreground_cadence_so_the_exit_grace_stays_ten_seconds() {
-        // MAX_EOF_POLL_TICKS is derived from POLL_INTERVAL; if a background pane ticked its
-        // EOF grace countdown at BACKGROUND_POLL_INTERVAL instead, the real ~10s
-        // exit-confirmation window would silently stretch ~4x (see tick_cadence's docs).
-        assert_eq!(
-            tick_cadence(false, true),
-            (POLL_INTERVAL, MAX_BYTES_PER_TICK)
-        );
-        assert_eq!(
-            tick_cadence(true, true),
-            (POLL_INTERVAL, MAX_BYTES_PER_TICK)
-        );
     }
 }
 
@@ -3112,44 +2860,6 @@ mod resize_tests {
         let actions = latch.apply((50, 170), true);
         assert!(actions.resize_grid);
         assert!(actions.resize_session);
-    }
-}
-
-#[cfg(test)]
-mod eof_poll_tests {
-    use super::*;
-
-    #[test]
-    fn resolves_immediately_when_try_wait_already_has_a_status() {
-        let status = ExitStatus::with_exit_code(7);
-        match eof_poll_decision(Ok(Some(status)), 0) {
-            Some(resolved) => assert_eq!(resolved.exit_code(), 7),
-            None => panic!("expected an immediate resolution from a ready try_wait result"),
-        }
-    }
-
-    #[test]
-    fn keeps_waiting_while_try_wait_has_no_answer_and_the_tick_cap_is_not_reached() {
-        assert!(eof_poll_decision(Ok(None), 0).is_none());
-        assert!(eof_poll_decision(Ok(None), MAX_EOF_POLL_TICKS - 1).is_none());
-        assert!(
-            eof_poll_decision(Err(()), MAX_EOF_POLL_TICKS - 1).is_none(),
-            "a transient try_wait error must also be retried, not treated as final"
-        );
-    }
-
-    #[test]
-    fn gives_up_at_the_tick_cap_with_a_synthetic_failed_status_not_silence() {
-        // The exact bug this whole decomposition exists to prevent: giving up must never
-        // look like "no exit status at all" (which `crate::rail::status::derive_status` would
-        // read as `Status::Idle`) - it must resolve to a real, if synthetic, failed status.
-        match eof_poll_decision(Ok(None), MAX_EOF_POLL_TICKS) {
-            Some(status) => assert!(
-                !status.success(),
-                "giving up must never be reported as a successful exit"
-            ),
-            None => panic!("expected the tick cap to force a resolution"),
-        }
     }
 }
 
@@ -3540,7 +3250,7 @@ mod clear_pty_signal_tests {
 /// escape bytes are produced by a real `printf`, exactly as a real agent CLI produces them.
 #[cfg(test)]
 mod terminal_signal_tests {
-    use super::pty_pane_fixtures::{pump_until, release, spawn_pane};
+    use super::pty_pane_fixtures::{pump_until, release, spawn_pane, stays_absent};
     use super::*;
     use crate::rail::title_signal::{classify_title, TitleSignal};
     use crate::terminal::osc::{Progress, ProgressState};
@@ -3648,10 +3358,16 @@ mod terminal_signal_tests {
         // The honest default, and the one every non-agent process hits: a `cat` sitting on a
         // real pty has no title, no ping and no progress - not an invented one.
         let pane = spawn_pane(cx, "cat", &[]);
-        for _ in 0..5 {
-            cx.background_executor.advance_clock(POLL_INTERVAL);
-            cx.run_until_parked();
-        }
+        assert!(
+            stays_absent(cx, Duration::from_millis(200), |cx| {
+                pane.read_with(cx, |pane, _| {
+                    pane.title().is_some()
+                        || pane.has_pending_attention_ping()
+                        || pane.progress().is_some()
+                })
+            }),
+            "a silent process must never report a title, ping, or progress signal"
+        );
         pane.read_with(cx, |pane, _| {
             assert_eq!(pane.title(), None);
             assert!(!pane.has_pending_attention_ping());
@@ -4163,7 +3879,7 @@ mod mouse_selection_tests {
 /// it.
 #[cfg(test)]
 mod utf8_input_tests {
-    use super::pty_pane_fixtures::release;
+    use super::pty_pane_fixtures::{release, PTY_ROUND_TRIP};
     use super::*;
     use gpui::{Modifiers, TestAppContext};
 
@@ -4236,8 +3952,7 @@ mod utf8_input_tests {
         });
 
         let mut echoed = None;
-        for _ in 0..100 {
-            cx.background_executor.advance_clock(POLL_INTERVAL);
+        test_support::wait_until(PTY_ROUND_TRIP, || {
             cx.run_until_parked();
             let row = pane.read_with(cx, |pane, _| pane.painted_rows_for_test().remove(0));
             let text: String = row
@@ -4247,9 +3962,11 @@ mod utf8_input_tests {
                 .collect();
             if text.trim_end() == "日本🎉" {
                 echoed = Some(row);
-                break;
+                true
+            } else {
+                false
             }
-        }
+        });
 
         let row = echoed.expect("expected the real pty's echo of the typed UTF-8 in the grid");
         assert_eq!(
@@ -4614,7 +4331,7 @@ mod terminal_theme_tests {
 /// loop while scrolled back neither moving the viewport nor going unnoticed.
 #[cfg(test)]
 mod scrollback_pane_tests {
-    use super::pty_pane_fixtures::release;
+    use super::pty_pane_fixtures::{release, PTY_ROUND_TRIP};
     use super::*;
     use gpui::{Modifiers, TestAppContext};
 
@@ -4685,8 +4402,7 @@ mod scrollback_pane_tests {
             pane.read_with(cx, |pane, _| pane.visible_text_lines())
                 .join("")
         };
-        test_support::wait_until(super::pty_pane_fixtures::PTY_ROUND_TRIP, || {
-            cx.background_executor.advance_clock(POLL_INTERVAL);
+        test_support::wait_until(PTY_ROUND_TRIP, || {
             cx.run_until_parked();
             predicate(&joined(cx))
         });
@@ -4760,24 +4476,16 @@ mod scrollback_pane_tests {
 
         // `cat` echoes back verbatim anything it receives on stdin - if PageUp had wrongly also
         // been forwarded as pty input (rather than claimed before `keystroke_to_bytes` runs at
-        // all), a real echoed reply would show up in the grid, and/or the poll loop draining it
-        // could perturb `display_offset`, within a handful of real poll ticks.
-        for _ in 0..20 {
-            cx.background_executor.advance_clock(POLL_INTERVAL);
-            cx.run_until_parked();
-        }
-
-        assert_eq!(
-            pane.read_with(cx, |pane, _| pane.grid.scroll_offset()),
-            offset_right_after,
-            "display_offset must not drift after PageUp once the poll loop has had many real \
-             ticks to run - it would if a stray echoed reply had reached the pty"
-        );
-        assert_eq!(
-            pane.read_with(cx, |pane, _| pane.visible_text_lines()),
-            lines_right_after,
-            "no new content may appear after PageUp with no further input - a real echoed PageUp \
-             byte sequence would show up here"
+        // all), a real echoed reply would show up in the grid, and/or the pane's output task
+        // draining it could perturb `display_offset`, within this real wall-clock window.
+        assert!(
+            test_support::stays_false(Duration::from_millis(200), || {
+                cx.run_until_parked();
+                pane.read_with(cx, |pane, _| pane.grid.scroll_offset()) != offset_right_after
+                    || pane.read_with(cx, |pane, _| pane.visible_text_lines()) != lines_right_after
+            }),
+            "display_offset must not drift and no new content may appear after PageUp with no \
+             further input - either would mean a stray echoed PageUp byte sequence reached the pty"
         );
         release(cx, pane);
     }
@@ -5268,19 +4976,14 @@ mod scrollback_pane_tests {
             cx.notify();
         });
         let last_line = format!("line {}", line_count - 1);
-        let mut echoed = false;
-        for _ in 0..300 {
-            cx.background_executor.advance_clock(POLL_INTERVAL);
+        let echoed = test_support::wait_until(PTY_ROUND_TRIP, || {
             cx.run_until_parked();
-            if pane.read_with(cx, |pane, _| {
+            pane.read_with(cx, |pane, _| {
                 pane.visible_text_lines()
                     .iter()
                     .any(|line| line.contains(&last_line))
-            }) {
-                echoed = true;
-                break;
-            }
-        }
+            })
+        });
         assert!(echoed, "the real pty must echo the first batch back");
 
         pane.update_in(cx, |pane, window, cx| {
@@ -5309,18 +5012,13 @@ mod scrollback_pane_tests {
                 .expect("writing to a real live pty must succeed");
             cx.notify();
         });
-        let mut saw_new_output_flag = false;
-        for _ in 0..300 {
-            cx.background_executor.advance_clock(POLL_INTERVAL);
+        let saw_new_output_flag = test_support::wait_until(PTY_ROUND_TRIP, || {
             cx.run_until_parked();
-            if pane.read_with(cx, |pane, _| pane.new_output_while_scrolled) {
-                saw_new_output_flag = true;
-                break;
-            }
-        }
+            pane.read_with(cx, |pane, _| pane.new_output_while_scrolled)
+        });
         assert!(
             saw_new_output_flag,
-            "real output arriving through the real poll loop while scrolled back must latch \
+            "real output arriving through the pane's output task while scrolled back must latch \
              the jump-to-bottom affordance's indicator"
         );
         assert_eq!(
@@ -5382,9 +5080,9 @@ mod scrollback_pane_tests {
 /// tracking must actually receive the clicks, hovers, and wheel notches the human aims at it.
 #[cfg(test)]
 mod mouse_reporting_tests {
+    use super::pty_pane_fixtures::PTY_ROUND_TRIP;
     use super::{
-        TerminalPane, TerminalSpec, PANE_PADDING_PX, POLL_INTERVAL, ROW_FONT_SIZE_PX,
-        WHEEL_LINES_PER_NOTCH,
+        TerminalPane, TerminalSpec, PANE_PADDING_PX, ROW_FONT_SIZE_PX, WHEEL_LINES_PER_NOTCH,
     };
     use crate::terminal::grid::ScrollAmount;
     use gpui::{
@@ -5489,23 +5187,20 @@ mod mouse_reporting_tests {
         }
     }
 
-    /// Pumps real poll ticks until `predicate` sees the round-trip land, or a generous cap is hit.
+    /// Pumps the executor until `predicate` sees the round-trip land, or [`PTY_ROUND_TRIP`] elapses.
     fn drain_until(
         pane: &gpui::Entity<TerminalPane>,
         cx: &mut VisualTestContext,
         predicate: impl Fn(&str) -> bool,
     ) -> String {
         let mut joined = String::new();
-        for _ in 0..400 {
-            cx.background_executor.advance_clock(POLL_INTERVAL);
+        test_support::wait_until(PTY_ROUND_TRIP, || {
             cx.run_until_parked();
             joined = pane
                 .read_with(cx, |pane, _| pane.visible_text_lines())
                 .join("");
-            if predicate(&joined) {
-                break;
-            }
-        }
+            predicate(&joined)
+        });
         joined
     }
 

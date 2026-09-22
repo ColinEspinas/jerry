@@ -16,7 +16,10 @@
     allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)
 )]
 
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use futures::channel::mpsc as futures_mpsc;
+use futures::executor::block_on;
+use futures::SinkExt;
+use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
 #[cfg(unix)]
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -25,7 +28,7 @@ use std::io::{Read, Write};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -51,9 +54,17 @@ pub use portable_pty::ExitStatus;
 ///
 /// **Also the dominant control on throughput**, which the memory framing hides. A consumer
 /// draining on an interval can only take what the channel buffered in between, so against a pty
-/// firehose drained every 8ms: capacity 16 gives 4.3 MB/s, capacity 256 gives 36.2 MB/s. Do not
-/// lower it without measuring under a *slow* consumer - both reach ~42 MB/s when drained in a
-/// tight loop, so a fast-consumer benchmark cannot see this at all.
+/// firehose drained every 8ms: capacity 16 gives 4.3 MB/s, capacity 256 gives 36.2 MB/s (measured
+/// against the earlier `std::sync::mpsc::sync_channel` design - a consumer that instead awaits
+/// every item, as [`PtySession::take_output`]'s callers do, is woken per chunk rather than per
+/// tick, so throughput is no longer interval-gated at all). Do not lower it without measuring
+/// under a *slow* consumer - both reach ~42 MB/s when drained in a tight loop, so a
+/// fast-consumer benchmark cannot see this at all.
+///
+/// `futures::channel::mpsc::channel`'s own capacity is `buffer + num-senders` - each live
+/// `Sender` reserves one guaranteed slot on top of these shared ones - so the real bound is this
+/// constant plus one slot per sender ever alive on the channel: the reader thread and
+/// [`run_wait_loop`]'s dedicated exit-status thread, two total.
 const OUTPUT_CHANNEL_CAPACITY: usize = 256;
 /// Size of each read from the pty master.
 ///
@@ -107,6 +118,19 @@ pub enum PtyError {
     CaptureTimeout(String),
     #[error("`{0}` printed no usable line")]
     CaptureEmpty(String),
+}
+
+/// One item from [`PtySession::take_output`]'s stream: either a chunk of raw bytes, or the
+/// child's real exit status once [`run_wait_loop`]'s dedicated thread has reaped it. Putting
+/// exit on the same channel as bytes is what lets a consumer simply await the stream to
+/// completion instead of separately polling [`PtySession::try_wait`] after an inferred pty EOF.
+#[derive(Debug)]
+pub enum PtyOutput {
+    /// Raw output, neither line-buffered nor UTF-8-validated, in read order.
+    Bytes(Vec<u8>),
+    /// The child process exited with this status. At most one per session, and no more `Bytes`
+    /// are guaranteed to follow it - see [`run_wait_loop`]'s docs for why they may still race.
+    Exited(ExitStatus),
 }
 
 /// Describes a process to spawn on a new PTY, plus the PTY's initial size.
@@ -309,10 +333,23 @@ pub struct PtySession {
     // `Option` so `shutdown`'s Windows twin can drop this before joining the reader thread:
     // that is what closes the ConPTY and unblocks the reader's `read`.
     master: Option<Box<dyn MasterPty + Send>>,
-    child: Option<Box<dyn Child + Send + Sync>>,
+    /// Cached once at spawn, before `child` moves into [`run_wait_loop`]'s dedicated thread - a
+    /// pid never changes, so reading the cache back needs no further synchronization.
+    pid: Option<u32>,
+    /// Signals the child without needing the `Child` handle itself, which
+    /// [`Self::wait_thread`] owns exclusively for the rest of the session's life.
+    killer: Option<Box<dyn ChildKiller + Send + Sync>>,
     exited: Option<ExitStatus>,
-    output_rx: Receiver<Vec<u8>>,
+    /// `None` once [`Self::take_output`] has been called - a session's output stream is claimed
+    /// exactly once, by whichever caller is going to hold and await it independently of every
+    /// other `PtySession` method (see that method's docs for why it must be owned, not borrowed).
+    output_rx: Option<futures_mpsc::Receiver<PtyOutput>>,
     reader_thread: Option<JoinHandle<()>>,
+    /// The one thread that ever calls [`Child::wait`] for this session - see [`run_wait_loop`]'s
+    /// docs for why a second, independent poll of the same child would race it. Its `JoinHandle`
+    /// carries the real exit status back, so [`Self::try_wait`]/[`Self::shutdown`] read it via
+    /// `is_finished`/`join` instead of a separate shared cell.
+    wait_thread: Option<JoinHandle<ExitStatus>>,
     writer_tx: Option<mpsc::Sender<Vec<u8>>>,
     /// Raised when a write fails, so [`PtySession::write_input`] stops reporting success into a
     /// broken pipe.
@@ -353,6 +390,12 @@ pub fn spawn(options: SpawnOptions) -> Result<PtySession, PtyError> {
     // Load-bearing for EOF delivery, not cleanup - see the doc comment above.
     drop(pair.slave);
 
+    // Cached/cloned before `child` moves into `run_wait_loop`'s thread below - see
+    // `PtySession::pid`/`PtySession::killer`'s own field docs for why each exists independently
+    // of the `Child` handle itself.
+    let pid = child.process_id();
+    let killer = child.clone_killer();
+
     let reader = pair
         .master
         .try_clone_reader()
@@ -362,7 +405,7 @@ pub fn spawn(options: SpawnOptions) -> Result<PtySession, PtyError> {
         .take_writer()
         .map_err(|err| PtyError::Writer(err.to_string()))?;
 
-    let (output_tx, output_rx) = mpsc::sync_channel::<Vec<u8>>(OUTPUT_CHANNEL_CAPACITY);
+    let (output_tx, output_rx) = futures_mpsc::channel::<PtyOutput>(OUTPUT_CHANNEL_CAPACITY);
 
     // Unix polls a self-pipe alongside the pty fd for deterministic shutdown; Windows has no safe
     // equivalent, so its reader blocks in `read` until the pty closes.
@@ -375,18 +418,24 @@ pub fn spawn(options: SpawnOptions) -> Result<PtySession, PtyError> {
             read: shutdown_read,
             write: shutdown_write,
         } = filedescriptor::Pipe::new().map_err(|err| PtyError::ShutdownPipe(err.to_string()))?;
-        let reader_thread = std::thread::spawn(move || {
-            run_reader_loop(reader, master_fd, shutdown_read, output_tx);
+        let reader_thread = std::thread::spawn({
+            let output_tx = output_tx.clone();
+            move || run_reader_loop(reader, master_fd, shutdown_read, output_tx)
         });
         (reader_thread, Some(shutdown_write))
     };
     #[cfg(windows)]
     let (reader_thread, shutdown_write) = {
-        let reader_thread = std::thread::spawn(move || {
-            run_reader_loop(reader, output_tx);
+        let reader_thread = std::thread::spawn({
+            let output_tx = output_tx.clone();
+            move || run_reader_loop(reader, output_tx)
         });
         (reader_thread, None)
     };
+
+    // Takes the original sender (the reader thread above holds a clone) so it survives
+    // independently of the reader - see `run_wait_loop`'s docs.
+    let wait_thread = std::thread::spawn(move || run_wait_loop(child, output_tx));
 
     let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>();
     let writer_failed = Arc::new(AtomicBool::new(false));
@@ -399,10 +448,12 @@ pub fn spawn(options: SpawnOptions) -> Result<PtySession, PtyError> {
 
     Ok(PtySession {
         master: Some(pair.master),
-        child: Some(child),
+        pid,
+        killer: Some(killer),
         exited: None,
-        output_rx,
+        output_rx: Some(output_rx),
         reader_thread: Some(reader_thread),
+        wait_thread: Some(wait_thread),
         writer_tx: Some(writer_tx),
         writer_failed,
         writer_thread: Some(writer_thread),
@@ -431,7 +482,7 @@ fn run_reader_loop(
     mut reader: Box<dyn Read + Send>,
     master_fd: RawFd,
     shutdown_read: filedescriptor::FileDescriptor,
-    output_tx: mpsc::SyncSender<Vec<u8>>,
+    mut output_tx: futures_mpsc::Sender<PtyOutput>,
 ) {
     let shutdown_fd = shutdown_read.as_raw_fd();
     let mut buf = [0u8; READ_BUF_SIZE];
@@ -462,8 +513,12 @@ fn run_reader_loop(
         match reader.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                if output_tx.send(buf[..n].to_vec()).is_err() {
-                    break;
+                let chunk = PtyOutput::Bytes(buf[..n].to_vec());
+                // Blocks this thread - and so, transitively, `read`, the kernel pty buffer, and
+                // the child's own `write` - exactly like the `sync_channel` this replaces (see
+                // `OUTPUT_CHANNEL_CAPACITY`'s docs and `docs/architecture/decisions.md` §8).
+                if block_on(output_tx.send(chunk)).is_err() {
+                    break; // the receiver was dropped; nobody is left to read further output
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -484,20 +539,48 @@ fn run_reader_loop(
 /// declared *before* `reader_thread` in the struct and so drops first - field order is
 /// load-bearing here, not `Drop`'s own body.
 #[cfg(windows)]
-fn run_reader_loop(mut reader: Box<dyn Read + Send>, output_tx: mpsc::SyncSender<Vec<u8>>) {
+fn run_reader_loop(
+    mut reader: Box<dyn Read + Send>,
+    mut output_tx: futures_mpsc::Sender<PtyOutput>,
+) {
     let mut buf = [0u8; READ_BUF_SIZE];
     loop {
         match reader.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                if output_tx.send(buf[..n].to_vec()).is_err() {
-                    break;
+                let chunk = PtyOutput::Bytes(buf[..n].to_vec());
+                if block_on(output_tx.send(chunk)).is_err() {
+                    break; // the receiver was dropped; nobody is left to read further output
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         }
     }
+}
+
+/// The one thread that ever calls [`Child::wait`] for a session: blocks until the child is
+/// really reaped, then delivers its status as the channel's final item, and returns it too so
+/// [`PtySession::try_wait`]/[`PtySession::shutdown`] can read it straight off this thread's
+/// `JoinHandle` instead of a second shared cell.
+///
+/// This is what lets exit land on the same channel as bytes without racing pty EOF against
+/// reaping (the bug `docs/architecture/decisions.md` §8's amendment replaces): unlike EOF, which
+/// can arrive before or after the child is actually reaped depending on who else still holds the
+/// pty slave open, `Child::wait` is the process's own authoritative exit signal, independent of
+/// pty state. The one race this doesn't remove is with the reader thread's own last bytes: both
+/// threads send on the same channel with no ordering between them, so a `Bytes` chunk read just
+/// before real exit may arrive after this `Exited` item. Callers that care about a final answer
+/// (not a live view) should keep draining until the stream ends, not stop at the first `Exited`.
+fn run_wait_loop(
+    mut child: Box<dyn Child + Send + Sync>,
+    mut output_tx: futures_mpsc::Sender<PtyOutput>,
+) -> ExitStatus {
+    let status = child
+        .wait()
+        .unwrap_or_else(|err| ExitStatus::with_signal(&format!("wait() failed: {err}")));
+    let _ = block_on(output_tx.send(PtyOutput::Exited(status.clone())));
+    status
 }
 
 /// The writer thread, so the pty's possibly-blocking `write` never happens on a caller's thread.
@@ -516,10 +599,17 @@ fn run_writer_loop(
 }
 
 impl PtySession {
-    /// Raw output chunks in read order, neither line-buffered nor UTF-8-validated. Bounded, so an
-    /// undrained receiver backpressures the pty instead of growing memory.
-    pub fn output(&self) -> &Receiver<Vec<u8>> {
-        &self.output_rx
+    /// Hands over this session's output stream - raw bytes plus the child's exit status as the
+    /// final item (see [`PtyOutput`]) - for the caller to hold and await independently of every
+    /// other `PtySession` method. Ownership, not a borrow, because the whole point is to
+    /// `.await` it across suspension points a `&mut PtySession` could never survive (a GPUI
+    /// entity update closure, for one - see `crate::terminal::pane` in `crates/jerry-app`).
+    ///
+    /// Bounded, so an undrained receiver backpressures the pty instead of growing memory - see
+    /// `OUTPUT_CHANNEL_CAPACITY`'s docs. `None` if already taken; a session's stream is claimed
+    /// exactly once, immediately after [`spawn`].
+    pub fn take_output(&mut self) -> Option<futures_mpsc::Receiver<PtyOutput>> {
+        self.output_rx.take()
     }
 
     /// Enqueues `data` for the pty's input side, as if typed. The write happens on a background
@@ -559,26 +649,37 @@ impl PtySession {
             .map_err(|err| PtyError::Resize(err.to_string()))
     }
 
-    /// The child's OS pid, if the platform exposes one and the session is not shut down.
+    /// The child's OS pid, if the platform exposes one and one was cached at spawn time.
     pub fn process_id(&self) -> Option<u32> {
-        self.child.as_ref().and_then(|child| child.process_id())
+        self.pid
     }
 
     /// Polls the child's exit status without blocking; `Ok(None)` while it is still running.
+    ///
+    /// Non-blocking because [`run_wait_loop`]'s dedicated thread, not this call, is what
+    /// actually blocks in [`Child::wait`] - this only checks (via `JoinHandle::is_finished`)
+    /// whether that thread has finished yet, and claims its result the first time it has.
     pub fn try_wait(&mut self) -> Result<Option<ExitStatus>, PtyError> {
-        let child = self.child.as_mut().ok_or(PtyError::AlreadyShutDown)?;
-        let status = child.try_wait().map_err(PtyError::Wait)?;
-        if let Some(status) = &status {
-            self.exited = Some(status.clone());
+        if self.exited.is_none()
+            && self
+                .wait_thread
+                .as_ref()
+                .is_some_and(JoinHandle::is_finished)
+        {
+            if let Some(handle) = self.wait_thread.take() {
+                self.exited = handle.join().ok();
+            }
         }
-        Ok(status)
+        Ok(self.exited.clone())
     }
 
     /// Signals the child's process group and any escaped descendants with `SIGHUP` then `SIGKILL`,
-    /// no grace between, and reaps the direct child if it has already exited.
+    /// no grace between.
     ///
-    /// Non-blocking: does not wait for termination or join the threads. Use
-    /// [`shutdown`](PtySession::shutdown) for that.
+    /// Non-blocking: does not wait for termination or join the threads (the real exit status
+    /// still arrives, asynchronously, as a [`PtyOutput::Exited`] item once
+    /// [`run_wait_loop`]'s thread reaps it). Use [`shutdown`](PtySession::shutdown) to block for
+    /// that.
     #[cfg(unix)]
     pub fn kill(&mut self) -> Result<(), PtyError> {
         if self.exited.is_some() {
@@ -587,16 +688,11 @@ impl PtySession {
         if let Some(pid) = self.process_id() {
             terminate_process_tree(pid, Duration::ZERO);
         }
-        if let Some(child) = self.child.as_mut() {
-            if let Ok(Some(status)) = child.try_wait() {
-                self.exited = Some(status);
-            }
-        }
         Ok(())
     }
 
     /// Terminates the child's whole process tree via [`windows_terminate_process_tree`], then
-    /// the direct child itself as the backstop.
+    /// the direct child itself (via [`Self::killer`]) as the backstop.
     #[cfg(windows)]
     pub fn kill(&mut self) -> Result<(), PtyError> {
         if self.exited.is_some() {
@@ -605,11 +701,8 @@ impl PtySession {
         if let Some(pid) = self.process_id() {
             windows_terminate_process_tree(pid);
         }
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
-            if let Ok(Some(status)) = child.try_wait() {
-                self.exited = Some(status);
-            }
+        if let Some(killer) = self.killer.as_mut() {
+            let _ = killer.kill();
         }
         Ok(())
     }
@@ -697,9 +790,12 @@ impl PtySession {
             if let Some(pid) = self.process_id() {
                 terminate_process_tree(pid, SHUTDOWN_GRACE_PERIOD);
             }
-            if let Some(child) = self.child.as_mut() {
-                let status = child.wait().map_err(PtyError::Wait)?;
-                self.exited = Some(status);
+            // The wait thread's only job is one blocking `Child::wait` call - joining it *is*
+            // "block until reaped, then know the status", this method's whole contract.
+            if let Some(handle) = self.wait_thread.take() {
+                self.exited = Some(handle.join().map_err(|_| {
+                    PtyError::Wait(std::io::Error::other("the pty exit-wait thread panicked"))
+                })?);
             }
         }
 
@@ -733,10 +829,15 @@ impl PtySession {
             if let Some(pid) = self.process_id() {
                 windows_terminate_process_tree(pid);
             }
-            if let Some(child) = self.child.as_mut() {
-                let _ = child.kill();
-                let status = child.wait().map_err(PtyError::Wait)?;
-                self.exited = Some(status);
+            if let Some(killer) = self.killer.as_mut() {
+                let _ = killer.kill();
+            }
+            // The wait thread's only job is one blocking `Child::wait` call - joining it *is*
+            // "block until reaped, then know the status", this method's whole contract.
+            if let Some(handle) = self.wait_thread.take() {
+                self.exited = Some(handle.join().map_err(|_| {
+                    PtyError::Wait(std::io::Error::other("the pty exit-wait thread panicked"))
+                })?);
             }
         }
 
@@ -803,28 +904,16 @@ impl Drop for PtySession {
                         .stderr(std::process::Stdio::null())
                         .spawn();
                 }
-                if let Some(child) = self.child.as_mut() {
-                    let _ = child.kill();
+                if let Some(killer) = self.killer.as_mut() {
+                    let _ = killer.kill();
                 }
             }
 
-            let reaped_immediately = self
-                .child
-                .as_mut()
-                .and_then(|child| child.try_wait().ok().flatten());
-
-            match reaped_immediately {
-                Some(status) => self.exited = Some(status),
-                None => {
-                    // `try_wait` may have run a moment before the just-SIGKILLed child died, so a
-                    // detached thread finishes the `wait()` - reaped, without blocking here.
-                    if let Some(mut child) = self.child.take() {
-                        std::thread::spawn(move || {
-                            let _ = child.wait();
-                        });
-                    }
-                }
-            }
+            // `self.wait_thread` (if not already claimed by `try_wait`/`shutdown`) still owns
+            // `child` and is blocked in exactly one `Child::wait` call - dropping the handle here
+            // without joining detaches that thread rather than blocking `Drop` on it, the same
+            // "reap on a thread nobody waits for" outcome the old `child.take()` fallback below
+            // used to build by hand.
         }
 
         if let Some(mut write) = self.shutdown_write.take() {
@@ -986,7 +1075,6 @@ fn terminate_process_tree(root_pid: u32, grace: Duration) {
 #[cfg(test)]
 mod pty_session_tests {
     use super::*;
-    use std::sync::mpsc::RecvTimeoutError;
     use std::time::{Duration, Instant};
 
     /// How long a real child process is given to reach a state before a test calls it a
@@ -1116,11 +1204,40 @@ mod pty_session_tests {
         out
     }
 
-    /// Reads from `session.output()` until `needle` appears in the accumulated (lossy
-    /// UTF-8) output or `timeout` elapses, returning whatever was collected either way.
-    /// Returns as soon as the needle is found rather than always waiting out the full
-    /// timeout, so tests aren't needlessly slow.
-    fn drain_until_contains(session: &PtySession, needle: &str, timeout: Duration) -> Vec<u8> {
+    /// Non-blocking `try_recv` in a short retry loop until an item appears, the channel closes,
+    /// or `timeout` elapses - the async channel has no blocking-with-timeout receive the way
+    /// `std::sync::mpsc::Receiver::recv_timeout` does, and pulling in a full async runtime for
+    /// test code alone isn't worth it.
+    fn recv_timeout(
+        rx: &mut futures_mpsc::Receiver<PtyOutput>,
+        timeout: Duration,
+    ) -> Option<PtyOutput> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match rx.try_recv() {
+                Ok(item) => return Some(item),
+                Err(err) if err.is_closed() => return None,
+                Err(_empty) => {
+                    if Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+    }
+
+    /// Reads from `rx` until `needle` appears in the accumulated (lossy UTF-8) output or
+    /// `timeout` elapses, returning whatever was collected either way. Returns as soon as the
+    /// needle is found rather than always waiting out the full timeout, so tests aren't
+    /// needlessly slow. A trailing [`PtyOutput::Exited`] or a closed channel ends the drain the
+    /// same way a timeout would - there is nothing further to collect either way.
+    fn drain_until_contains(
+        session: &PtySession,
+        rx: &mut futures_mpsc::Receiver<PtyOutput>,
+        needle: &str,
+        timeout: Duration,
+    ) -> Vec<u8> {
         let mut collected = Vec::new();
         let mut answered = false;
         let deadline = Instant::now() + timeout;
@@ -1133,10 +1250,9 @@ mod pty_session_tests {
             if remaining.is_zero() {
                 return collected;
             }
-            match session.output().recv_timeout(remaining) {
-                Ok(chunk) => collected.extend_from_slice(&chunk),
-                Err(RecvTimeoutError::Timeout) => return collected,
-                Err(RecvTimeoutError::Disconnected) => return collected,
+            match recv_timeout(rx, remaining) {
+                Some(PtyOutput::Bytes(chunk)) => collected.extend_from_slice(&chunk),
+                Some(PtyOutput::Exited(_)) | None => return collected,
             }
         }
     }
@@ -1145,7 +1261,7 @@ mod pty_session_tests {
     /// report a background job's pid deterministically instead of racing `/proc` to find it.
     #[cfg(unix)]
     fn read_line_after_prefix(
-        session: &PtySession,
+        rx: &mut futures_mpsc::Receiver<PtyOutput>,
         prefix: &str,
         timeout: Duration,
     ) -> Option<String> {
@@ -1162,19 +1278,25 @@ mod pty_session_tests {
             if remaining.is_zero() {
                 return None;
             }
-            match session.output().recv_timeout(remaining) {
-                Ok(chunk) => collected.push_str(&String::from_utf8_lossy(&chunk)),
-                Err(_) => return None,
+            match recv_timeout(rx, remaining) {
+                Some(PtyOutput::Bytes(chunk)) => {
+                    collected.push_str(&String::from_utf8_lossy(&chunk))
+                }
+                Some(PtyOutput::Exited(_)) | None => return None,
             }
         }
     }
 
     #[test]
     fn spawns_and_reads_short_process_output() {
-        let session = spawn(echo_command("hello-jerry-pty"))
+        let mut session = spawn(echo_command("hello-jerry-pty"))
             .expect("spawning an echo command should succeed");
+        let mut rx = session
+            .take_output()
+            .expect("a freshly spawned session must still have its output stream");
 
-        let output = drain_until_contains(&session, "hello-jerry-pty", Duration::from_secs(5));
+        let output =
+            drain_until_contains(&session, &mut rx, "hello-jerry-pty", Duration::from_secs(5));
         let text = String::from_utf8_lossy(&output);
         assert!(
             text.contains("hello-jerry-pty"),
@@ -1189,8 +1311,11 @@ mod pty_session_tests {
         // gets a smaller count rather than a longer timeout.
         const LINES: usize = if cfg!(windows) { 20_000 } else { 200_000 };
 
-        let session =
+        let mut session =
             spawn(counting_command(LINES)).expect("spawning a counting command should succeed");
+        let mut rx = session
+            .take_output()
+            .expect("a freshly spawned session must still have its output stream");
 
         let mut collected = Vec::new();
         let mut received = 0usize;
@@ -1209,8 +1334,8 @@ mod pty_session_tests {
             if remaining.is_zero() {
                 break;
             }
-            match session.output().recv_timeout(remaining) {
-                Ok(chunk) => {
+            match recv_timeout(&mut rx, remaining) {
+                Some(PtyOutput::Bytes(chunk)) => {
                     newlines += chunk.iter().filter(|byte| **byte == b'\n').count();
                     collected.extend_from_slice(&chunk);
                     received += 1;
@@ -1218,7 +1343,7 @@ mod pty_session_tests {
                         std::thread::sleep(Duration::from_millis(5));
                     }
                 }
-                Err(RecvTimeoutError::Disconnected | RecvTimeoutError::Timeout) => break,
+                Some(PtyOutput::Exited(_)) | None => break,
             }
         }
 
@@ -1310,21 +1435,23 @@ mod pty_session_tests {
     fn drop_terminates_entire_process_tree_including_escaped_grandchild() {
         // A process that escapes the group via its own `setsid()` is unreachable by `killpg`
         // alone. The shell reports its pid over the pty rather than us racing `/proc` for it.
-        let session = spawn(
+        let mut session = spawn(
             SpawnOptions::new("sh")
                 .arg("-c")
                 .arg("set -m; sleep 100 & echo GRANDCHILD:$!; exec sleep 300"),
         )
         .expect("spawning the shell pipeline should succeed");
+        let mut rx = session
+            .take_output()
+            .expect("a freshly spawned session must still have its output stream");
 
         let direct_pid = session
             .process_id()
             .expect("a spawned unix child should report a pid");
 
-        let grandchild_pid =
-            read_line_after_prefix(&session, "GRANDCHILD:", Duration::from_secs(5))
-                .and_then(|line| line.trim().parse::<u32>().ok())
-                .expect("shell should report the detached grandchild's pid over the pty");
+        let grandchild_pid = read_line_after_prefix(&mut rx, "GRANDCHILD:", Duration::from_secs(5))
+            .and_then(|line| line.trim().parse::<u32>().ok())
+            .expect("shell should report the detached grandchild's pid over the pty");
 
         assert!(
             pid_exists(direct_pid),
@@ -1440,17 +1567,19 @@ mod pty_session_tests {
             );
         }
 
-        let session = spawn(
+        let mut session = spawn(
             SpawnOptions::new("sh")
                 .arg("-c")
                 .arg("setsid sleep 100 & echo GRANDCHILD:$!; exec sleep 300"),
         )
         .expect("spawning the shell pipeline should succeed");
+        let mut rx = session
+            .take_output()
+            .expect("a freshly spawned session must still have its output stream");
 
-        let grandchild_pid =
-            read_line_after_prefix(&session, "GRANDCHILD:", Duration::from_secs(5))
-                .and_then(|line| line.trim().parse::<u32>().ok())
-                .expect("shell should report the detached grandchild's pid over the pty");
+        let grandchild_pid = read_line_after_prefix(&mut rx, "GRANDCHILD:", Duration::from_secs(5))
+            .and_then(|line| line.trim().parse::<u32>().ok())
+            .expect("shell should report the detached grandchild's pid over the pty");
 
         wait_for_state(
             grandchild_pid,
@@ -1492,6 +1621,50 @@ mod pty_session_tests {
         session
             .resume()
             .expect("resume on an already-exited child must be a harmless no-op");
+    }
+
+    /// The channel-native replacement for the old EOF-then-poll `try_wait` dance: a quick child's
+    /// real exit status must arrive as a [`PtyOutput::Exited`] item on the same stream as its
+    /// bytes, on every platform - this is what lets a consumer simply await the stream instead of
+    /// separately polling `try_wait` after inferring EOF (`docs/architecture/decisions.md` §8's
+    /// amendment).
+    #[test]
+    fn a_quick_exit_is_delivered_as_an_exited_item_on_the_output_channel() {
+        let mut session =
+            spawn(quick_exit_command()).expect("spawning a quick-exit command should succeed");
+        let mut rx = session
+            .take_output()
+            .expect("a freshly spawned session must still have its output stream");
+
+        // On Windows, ConPTY's own startup cursor-position query blocks the child's entire
+        // output (and, transitively, its exit) until something answers it - see
+        // `answer_cursor_position_query`'s docs. A bare consumer that only drains bytes without
+        // answering would make this test hang for the same reason a real, un-instrumented
+        // caller would need to answer it via a real terminal emulator.
+        let mut collected = Vec::new();
+        let mut answered = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let exited = loop {
+            answer_cursor_position_query(&session, &collected, &mut answered);
+            match recv_timeout(&mut rx, deadline.saturating_duration_since(Instant::now())) {
+                Some(PtyOutput::Exited(status)) => break Some(status),
+                Some(PtyOutput::Bytes(chunk)) => {
+                    collected.extend_from_slice(&chunk);
+                    continue;
+                }
+                None => break None,
+            }
+        };
+
+        assert!(
+            exited.is_some(),
+            "the child's real exit status must arrive on the output channel, not just be \
+             inferable from the channel closing"
+        );
+        assert!(
+            exited.expect("checked above").success(),
+            "a clean `exit 0`/`true` must report success"
+        );
     }
 
     // Unix-only by subject, not just by binary: the mechanism under test is the self-pipe that
@@ -1541,13 +1714,12 @@ mod pty_session_tests {
         let _session = spawn(SpawnOptions::new("yes")).expect("spawning `yes` should succeed");
 
         let rss_before = read_self_rss_kb();
-        // Deliberately don't drain `session.output()` while `yes` floods the pty as
-        // fast as it can. With an unbounded channel this measurably grows RSS (an
-        // earlier version of this crate measured ~3.4MB -> ~127MB in 3s against a
-        // comparable undrained producer); with the bounded `sync_channel`, the reader
-        // thread blocks in `send` once the channel fills, which backpressures its
-        // `read`, which fills the kernel pty buffer, which blocks `yes`'s `write` - so
-        // growth should stay small and bounded.
+        // Deliberately never call `take_output` while `yes` floods the pty as fast as it can, so
+        // nothing ever drains the channel. With an unbounded channel this measurably grows RSS
+        // (an earlier version of this crate measured ~3.4MB -> ~127MB in 3s against a comparable
+        // undrained producer); with the bounded async channel, the reader thread blocks in
+        // `send` once the channel fills, which backpressures its `read`, which fills the kernel
+        // pty buffer, which blocks `yes`'s `write` - so growth should stay small and bounded.
         //
         // `stays_false` rather than a bare sleep-then-measure: it holds the same 500ms window
         // open while asserting the bound *continuously*, so a transient spike is caught too.
@@ -1564,8 +1736,11 @@ mod pty_session_tests {
 
     #[test]
     fn a_live_session_reports_a_healthy_writer_and_keeps_accepting_writes() {
-        let session =
+        let mut session =
             spawn(stdin_echoing_command()).expect("spawning an echoing shell should succeed");
+        let mut rx = session
+            .take_output()
+            .expect("a freshly spawned session must still have its output stream");
         assert!(!session.writer_failed());
         for _ in 0..3 {
             session
@@ -1573,7 +1748,8 @@ mod pty_session_tests {
                 .expect("a healthy writer must keep accepting writes");
         }
         assert!(!session.writer_failed());
-        let output = drain_until_contains(&session, "still-writing", Duration::from_secs(5));
+        let output =
+            drain_until_contains(&session, &mut rx, "still-writing", Duration::from_secs(5));
         assert!(String::from_utf8_lossy(&output).contains("still-writing"));
     }
 
@@ -1592,14 +1768,18 @@ mod pty_session_tests {
     fn write_input_is_echoed_back_by_the_pty_line_discipline() {
         // A cooked-mode pty echoes writes back through the reader regardless of the child; `cat`
         // just keeps the session alive long enough to see it.
-        let session =
+        let mut session =
             spawn(stdin_echoing_command()).expect("spawning an echoing shell should succeed");
+        let mut rx = session
+            .take_output()
+            .expect("a freshly spawned session must still have its output stream");
 
         session
             .write_input(b"ping-jerry-pty\n")
             .expect("writing input to a live pty should succeed");
 
-        let output = drain_until_contains(&session, "ping-jerry-pty", Duration::from_secs(5));
+        let output =
+            drain_until_contains(&session, &mut rx, "ping-jerry-pty", Duration::from_secs(5));
         let text = String::from_utf8_lossy(&output);
         assert!(
             text.contains("ping-jerry-pty"),
@@ -1658,13 +1838,16 @@ mod pty_session_tests {
             .into_owned();
 
         let (options, pwd_line) = pwd_shell_command();
-        let session = spawn(options.cwd(requested.clone()))
+        let mut session = spawn(options.cwd(requested.clone()))
             .expect("spawning a shell in a real directory should succeed");
+        let mut rx = session
+            .take_output()
+            .expect("a freshly spawned session must still have its output stream");
         session
             .write_input(pwd_line.as_bytes())
             .expect("writing to a freshly spawned shell should succeed");
 
-        let output = drain_until_contains(&session, &leaf, Duration::from_secs(15));
+        let output = drain_until_contains(&session, &mut rx, &leaf, Duration::from_secs(15));
         let text = strip_ansi(&String::from_utf8_lossy(&output));
 
         // Substring, not line-splitting: ConPTY runs the prompt and the command's output together

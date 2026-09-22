@@ -1005,7 +1005,7 @@ impl AdeApp {
         }
         // Makes this worktree's own tab the globally active one, whether it was just spawned
         // above or was already running from an earlier visit.
-        self.agents.activate_for_worktree(&cwd, cx);
+        self.agents.activate_for_worktree(&cwd);
         // `focus_newly_spawned_agent`, not a bare `Agents::focus_active`: a focused window must
         // never be left with `Window::focus == None` (see this crate's `OverlayFocus`/
         // `restore_focus` docs), but it must equally never point focus at a terminal pane that
@@ -1646,7 +1646,7 @@ impl AdeApp {
         // fix this revision makes: before it, selecting a worktree never touched `self.agents`
         // at all, so the centre pane could keep showing a completely different worktree's
         // terminal after a rail click.
-        self.agents.activate_for_worktree(&path, cx);
+        self.agents.activate_for_worktree(&path);
         self.reset_repo_scoped_state(path.clone(), window, cx);
         // Last, and deliberately so: `reset_repo_scoped_state` is what re-roots
         // `Self::file_tree_root` onto this worktree, and restoring file tabs before that would

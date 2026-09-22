@@ -257,6 +257,33 @@ the child is reaped. Callers must therefore poll `try_wait` rather than wait for
 to disconnect. These paths are `#[cfg(windows)]`, never `#[cfg(not(unix))]`, so an unsupported
 non-unix target fails to compile instead of silently inheriting Windows semantics.
 
+**Amended 2026-09-22 (#504):** The output channel is now `futures::channel::mpsc` rather than
+`std::sync::mpsc::sync_channel`, so a GPUI task can `.await` it instead of `crates/jerry-app`
+polling it on a timer — the reader thread drives its `Sender` with
+`futures::executor::block_on(tx.send(chunk))`, which blocks exactly like the old `sync_channel`
+did once the bounded channel fills, preserving this entry's backpressure contract unchanged.
+Process exit is now an item on that same channel (`PtyOutput::Bytes(Vec<u8>) | Exited(ExitStatus)`),
+produced by one new dedicated thread (`run_wait_loop`) that owns the `portable_pty::Child` handle
+for the rest of the session and makes the one blocking `Child::wait()` call — a real,
+platform-uniform exit signal (on Windows, `portable-pty`'s own `WaitForSingleObject` on the
+process handle) that replaced the Windows-only independent `try_wait` poll this entry originally
+called for and, on unix, the `eof_poll_decision` retry dance that used to bound the race between
+observing pty EOF and the child actually being reaped. `PtySession::try_wait` stays (now a
+non-blocking peek at whether that thread has finished, via `JoinHandle::is_finished`), but nothing
+in `crates/jerry-app` calls it anymore. `PtySession::pid`/`killer` are cached/cloned at spawn time,
+before `child` moves to that thread, so `process_id()`/`kill()` don't need it back.
+
+One more consequence, GPUI-specific: `crates/jerry-app`'s tests that spawn a real `TerminalPane`
+must call `cx.background_executor().allow_parking()` first (done once, centrally, in
+`TerminalPane::new` and gated `#[cfg(test)]`) — `jerry-pty`'s reader/wait threads now wake the
+pane's output task through a real cross-thread waker, and GPUI's test scheduler treats any wake
+from a thread other than the test's own as non-deterministic and fails the test at teardown
+unless this has been called. A real shell process (`cmd.exe` on Windows in particular, which sets
+its own OSC 0 window title as part of its ConPTY startup handshake) can also now report state to
+the grid before a test's own `run_until_parked` returns, where the old polling design accidentally
+never drained it at all; tests asserting on a pane's "hasn't reported anything yet" state need to
+clear it explicitly (`TerminalPane::reset_grid_for_test`) rather than assume it.
+
 ## 9. `crates/test-support` is a real crate, not a feature-gated one
 
 **Status:** Accepted.

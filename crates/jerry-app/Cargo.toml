@@ -26,6 +26,10 @@ jerry-pty = { path = "../jerry-pty" }
 # only ever one resolved version of it in this workspace.
 jerry-lsp = { path = "../jerry-lsp" }
 anyhow = { workspace = true }
+# `crate::terminal::pane`'s poll-free output loop awaits `jerry_pty::PtyOutput` directly
+# (`futures::StreamExt::next`) instead of draining a channel on a timer - see
+# `docs/architecture/decisions.md` §8's amendment.
+futures = { workspace = true }
 env_logger = "0.11"
 log = "0.4"
 # Real ANSI/grid terminal emulation, replacing step 3's hand-rolled plain-text scan (see

@@ -293,7 +293,7 @@ impl AdeApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.agents.set_active(id, cx);
+        self.agents.set_active(id);
         self.prune_confirm_armed = false;
         // If the git graph tab was showing, this leaves it (without closing its tab) - see
         // `crate::graph_view::render::AdeApp::leave_graph_tab`'s own docs for why this must run
@@ -3531,76 +3531,6 @@ mod tab_scoping_tests {
     }
 
     #[gpui::test]
-    fn only_the_active_agents_pane_polls_at_the_foreground_cadence(cx: &mut TestAppContext) {
-        let repo = crate::test_support::temp_root();
-        let wt_empty = crate::test_support::temp_root();
-        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
-
-        let foreground_ids =
-            |app: &gpui::Entity<AdeApp>, cx: &mut TestAppContext| -> Vec<AgentId> {
-                app.read_with(cx, |app, cx| {
-                    app.agents
-                        .iter()
-                        .filter(|s| s.pane.read(cx).is_foreground())
-                        .map(|s| s.id)
-                        .collect()
-                })
-            };
-
-        let (first_id, second_id) = app.update_in(cx, |app, window, cx| {
-            let first_id = app.agents.active_id().expect("initial shell agent");
-            let second_id = app.agents.spawn(
-                ProcessKind::Shell,
-                repo.path().to_path_buf(),
-                12.0,
-                None,
-                None,
-                window,
-                cx,
-            );
-            (first_id, second_id)
-        });
-
-        assert_eq!(
-            foreground_ids(&app, cx),
-            vec![second_id],
-            "after spawn, only the newly active agent's pane may be foreground"
-        );
-
-        app.update_in(cx, |app, window, cx| {
-            app.select_agent(first_id, window, cx);
-        });
-        assert_eq!(
-            foreground_ids(&app, cx),
-            vec![first_id],
-            "selecting a tab must promote exactly that pane and demote the previous one"
-        );
-
-        app.update_in(cx, |app, window, cx| {
-            app.agents.close(first_id, false, window, cx);
-        });
-        assert_eq!(
-            foreground_ids(&app, cx),
-            vec![second_id],
-            "closing the active tab must hand the foreground cadence to the promoted sibling"
-        );
-
-        // Switching to a worktree with no agents: nothing is active, nothing is watchable -
-        // every pane must be background.
-        app.update(cx, |app, _cx| {
-            app.worktrees = vec![worktree_item(wt_empty.path().to_path_buf(), "empty")];
-        });
-        app.update_in(cx, |app, window, cx| {
-            app.select_worktree(0, window, cx);
-        });
-        assert_eq!(
-            foreground_ids(&app, cx),
-            Vec::<AgentId>::new(),
-            "with no active agent, no pane may keep the foreground cadence"
-        );
-    }
-
-    #[gpui::test]
     fn dragging_a_file_or_graph_tab_between_two_agent_tabs_interleaves_them(
         cx: &mut TestAppContext,
     ) {
@@ -4035,6 +3965,14 @@ mod tab_scoping_tests {
                 .expect("the real startup shell agent")
         });
         cx.run_until_parked();
+        // A real Windows `cmd.exe` sets its own OSC 0 title (its own full executable path) as
+        // part of its ConPTY startup handshake - genuinely, not a fixture artifact - and the
+        // pane's output task now processes that the moment it arrives rather than only on a
+        // polling interval (`docs/architecture/decisions.md` §8's amendment), so by the time
+        // `run_until_parked` above returns it may already have landed. Clearing it explicitly is
+        // what actually puts this pane in the "no title set yet" state this test means to exercise.
+        set_live_title(&app, cx, shell_id, "");
+        cx.run_until_parked();
 
         let program = app.read_with(cx, |app, cx| {
             app.agents
@@ -4165,6 +4103,14 @@ mod tab_scoping_tests {
                 cx,
             )
         });
+        cx.run_until_parked();
+        // A real Windows `cmd.exe` sets its own OSC 0 title (its own full executable path) as
+        // part of its ConPTY startup handshake - genuinely, not a fixture artifact - and the
+        // pane's output task now processes that the moment it arrives rather than only on a
+        // polling interval (`docs/architecture/decisions.md` §8's amendment), so by the time
+        // `run_until_parked` above returns it may already have landed. Clearing it explicitly is
+        // what actually puts this pane in the "titleless" state this test means to exercise.
+        set_live_title(&app, cx, shell_id, "");
         cx.run_until_parked();
 
         let (label, program) = app.read_with(cx, |app, cx| {
@@ -4762,6 +4708,12 @@ mod terminal_action_tests {
             .read_with(cx, |app, _| app.agents.active().map(|s| s.pane.clone()))
             .expect("a fresh test window has one real, active shell agent");
         pane.update(cx, |pane, cx| {
+            // Reset first, in the same `update`: the real shell this pane is also running now
+            // wakes and drains the moment it has real output, rather than on a polling interval
+            // (`docs/architecture/decisions.md` §8's amendment), so its own banner/prompt could
+            // otherwise land on row 9 (or scroll it) between this injection and the selection
+            // this test depends on landing on fixed coordinates.
+            pane.reset_grid_for_test(cx);
             pane.inject_bytes_for_test(format!("\x1b[10;1H{text}").as_bytes(), cx);
             pane.select_cells_for_test(9, 0..text.chars().count());
         });
