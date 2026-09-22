@@ -809,6 +809,11 @@ fn a_real_claude_session_uses_jerry_wt_new_and_the_real_host_hears_about_it() {
         ),
     )
     .expect("PATH joins");
+    // No `--dangerously-skip-permissions`, unlike a full permission-bypassed agent: `--allowedTools`
+    // alone is what every other real-`claude` test in this file relies on. Not verified here that
+    // headless `-p` mode honors it without also skipping permissions outright - if this test is
+    // ever actually run and stalls on a permission prompt instead of completing, that is the first
+    // thing to check.
     let args = vec![
         "--settings".to_owned(),
         files.settings_path().to_string_lossy().into_owned(),
@@ -816,7 +821,6 @@ fn a_real_claude_session_uses_jerry_wt_new_and_the_real_host_hears_about_it() {
         files.plugin_dir().to_string_lossy().into_owned(),
         "--allowedTools".to_owned(),
         "Bash(jerry:*)".to_owned(),
-        "--dangerously-skip-permissions".to_owned(),
     ];
     let env = vec![
         (AGENT_ENV.to_owned(), agent_id.to_string()),

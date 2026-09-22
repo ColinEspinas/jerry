@@ -259,10 +259,7 @@ impl AgentSpec {
     }
 }
 
-/// Creates a sibling worktree on a new branch. The agent spawn (when `agent` is given) is the
-/// host's reaction to a successful outcome, never something this crate does itself - see
-/// `docs/architecture/decisions.md` §21. `Invocability::Allowed`: unlike merge/rebase, git gives
-/// an agent no way to start a *Jerry-supervised* sibling session on its own.
+/// Creates a sibling worktree on a new branch - see `docs/architecture/decisions.md` §21.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorktreeCreate {
     pub branch: String,
@@ -312,14 +309,24 @@ impl Command for WorktreeCreate {
 /// itself, which would otherwise show up there as an untracked directory in `git status`.
 /// `common_git_dir` is `Ctx::repo_path`, always the main worktree's own `.git` directory
 /// regardless of which linked worktree the caller is acting from (§15).
+///
+/// `branch` is untrusted (an agent may call this Command directly), so every step here is a real
+/// check, not just a happy-path derivation: `branch` must be a git-valid ref name before anything
+/// else runs (rejects `..`, a leading `-`, `\`, and every other ref-format violation - see
+/// [`jerry_git::is_valid_branch_name`]), the sanitized directory name it becomes must itself be
+/// non-empty and not `.`/`..`, and the resulting path must land exactly one level under the
+/// worktrees container - never escape it, however `branch` was spelled.
 fn worktree_target(common_git_dir: &Path, branch: &str) -> Result<PathBuf, Error> {
+    if !jerry_git::is_valid_branch_name(common_git_dir, branch)? {
+        return Err(invalid_branch(branch));
+    }
     let main_root = common_git_dir.parent().ok_or_else(|| {
         Error::new(
             "worktree-location-unavailable",
             format!("{} has no parent directory", common_git_dir.display()),
         )
     })?;
-    let container = main_root.parent().ok_or_else(|| {
+    let container_parent = main_root.parent().ok_or_else(|| {
         Error::new(
             "worktree-location-unavailable",
             format!(
@@ -332,9 +339,11 @@ fn worktree_target(common_git_dir: &Path, branch: &str) -> Result<PathBuf, Error
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("repo");
-    let target = container
-        .join(format!("{repo_name}-worktrees"))
-        .join(sanitize_branch_for_path(branch));
+    let container = container_parent.join(format!("{repo_name}-worktrees"));
+    let target = container.join(sanitize_branch_for_path(branch)?);
+    if !target.starts_with(&container) || target.parent() != Some(container.as_path()) {
+        return Err(invalid_branch(branch));
+    }
     if target.exists() {
         return Err(Error::new(
             "worktree-path-exists",
@@ -344,9 +353,24 @@ fn worktree_target(common_git_dir: &Path, branch: &str) -> Result<PathBuf, Error
     Ok(target)
 }
 
-/// A branch name may contain `/`; a directory name may not treat it as a separator.
-fn sanitize_branch_for_path(branch: &str) -> String {
-    branch.replace('/', "-")
+fn invalid_branch(branch: &str) -> Error {
+    Error::new(
+        "worktree-branch-invalid",
+        format!("{branch:?} is not a usable git branch name"),
+    )
+}
+
+/// A branch name may contain `/`; a directory name may not treat it as a separator, and `\` is a
+/// path separator on Windows - both become `-`. `jerry_git::is_valid_branch_name` already refuses
+/// a branch containing either at the git level, so this is a second, independent line of defense
+/// rather than the only one: nothing here trusts that check alone to keep `Path::join` from ever
+/// seeing a rooted or `..` component.
+fn sanitize_branch_for_path(branch: &str) -> Result<String, Error> {
+    let sanitized = branch.replace(['/', '\\'], "-");
+    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+        return Err(invalid_branch(branch));
+    }
+    Ok(sanitized)
 }
 
 /// One rebase todo row on the wire, mirroring `jerry_git::rebase::RebasePlanEntry` - never
@@ -909,6 +933,56 @@ mod worktree_create_tests {
             !created.path.join("b.txt").exists(),
             "must start from the given ref, before the later commit"
         );
+        cleanup(&created.path);
+    }
+
+    /// An agent may call this Command directly (`Invocability::Allowed`), so `branch` is
+    /// untrusted input: none of these must ever create a worktree outside the intended
+    /// `<repo>-worktrees` container, however `branch` is spelled.
+    #[test]
+    fn a_branch_that_would_escape_the_worktrees_container_is_denied_and_creates_nothing() {
+        let repo = seed_repo();
+        let ctx = ctx_for(repo.path());
+        let container = repo.path().parent().expect("parent").join(format!(
+            "{}-worktrees",
+            repo.path().file_name().expect("name").to_string_lossy()
+        ));
+
+        for branch in [
+            r"\Temp\x",
+            r"..\..\evil",
+            "..",
+            ".",
+            "",
+            "-evil",
+            "a/../../b",
+            "C:evil",
+        ] {
+            let denied = validate_command(&worktree_create(branch), &ctx);
+            assert!(
+                matches!(denied, Report::Denied { ref code, .. } if code == "worktree-branch-invalid"),
+                "{branch:?}: {denied:?}"
+            );
+            let executed = run_command(worktree_create(branch), &ctx);
+            assert!(
+                matches!(executed, Report::Denied { ref code, .. } if code == "worktree-branch-invalid"),
+                "{branch:?}: {executed:?}"
+            );
+        }
+        assert!(
+            !container.exists(),
+            "nothing must be created outside a genuinely valid branch"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_slash_branch_still_creates_a_real_contained_worktree() {
+        let repo = seed_repo();
+        let ctx = ctx_for(repo.path());
+        let created = outcome(run_command(worktree_create("feature/still-works"), &ctx));
+        assert!(created.path.is_dir());
+        let container = created.path.parent().expect("parent");
+        assert!(created.path.starts_with(container));
         cleanup(&created.path);
     }
 }
