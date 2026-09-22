@@ -28,17 +28,17 @@ pub use command::{
     Query,
 };
 pub use commands::{
-    AmendHeadMessage, ConflictKind, ConflictedPathReport, MergeAbort, MergeAttempt,
+    AgentSpec, AmendHeadMessage, ConflictKind, ConflictedPathReport, MergeAbort, MergeAttempt,
     MergeAttemptOutcome, MergeBranchIntoCurrent, MergeComplete, MergeCompleteOutcome, RebaseAbort,
     RebaseActionWire, RebaseContinue, RebaseOutcomeReport, RebasePlanEntryWire, RebaseSkip,
-    RebaseStart, StageResolved, StopReasonWire,
+    RebaseStart, StageResolved, StopReasonWire, WorktreeCreate, WorktreeCreateOutcome,
 };
 pub use ctx::{AgentId, Caller, Ctx};
 pub use error::Error;
 pub use method::Method;
 pub use queries::{
-    MergeStatusOutcome, MergeStatusQuery, RebaseStatusOutcome, RebaseStatusQuery, StatusOutcome,
-    StatusQuery,
+    AgentsEntry, AgentsQuery, MergeStatusOutcome, MergeStatusQuery, RebaseStatusOutcome,
+    RebaseStatusQuery, StatusOutcome, StatusQuery,
 };
 pub use report::Report;
 pub use request::{execute_locally, AppCommand, AppQuery, HookEvent, LocalDispatchError, Request};

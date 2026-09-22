@@ -10,16 +10,18 @@ pub mod cli;
 pub mod exit;
 pub mod transport;
 
-use crate::cli::{Cli, Command, GitEditorArgs, GitSequenceEditorArgs, HookArgs, MergeArgs};
+use crate::cli::{
+    Cli, Command, GitEditorArgs, GitSequenceEditorArgs, HookArgs, MergeArgs, WtAction, WtNewArgs,
+};
 use crate::transport::{ChooseError, Transport};
 use clap::Parser;
 use jerry_core::client::{Client, ClientError};
 use jerry_core::registry::{runtime_dir_for, Os, Registry};
 use jerry_core::wire::rpc_code;
 use jerry_core::{
-    execute_locally, AgentId, AppCommand, AppQuery, Call, Caller, ConflictKind, Ctx, HookEvent,
-    LocalDispatchError, MergeAbort, MergeAttempt, MergeAttemptOutcome, MergeComplete,
-    MergeStatusOutcome, MergeStatusQuery, Report, Request, RpcError, StageResolved,
+    execute_locally, AgentId, AgentSpec, AppCommand, AppQuery, Call, Caller, ConflictKind, Ctx,
+    HookEvent, LocalDispatchError, MergeAbort, MergeAttempt, MergeAttemptOutcome, MergeComplete,
+    MergeStatusOutcome, MergeStatusQuery, Report, Request, RpcError, StageResolved, WorktreeCreate,
 };
 use std::ffi::OsString;
 use std::io::{Read, Write};
@@ -41,6 +43,12 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 /// `jerry hook`'s own budget: it runs inline with an agent's tool call, so it must never hold
 /// that call open for anywhere near as long as an interactive command may.
 const HOOK_CALL_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The `jerry` skill, carried in the binary so `jerry skill` and every agent spawn's skill
+/// injection (`crates/jerry-app/src/hooks/settings_file.rs`) read the exact same document -
+/// included by file-system-relative path, not a crate dependency, since `jerry-cli` stays a leaf
+/// crate no other crate depends on.
+pub const SKILL_MD: &str = include_str!("../skill/SKILL.md");
 
 /// The largest hook payload `jerry hook` will read off stdin before giving up on the rest -
 /// mirrors `crate::hooks::event::MAX_PAYLOAD_BYTES` in the app (a `Write`'s `tool_input.content`
@@ -77,6 +85,7 @@ pub fn run(
     match &cli.command {
         Command::GitSequenceEditor(args) => return git_sequence_editor(cwd, args, err),
         Command::GitEditor(args) => return git_editor(cwd, args, err),
+        Command::Skill => return skill(out),
         _ => {}
     }
     let caller = match env(AGENT_ENV) {
@@ -128,11 +137,23 @@ pub fn run(
     match &cli.command {
         Command::Status => status(&mut session, cli.json, out, err),
         Command::Merge(args) => merge(&mut session, args, cli.json, out, err),
+        Command::Wt(args) => match &args.action {
+            WtAction::New(new_args) => wt_new(&mut session, new_args, cli.json, out, err),
+        },
+        Command::Agents => agents(&mut session, cli.json, out, err),
         Command::Hook(args) => hook(&mut session, args, stdin, err),
         // Already handled and returned above, before any `Ctx`/transport existed to build a
         // `Session` from.
-        Command::GitSequenceEditor(_) | Command::GitEditor(_) => unreachable_editor_hook(),
+        Command::GitSequenceEditor(_) | Command::GitEditor(_) | Command::Skill => {
+            unreachable_editor_hook()
+        }
     }
+}
+
+/// Prints [`SKILL_MD`] verbatim; needs no repository, no `Ctx`, no transport.
+fn skill(out: &mut dyn Write) -> u8 {
+    let _ = write!(out, "{SKILL_MD}");
+    exit::DONE
 }
 
 /// The two arms [`run`] always returns before reaching, matched here only so the exhaustive
@@ -618,6 +639,100 @@ fn merge_abort(session: &mut Session, json: bool, out: &mut dyn Write, err: &mut
     exit::for_report(&report)
 }
 
+/// Creates a worktree, and - only when `--agent` was given and a Jerry is actually reachable -
+/// asks it to spawn that agent there. Worktree creation itself is Git-locality (§15) and always
+/// runs, connected or standalone; the spawn is the host's own reaction to a successful outcome
+/// (§21), so a standalone run creates the worktree but warns that no agent was started.
+fn wt_new(
+    session: &mut Session,
+    args: &WtNewArgs,
+    json: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> u8 {
+    let agent = match &args.agent {
+        Some(raw) => match AgentSpec::parse(raw) {
+            Some(spec) => Some(spec),
+            None => {
+                let _ = writeln!(
+                    err,
+                    "jerry: unknown agent kind {raw:?}; expected one of: claude, codex, cursor"
+                );
+                return exit::USAGE;
+            }
+        },
+        None => None,
+    };
+    let standalone = matches!(session.transport, Transport::Standalone);
+    let report = match session.call(
+        Request::Command(AppCommand::WorktreeCreate(WorktreeCreate {
+            branch: args.branch.clone(),
+            from: args.from.clone(),
+            agent,
+            prompt: args.prompt.clone(),
+        })),
+        err,
+    ) {
+        Ok(report) => report,
+        Err(code) => return code,
+    };
+    let agent_needs_host = agent.is_some() && standalone && report.is_ok();
+    if json {
+        let code = emit_json(&report, out);
+        return if agent_needs_host {
+            exit::NO_INSTANCE
+        } else {
+            code
+        };
+    }
+    match &report {
+        Report::Ok { outcome } => {
+            let path = outcome["path"].as_str().unwrap_or("?");
+            let _ = writeln!(out, "{path}");
+        }
+        other => explain(other, err),
+    }
+    if agent_needs_host {
+        let _ = writeln!(
+            err,
+            "jerry: created the worktree, but no agent was spawned - no Jerry serves this \
+             repository"
+        );
+        return exit::NO_INSTANCE;
+    }
+    exit::for_report(&report)
+}
+
+/// Lists every agent the connected Jerry is supervising, one per line as `<id>\t<kind>\t
+/// <worktree>` (or a JSON array with `--json`). `Locality::Session`, so this always needs a
+/// running Jerry - standalone answers `NEEDS_HOST` through the same generic path every other
+/// Session-locality request does.
+fn agents(session: &mut Session, json: bool, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
+    let report = match session.call(Request::Query(AppQuery::Agents(Default::default())), err) {
+        Ok(report) => report,
+        Err(code) => return code,
+    };
+    if json {
+        return emit_json(&report, out);
+    }
+    match &report {
+        Report::Ok { outcome } => {
+            let Some(entries) = outcome.as_array() else {
+                let _ = writeln!(err, "jerry: unreadable agent list: {outcome}");
+                return exit::FAILED;
+            };
+            for entry in entries {
+                let id = entry["id"].as_str().unwrap_or("?");
+                let kind = entry["kind"].as_str().unwrap_or("?");
+                let worktree = entry["worktree"].as_str().unwrap_or("?");
+                let _ = writeln!(out, "{id}\t{kind}\t{worktree}");
+            }
+        }
+        other => explain(other, err),
+    }
+    exit::for_report(&report)
+}
+
 fn emit_json(report: &Report, out: &mut dyn Write) -> u8 {
     if serde_json::to_writer(&mut *out, report).is_err() {
         return exit::FAILED;
@@ -1004,6 +1119,205 @@ mod run_tests {
         assert!(err.contains("not inside a git repository"), "{err}");
     }
 
+    /// `wt new`'s sibling directory never lives inside a `seed_repo`/`seed_empty_repo` tempdir
+    /// (`jerry_core::commands::worktree_target`'s own docs), so nothing removes it automatically.
+    fn cleanup_sibling(path: &str) {
+        if let Some(container) = Path::new(path).parent() {
+            let _ = fs::remove_dir_all(container);
+        }
+    }
+
+    #[test]
+    fn wt_new_creates_a_worktree_standalone_and_prints_its_path() {
+        let repo = seed_repo();
+        let runtime = tempfile::TempDir::new().expect("runtime");
+        let env = env(&[(runtime_env_key(), runtime.path())]);
+
+        let (code, out, err) = invoke(&["wt", "new", "feature-standalone"], &env, repo.path());
+        assert_eq!(code, 0, "stderr: {err}");
+        let path = out.trim();
+        assert!(Path::new(path).is_dir(), "{path}");
+        cleanup_sibling(path);
+    }
+
+    #[test]
+    fn wt_new_with_agent_but_no_host_still_creates_the_worktree_and_warns() {
+        let repo = seed_repo();
+        let runtime = tempfile::TempDir::new().expect("runtime");
+        let env = env(&[(runtime_env_key(), runtime.path())]);
+
+        let (code, out, err) = invoke(
+            &["wt", "new", "feature-agent-no-host", "--agent", "claude"],
+            &env,
+            repo.path(),
+        );
+        assert_eq!(code, 4, "stderr: {err}");
+        let path = out.trim();
+        assert!(
+            Path::new(path).is_dir(),
+            "the worktree is still created: {path}"
+        );
+        assert!(err.contains("no agent was spawned"), "{err}");
+        cleanup_sibling(path);
+    }
+
+    #[test]
+    fn wt_new_rejects_an_unknown_agent_kind_before_touching_git() {
+        let repo = seed_repo();
+        let env = env(&[]);
+        let (code, out, err) = invoke(
+            &["wt", "new", "feature-bad-agent", "--agent", "nonsense"],
+            &env,
+            repo.path(),
+        );
+        assert_eq!(code, 2, "{err}");
+        assert!(out.is_empty());
+        assert!(!repo
+            .path()
+            .parent()
+            .expect("parent")
+            .join(format!(
+                "{}-worktrees",
+                repo.path().file_name().expect("name").to_string_lossy()
+            ))
+            .exists());
+    }
+
+    #[test]
+    fn wt_new_reaches_a_running_jerry_and_it_spawns_the_agent() {
+        let repo = seed_repo();
+        let runtime = tempfile::TempDir::new().expect("runtime");
+        let env = env(&[(runtime_env_key(), runtime.path())]);
+        let registry_dir =
+            jerry_core::registry::runtime_dir_for(Os::host(), &env).expect("runtime dir");
+        let registry = Registry::open(registry_dir).expect("registry");
+        let instance = registry.allocate().expect("instance");
+        let host = jerry_host::Host::start().expect("host");
+        host.listen(&instance.socket).expect("listen");
+        let common = jerry_core::Ctx::from_cwd(repo.path(), jerry_core::Caller::Human)
+            .expect("a repo")
+            .repo_path;
+        registry.publish(&instance, &[common]).expect("publish");
+        let mut events = host.client().subscribe();
+
+        let (code, out, err) = invoke(
+            &[
+                "wt",
+                "new",
+                "feature-with-host",
+                "--agent",
+                "codex",
+                "fix it",
+            ],
+            &env,
+            repo.path(),
+        );
+        assert_eq!(code, 0, "stderr: {err}");
+        let path = out.trim();
+        assert!(Path::new(path).is_dir(), "{path}");
+
+        let mut received = None;
+        assert!(
+            test_support::wait_until(Duration::from_secs(5), || {
+                received = events.try_recv().ok();
+                received.is_some()
+            }),
+            "a worktree-created notification arrives"
+        );
+        match received.expect("received") {
+            jerry_core::Message::Notification { method, params } => {
+                assert_eq!(method, "event/worktree-created");
+                assert_eq!(params["agent"], serde_json::json!("codex"));
+                assert_eq!(params["prompt"], serde_json::json!("fix it"));
+            }
+            other => panic!("expected a notification, got {other:?}"),
+        }
+
+        cleanup_sibling(path);
+        host.shutdown_and_join();
+        registry.remove(&instance).expect("remove");
+    }
+
+    #[test]
+    fn agents_prints_nothing_and_exits_zero_when_the_host_has_none() {
+        let repo = seed_empty_repo();
+        let runtime = tempfile::TempDir::new().expect("runtime");
+        let env = env(&[(runtime_env_key(), runtime.path())]);
+        let registry_dir =
+            jerry_core::registry::runtime_dir_for(Os::host(), &env).expect("runtime dir");
+        let registry = Registry::open(registry_dir).expect("registry");
+        let instance = registry.allocate().expect("instance");
+        let host = jerry_host::Host::start().expect("host");
+        host.listen(&instance.socket).expect("listen");
+        let common = jerry_core::Ctx::from_cwd(repo.path(), jerry_core::Caller::Human)
+            .expect("a repo")
+            .repo_path;
+        registry.publish(&instance, &[common]).expect("publish");
+
+        let (code, out, err) = invoke(&["agents"], &env, repo.path());
+        assert_eq!(code, 0, "stderr: {err}");
+        assert!(out.is_empty(), "{out}");
+
+        host.shutdown_and_join();
+        registry.remove(&instance).expect("remove");
+    }
+
+    #[test]
+    fn agents_lists_every_registered_agent_plain_and_json() {
+        let repo = seed_empty_repo();
+        let runtime = tempfile::TempDir::new().expect("runtime");
+        let env = env(&[(runtime_env_key(), runtime.path())]);
+        let registry_dir =
+            jerry_core::registry::runtime_dir_for(Os::host(), &env).expect("runtime dir");
+        let registry = Registry::open(registry_dir).expect("registry");
+        let instance = registry.allocate().expect("instance");
+        let host = jerry_host::Host::start().expect("host");
+        host.listen(&instance.socket).expect("listen");
+        let common = jerry_core::Ctx::from_cwd(repo.path(), jerry_core::Caller::Human)
+            .expect("a repo")
+            .repo_path;
+        registry.publish(&instance, &[common]).expect("publish");
+        host.agents().register(
+            jerry_core::AgentId::from("a-1"),
+            repo.path().to_path_buf(),
+            "Claude".into(),
+        );
+
+        let (code, out, err) = invoke(&["agents"], &env, repo.path());
+        assert_eq!(code, 0, "stderr: {err}");
+        assert!(out.contains("a-1\tClaude\t"), "{out}");
+
+        let (code, out, err) = invoke(&["agents", "--json"], &env, repo.path());
+        assert_eq!(code, 0, "stderr: {err}");
+        let report: serde_json::Value = serde_json::from_str(out.trim()).expect("json");
+        assert_eq!(report["outcome"][0]["id"], serde_json::json!("a-1"));
+        assert_eq!(report["outcome"][0]["kind"], serde_json::json!("Claude"));
+
+        host.shutdown_and_join();
+        registry.remove(&instance).expect("remove");
+    }
+
+    #[test]
+    fn agents_needs_a_running_jerry_standalone() {
+        let repo = seed_empty_repo();
+        let runtime = tempfile::TempDir::new().expect("runtime");
+        let env = env(&[(runtime_env_key(), runtime.path())]);
+        let (code, out, err) = invoke(&["agents"], &env, repo.path());
+        assert_eq!(code, 4, "{err}");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn skill_prints_a_real_non_empty_document_mentioning_wt_new() {
+        let repo = seed_empty_repo();
+        let env = env(&[]);
+        let (code, out, err) = invoke(&["skill"], &env, repo.path());
+        assert_eq!(code, 0, "{err}");
+        assert!(!out.is_empty());
+        assert!(out.contains("jerry wt new"), "{out}");
+        assert!(out.contains("jerry agents"), "{out}");
+    }
+
     #[test]
     fn a_usage_mistake_is_exit_two_and_help_is_exit_zero() {
         let repo = seed_empty_repo();
@@ -1089,7 +1403,7 @@ mod run_tests {
         host.listen(&socket.path).expect("listen");
         let id = jerry_core::AgentId::from("9");
         host.agents()
-            .register(id.clone(), repo.path().to_path_buf());
+            .register(id.clone(), repo.path().to_path_buf(), "Claude".into());
         let mut events = host.client().subscribe();
         let env = env(&[
             (crate::SOCKET_ENV, socket.path.as_path()),
@@ -1135,7 +1449,8 @@ mod run_tests {
         let socket = socket_path("raw");
         host.listen(&socket.path).expect("listen");
         let id = jerry_core::AgentId::from("3");
-        host.agents().register(id, repo.path().to_path_buf());
+        host.agents()
+            .register(id, repo.path().to_path_buf(), "Claude".into());
         let mut events = host.client().subscribe();
         let env = env(&[
             (crate::SOCKET_ENV, socket.path.as_path()),

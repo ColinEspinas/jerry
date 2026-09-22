@@ -29,6 +29,10 @@ pub struct HostRuntime {
     instance: Instance,
     /// Common git dirs published so far; republished as a whole when one is added.
     repos: Vec<PathBuf>,
+    /// `crate::work_surface::worktree_created::spawn_consumer`'s task, started once by
+    /// `AdeApp::adopt_host` - held here (rather than detached) so it is cancelled, not orphaned,
+    /// when this runtime drops (§16, CLAUDE.md's entity-lifecycle rule). `None` until adoption.
+    worktree_created_consumer: Option<Task<()>>,
 }
 
 impl HostRuntime {
@@ -46,6 +50,7 @@ impl HostRuntime {
             registry_dir,
             instance,
             repos: Vec::new(),
+            worktree_created_consumer: None,
         };
         Ok((runtime, dispatch))
     }
@@ -69,6 +74,7 @@ impl HostRuntime {
                 descriptor: PathBuf::new(),
             },
             repos: Vec::new(),
+            worktree_created_consumer: None,
         }
     }
 
@@ -104,6 +110,13 @@ impl HostRuntime {
 
     pub fn socket(&self) -> &Path {
         &self.instance.socket
+    }
+
+    /// Installs `AdeApp::adopt_host`'s `event/worktree-created` consumer task, replacing (and so
+    /// cancelling) any earlier one - `adopt_host` runs at most once per runtime in practice, but
+    /// this stays correct even if that ever changes.
+    pub(crate) fn set_worktree_created_consumer(&mut self, task: Task<()>) {
+        self.worktree_created_consumer = Some(task);
     }
 }
 
@@ -171,9 +184,15 @@ impl AdeApp {
 
     /// Installs a started runtime, hands the host every agent already open, and publishes
     /// every repository open right now, including any added while the host was starting.
-    pub(crate) fn adopt_host(&mut self, runtime: HostRuntime, cx: &mut Context<Self>) {
+    pub(crate) fn adopt_host(&mut self, mut runtime: HostRuntime, cx: &mut Context<Self>) {
         if let Some(agents) = runtime.agents() {
             self.agents.attach_host(agents);
+        }
+        // Started once, here, rather than at `HostRuntime` construction: the consumer needs a
+        // real `LocalClient` to subscribe through, which only exists once the host is up.
+        if let Some(client) = runtime.client() {
+            let task = crate::work_surface::worktree_created::spawn_consumer(client, cx);
+            runtime.set_worktree_created_consumer(task);
         }
         self.host_runtime = Some(runtime);
         let repo_paths: Vec<PathBuf> = self.repos.iter().map(|repo| repo.path.clone()).collect();

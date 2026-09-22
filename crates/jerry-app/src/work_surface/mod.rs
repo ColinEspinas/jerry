@@ -21,3 +21,4 @@ pub mod tab_order_state;
 
 pub(crate) mod render;
 pub(crate) mod session;
+pub(crate) mod worktree_created;

@@ -37,6 +37,41 @@ impl Query for StatusQuery {
     }
 }
 
+/// Every agent the session host is currently supervising - `Locality::Session`, since the
+/// answer lives in `jerry-host`'s own agent table (§15), not anything this crate can read. Local
+/// dispatch always answers `NeedsHost` for it, exactly like every other Session-locality request;
+/// the host itself special-cases it in its dispatcher rather than calling [`Query::run`] below.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentsQuery {}
+
+/// One agent as the wire sees it: its host-assigned id, which CLI it runs, and its worktree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentsEntry {
+    pub id: String,
+    pub kind: String,
+    pub worktree: PathBuf,
+}
+
+impl Query for AgentsQuery {
+    type Outcome = Vec<AgentsEntry>;
+    const NAME: &'static str = "agents";
+
+    fn locality(&self) -> Locality {
+        Locality::Session
+    }
+
+    /// Never actually reached: `Locality::Session` means `execute_locally` returns `NeedsHost`
+    /// before calling this, and the real host answers from its own agent table instead of this
+    /// trait method (see the type's own docs). Honest about that rather than pretending to have
+    /// host access it does not.
+    fn run(&self, _ctx: &Ctx) -> Result<Vec<AgentsEntry>, Error> {
+        Err(Error::new(
+            "needs-host",
+            "the agent table lives on the session host, not in this process",
+        ))
+    }
+}
+
 /// Is a merge in progress for this repository, and what is still unmerged in it. What
 /// `jerry merge --continue` and `--abort` read before acting.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

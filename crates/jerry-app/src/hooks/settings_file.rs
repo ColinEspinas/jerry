@@ -38,11 +38,31 @@ const DIRECTORY_PREFIX: &str = "jerry-hooks-";
 /// The generated settings file's name inside the launch directory.
 const SETTINGS_NAME: &str = "jerry-hook-settings.json";
 
-/// The real on-disk file backing one Jerry launch's hook injection. Removed on drop.
+/// The `jerry` skill (`docs/architecture/decisions.md` §21), included by file-system-relative
+/// path from `jerry-cli`'s own crate directory rather than a dependency on it (`jerry-cli` stays
+/// a leaf crate no other crate depends on) - the exact same bytes `jerry skill` prints.
+const SKILL_MD: &str = include_str!("../../../jerry-cli/skill/SKILL.md");
+
+/// The plugin manifest naming the skill directory - the minimal shape `claude --plugin-dir`
+/// accepts (verified against a real `claude --help` on this machine and
+/// <https://code.claude.com/docs/en/plugins.md>).
+fn plugin_manifest_json() -> String {
+    serde_json::json!({
+        "name": "jerry",
+        "description": "The jerry CLI: status, worktree creation, merge, and what agents Jerry is supervising.",
+        "version": env!("CARGO_PKG_VERSION"),
+    })
+    .to_string()
+}
+
+/// The real on-disk files backing one Jerry launch's hook and skill injection. Removed on drop.
 #[derive(Debug)]
 pub struct HookFiles {
     directory: PathBuf,
     settings: PathBuf,
+    /// The plugin directory to pass as `claude --plugin-dir <path>` - `directory` itself, once
+    /// [`Self::fill`] has written its `.claude-plugin/plugin.json` and `SKILL.md`.
+    plugin_dir: PathBuf,
 }
 
 impl HookFiles {
@@ -51,8 +71,14 @@ impl HookFiles {
         &self.settings
     }
 
-    /// Writes this launch's settings file, naming `jerry_binary`, into a fresh private
-    /// directory under `parent` (the OS temp directory in production).
+    /// The path to pass as `claude --plugin-dir <path>`, carrying the `jerry` skill.
+    pub fn plugin_dir(&self) -> &Path {
+        &self.plugin_dir
+    }
+
+    /// Writes this launch's settings file, naming `jerry_binary`, plus its skill plugin
+    /// directory, into a fresh private directory under `parent` (the OS temp directory in
+    /// production).
     pub fn write_in(parent: &Path, jerry_binary: &Path) -> io::Result<HookFiles> {
         // Tidy away anything a previously crashed Jerry left here. Best-effort and never fatal.
         sweep_stale_directories(parent);
@@ -60,6 +86,7 @@ impl HookFiles {
         let directory = create_private_dir(parent)?;
         match Self::fill(&directory, jerry_binary) {
             Ok(settings) => Ok(HookFiles {
+                plugin_dir: directory.clone(),
                 directory,
                 settings,
             }),
@@ -70,11 +97,21 @@ impl HookFiles {
         }
     }
 
-    /// Writes the settings file into an already-created launch `directory`, returning its path.
+    /// Writes the settings file and the skill plugin into an already-created launch `directory`,
+    /// returning the settings file's own path.
     fn fill(directory: &Path, jerry_binary: &Path) -> io::Result<PathBuf> {
         let settings = directory.join(SETTINGS_NAME);
         // Not executable, and readable only by this user.
         write_private_file(&settings, settings_json(jerry_binary)?.as_bytes(), 0o600)?;
+
+        let plugin_manifest_dir = directory.join(".claude-plugin");
+        std::fs::create_dir_all(&plugin_manifest_dir)?;
+        write_private_file(
+            &plugin_manifest_dir.join("plugin.json"),
+            plugin_manifest_json().as_bytes(),
+            0o600,
+        )?;
+        write_private_file(&directory.join("SKILL.md"), SKILL_MD.as_bytes(), 0o600)?;
         Ok(settings)
     }
 }
@@ -428,6 +465,35 @@ mod tests {
                 "{event}: must point at the real located jerry binary, got {command:?}"
             );
         }
+    }
+
+    #[test]
+    fn write_in_also_writes_a_real_skill_plugin_directory_claude_can_load() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let jerry = temp.path().join(jerry_binary_name());
+        let files = HookFiles::write_in(temp.path(), &jerry).expect("must write");
+
+        assert_eq!(
+            files.plugin_dir(),
+            files.settings_path().parent().expect("parent")
+        );
+        let manifest_raw = std::fs::read_to_string(
+            files
+                .plugin_dir()
+                .join(".claude-plugin")
+                .join("plugin.json"),
+        )
+        .expect("plugin.json must exist");
+        let manifest: serde_json::Value = serde_json::from_str(&manifest_raw).expect("valid JSON");
+        assert_eq!(manifest["name"], serde_json::json!("jerry"));
+        assert!(manifest["description"]
+            .as_str()
+            .is_some_and(|d| !d.is_empty()));
+
+        let skill = std::fs::read_to_string(files.plugin_dir().join("SKILL.md"))
+            .expect("SKILL.md must exist");
+        assert_eq!(skill, super::SKILL_MD);
+        assert!(skill.contains("jerry wt new"), "{skill}");
     }
 
     #[test]

@@ -84,6 +84,7 @@ impl HookRuntime {
     pub fn injection(&self) -> HookInjection {
         HookInjection {
             settings_path: self.files.settings_path().to_path_buf(),
+            plugin_dir: self.files.plugin_dir().to_path_buf(),
             host_socket: self.host_socket.clone(),
         }
     }
@@ -231,12 +232,17 @@ fn record_hook_notification(
 pub struct HookInjection {
     /// Kept as a real [`PathBuf`], not a `String`.
     settings_path: PathBuf,
+    /// The skill plugin directory (`docs/architecture/decisions.md` §21), passed as
+    /// `claude --plugin-dir <path>` alongside `--settings` - `settings_file::HookFiles::fill`
+    /// writes it next to the settings file in the same per-launch directory.
+    plugin_dir: PathBuf,
     host_socket: PathBuf,
 }
 
 impl HookInjection {
     /// The extra CLI arguments and environment a freshly spawned `claude` needs so its hooks
-    /// reach this Jerry - `(args, env)`, ready for `crate::terminal::pane::TerminalSpec`.
+    /// reach this Jerry and it can discover the `jerry` skill - `(args, env)`, ready for
+    /// `crate::terminal::pane::TerminalSpec`.
     pub fn spawn_extras(&self, id: AgentId) -> Option<crate::work_surface::agents::SpawnExtras> {
         let Some(settings_path) = self.settings_path.to_str() else {
             log::warn!(
@@ -247,7 +253,18 @@ impl HookInjection {
             );
             return None;
         };
-        let args = vec!["--settings".to_owned(), settings_path.to_owned()];
+        let mut args = vec!["--settings".to_owned(), settings_path.to_owned()];
+        match self.plugin_dir.to_str() {
+            Some(plugin_dir) => {
+                args.push("--plugin-dir".to_owned());
+                args.push(plugin_dir.to_owned());
+            }
+            None => log::warn!(
+                "the generated skill plugin directory ({}) is not valid UTF-8, so it cannot be \
+                 passed as a command-line argument - this agent will not have the jerry skill",
+                self.plugin_dir.display()
+            ),
+        }
         Some((args, self.env(id)))
     }
 
@@ -276,8 +293,13 @@ impl HookInjection {
     /// notification-consuming task a full [`HookRuntime::start`] needs. For tests whose subject
     /// is what a spawn *does* with an injection, not how one comes to exist.
     pub(crate) fn for_test(settings_path: PathBuf, host_socket: PathBuf) -> HookInjection {
+        let plugin_dir = settings_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
         HookInjection {
             settings_path,
+            plugin_dir,
             host_socket,
         }
     }

@@ -183,7 +183,7 @@ mod socket_tests {
         host.listen(&socket.path).expect("listen");
         let id = AgentId::from("agent-9");
         host.agents()
-            .register(id.clone(), repo.path().to_path_buf());
+            .register(id.clone(), repo.path().to_path_buf(), "Claude".into());
 
         // A bare connection that only listens, opened before the event is produced.
         let mut watcher = Stream::connect(&socket.path).expect("watcher connects");
