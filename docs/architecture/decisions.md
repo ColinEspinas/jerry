@@ -413,3 +413,102 @@ until `jerry-cli` (#499) claims that name and the GUI ships as `jerry-app`. The 
 greps `jerry_git::`/`jerry_pty::`/`jerry_lsp::` and its baseline counts are unchanged, since the
 rename moves no call. Older entries in this file were rewritten to the new names in the same PR;
 `CHANGELOG.md` keeps the names each release shipped with, and the table above is the map.
+
+## 18. Spike: `gpui-base` (longbridge/gpui-kit) as `jerry-ui`'s behavior layer — pass/fail (#503 part A)
+
+**Status:** Spike, evidence only (2026-09-22, issue #503 part A). Not itself a decision to adopt or
+reject `gpui-base` — that call belongs to whoever scopes #503 part B from this evidence. Numbered
+`18` provisionally; several branches are adding entries in this same range concurrently and this
+one expects a renumber at merge (its title is unambiguous either way).
+
+**Context:** #503 asked whether `jerry-ui` (the design-system crate #492's plan carves out) should
+be built on `gpui-base`, the headless behavior layer (`dock`, `focus_trap`, `positioner`/`popup`,
+`resizable`, `scrollbar`, `tabs`, `virtual_list`, `tree`) from longbridge/gpui-kit, rather than
+hand-rolling the same behaviors the way `crates/jerry-app/src/root` does today. `gpui-base` and its
+sibling `gpui-component`/`gpui-kit` pin `gpui` to `gpui-pre`, weekly crates.io snapshots of Zed's
+own `gpui` crates — a different distribution channel from the `zed-industries/zed` git rev
+`crates/jerry-app` currently pins. Adopting `gpui-base` therefore means moving off the git rev.
+Branch: `spike/503-gpui-base` (from `chore/493-rename-jerry-crates`), throwaway quality, not merged.
+
+**Decision — pass/fail per criterion:**
+
+**1. Does the workspace compile on gpui-kit's exact `gpui-pre` snapshot, with `alacritty_terminal`
+and `tree-sitter` unmoved, no duplicate native `tree-sitter` link?** **PASS.** `gpui` moved from
+`{ git = "…zed-industries/zed", rev = "7b030b5…" }` (2026-07-27) to
+`{ package = "gpui-pre", version = "=0.3.6" }` — the exact pin gpui-kit's own `Cargo.toml` carries
+on its current `main`, published 2026-09-21 (one day before this spike; verified against
+crates.io) — and the three `gpui_platform` target tables to `gpui-pre-platform = "=0.3.6"` with the
+same features. `alacritty_terminal` and every `tree-sitter*` pin in `crates/jerry-app/Cargo.toml`
+were untouched. `gpui-base = "0.6.5"` (resolved `0.6.6`) was added to `jerry-app`'s real
+dependencies, `gpui-component` deliberately was not. Result: `cargo check --workspace --all-targets`
+and `cargo clippy --workspace --all-targets -- -D warnings` both finish clean (0 warnings), with
+**zero call-site changes** anywhere in `jerry-app`, `jerry-git`, `jerry-pty`, or `jerry-lsp` — a
+~56-day snapshot gap cost nothing this time. `Cargo.lock` carries exactly one `tree-sitter` entry
+(`0.26.9`) and `alacritty_terminal` still resolves from the same fork rev
+(`git+…/zed-industries/alacritty?rev=4c129667…`) — no duplicate link, no conflict.
+
+**2a. Does `gpui_base::dock` replace the root's hand-rolled tab-drag state?** **Partial, and not
+free.** `gpui_base::dock::PaneTree` is a pure-data pane tree (splits + tab groups, stable
+`NodeId`/`PanelId`) whose edit algebra (`move_panel`, `insert_panel`) was verified, not assumed:
+`crates/jerry-app/src/work_surface/dock_prototype.rs` (174 lines, `#[cfg(test)]`-only) builds a
+single unsplit `Tabs` group mirroring the unified tab strip and asserts `move_panel` reproduces
+`work_surface::state::move_tab_order`'s own reorder result for every `(dragged, target,
+insert_after)` combination over a 4-tab sample — it does, after two real adaptations dock does not
+supply on its own: a self-drop guard (`move_panel` has no built-in "dropped on itself" no-op,
+unlike `move_tab_order`) and computing the target index against the list with `dragged` already
+removed (`move_panel` detaches before it inserts, so indexing the pre-detach list is off by one).
+That is genuine logic-level parity, but the measured line count runs the *wrong* way for the
+reorder algebra alone: 174 new lines to prove 18 old lines (`move_tab_order`'s body) are
+replaceable. The plausible deletion is elsewhere and was **not** measured: `root::AdeApp`'s own
+`dragging_tab`/`tab_drag_insertion`/`tab_bounds` fields (~70 lines with docs) could go if dock owned
+that bookkeeping, in exchange for implementing `TabGroupRenderer`/`DockAreaRenderer` (new code, size
+unknown - not attempted). Two real gaps, not adaptable by more glue code alone:
+`dropped_tab_settle`'s settle-fade and `tab_slide`'s neighbor-slide-on-drop animations have no dock
+equivalent (`dock`'s own module docs: "Base supplies behavior; the host supplies appearance...
+nothing in this module paints a color, a border, or a size") — `gpui_base::motion::spring`/
+`transition` are real, reusable primitives that could replace the hand-rolled pixel-offset math, but
+that is a rewrite, not a deletion. Larger: `DockLayout::panel` takes a real `Entity<P: Panel>` per
+tab (`PanelId` wraps a real `EntityId`) — Jerry's `TabRef` is a plain value enum
+(`Agent`/`File`/`Graph`/`Review`/`Run`) with no per-tab GPUI entity today; every tab's content
+renders inline from one monolithic `AdeApp` view. Real adoption means decomposing each tab kind into
+its own entity implementing `Panel`, which is a materially larger change than replacing the drag
+fields.
+
+**2b. Does `gpui_base::focus_trap` replace `root/focus.rs`?** **FAIL — no overlap.**
+`focus_trap` is a Tab/Shift-Tab-cycling containment primitive: a global `FocusTrapManager` plus a
+`.focus_trap(id, handle)` element wrapper so Root's dispatch can keep Tab from leaving an open
+modal. `root/focus.rs` (2094 lines) does a different job entirely — capturing the pre-open focus
+target and restoring the right one on close, per overlay (palette, Settings, the code surface, the
+"New file" prompt), with per-overlay fallback rules (the module's own docs: "This project has hit
+'close forgot to restore' bugs repeatedly"). Measured, not estimated: the real logic is lines 1–184
+(`impl AdeApp`); lines 185–2094 (91%) are `#[cfg(test)]` regression tests guarding that exact
+capture/restore behavior. `focus.rs` has no Tab-cycling code today (grepped, absent) and
+`focus_trap` has no capture/restore API at all (`focus_trap()` and `active_focus_trap()` are its
+whole public surface). Adopting `focus_trap` would add a capability Jerry lacks today; it would
+delete none of `focus.rs`'s 184 logic lines or 1909 test lines, because it answers a different
+question.
+
+**3. Is the `gpui-pre` snapshot cadence a risk Jerry can live with?** **Livable, with a real
+trade named.** gpui-kit's own `Cargo.toml` states the risk plainly: "GPUI comes from the `gpui-pre-*`
+snapshots of Zed's crates, and any snapshot may change GPUI's API... a caret requirement let the
+weekly release move applications onto a newer snapshot that gpui-component did not compile with
+(#3156)" — which is why every one of its own snapshot pins is exact (`=0.3.6`), enforced by its own
+`script/check-gpui-pin.ts` in CI. This spike's own 2026-07-27 → 2026-09-21 gap cost zero
+adaptations, but that is one data point on a narrow API surface, not a guarantee — the same
+"bump deliberately, rerun the full suite" discipline `crates/jerry-app/Cargo.toml`'s existing git-rev
+comment already states would carry over unchanged to an exact `gpui-pre` pin. The trade genuinely
+lost: today `crates/jerry-app` can pin *any* `zed-industries/zed` commit; on `gpui-pre`, Jerry can
+only bump to whatever longbridge has already snapshotted and published, so a Zed fix or feature
+lands on Jerry's own timeline only once gpui-kit has picked it up.
+
+**Consequences:** Criterion 1 passes outright. Criterion 2 is genuinely split: the dock's pure edit
+algebra is a verified, reusable building block, but the issue's framing ("does dock replace the tab
+strip", "does focus_trap replace focus.rs") oversold both — the tab-strip win requires an
+entity-decomposition cost this spike did not attempt to size, and the focus_trap question was
+answered no. Recommendation for #503 part B: **do not build `jerry-ui` on `gpui-base` as a whole.**
+The `dock` module's edit algebra is worth revisiting narrowly if/when the tab strip's content
+becomes per-tab entities for an unrelated reason; `focus_trap` is worth adopting on its own merits
+(a real, currently-missing capability) independent of anything else in #503; neither justifies moving
+`crates/jerry-app`'s `gpui` pin off the git rev today. Part B should move `theme.rs`/`icons.rs`/
+`fonts.rs`/`root/widgets.rs`/`settings/widgets.rs` into `jerry-ui` re-based on Jerry's own existing
+behavior code, not `gpui-base`'s.

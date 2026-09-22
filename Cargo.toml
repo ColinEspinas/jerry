@@ -34,11 +34,11 @@ expect_used = "warn"
 dbg_macro = "warn"
 
 [workspace.dependencies]
-# Pinned to the exact zed-industries/zed commit this workspace was built and verified
-# against. Bump only deliberately, together with re-running the full
-# test/build/clippy suite - GPUI's API surface is not stable across arbitrary upstream
-# commits.
-gpui = { git = "https://github.com/zed-industries/zed", rev = "7b030b500810b04cf5fb4aa5973be99a502d9f36" }
+# SPIKE (issue #503, part A): swapped from the git `zed-industries/zed` rev to the exact
+# `gpui-pre` crates.io snapshot longbridge/gpui-kit's own `Cargo.toml` pins on its current
+# main (`gpui = { package = "gpui-pre", version = "=0.3.6" }`), to test whether `jerry-ui`
+# can build on `gpui-base`. Not a real pin - see docs/architecture/decisions.md's spike entry.
+gpui = { package = "gpui-pre", version = "=0.3.6" }
 anyhow = "1"
 thiserror = "1"
 # Real config-file (de)serialization for `crate::settings_store::Settings`. Pinned to

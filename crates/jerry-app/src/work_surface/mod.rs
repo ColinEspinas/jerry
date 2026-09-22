@@ -19,5 +19,9 @@ pub mod agents;
 pub mod state;
 pub mod tab_order_state;
 
+// SPIKE (issue #503, part A): see the module's own docs.
+#[cfg(test)]
+mod dock_prototype;
+
 pub(crate) mod render;
 pub(crate) mod session;

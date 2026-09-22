@@ -15,6 +15,11 @@ path = "src/main.rs"
 
 [dependencies]
 gpui = { workspace = true }
+# SPIKE (issue #503, part A): headless dock/focus_trap behavior from longbridge/gpui-kit,
+# evaluated as the behavior layer under a future `jerry-ui` crate. Pinned to the same
+# `0.6.5` release gpui-kit's own workspace carries against `gpui-pre = "=0.3.6"` above -
+# `gpui-component` is deliberately NOT added (see issue #503's part A scope).
+gpui-base = "0.6.5"
 jerry-git = { path = "../jerry-git" }
 jerry-pty = { path = "../jerry-pty" }
 # Real LSP client (spawns `rust-analyzer`, real initialize/initialized handshake, real
@@ -316,7 +321,9 @@ rodio = { version = "0.22.2", default-features = false, features = [
 # `"freebsd"` as one of its real cases) already treats as a supported target elsewhere in this
 # crate.
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "7b030b500810b04cf5fb4aa5973be99a502d9f36", features = [
+# SPIKE (issue #503, part A): `gpui-pre-platform`, the crates.io snapshot counterpart of the
+# git `gpui_platform`, at gpui-kit's own pinned `=0.3.6`.
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.6", features = [
     "wayland",
     "x11",
 ] }
@@ -344,14 +351,16 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # without the "font-kit" feature, so no text will be rendered` and shows a real, empty window -
 # confirmed the hard way running this app on macOS for the first time.
 [target.'cfg(target_os = "macos")'.dependencies]
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "7b030b500810b04cf5fb4aa5973be99a502d9f36", features = [
+# SPIKE (issue #503, part A): see the Linux/FreeBSD table's comment above.
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.6", features = [
     "font-kit",
 ] }
 
 # Windows: same as macOS - `gpui_windows` (and `gpui`'s own `windows-manifest` feature) are
 # pulled in automatically by `gpui_platform`'s own Windows target section.
 [target.'cfg(target_os = "windows")'.dependencies]
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "7b030b500810b04cf5fb4aa5973be99a502d9f36" }
+# SPIKE (issue #503, part A): see the Linux/FreeBSD table's comment above.
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.6" }
 
 # Unix only, and used for two things. First, `kill(pid, 0)` as the portable POSIX check for
 # whether a process still exists, so `crate::hooks::settings_file` can sweep launch directories
