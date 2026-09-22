@@ -268,10 +268,24 @@ pub fn write_line_frame<W: Write + ?Sized>(
 /// `FrameError::Json`, letting the caller answer a JSON-RPC parse error and keep reading rather
 /// than tearing down the connection.
 pub fn read_line_frame<R: BufRead + ?Sized>(reader: &mut R) -> Result<Message, FrameError> {
+    read_line_frame_capped(reader, MAX_FRAME_BYTES)
+}
+
+/// [`read_line_frame`] with an explicit cap, so a test can hit it without allocating a
+/// `MAX_FRAME_BYTES`-sized line. There is no length prefix to check first here (unlike
+/// [`read_frame`]), so an oversized line is only detected by hitting the cap.
+fn read_line_frame_capped<R: BufRead + ?Sized>(
+    reader: &mut R,
+    cap: u32,
+) -> Result<Message, FrameError> {
+    let limit = u64::from(cap) + 1;
     let mut line = String::new();
-    let read = reader.read_line(&mut line)?;
+    let read = (&mut *reader).take(limit).read_line(&mut line)?;
     if read == 0 {
         return Err(FrameError::Closed);
+    }
+    if !line.ends_with('\n') && line.len() as u64 >= limit {
+        return Err(FrameError::TooLarge(cap + 1));
     }
     Ok(serde_json::from_str(line.trim_end_matches(['\n', '\r']))?)
 }
@@ -454,6 +468,31 @@ mod line_frame_codec_tests {
             b"{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}\r\n".to_vec(),
         ));
         let message = read_line_frame(&mut reader).expect("decodes despite CRLF");
+        assert_eq!(
+            message,
+            Message::Notification {
+                method: "ping".into(),
+                params: serde_json::Value::Null,
+            }
+        );
+    }
+
+    #[test]
+    fn a_line_past_the_cap_is_refused_without_reading_the_rest_of_the_stream() {
+        let cap = 16;
+        // No newline within `cap` bytes - the pathological input the cap exists for.
+        let oversized = vec![b'a'; (cap as usize) * 4];
+        let mut reader = BufReader::new(Cursor::new(oversized));
+        let err = super::read_line_frame_capped(&mut reader, cap).expect_err("too large");
+        assert!(matches!(err, FrameError::TooLarge(_)), "{err}");
+    }
+
+    #[test]
+    fn a_line_within_the_cap_still_decodes() {
+        let mut reader =
+            BufReader::new(Cursor::new(b"{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}\n"));
+        let message =
+            super::read_line_frame_capped(&mut reader, 1024).expect("well within the cap");
         assert_eq!(
             message,
             Message::Notification {

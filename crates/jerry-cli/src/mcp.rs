@@ -10,13 +10,8 @@ use jerry_core::{permits, Caller, Message, Method, Report, Request, RequestId, R
 use serde_json::Value;
 use std::io::{BufReader, Read, Write};
 
-/// The latest protocol revision that still uses the classic `initialize` handshake - the MCP
-/// specification calls this "legacy" as of its 2026-07-28 revision, which replaced it for new
-/// clients with a stateless, per-request `_meta.protocolVersion` plus a mandatory
-/// `server/discover` call (verified at
-/// <https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning> and
-/// <https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle>). Real MCP clients,
-/// Claude Code included, still overwhelmingly speak the handshake this module implements.
+/// The legacy `initialize`-handshake protocol version this server speaks - see why, over the
+/// current `2026-07-28` revision, in `docs/architecture/decisions.md` §22.
 const PROTOCOL_VERSION: &str = "2025-11-25";
 
 /// The kebab-case code an MCP tool result's `structuredContent` carries when the caller's
@@ -25,7 +20,8 @@ const PROTOCOL_VERSION: &str = "2025-11-25";
 /// (`Denied::code`, `Report::Denied::code`).
 const FORBIDDEN_CODE: &str = "forbidden";
 
-/// Runs the server loop until stdin closes (a clean EOF exits 0).
+/// Runs the server loop until stdin closes (a clean EOF exits 0) or stdin/stdout itself fails
+/// (the failure exit code - there is no request left to answer, so nothing to keep looping for).
 pub(crate) fn run(
     session: &mut Session,
     caller: &Caller,
@@ -39,30 +35,51 @@ pub(crate) fn run(
         let message = match read_line_frame(&mut reader) {
             Ok(message) => message,
             Err(FrameError::Closed) => return exit::DONE,
-            // A malformed line is the client's mistake, not this server's: answer it and keep
-            // reading, exactly as a length-prefixed connection would keep serving other calls.
-            Err(parse_error) => {
-                let _ = write_line_frame(
-                    out,
-                    &Message::Response {
-                        id: RequestId::Null,
-                        result: Err(RpcError::new(
-                            rpc_code::PARSE_ERROR,
-                            parse_error.to_string(),
-                        )),
-                    },
-                );
+            // The client's own mistake, not this server's: answer it and keep reading, exactly
+            // as a length-prefixed connection would keep serving other calls.
+            Err(error @ FrameError::Json(_)) => {
+                let response = Message::Response {
+                    id: RequestId::Null,
+                    result: Err(RpcError::new(rpc_code::PARSE_ERROR, error.to_string())),
+                };
+                if !write_response(out, err, &response) {
+                    return exit::FAILED;
+                }
                 continue;
+            }
+            // Unlike a malformed line, this is stdin itself misbehaving (a truncated read, or a
+            // single line past `MAX_FRAME_BYTES` with no terminator) - answering and continuing
+            // would just repeat the same failure against whatever is left of the stream.
+            Err(error) => {
+                let _ = writeln!(err, "jerry mcp: stdin read failed: {error}");
+                return exit::FAILED;
             }
         };
         match message {
             Message::Request { id, method, params } => {
                 let result = handle(session, caller, &method, params, err);
-                let _ = write_line_frame(out, &Message::Response { id, result });
+                if !write_response(out, err, &Message::Response { id, result }) {
+                    return exit::FAILED;
+                }
             }
             // `notifications/initialized` needs no reply; an MCP client never sends `jerry mcp` a
             // `Response`, so any that arrives is equally inert.
             Message::Notification { .. } | Message::Response { .. } => {}
+        }
+    }
+}
+
+/// Writes one response frame; `false` means the write itself failed, so the caller has nothing
+/// left to answer with and should stop rather than fail the same write again on every request.
+fn write_response(out: &mut dyn Write, err: &mut dyn Write, message: &Message) -> bool {
+    match write_line_frame(out, message) {
+        Ok(()) => true,
+        Err(error) => {
+            let _ = writeln!(
+                err,
+                "jerry mcp: could not write a response to stdout: {error}"
+            );
+            false
         }
     }
 }
@@ -320,6 +337,63 @@ mod mcp_server_tests {
         assert_eq!(lines[0]["id"], serde_json::Value::Null);
         assert!(lines[0]["error"]["code"].is_i64(), "{:?}", lines[0]);
         assert_eq!(lines[1]["result"], serde_json::json!({}));
+    }
+
+    /// Always fails the write - stands in for a broken stdout (a closed pipe, a client that
+    /// exited).
+    struct FailingWriter;
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("simulated write failure"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_broken_stdout_ends_the_loop_with_the_failure_exit_code() {
+        let repo = seed_empty_repo();
+        let input = request(1, "ping", serde_json::json!({})).to_string() + "\n";
+        let stdin: Box<dyn Read + Send> = Box::new(std::io::Cursor::new(input.into_bytes()));
+        let mut out = FailingWriter;
+        let mut err = Vec::new();
+        let code = crate::run(
+            args(&["mcp"]),
+            &env(&[]),
+            repo.path(),
+            stdin,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, crate::exit::FAILED);
+    }
+
+    #[test]
+    fn a_line_past_the_frame_cap_ends_the_loop_instead_of_spinning_on_the_rest_of_the_stream() {
+        let repo = seed_empty_repo();
+        // One line, never terminated, past `jerry_core::wire::MAX_FRAME_BYTES` - proves the loop
+        // stops on the first oversized read rather than re-reading the same unterminated tail.
+        let oversized = vec![b'a'; 16 * 1024 * 1024 + 10];
+        let stdin: Box<dyn Read + Send> = Box::new(std::io::Cursor::new(oversized));
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = crate::run(
+            args(&["mcp"]),
+            &env(&[]),
+            repo.path(),
+            stdin,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(
+            code,
+            crate::exit::FAILED,
+            "stderr: {}",
+            String::from_utf8_lossy(&err)
+        );
+        assert!(out.is_empty(), "an oversized line has no response to send");
     }
 
     #[test]

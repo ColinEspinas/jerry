@@ -972,16 +972,20 @@ fn a_real_claude_session_lists_and_calls_a_real_jerry_mcp_tool() {
     let settings_temp = tempfile::tempdir().expect("temp dir");
     let files = crate::hooks::settings_file::HookFiles::write_in(settings_temp.path(), &jerry)
         .expect("files must write");
-    // Unlike the sibling `jerry wt new` test above, this one keeps `--dangerously-skip-permissions`:
-    // an MCP tool call is a different approval surface than a Bash command, with no
-    // `--allowedTools`-style equivalent verified for MCP tools - a real run of this test confirms
-    // the flag is what lets a headless `-p` turn call the tool instead of stalling on approval.
     let args = vec![
         "--settings".to_owned(),
         files.settings_path().to_string_lossy().into_owned(),
         "--plugin-dir".to_owned(),
         files.plugin_dir().to_string_lossy().into_owned(),
-        "--dangerously-skip-permissions".to_owned(),
+        "--allowedTools".to_owned(),
+        // The MCP-tool allow-rule syntax (verified at
+        // <https://code.claude.com/docs/en/permissions>): `mcp__<server>__<tool>` for one tool. A
+        // server declared by a *plugin's* `.mcp.json` (rather than a project one) is additionally
+        // namespaced `plugin_<plugin name>_<server name>` - confirmed against a real denial
+        // message naming the tool exactly this way (both our plugin and our server are named
+        // "jerry", hence the doubled segment); `query_status` is `query/status`'s own tool name
+        // (`jerry_core::mcp::tool_name`).
+        "mcp__plugin_jerry_jerry__query_status".to_owned(),
     ];
 
     let Some(stdout) = run_real_claude_capturing_stdout(

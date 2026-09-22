@@ -55,15 +55,11 @@ fn plugin_manifest_json() -> String {
     .to_string()
 }
 
-/// The plugin-root `.mcp.json` registering `jerry mcp` (`docs/architecture/decisions.md` §22) -
-/// verified real, auto-loaded by `--plugin-dir` with no further flag, at
-/// <https://code.claude.com/docs/en/mcp.md> and <https://code.claude.com/docs/en/plugins.md>.
-/// Carries no `env`: `jerry mcp`'s own `JERRY_AGENT_ID`/`JERRY_HOST_SOCKET` reach it exactly the
-/// way they already reach a spawned `jerry hook <event>` - inherited from the `claude` process's
-/// own environment, which [`AGENT_ENV`]/[`SOCKET_ENV`] are injected into at spawn time
-/// (`crate::hooks::HookInjection::env`), not written into this shared, per-launch file (every
-/// agent this launch spawns shares one plugin directory, so no single static value here could
-/// name any one of them).
+/// The plugin-root `.mcp.json` registering `jerry mcp` - see `docs/architecture/decisions.md`
+/// §22. Carries no `env`: this file is shared by every agent the launch spawns (one plugin
+/// directory per launch, not per agent), so no static value here could name any one of them -
+/// `JERRY_AGENT_ID`/`JERRY_HOST_SOCKET` reach the spawned server by environment inheritance
+/// instead, the same way they already reach a spawned `jerry hook <event>`.
 fn mcp_manifest_json(jerry_binary: &Path) -> String {
     serde_json::json!({
         "mcpServers": {
