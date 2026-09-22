@@ -380,7 +380,11 @@ fn merge_continue(
         };
         match staged {
             Report::Ok { .. } => {}
-            Report::Denied { .. } => remaining.push(path),
+            // Only "markers still there" is the caller's next step; any other refusal is
+            // reported as itself rather than folded into the to-do list.
+            Report::Denied { ref code, .. } if code == "merge-file-not-fully-resolved" => {
+                remaining.push(path)
+            }
             other => {
                 if json {
                     return emit_json(&other, out);
@@ -392,10 +396,10 @@ fn merge_continue(
     }
     if !remaining.is_empty() {
         if json {
-            let _ = serde_json::to_writer(
-                &mut *out,
-                &serde_json::json!({ "status": "action-required", "unresolved": remaining }),
-            );
+            let still = serde_json::json!({ "status": "action-required", "unresolved": remaining });
+            if serde_json::to_writer(&mut *out, &still).is_err() {
+                return exit::FAILED;
+            }
             let _ = writeln!(out);
             return exit::ACTION_REQUIRED;
         }

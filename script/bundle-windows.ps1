@@ -35,6 +35,7 @@ $Version = $Matches[1]
 Write-Host "==> Bundling $AppName $Version for Windows"
 
 $ReleaseBin = Join-Path $RepoRoot "target\release\$BinName"
+$ReleaseCli = Join-Path $RepoRoot "target\release\$CliName"
 if ((Test-Path $ReleaseBin) -and $env:SKIP_BUILD) {
     Write-Host "==> SKIP_BUILD set and $ReleaseBin exists - reusing it"
 } elseif (Test-Path $ReleaseBin) {
