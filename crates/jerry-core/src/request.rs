@@ -2,10 +2,15 @@
 //! event. One enum per kind so dispatch applies each kind's default policy without inspecting
 //! variants, and so a CLI or an MCP tool list can be generated from the same source.
 
-use crate::command::{permits, run_query, Invocability, Locality, Query};
+use crate::command::{
+    permits, run_command, run_query, validate_command, Command, Invocability, Locality, Query,
+};
+use crate::commands::{
+    MergeAbort, MergeAttempt, MergeBranchIntoCurrent, MergeComplete, StageResolved,
+};
 use crate::ctx::Ctx;
 use crate::method::Method;
-use crate::queries::StatusQuery;
+use crate::queries::{MergeStatusQuery, StatusQuery};
 use crate::report::Report;
 use crate::wire::{rpc_code, RpcError};
 use serde::{Deserialize, Serialize};
@@ -21,23 +26,36 @@ pub struct HookEvent {
     pub payload: Value,
 }
 
-/// Every Command a client can send. Empty until the merge pilot (#498) lands the first ones.
+/// Every Command a client can send.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "name", content = "params", rename_all = "kebab-case")]
-pub enum AppCommand {}
+pub enum AppCommand {
+    MergeAttempt(MergeAttempt),
+    MergeBranchIntoCurrent(MergeBranchIntoCurrent),
+    MergeComplete(MergeComplete),
+    MergeAbort(MergeAbort),
+    StageResolved(StageResolved),
+}
 
 /// Every Query a client can send.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "name", content = "params", rename_all = "kebab-case")]
 pub enum AppQuery {
     Status(StatusQuery),
+    MergeStatus(MergeStatusQuery),
 }
 
 /// The kebab-case names of every `AppCommand` variant, for method lookup and tool listing.
-pub const COMMAND_NAMES: &[&str] = &[];
+pub const COMMAND_NAMES: &[&str] = &[
+    "merge-abort",
+    "merge-attempt",
+    "merge-branch-into-current",
+    "merge-complete",
+    "stage-resolved",
+];
 
 /// The kebab-case names of every `AppQuery` variant.
-pub const QUERY_NAMES: &[&str] = &["status"];
+pub const QUERY_NAMES: &[&str] = &["merge-status", "status"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Request {
@@ -58,37 +76,75 @@ pub enum LocalDispatchError {
     Forbidden(Method),
 }
 
+/// One match per property, so adding a variant is a compile error until it is classified.
+macro_rules! each_command {
+    ($self:expr, |$c:ident| $body:expr) => {
+        match $self {
+            AppCommand::MergeAttempt($c) => $body,
+            AppCommand::MergeBranchIntoCurrent($c) => $body,
+            AppCommand::MergeComplete($c) => $body,
+            AppCommand::MergeAbort($c) => $body,
+            AppCommand::StageResolved($c) => $body,
+        }
+    };
+}
+
 impl AppCommand {
     fn name(&self) -> &'static str {
-        match *self {}
+        match self {
+            AppCommand::MergeAttempt(_) => MergeAttempt::NAME,
+            AppCommand::MergeBranchIntoCurrent(_) => MergeBranchIntoCurrent::NAME,
+            AppCommand::MergeComplete(_) => MergeComplete::NAME,
+            AppCommand::MergeAbort(_) => MergeAbort::NAME,
+            AppCommand::StageResolved(_) => StageResolved::NAME,
+        }
     }
 
     pub fn invocability(&self) -> Invocability {
-        match *self {}
+        each_command!(self, |c| c.invocability())
     }
 
     pub fn locality(&self) -> Locality {
-        match *self {}
+        each_command!(self, |c| c.locality())
     }
+
+    /// The one execution path: validate, then execute, as a `Report`.
+    pub fn run(self, ctx: &Ctx) -> Report {
+        each_command!(self, |c| run_command(c, ctx))
+    }
+
+    pub fn validate(&self, ctx: &Ctx) -> Report {
+        each_command!(self, |c| validate_command(c, ctx))
+    }
+}
+
+macro_rules! each_query {
+    ($self:expr, |$q:ident| $body:expr) => {
+        match $self {
+            AppQuery::Status($q) => $body,
+            AppQuery::MergeStatus($q) => $body,
+        }
+    };
 }
 
 impl AppQuery {
     fn name(&self) -> &'static str {
         match self {
             AppQuery::Status(_) => StatusQuery::NAME,
+            AppQuery::MergeStatus(_) => MergeStatusQuery::NAME,
         }
     }
 
     pub fn invocability(&self) -> Invocability {
-        match self {
-            AppQuery::Status(query) => query.invocability(),
-        }
+        each_query!(self, |q| q.invocability())
     }
 
     pub fn locality(&self) -> Locality {
-        match self {
-            AppQuery::Status(query) => query.locality(),
-        }
+        each_query!(self, |q| q.locality())
+    }
+
+    pub fn run(&self, ctx: &Ctx) -> Report {
+        each_query!(self, |q| run_query(q, ctx))
     }
 }
 
@@ -173,6 +229,43 @@ impl Request {
                 "request-query-status",
                 Request::Query(AppQuery::Status(StatusQuery::default())),
             ),
+            (
+                "request-query-merge-status",
+                Request::Query(AppQuery::MergeStatus(MergeStatusQuery::default())),
+            ),
+            (
+                "request-command-merge-attempt",
+                Request::Command(AppCommand::MergeAttempt(MergeAttempt::default())),
+            ),
+            (
+                "request-validate-merge-attempt",
+                Request::Validate(AppCommand::MergeAttempt(MergeAttempt::default())),
+            ),
+            (
+                "request-command-merge-branch-into-current",
+                Request::Command(AppCommand::MergeBranchIntoCurrent(MergeBranchIntoCurrent {
+                    source_branch: "feature/login".into(),
+                })),
+            ),
+            (
+                "request-command-merge-complete",
+                Request::Command(AppCommand::MergeComplete(MergeComplete {
+                    base_worktree_path: "/repo".into(),
+                })),
+            ),
+            (
+                "request-command-merge-abort",
+                Request::Command(AppCommand::MergeAbort(MergeAbort {
+                    base_worktree_path: "/repo".into(),
+                })),
+            ),
+            (
+                "request-command-stage-resolved",
+                Request::Command(AppCommand::StageResolved(StageResolved {
+                    worktree_path: "/repo".into(),
+                    path: "src/a.rs".into(),
+                })),
+            ),
         ]
     }
 }
@@ -188,8 +281,9 @@ pub fn execute_locally(request: &Request, ctx: &Ctx) -> Result<Report, LocalDisp
     }
     match request {
         Request::Hook(_) => Err(LocalDispatchError::NeedsHost(request.method())),
-        Request::Command(command) | Request::Validate(command) => match *command {},
-        Request::Query(AppQuery::Status(query)) => Ok(run_query(query, ctx)),
+        Request::Command(command) => Ok(command.clone().run(ctx)),
+        Request::Validate(command) => Ok(command.validate(ctx)),
+        Request::Query(query) => Ok(query.run(ctx)),
     }
 }
 

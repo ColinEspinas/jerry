@@ -16,12 +16,17 @@ use jerry_core::wire::rpc_code;
 use jerry_core::{AgentId, Call, Message, Report, RpcError};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::future::Future;
 use std::io;
 use std::net::Shutdown;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
+
+/// The dispatch loop, to run on whichever executor the embedding process provides.
+pub type DispatchFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum HostError {
@@ -144,8 +149,34 @@ pub struct Host {
 }
 
 impl Host {
-    /// Starts the dispatch thread. It sleeps on its channel until a call arrives.
+    /// Starts the host with its own dispatch thread, for a process that has no executor of
+    /// its own (the standalone host binary, tests).
     pub fn start() -> Result<Host, HostError> {
+        let (host, dispatch) = Host::start_detached();
+        let dispatcher = thread::Builder::new()
+            .name("jerry-host-dispatch".into())
+            .spawn(move || futures::executor::block_on(dispatch))
+            .map_err(|source| HostError::Thread {
+                name: "dispatch",
+                source,
+            })?;
+        *lock(&host.dispatcher) = Some(dispatcher);
+        Ok(host)
+    }
+
+    /// Starts the host with its dispatch loop handed to `spawn`, so an embedding process runs
+    /// it on its own executor: the app spawns it on GPUI's background executor, and a GPUI
+    /// test drives it deterministically. Blocking git work runs wherever `spawn` puts it.
+    pub fn start_with(spawn: impl FnOnce(DispatchFuture)) -> Host {
+        let (host, dispatch) = Host::start_detached();
+        spawn(dispatch);
+        host
+    }
+
+    /// Builds the host and hands back its dispatch loop for the caller to spawn wherever it
+    /// lives: the app puts it on GPUI's background executor, and a GPUI test drives it
+    /// deterministically. Blocking git work runs wherever the loop runs.
+    pub fn start_detached() -> (Host, DispatchFuture) {
         let (jobs, mut receiver) = mpsc::unbounded::<Job>();
         let inner = Arc::new(Inner {
             jobs: Mutex::new(Some(jobs)),
@@ -155,31 +186,24 @@ impl Host {
             shutting_down: AtomicBool::new(false),
         });
         let worker = Arc::clone(&inner);
-        let dispatcher = thread::Builder::new()
-            .name("jerry-host-dispatch".into())
-            .spawn(move || {
-                use futures::StreamExt;
-                futures::executor::block_on(async move {
-                    while let Some(job) = receiver.next().await {
-                        let result = if worker.is_shutting_down() {
-                            Err(shutting_down())
-                        } else {
-                            dispatch::handle(&worker, job.call)
-                        };
-                        // The caller may have given up waiting; nothing to do about that here.
-                        let _ = job.reply.send(result);
-                    }
-                });
-            })
-            .map_err(|source| HostError::Thread {
-                name: "dispatch",
-                source,
-            })?;
-        Ok(Host {
+        let dispatch: DispatchFuture = Box::pin(async move {
+            use futures::StreamExt;
+            while let Some(job) = receiver.next().await {
+                let result = if worker.is_shutting_down() {
+                    Err(shutting_down())
+                } else {
+                    dispatch::handle(&worker, job.call)
+                };
+                // The caller may have given up waiting; nothing to do about that here.
+                let _ = job.reply.send(result);
+            }
+        });
+        let host = Host {
             inner,
-            dispatcher: Mutex::new(Some(dispatcher)),
+            dispatcher: Mutex::new(None),
             listening: Mutex::new(None),
-        })
+        };
+        (host, dispatch)
     }
 
     pub fn agents(&self) -> AgentTable {

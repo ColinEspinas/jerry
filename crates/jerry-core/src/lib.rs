@@ -11,6 +11,7 @@
 pub mod call;
 pub mod client;
 pub mod command;
+pub mod commands;
 pub mod ctx;
 pub mod error;
 pub mod method;
@@ -25,9 +26,14 @@ pub use command::{
     permits, run_command, run_query, validate_command, Command, Denied, Invocability, Locality,
     Query,
 };
+pub use commands::{
+    ConflictKind, ConflictedPathReport, MergeAbort, MergeAttempt, MergeAttemptOutcome,
+    MergeBranchIntoCurrent, MergeComplete, MergeCompleteOutcome, StageResolved,
+};
 pub use ctx::{AgentId, Caller, Ctx};
 pub use error::Error;
 pub use method::Method;
+pub use queries::{MergeStatusOutcome, MergeStatusQuery, StatusOutcome, StatusQuery};
 pub use report::Report;
 pub use request::{execute_locally, AppCommand, AppQuery, HookEvent, LocalDispatchError, Request};
 pub use wire::{Message, RequestId, RpcError, PROTOCOL_VERSION};

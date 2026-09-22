@@ -93,7 +93,12 @@ pub(crate) fn open_test_app_with_settings(
     settings_path: Option<PathBuf>,
 ) -> (Entity<AdeApp>, &mut VisualTestContext) {
     cx.add_window_view(|window, cx| {
-        AdeApp::new_with_settings(Some(repo_path), true, settings, settings_path, window, cx)
+        let mut app =
+            AdeApp::new_with_settings(Some(repo_path), true, settings, settings_path, window, cx);
+        // Every test app dispatches through a real in-process host, driven by the test
+        // executor; it has no socket, so `jerry` never finds a test instance.
+        app.adopt_host(crate::host::HostRuntime::in_process(), cx);
+        app
     })
 }
 

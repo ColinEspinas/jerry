@@ -486,3 +486,31 @@ the UI-optional plan touches follow the rule, `jerry-pty`'s output channel first
 producer is a thread in this process or, at stage 3, a socket. The one cost is that a producer
 must be given its channel rather than polled, which is why `jerry-core` exposes no threads and
 `jerry-host` owns the only ones.
+
+## 18. The merge pilot: index mutations are Commands, disk edits and reads stay local
+
+**Status:** Accepted (2026-09-22, issue #498; decisions Q1 and Q11 of the UI-optional plan).
+
+**Context:** Merge was the first flow migrated to the Command model because it is the one with
+a continuation and in-memory state. The question it settled is where the line runs between
+"goes through the host" and "runs in the app".
+
+**Decision:** Every mutation of git's own state is a Command dispatched through the host:
+`MergeAttempt`, `MergeBranchIntoCurrent`, `MergeComplete`, `MergeAbort`, and `StageResolved`.
+Each carries a `validate` that answers "could this run" without running it (`merge_preflight`
+in `jerry-git` is `attempt_merge` minus the merge), and every one is `Denied` to agents, since
+git already gives an agent a merge. Resolving a hunk is a disk edit under write-through (§ the
+#497 change) and stays a local write; only staging the finished file touches the index, so only
+staging is a Command. The GUI consumes the wire `Report`, which names paths and hunk counts, and
+re-reads the conflicted files from the base worktree itself: contents never travel, and a
+socket client in stage 3 does exactly what the in-process client does today. Git reads the
+resolver needs at render latency (`classify_conflicted_file`, `load_conflicted_file`,
+`merge_head_exists`, `find_in_progress_merge`) stay local per §15's `Locality` rule.
+
+**Consequences:** `crates/jerry-app/src/merge/flow.rs` no longer calls `attempt_merge`,
+`complete_merge`, `abort_merge` or `stage_conflict_resolution`; the plan's "no `jerry_git::`
+call remains in `merge/`" is therefore met for mutations and deliberately not for reads. Every
+test app runs an unpublished in-process host on the deterministic test executor, so the existing
+merge tests drive the real dispatch path without a socket. `MergeFlowState` keeps its shape:
+its `Conflicted` variant already isolates the cursor, and the outcome-versus-error split the
+plan asked for was already there.
