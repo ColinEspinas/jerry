@@ -5,6 +5,7 @@ use crate::command::{Locality, Query};
 use crate::commands::StopReasonWire;
 use crate::ctx::Ctx;
 use crate::error::Error;
+use crate::session::SessionRecord;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -68,6 +69,32 @@ impl Query for AgentsQuery {
         Err(Error::new(
             "needs-host",
             "the agent table lives on the session host, not in this process",
+        ))
+    }
+}
+
+/// Every PTY session the host is tracking - agents and plain terminal tabs alike
+/// (decisions.md §23), superseding [`AgentsQuery`] as the real source of truth: that query is
+/// now implemented on top of the same table, filtered to sessions with an [`crate::session::
+/// SessionAgentInfo`]. `Locality::Session`, answered directly from `jerry-host`'s own
+/// `SessionManager`, exactly like `AgentsQuery` already is - see that type's own docs for why
+/// [`Query::run`] below is never actually reached.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SessionsQuery {}
+
+impl Query for SessionsQuery {
+    type Outcome = Vec<SessionRecord>;
+    const NAME: &'static str = "sessions";
+
+    fn locality(&self) -> Locality {
+        Locality::Session
+    }
+
+    /// Never actually reached - see the type's own docs.
+    fn run(&self, _ctx: &Ctx) -> Result<Vec<SessionRecord>, Error> {
+        Err(Error::new(
+            "needs-host",
+            "the session table lives on the session host, not in this process",
         ))
     }
 }

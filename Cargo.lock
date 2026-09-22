@@ -4500,6 +4500,7 @@ version = "0.2.0"
 dependencies = [
  "futures",
  "jerry-core",
+ "jerry-pty",
  "log",
  "serde_json",
  "tempfile",

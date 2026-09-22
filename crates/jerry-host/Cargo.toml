@@ -11,6 +11,10 @@ workspace = true
 
 [dependencies]
 jerry-core = { path = "../jerry-core" }
+# `SessionManager` owns the real `jerry_pty::PtySession` for every session it spawns
+# (decisions.md §23) - the one place in this workspace besides `jerry-app` that links PTY
+# machinery.
+jerry-pty = { path = "../jerry-pty" }
 futures = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

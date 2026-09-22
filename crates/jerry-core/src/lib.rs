@@ -21,6 +21,7 @@ pub mod queries;
 pub mod registry;
 pub mod report;
 pub mod request;
+pub mod session;
 pub mod wire;
 
 pub use call::Call;
@@ -40,8 +41,12 @@ pub use mcp::{all_tools, method_for_tool_name, tool_name, ToolSpec};
 pub use method::Method;
 pub use queries::{
     AgentsEntry, AgentsQuery, MergeStatusOutcome, MergeStatusQuery, RebaseStatusOutcome,
-    RebaseStatusQuery, StatusOutcome, StatusQuery,
+    RebaseStatusQuery, SessionsQuery, StatusOutcome, StatusQuery,
 };
 pub use report::Report;
 pub use request::{execute_locally, AppCommand, AppQuery, HookEvent, LocalDispatchError, Request};
+pub use session::{
+    ExitStatusWire, SessionAgentInfo, SessionId, SessionKill, SessionKind, SessionRecord,
+    SessionResize, SessionSpawn, SessionSpawnOutcome,
+};
 pub use wire::{Message, RequestId, RpcError, PROTOCOL_VERSION};

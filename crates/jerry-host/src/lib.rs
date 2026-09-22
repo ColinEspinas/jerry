@@ -1,7 +1,7 @@
 //! The session host: the one place a `Call` is authorized and executed. Owns the dispatch
-//! thread, the socket listener, the table of agents it spawned, and the notification fan-out.
-//! Every task here wakes on a channel, never on a timer. Sessions and the hook store are not
-//! here yet; a request needing them is answered `NEEDS_HOST`. Zero `gpui`.
+//! thread, the socket listener, the session table (`crate::session`, every PTY it spawned or is
+//! tracking) and the notification fan-out. Every task here wakes on a channel, never on a timer.
+//! The hook store is not here yet; a request needing it is answered `NEEDS_HOST`. Zero `gpui`.
 
 // Only production code is held to `unwrap_used`/`expect_used` (`CLAUDE.md`).
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
@@ -9,13 +9,15 @@
 mod dispatch;
 mod fanout;
 mod listener;
+mod session;
+
+pub use session::{SessionError, SessionHandle, SessionManager, SessionSpawnError};
 
 use futures::channel::{mpsc, oneshot};
 use jerry_core::client::Stream;
 use jerry_core::wire::rpc_code;
 use jerry_core::{AgentId, Call, Message, Report, RpcError};
 use serde_json::Value;
-use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::net::Shutdown;
@@ -58,36 +60,43 @@ pub struct AgentRecord {
 /// The agents this host spawned, by the identity it injected as `JERRY_AGENT_ID`. Shared by the
 /// app, which registers and forgets, and the dispatcher, which classifies callers against it and
 /// answers `AgentsQuery` from it.
-#[derive(Clone, Default)]
-pub struct AgentTable(Arc<Mutex<HashMap<AgentId, AgentRecord>>>);
+///
+/// A thin view over [`SessionManager`] (`docs/architecture/decisions.md` §23) - kept as its own
+/// type, rather than every caller reaching for `SessionManager` directly, only because its public
+/// shape (`register`/`forget`/`worktree_of`/`list`) predates the session table and `jerry-app`
+/// still calls exactly this during its own migration to it. There is exactly one underlying
+/// table: constructing one from scratch is not offered - see [`SessionManager::agent_table`].
+#[derive(Clone)]
+pub struct AgentTable(SessionManager);
 
 impl AgentTable {
     pub fn register(&self, id: AgentId, worktree: PathBuf, kind: String) {
-        lock(&self.0).insert(id, AgentRecord { worktree, kind });
+        self.0.register_agent(id, worktree, kind);
     }
 
     pub fn forget(&self, id: &AgentId) {
-        lock(&self.0).remove(id);
+        self.0.forget_agent(id);
     }
 
     pub fn worktree_of(&self, id: &AgentId) -> Option<PathBuf> {
-        lock(&self.0).get(id).map(|record| record.worktree.clone())
+        self.0.worktree_of_agent(id)
     }
 
     pub fn len(&self) -> usize {
-        lock(&self.0).len()
+        self.0.agent_count()
     }
 
     pub fn is_empty(&self) -> bool {
-        lock(&self.0).is_empty()
+        self.len() == 0
     }
 
     /// Every agent this host is tracking right now, for `AgentsQuery` - the dispatcher's own
     /// answer for a request `execute_locally` can never resolve on its own (§15).
     pub fn list(&self) -> Vec<(AgentId, AgentRecord)> {
-        lock(&self.0)
-            .iter()
-            .map(|(id, record)| (id.clone(), record.clone()))
+        self.0
+            .agent_entries()
+            .into_iter()
+            .map(|(id, worktree, kind)| (id, AgentRecord { worktree, kind }))
             .collect()
     }
 }
@@ -105,6 +114,7 @@ struct Job {
 pub(crate) struct Inner {
     jobs: Mutex<Option<mpsc::UnboundedSender<Job>>>,
     agents: AgentTable,
+    sessions: SessionManager,
     fanout: fanout::Fanout,
     /// One handle per live socket connection, so shutdown can close them under their threads.
     connections: Mutex<Vec<Stream>>,
@@ -131,6 +141,10 @@ impl Inner {
 
     pub(crate) fn agents(&self) -> &AgentTable {
         &self.agents
+    }
+
+    pub(crate) fn sessions(&self) -> &SessionManager {
+        &self.sessions
     }
 
     pub(crate) fn fanout(&self) -> &fanout::Fanout {
@@ -196,10 +210,14 @@ impl Host {
     /// deterministically. Blocking git work runs wherever the loop runs.
     pub fn start_detached() -> (Host, DispatchFuture) {
         let (jobs, mut receiver) = mpsc::unbounded::<Job>();
+        let fanout = fanout::Fanout::default();
+        let sessions = SessionManager::new(fanout.clone());
+        let agents = sessions.agent_table();
         let inner = Arc::new(Inner {
             jobs: Mutex::new(Some(jobs)),
-            agents: AgentTable::default(),
-            fanout: fanout::Fanout::default(),
+            agents,
+            sessions,
+            fanout,
             connections: Mutex::new(Vec::new()),
             shutting_down: AtomicBool::new(false),
         });
@@ -226,6 +244,14 @@ impl Host {
 
     pub fn agents(&self) -> AgentTable {
         self.inner.agents.clone()
+    }
+
+    /// The session table (`docs/architecture/decisions.md` §23): the same one `SessionSpawn`/
+    /// `SessionResize`/`SessionKill`/`SessionsQuery` act on. An in-process caller attaches to a
+    /// spawned session's data-plane adapter through [`SessionManager::handle_for`] here, never
+    /// through `Call`/`Report` - see that method's own docs.
+    pub fn sessions(&self) -> SessionManager {
+        self.inner.sessions.clone()
     }
 
     pub fn client(&self) -> LocalClient {

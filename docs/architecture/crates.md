@@ -45,16 +45,21 @@ Git-locality Command and Query implementations live here so standalone `jerry-cl
 
 **Scope.** The session host: the one place a `Call` is authorized and executed. A dispatch
 thread woken by a channel, the AF_UNIX listener with a reader and writer per connection, the
-table of agents the host spawned (identity, confining worktree, and which CLI kind), and
-notification fan-out to every connected client. In-process inside `jerry-app` through stage 2;
-its own process at stage 3.
+session table (`crate::session::SessionManager`, every PTY it spawned or is tracking - agents
+and plain terminal tabs alike), and notification fan-out to every connected client. In-process
+inside `jerry-app` through stage 2; its own process at stage 3.
 
 **Owns.** Caller classification (an env-injected agent id the host itself handed out, or a
-human), `Invocability` and cwd confinement, `event/*` push. From stage 2 (#505): every PTY
-session and the hook store.
+human), `Invocability` and cwd confinement, `event/*` push. The session table and the real
+`jerry_pty::PtySession` behind each session it spawns (`SessionSpawn`/`SessionResize`/
+`SessionKill`/`SessionsQuery`, decisions.md §23) - `AgentTable` is now a thin view over it, kept
+for its pre-existing callers. The data-plane adapter (`SessionHandle`): an in-process byte
+stream and `write_input`, handed out directly, never through `Call`/`Report`.
 
-**Does not own.** The wire contract and the Git-locality implementations (`jerry-core`), any
-rendering, anything `gpui`.
+**Does not own (yet).** The wire contract and the Git-locality implementations (`jerry-core`);
+any rendering, anything `gpui`. The hook store (still `jerry-app`'s `hooks/store.rs`) and
+`jerry-app`'s own production pane-spawn path, which does not yet dispatch `SessionSpawn` -
+decisions.md §23 names the remaining work.
 
 ## `jerry-lsp`
 

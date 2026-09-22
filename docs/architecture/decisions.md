@@ -951,3 +951,101 @@ describe, since `jerry mcp` is a `jerry-cli` subcommand talking to a real socket
 own in-process `LocalClient`. `crates/jerry-cli/skill/SKILL.md` gained an "MCP" section so an
 agent reading the skill knows the tools mirror the CLI one-for-one rather than discovering it by
 trial and error.
+
+## 23. `jerry-host` owns the session table and every PTY it spawns; the data plane is a separate
+byte stream, never `Call`/`Report`
+
+**Status:** Accepted (2026-09-23, issue #505; decisions Q2, Q12, Q13 of the UI-optional plan).
+Partial: see "What did not move" below.
+
+**Context:** `AgentTable` (§21) already gave the host a table of *identities* - which worktree an
+agent may act in - but the real `jerry_pty::PtySession` for every terminal tab, agent or plain
+shell, still lived entirely inside `crates/jerry-app`'s `TerminalPane`, spawned with a direct
+`jerry_pty::spawn` call. Two different things were both called "the session": the host's identity
+record and the app's own process handle, with no single table naming a PTY the same way twice.
+This issue was scoped to unify them - one `SessionId` per PTY, host-owned - while keeping the
+byte stream itself off the JSON-RPC wire, since bytes are not a control-plane concern.
+
+**Decision:**
+
+- **One session table, in `jerry-host`** (`crate::session::SessionManager`): `SessionId` (a
+  host-minted, wire-serializable newtype), `SessionKind::Pty` (the only kind today - an ACP kind
+  is planned, out of scope here), `worktree`, `agent: Option<SessionAgentInfo { kind, agent_id }>`,
+  `started_at`, `exit: Option<ExitStatusWire>`. `AgentTable` (§21) is now a thin view over this
+  table (`SessionManager::agent_table`) rather than its own independent map: `register`/`forget`/
+  `worktree_of`/`len`/`is_empty`/`list` keep their exact pre-existing signatures and behaviour
+  (`jerry-app`'s own callers, and `dispatch.rs`'s `classify`/`confine`, are unchanged), but every
+  entry they create or remove lives in the same `HashMap<SessionId, Entry>` a real spawn does -
+  one source of truth, not two tables that can drift. An `AgentTable`-only registration (no
+  process behind it, exactly `register`'s pre-existing contract) is a real, listed `SessionRecord`
+  with `exit: None` forever; `SessionResize`/`SessionKill` against its id answer a real
+  `session-not-owned` error rather than pretending to act on a process that was never spawned.
+- **`SessionManager::spawn` owns the real `PtySession`.** It calls `jerry_pty::spawn` directly (the
+  one new PTY-owning caller besides `jerry-app`), takes the session's own output stream once, and
+  hands the caller back `(SessionId, Arc<SessionHandle>)`. `SessionHandle` is the data-plane
+  adapter: `write_input` (delegates straight to `PtySession::write_input`) and `take_output`
+  (hands out the relayed `futures::channel::mpsc::Receiver<PtyOutput>` exactly once - `None` on a
+  second call). Neither travels through `Call`/`Report`; an in-process caller reaches a spawned
+  session's handle directly via `Host::sessions().handle_for(id)` ("attach"), a plain Rust call,
+  since a JSON envelope cannot carry a byte-stream receiver at all, in-process or otherwise. A
+  **relay thread**, one per spawned session, is what makes this possible without the host needing
+  to understand ANSI/grid state: it drains `PtySession::take_output`'s own stream on its own
+  thread and forwards every item, in order, to the channel `SessionHandle` hands out - the same
+  `Bytes*, Exited` shape and Exited-last ordering guarantee `jerry_pty::PtyOutput` itself documents
+  (§8's amendment) is preserved by construction, since the relay only ever forwards, never
+  reorders or drops. The moment it observes `Exited`, it records the exit on the table and
+  publishes `event/session-exited { id, status }` on the same `Fanout` the rest of the host uses -
+  before forwarding that same item downstream - so the control-plane notification and the
+  data-plane byte stream's own terminal item are never out of step with each other. **Stated
+  explicitly, per this issue's own scope note:** this is single-consumer - one relay, one
+  `SessionHandle`, `take_output` gives out its receiver exactly once. A second attacher (two panes
+  on one session) is not supported; it would need a real per-session fan-out in
+  `SessionHandle::take_output` instead of a plain `Option::take`, which nothing here needed yet.
+- **Control plane: `SessionSpawn`, `SessionResize`, `SessionKill`, `SessionsQuery`.** All
+  `Locality::Session`; `SessionSpawn`/`SessionResize`/`SessionKill` are `Invocability::Denied` to
+  agents (an agent already has a real pty of its own from whatever spawned it, and resizes/kills
+  that one, not one Jerry is holding on someone else's behalf). Like `AgentsQuery` before them,
+  none of the four ever actually reaches `Command::execute`/`Query::run`: `jerry-host`'s
+  dispatcher special-cases all four, exactly as it already did for `AgentsQuery` and `Hook`,
+  answering directly from `inner.sessions()`. `AgentsQuery` is unchanged on the wire and is now
+  genuinely "implemented on top of" the same table `SessionsQuery` reads, for free, since
+  `AgentTable` is that table's own view. `SessionSpawn`'s worktree is the caller's own `cwd` from
+  the call envelope, never a field on the command - a caller cannot ask to spawn somewhere its own
+  confinement would not otherwise reach.
+- **A real shell, not a fake one, is what a Windows PTY consumer must answer.** Every jerry-host
+  session test spawns `cmd /c`/`sh -c` for real. Doing so surfaced a real, pre-existing contract
+  `crates/jerry-app/src/terminal/pane.rs` already had to honor and `jerry-pty`'s own tests already
+  work around: on Windows, ConPTY withholds *all* child output until something answers its startup
+  Device Status Report query (`ESC[6n`) with a cursor position report - a real consumer answers
+  this from its VT parser (`jerry-app`'s pane, from `alacritty_terminal`'s grid); a bare test
+  harness with no grid has to answer it by hand, exactly as `jerry-pty`'s own
+  `answer_cursor_position_query` test helper does, or the session hangs forever, not just slowly.
+  `jerry-host`'s own session tests needed the identical helper, since `SessionManager`'s test
+  seam is likewise VT-blind by design.
+
+**What moved:** the session table and the real `PtySession` for every session `SessionManager`
+itself spawns; `AgentTable`'s storage (not its public shape).
+
+**What did not move, and why - the honest remainder of this issue's scope:**
+
+- **`crates/jerry-app`'s `TerminalPane` still calls `jerry_pty::spawn` directly** for every
+  production tab (agent or shell) and still owns its own `PtySession`. Flipping every spawn call
+  site to dispatch `SessionSpawn` through the host was not done, because `AdeApp::new` spawns the
+  opened repository's first shell during `Self::new_with_settings`, and only calls `Self::
+  start_host` (which brings the host up asynchronously, on a background task) afterward - the
+  identical ordering the test fixture (`crate::test_support::open_test_app_with_settings`) makes
+  explicit by calling `new_with_settings` and only then `adopt_host`. A `TerminalPane` cannot
+  reliably dispatch a Command through a host that provably does not exist yet at the moment it
+  needs to spawn. Making it reliable is a real, separate restructuring - the host's cheap,
+  in-memory `Host::start_detached()` half would need to run eagerly, before any pane exists, with
+  only the slower registry-publish/socket-bind half staying deferred - not a session-ownership
+  change, and out of this issue's diff.
+- **The hook store (`hooks/store.rs`) and the rest of `Agents` bookkeeping stay in `jerry-app`.**
+  Unchanged in this issue; still tracked as decision 4 of this issue's own scope, alongside the
+  pane-spawn migration above, as follow-up work.
+- Because of both of the above, `jerry-app` needed **zero code changes** for this issue:
+  `AgentTable`'s public surface is identical, so every existing call site and test still compiles
+  and passes unmodified. The DoD's "pane tests against the in-process byte adapter" and "`AdeApp`
+  reflects a session exit received as an event" are not met here for the same reason - there is no
+  real production consumer of `SessionHandle` yet to test honestly; building one before the spawn
+  path is wired through would be exactly the fake-functionality this project's standards forbid.
