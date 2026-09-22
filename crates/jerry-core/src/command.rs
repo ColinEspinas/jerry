@@ -6,6 +6,7 @@ use crate::error::Error;
 use crate::report::Report;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Whether an `Agent` caller may ask for this at all. A `Human` caller always may.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +109,14 @@ pub fn run_query<Q: Query>(query: &Q, ctx: &Ctx) -> Report {
         Ok(outcome) => Report::ok(&outcome),
         Err(error) => Report::Error { error },
     }
+}
+
+/// A JSON Schema for `T`, as the MCP `tools/list` `inputSchema` (`docs/architecture/decisions.md`
+/// §22).
+pub fn schema_of<T: schemars::JsonSchema>() -> Value {
+    schemars::SchemaGenerator::default()
+        .into_root_schema_for::<T>()
+        .to_value()
 }
 
 #[cfg(test)]

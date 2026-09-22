@@ -3,7 +3,8 @@
 //! variants, and so a CLI or an MCP tool list can be generated from the same source.
 
 use crate::command::{
-    permits, run_command, run_query, validate_command, Command, Invocability, Locality, Query,
+    permits, run_command, run_query, schema_of, validate_command, Command, Invocability, Locality,
+    Query,
 };
 use crate::commands::{
     AgentSpec, AmendHeadMessage, MergeAbort, MergeAttempt, MergeBranchIntoCurrent, MergeComplete,
@@ -136,6 +137,66 @@ impl AppCommand {
         each_command!(self, |c| c.locality())
     }
 
+    /// One line describing what this variant does - the MCP tool description
+    /// (`docs/architecture/decisions.md` §22). One match per property, like [`Self::name`]: a new
+    /// variant is a compile error here until it is given one.
+    pub fn description(&self) -> &'static str {
+        match self {
+            AppCommand::MergeAttempt(_) => {
+                "Merge the caller's worktree branch into the repository's detected base branch."
+            }
+            AppCommand::MergeBranchIntoCurrent(_) => {
+                "Merge a named branch into whatever the caller's worktree has checked out."
+            }
+            AppCommand::MergeComplete(_) => {
+                "Commit the merge in progress at a base worktree, once nothing is unmerged."
+            }
+            AppCommand::MergeAbort(_) => {
+                "Abort the merge in progress at a base worktree, restoring it."
+            }
+            AppCommand::StageResolved(_) => "Stage one file whose conflict markers are all gone.",
+            AppCommand::RebaseStart(_) => {
+                "Start a real interactive rebase, driving the given plan to completion or the \
+                 first stop."
+            }
+            AppCommand::RebaseContinue(_) => {
+                "Resume a stopped rebase, driving it to completion or the next stop."
+            }
+            AppCommand::RebaseSkip(_) => {
+                "Skip the commit a stopped rebase is at, driving it to completion or the next \
+                 stop."
+            }
+            AppCommand::RebaseAbort(_) => {
+                "Abort an in-progress rebase, restoring the pre-rebase state."
+            }
+            AppCommand::AmendHeadMessage(_) => {
+                "Amend the message of the commit a rebase is stopped at."
+            }
+            AppCommand::WorktreeCreate(_) => {
+                "Create a sibling git worktree on a new branch, optionally starting an agent in \
+                 it."
+            }
+        }
+    }
+
+    /// The JSON Schema for this variant's own input struct, for the MCP `tools/list`
+    /// `inputSchema` (`docs/architecture/decisions.md` §22).
+    pub fn input_schema(&self) -> Value {
+        match self {
+            AppCommand::MergeAttempt(_) => schema_of::<MergeAttempt>(),
+            AppCommand::MergeBranchIntoCurrent(_) => schema_of::<MergeBranchIntoCurrent>(),
+            AppCommand::MergeComplete(_) => schema_of::<MergeComplete>(),
+            AppCommand::MergeAbort(_) => schema_of::<MergeAbort>(),
+            AppCommand::StageResolved(_) => schema_of::<StageResolved>(),
+            AppCommand::RebaseStart(_) => schema_of::<RebaseStart>(),
+            AppCommand::RebaseContinue(_) => schema_of::<RebaseContinue>(),
+            AppCommand::RebaseSkip(_) => schema_of::<RebaseSkip>(),
+            AppCommand::RebaseAbort(_) => schema_of::<RebaseAbort>(),
+            AppCommand::AmendHeadMessage(_) => schema_of::<AmendHeadMessage>(),
+            AppCommand::WorktreeCreate(_) => schema_of::<WorktreeCreate>(),
+        }
+    }
+
     /// The one execution path: validate, then execute, as a `Report`.
     pub fn run(self, ctx: &Ctx) -> Report {
         each_command!(self, |c| run_command(c, ctx))
@@ -173,6 +234,34 @@ impl AppQuery {
 
     pub fn locality(&self) -> Locality {
         each_query!(self, |q| q.locality())
+    }
+
+    /// One line describing what this variant reports - the MCP tool description
+    /// (`docs/architecture/decisions.md` §22).
+    pub fn description(&self) -> &'static str {
+        match self {
+            AppQuery::Status(_) => {
+                "Report the worktree, repository, and caller identity the request resolved to."
+            }
+            AppQuery::MergeStatus(_) => {
+                "Report whether a merge is in progress and what remains unmerged."
+            }
+            AppQuery::RebaseStatus(_) => {
+                "Report whether a rebase is stopped in this worktree, and where."
+            }
+            AppQuery::Agents(_) => "List every agent the connected Jerry is currently supervising.",
+        }
+    }
+
+    /// The JSON Schema for this variant's own input struct, for the MCP `tools/list`
+    /// `inputSchema` (`docs/architecture/decisions.md` §22).
+    pub fn input_schema(&self) -> Value {
+        match self {
+            AppQuery::Status(_) => schema_of::<StatusQuery>(),
+            AppQuery::MergeStatus(_) => schema_of::<MergeStatusQuery>(),
+            AppQuery::RebaseStatus(_) => schema_of::<RebaseStatusQuery>(),
+            AppQuery::Agents(_) => schema_of::<AgentsQuery>(),
+        }
     }
 
     pub fn run(&self, ctx: &Ctx) -> Report {

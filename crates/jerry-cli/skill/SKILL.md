@@ -75,6 +75,20 @@ rather than a bare `git merge`:
 
 Prints this document.
 
+### `jerry mcp`
+
+Runs an MCP server on stdio. Every command above is also available as an MCP tool, generated
+directly from the same catalogue: `jerry status` is the `query_status` tool, `jerry wt new` is
+`command_worktree-create`, `jerry merge` is `command_merge-attempt` +
+`command_merge-complete`/`command_merge-abort`, and so on - a tool's `inputSchema` and description
+match its CLI equivalent exactly, because both are generated from the same source. `tools/list`
+only ever returns tools this caller may invoke; a tool call that's refused comes back as a normal
+tool result with `isError: true`, never a protocol-level error.
+
+If you're already running inside a Jerry-supervised session, `jerry mcp` is registered
+automatically - nothing to configure. Prefer it over the plain CLI when your client only speaks
+tool calls, or when you want structured JSON back instead of parsing text/exit codes.
+
 ## When to reach for `jerry` instead of raw `git`
 
 - Splitting a task across parallel branches: `jerry wt new`, not `git worktree add` by hand -

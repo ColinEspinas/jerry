@@ -759,3 +759,107 @@ uses a real threaded socket host with a plain `claude -p` subprocess
 (`hooks::integration_tests::a_real_claude_session_uses_jerry_wt_new_and_the_real_host_hears_about_it`)
 - never combined in one test, the same real-socket-or-in-process-consumer split §19's own
 consequences section already documents for hooks.
+
+## 22. `jerry mcp`: an MCP server generated from the `Request` catalogue, not hand-maintained
+
+**Status:** Accepted (2026-09-22, issue #509).
+
+**Context:** MCP is JSON-RPC 2.0, the same codec `jerry-core` already speaks (§15). The question
+this issue settled was whether an MCP server's tool list is a second, hand-maintained catalogue
+that can drift from `AppCommand`/`AppQuery`, or a real projection of the one catalogue that already
+exists.
+
+**Decision:** `jerry mcp` (`crates/jerry-cli/src/mcp.rs`) is a subcommand of the existing `jerry`
+binary: a blocking read loop over newline-delimited JSON-RPC 2.0 on stdin, writing the same framing
+to stdout - stdout is reserved for the protocol, every diagnostic goes to stderr, one request at a
+time, no new async runtime. It reuses `jerry_core::wire::Message`/`RequestId`/`RpcError` rather than
+a second codec; the one addition is `jerry_core::wire::{read_line_frame, write_line_frame}`, a
+newline-delimited sibling of the length-prefixed frame the host socket uses, tested the same way.
+
+- **Protocol version:** `2025-11-25`, the latest revision that still uses the classic `initialize`
+  handshake (`initialize` then `notifications/initialized`, then `ping`/`tools/list`/`tools/call`).
+  Verified directly against <https://modelcontextprotocol.io/specification>: the *current* spec
+  revision is `2026-07-28`, but that revision replaced the handshake entirely with a stateless,
+  per-request `_meta.protocolVersion` plus a mandatory `server/discover` call - the spec's own
+  compatibility matrix calls everything before it "legacy" and documents that `2026-07-28` servers
+  are expected to keep answering legacy `initialize` requests for exactly this reason. Real MCP
+  clients, Claude Code included, still overwhelmingly speak the legacy handshake as of this
+  writing; implementing `server/discover` instead would not interoperate with them today. This
+  server supports exactly one protocol version and always answers `initialize` with it, which the
+  legacy negotiation rule explicitly allows (a client that does not like it disconnects).
+- **Tool list, generated, never hand-maintained:** one tool per `AppCommand`/`AppQuery` variant,
+  built from `Request::examples()` (`jerry_core::mcp::all_tools`) so the tool catalogue cannot
+  diverge from the wire catalogue - a new `Request` variant already has to appear in
+  `Request::examples()` for the existing fixture test (§15) to pass, and now automatically becomes
+  a tool too. **Tool name:** the wire method with `/` replaced by `_`
+  (`command/merge-attempt` becomes `command_merge-attempt`) - a `.` separator was the brief's own
+  first instinct and was rejected because MCP tool names must match `^[a-zA-Z0-9_-]{1,64}$`, which
+  has no `.`. The substitution is bijective and has a test (`jerry_core::mcp::tool_name`/
+  `method_for_tool_name`): a wire method's kind (`command`/`query`) and kebab-case name never
+  contain `_` (`Method::parse`'s own `is_kebab` check), so the first `_` in a tool name is always
+  the boundary the mapping put there. **Description:** a hand-written `&'static str` per variant in
+  an exhaustive match (`AppCommand::description`/`AppQuery::description` in `request.rs`), mirroring
+  each variant's own doc comment rather than extracting it mechanically - true rustdoc extraction at
+  compile time needs a proc macro this issue did not add; a test asserts every description is
+  non-empty. **Input schema:** `schemars = "1.0"` (the same line `vendor/zed/Cargo.toml` pins,
+  verified against the real checkout), `#[derive(schemars::JsonSchema)]` added to every
+  Command/Query input struct and the wire enums nested inside one (`AgentSpec`,
+  `RebasePlanEntryWire`, `RebaseActionWire`) - never on outcome types, which no tool needs a schema
+  for. `command.rs::schema_of::<T>()` wraps `SchemaGenerator::default().into_root_schema_for::<T>()`;
+  schemars reads the same `#[serde(...)]` attributes already on these structs (tag, rename_all,
+  default) with no extra `#[schemars(...)]` annotations needed anywhere in this pass.
+- **Caller classification and `Invocability`:** `jerry mcp` classifies its caller exactly the way
+  every other subcommand does - `JERRY_AGENT_ID` in the environment makes an agent, its absence a
+  human (`crate::run`'s existing `Caller` derivation, unchanged). `tools/list` filters
+  `jerry_core::all_tools()` through `jerry_core::permits(caller, tool.invocability)`, so an agent
+  never even sees a tool it cannot call. A `tools/call` naming a tool the caller may not invoke is
+  still checked again at call time (a client can call a tool it never listed) and answered with a
+  normal `Ok` tool result, `isError: true`, `structuredContent: {"code": "forbidden", "reason":
+  "..."}` - never a JSON-RPC error, so an MCP client's ordinary tool-result handling sees it rather
+  than a transport-level failure. `forbidden` is this module's own kebab-case spelling of the
+  socket's `rpc_code::FORBIDDEN`; the two are not the same wire shape (one is a JSON-RPC error code,
+  the other a string in a tool result), so there was no existing kebab constant to reuse. Anything
+  else a `tools/call` produces - `Report::Ok`, `Report::Denied` (a command's own `validate`
+  refusing it, e.g. `merge-abort` with no merge in progress), `Report::Error` - becomes the tool
+  result's `content[0].text` (the `Report` as compact JSON) plus `structuredContent` (the raw
+  `Report`), `isError` set for anything but `Ok`. Each call dispatches through the same `Session`
+  every other subcommand uses (host socket when one is running, local execution otherwise - §17).
+  Malformed `tools/call` params (`name` missing, an unknown tool name, arguments that fail the
+  target Command/Query's own `Deserialize`) are real JSON-RPC errors, same as an unknown top-level
+  method (`METHOD_NOT_FOUND`/`INVALID_PARAMS`) - these are the client's own mistake, not an outcome
+  of running anything.
+- **Zero-setup registration for Claude Code:** the per-launch plugin directory `HookFiles::write_in`
+  already writes (§21) gains a `.mcp.json` at its root (`crate::hooks::settings_file::
+  mcp_manifest_json`) declaring a `jerry` server whose `command` is the located `jerry` binary and
+  `args` is `["mcp"]`. Verified real and auto-loaded with no extra flag beyond the `--plugin-dir`
+  Jerry already passes, at <https://code.claude.com/docs/en/mcp.md> and
+  <https://code.claude.com/docs/en/plugins.md>. It carries no `env` field: `JERRY_AGENT_ID`/
+  `JERRY_HOST_SOCKET` are meant to reach the spawned `jerry mcp` process exactly the way they
+  already reach a spawned `jerry hook <event>` - inherited from the `claude` process's own
+  environment, which `HookInjection::env` injects them into at spawn time, not written into this
+  file at all. This is forced by the file's own shape as much as chosen: `.mcp.json` lives in the
+  one plugin directory a whole Jerry launch shares (`HookFiles::write_in` is called once per
+  launch, not once per agent spawn), so no single static value in it could ever name one specific
+  agent among several sharing that directory. What is not independently verified: whether Claude
+  Code's MCP stdio child-process spawn inherits the parent `claude` process's environment the same
+  way its hook-command spawn does - both were checked against Claude Code's own docs, which
+  describe `${CLAUDE_PLUGIN_ROOT}`-style interpolation for `.mcp.json`'s `env` field but do not
+  state either way whether an omitted `env` field means full inheritance for an MCP child
+  specifically. Ordinary child-process spawning inherits the parent's environment by default on
+  every OS, and hooks already prove Claude Code's own command spawning does; this is believed to
+  extend to MCP servers but is flagged here, not silently assumed solid. Other agent kinds get
+  nothing: neither `codex` nor `cursor-agent`'s own `--help` on this machine documents a per-launch,
+  no-user-setup MCP registration equivalent to `--plugin-dir`, mirroring §21's identical finding for
+  skill injection.
+
+**Consequences:** `jerry-core` gained a `schemars` dependency (cheap, no feature flag) and its
+first module with no `jerry-git`/`gpui` involvement at all, `mcp.rs`. `jerry-cli/src/mcp.rs`'s own
+test suite drives `crate::run(["mcp"], ...)` end to end through an in-memory pipe (initialize,
+`ping`, `tools/list` for an agent vs. a human, a `tools/call` of `query_agents` against a real
+in-process `jerry-host::Host`, a `Report::Denied` command and an `Invocability`-forbidden one both
+becoming `isError: true` tool results, a malformed line answered without ending the loop, and EOF
+exiting 0) - the same real-socket-vs-in-process-consumer boundary §19's consequences already
+describe, since `jerry mcp` is a `jerry-cli` subcommand talking to a real socket, never the app's
+own in-process `LocalClient`. `crates/jerry-cli/skill/SKILL.md` gained an "MCP" section so an
+agent reading the skill knows the tools mirror the CLI one-for-one rather than discovering it by
+trial and error.

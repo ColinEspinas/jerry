@@ -15,6 +15,7 @@ pub mod commands;
 pub mod ctx;
 pub mod error;
 pub mod jerry_binary;
+pub mod mcp;
 pub mod method;
 pub mod queries;
 pub mod registry;
@@ -35,6 +36,7 @@ pub use commands::{
 };
 pub use ctx::{AgentId, Caller, Ctx};
 pub use error::Error;
+pub use mcp::{all_tools, method_for_tool_name, tool_name, ToolSpec};
 pub use method::Method;
 pub use queries::{
     AgentsEntry, AgentsQuery, MergeStatusOutcome, MergeStatusQuery, RebaseStatusOutcome,

@@ -909,3 +909,93 @@ fn run_real_claude_with_prompt(
         }
     }
 }
+
+/// [`run_real_claude_with_prompt`], returning the captured stdout instead of a bool - this test
+/// needs to see what a real tool call actually printed, not just whether the process exited 0.
+fn run_real_claude_capturing_stdout(
+    binary: &Path,
+    cwd: &Path,
+    args: &[String],
+    prompt: &str,
+) -> Option<String> {
+    let mut command = std::process::Command::new(binary);
+    command
+        .args(args)
+        .arg("-p")
+        .arg(prompt)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    match command.output() {
+        Ok(output) => {
+            if !output.status.success() {
+                skip_or_fail(&format!(
+                    "the installed `claude` could not complete a turn here ({:?}): {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+                return None;
+            }
+            Some(String::from_utf8_lossy(&output.stdout).into_owned())
+        }
+        Err(err) => {
+            skip_or_fail(&format!("could not run `claude` ({err})"));
+            None
+        }
+    }
+}
+
+/// Issue #509's definition of done: a real, autonomous `claude` session launched with nothing but
+/// the per-launch plugin directory (`--plugin-dir`, the same directory `.claude-plugin/plugin.json`
+/// and `SKILL.md` already live in) can see and call a real `jerry` MCP tool over stdio - proving
+/// `.mcp.json`'s auto-load (`docs/architecture/decisions.md` §22) really works end to end, not
+/// just that the generated file has the right shape (`hooks::settings_file::tests`' own job,
+/// unit-tier). No `JERRY_HOST_SOCKET`/host needed: `query_status` is Git-locality and answers
+/// standalone.
+#[ignore = "external: claude, jerry; see docs/testing.md"]
+#[test]
+fn a_real_claude_session_lists_and_calls_a_real_jerry_mcp_tool() {
+    let Some(claude) = real_claude() else {
+        skip_or_fail(
+            "no `claude` binary on PATH - the MCP server itself is still covered by jerry-cli's \
+             own in-process test suite",
+        );
+        return;
+    };
+    let Some(jerry) = real_jerry_binary() else {
+        skip_or_fail("no `jerry` binary reachable - cannot generate a real, runnable .mcp.json");
+        return;
+    };
+
+    let repo = test_support::seed_repo();
+    let settings_temp = tempfile::tempdir().expect("temp dir");
+    let files = crate::hooks::settings_file::HookFiles::write_in(settings_temp.path(), &jerry)
+        .expect("files must write");
+    // Unlike the sibling `jerry wt new` test above, this one keeps `--dangerously-skip-permissions`:
+    // an MCP tool call is a different approval surface than a Bash command, with no
+    // `--allowedTools`-style equivalent verified for MCP tools - a real run of this test confirms
+    // the flag is what lets a headless `-p` turn call the tool instead of stalling on approval.
+    let args = vec![
+        "--settings".to_owned(),
+        files.settings_path().to_string_lossy().into_owned(),
+        "--plugin-dir".to_owned(),
+        files.plugin_dir().to_string_lossy().into_owned(),
+        "--dangerously-skip-permissions".to_owned(),
+    ];
+
+    let Some(stdout) = run_real_claude_capturing_stdout(
+        &claude,
+        repo.path(),
+        &args,
+        "Call the jerry MCP tool that reports status - your worktree, repository and caller - \
+         and print its raw JSON result, and nothing else.",
+    ) else {
+        return;
+    };
+    assert!(
+        stdout.contains("worktree_path"),
+        "expected the real jerry `query_status` tool's own outcome field in the transcript: \
+         {stdout}"
+    );
+}

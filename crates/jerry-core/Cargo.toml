@@ -16,6 +16,9 @@ jerry-git = { path = "../jerry-git" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# Derives the `tools/list` `inputSchema` for `jerry mcp` (decisions.md §22) from the same
+# Command/Query input structs the wire already (de)serializes.
+schemars = { workspace = true }
 
 # AF_UNIX on Windows 10 1803+. Pinned to the exact version already resolved in Cargo.lock
 # (pulled by `zbus` via gpui), so this adds no new version surface.

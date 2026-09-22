@@ -8,6 +8,10 @@
 
 pub mod cli;
 pub mod exit;
+// `Session` (the type every subcommand handler dispatches through) is crate-private, so this
+// module - which needs it - stays crate-private too, rather than tripping rustc's
+// private-interfaces lint on a `pub fn` no other crate could call anyway.
+pub(crate) mod mcp;
 pub mod transport;
 
 use crate::cli::{
@@ -128,6 +132,10 @@ pub fn run(
         Command::Hook(_) => HOOK_CALL_TIMEOUT,
         _ => CALL_TIMEOUT,
     };
+    // Captured before `ctx` moves into `session` below - `mcp::run` needs the caller alongside
+    // an exclusive borrow of `session` itself, which an unmoved `session.ctx.caller` field
+    // couldn't lend it at the same time.
+    let caller = ctx.caller.clone();
     let mut session = Session {
         transport,
         ctx,
@@ -142,6 +150,7 @@ pub fn run(
         },
         Command::Agents => agents(&mut session, cli.json, out, err),
         Command::Hook(args) => hook(&mut session, args, stdin, err),
+        Command::Mcp => mcp::run(&mut session, &caller, stdin, out, err),
         // Already handled and returned above, before any `Ctx`/transport existed to build a
         // `Session` from.
         Command::GitSequenceEditor(_) | Command::GitEditor(_) | Command::Skill => {

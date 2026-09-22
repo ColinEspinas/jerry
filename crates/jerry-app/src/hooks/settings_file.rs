@@ -55,6 +55,27 @@ fn plugin_manifest_json() -> String {
     .to_string()
 }
 
+/// The plugin-root `.mcp.json` registering `jerry mcp` (`docs/architecture/decisions.md` §22) -
+/// verified real, auto-loaded by `--plugin-dir` with no further flag, at
+/// <https://code.claude.com/docs/en/mcp.md> and <https://code.claude.com/docs/en/plugins.md>.
+/// Carries no `env`: `jerry mcp`'s own `JERRY_AGENT_ID`/`JERRY_HOST_SOCKET` reach it exactly the
+/// way they already reach a spawned `jerry hook <event>` - inherited from the `claude` process's
+/// own environment, which [`AGENT_ENV`]/[`SOCKET_ENV`] are injected into at spawn time
+/// (`crate::hooks::HookInjection::env`), not written into this shared, per-launch file (every
+/// agent this launch spawns shares one plugin directory, so no single static value here could
+/// name any one of them).
+fn mcp_manifest_json(jerry_binary: &Path) -> String {
+    serde_json::json!({
+        "mcpServers": {
+            "jerry": {
+                "command": jerry_binary.to_string_lossy(),
+                "args": ["mcp"],
+            }
+        }
+    })
+    .to_string()
+}
+
 /// The real on-disk files backing one Jerry launch's hook and skill injection. Removed on drop.
 #[derive(Debug)]
 pub struct HookFiles {
@@ -112,6 +133,11 @@ impl HookFiles {
             0o600,
         )?;
         write_private_file(&directory.join("SKILL.md"), SKILL_MD.as_bytes(), 0o600)?;
+        write_private_file(
+            &directory.join(".mcp.json"),
+            mcp_manifest_json(jerry_binary).as_bytes(),
+            0o600,
+        )?;
         Ok(settings)
     }
 }
@@ -494,6 +520,23 @@ mod tests {
             .expect("SKILL.md must exist");
         assert_eq!(skill, super::SKILL_MD);
         assert!(skill.contains("jerry wt new"), "{skill}");
+    }
+
+    #[test]
+    fn write_in_also_registers_jerry_mcp_in_a_real_plugin_root_mcp_json() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let jerry = temp.path().join(jerry_binary_name());
+        let files = HookFiles::write_in(temp.path(), &jerry).expect("must write");
+
+        let raw = std::fs::read_to_string(files.plugin_dir().join(".mcp.json"))
+            .expect(".mcp.json must exist next to plugin.json/SKILL.md");
+        let manifest: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        let jerry_server = &manifest["mcpServers"]["jerry"];
+        assert_eq!(
+            jerry_server["command"],
+            serde_json::json!(jerry.to_string_lossy())
+        );
+        assert_eq!(jerry_server["args"], serde_json::json!(["mcp"]));
     }
 
     #[test]

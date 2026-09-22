@@ -10,29 +10,30 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Merge the caller's worktree branch into the repository's detected base branch.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MergeAttempt {}
 
 /// Merge `source_branch` into whatever the caller's worktree has checked out.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MergeBranchIntoCurrent {
     pub source_branch: String,
 }
 
 /// Commit the merge in progress at `base_worktree_path`, once nothing is unmerged.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MergeComplete {
     pub base_worktree_path: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Abort the merge in progress at `base_worktree_path`, restoring the base worktree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MergeAbort {
     pub base_worktree_path: PathBuf,
 }
 
 /// Stage one file whose conflict markers are all gone. The write itself is a plain disk edit;
 /// only staging touches the index.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct StageResolved {
     pub worktree_path: PathBuf,
     /// Relative to `worktree_path`.
@@ -238,7 +239,7 @@ impl Command for StageResolved {
 /// Mirrors `jerry_app::work_surface::agents::AgentKind`'s three labels - jerry-core cannot
 /// depend on jerry-app (§1), so this is an independent wire type the app converts to/from at
 /// the dispatch boundary (a `From<AgentSpec> for AgentKind` there).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum AgentSpec {
     Claude,
@@ -260,7 +261,7 @@ impl AgentSpec {
 }
 
 /// Creates a sibling worktree on a new branch - see `docs/architecture/decisions.md` §21.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WorktreeCreate {
     pub branch: String,
     /// The start point for `branch`; `None` lets git pick its default (`HEAD`).
@@ -377,7 +378,7 @@ fn sanitize_branch_for_path(branch: &str) -> Result<String, Error> {
 /// deriving `Serialize` on the domain type itself (which would put a wire-format contract on a
 /// pure-domain crate that has no `serde` dependency at all), so the wire shape and jerry-git's own
 /// verb names can't silently diverge. Mirrors `ConflictKind`'s identical reasoning for merge.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RebasePlanEntryWire {
     /// A full object id, not abbreviated - `jerry_git::rebase::RebasePlanEntry::commit`'s own
     /// contract.
@@ -385,7 +386,7 @@ pub struct RebasePlanEntryWire {
     pub action: RebaseActionWire,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum RebaseActionWire {
     Pick,
@@ -534,28 +535,28 @@ impl From<RebaseOutcomeReport> for jerry_git::rebase::RebaseOutcome {
 
 /// Starts a real interactive rebase onto `onto`, driving `plan` to completion or the first stop.
 /// `Denied` to agents: git already gives an agent a rebase.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RebaseStart {
     pub onto: String,
     pub plan: Vec<RebasePlanEntryWire>,
 }
 
 /// Resumes a stopped rebase, driving it to completion or the next stop.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RebaseContinue {}
 
 /// Skips the commit a stopped rebase is at, driving it to completion or the next stop.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RebaseSkip {}
 
 /// Aborts an in-progress rebase, restoring the pre-rebase state.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RebaseAbort {}
 
 /// Amends the message of the commit a rebase is stopped at - applying a message obtained *after*
 /// a message-less `reword` stop, which `jerry_git::rebase::start_interactive_rebase`'s own reword
 /// queue can never pick up retroactively.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AmendHeadMessage {
     pub message: String,
 }
