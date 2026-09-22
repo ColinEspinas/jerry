@@ -554,18 +554,26 @@ issue spends it on the hook side-channel, its first caller.
 
 **Decision:** A generated hook entry now runs `<located jerry> hook <Event>` directly - no
 forwarder script, no curl, no port, no token. `jerry hook`
-(`crates/jerry-cli/src/lib.rs::hook`) reads stdin whole, parses it as JSON (falling back to
+(`crates/jerry-cli/src/lib.rs::hook`) reads stdin, parses it as JSON (falling back to
 `{"raw": "<text>"}` so nothing already-broken payload is silently dropped), sends
 `Request::Hook(HookEvent { event, payload })` through the same `Session` every other subcommand
-uses (`JERRY_HOST_SOCKET` then registry discovery), and unconditionally exits 0 - a short,
-dedicated timeout (`HOOK_CALL_TIMEOUT`, a few seconds) rather than the interactive-command one,
-since a hook runs inline with the agent's own tool call. The injected environment shrinks to
-`JERRY_AGENT_ID` plus `JERRY_HOST_SOCKET` (`crate::hooks::settings_file::{AGENT_ENV,
-SOCKET_ENV}`); `crate::host::find_jerry_binary` (sibling of `current_exe`, then `bin/` next to
-it, then `PATH`) locates the binary named in the generated command, and hook injection is
-withheld - not offered with a broken command - when it can't be found, or while the session
-host is still starting (a real, transient window every launch passes through once, not counted
-against the existing "bring-up attempted once" gate in `hooks/flow.rs`).
+uses (`JERRY_HOST_SOCKET` then registry discovery), and **always exits 0, within a bounded
+time** - never blocking or failing the agent's own tool call. Three separate bounds make that
+true rather than assumed: the stdin read is capped at `MAX_HOOK_PAYLOAD_BYTES` (1 MiB, mirroring
+`crate::hooks::event::MAX_PAYLOAD_BYTES` in the app, well under `jerry_core::wire`'s 16 MiB
+frame limit) via `Read::take`, silently truncating rather than erroring on an oversized payload;
+the read itself runs on its own thread and is bounded by `HOOK_STDIN_DEADLINE` (a few seconds)
+via a channel `recv_timeout` (`read_hook_stdin`), so a stdin pipe that never sends EOF cannot
+hang the hook either - on expiry that thread is abandoned, not joined, since there is no
+portable way to cancel one blocked in a `read` syscall; and once a payload is in hand, the RPC
+itself is bounded by a short, dedicated `HOOK_CALL_TIMEOUT` (a few seconds) rather than the
+interactive-command one. The injected environment shrinks to `JERRY_AGENT_ID` plus
+`JERRY_HOST_SOCKET` (`crate::hooks::settings_file::{AGENT_ENV, SOCKET_ENV}`);
+`crate::host::find_jerry_binary` (sibling of `current_exe`, then `bin/` next to it, then `PATH`)
+locates the binary named in the generated command, and hook injection is withheld - not offered
+with a broken command - when it can't be found, or while the session host is still starting (a
+real, transient window every launch passes through once, not counted against the existing
+"bring-up attempted once" gate in `hooks/flow.rs`).
 
 On the receiving end, `jerry-host`'s dispatcher (already built by #495/#496) fans a `hook`
 request out to every connected client as an `event/hook` notification

@@ -24,6 +24,8 @@ use jerry_core::{
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
 /// The identity Jerry injects into an agent's environment.
@@ -40,13 +42,28 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 /// that call open for anywhere near as long as an interactive command may.
 const HOOK_CALL_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Runs one invocation and returns its exit code. `stdin` is read only by `hook`. `out` receives
-/// the result (JSON with `--json`, prose otherwise); `err` receives diagnostics only.
+/// The largest hook payload `jerry hook` will read off stdin before giving up on the rest -
+/// mirrors `crate::hooks::event::MAX_PAYLOAD_BYTES` in the app (a `Write`'s `tool_input.content`
+/// can carry a whole file), and stays well under `jerry_core::wire::MAX_FRAME_BYTES` (16 MiB) so
+/// a maximal payload is still one the host's own frame limit will accept.
+const MAX_HOOK_PAYLOAD_BYTES: u64 = 1024 * 1024;
+
+/// How long `jerry hook` will wait for stdin to finish (or hit [`MAX_HOOK_PAYLOAD_BYTES`])
+/// before giving up on the payload entirely. Separate from [`HOOK_CALL_TIMEOUT`]: that bounds
+/// the RPC once a payload is in hand, this bounds getting one in the first place - a stdin pipe
+/// that never sends EOF must not hang the agent's tool call either.
+const HOOK_STDIN_DEADLINE: Duration = Duration::from_secs(3);
+
+/// Runs one invocation and returns its exit code. `stdin` is read only by `hook`, and only up to
+/// [`MAX_HOOK_PAYLOAD_BYTES`]/[`HOOK_STDIN_DEADLINE`] - owned, not borrowed, because bounding a
+/// blocking read with a deadline means reading it on a thread this call may have to walk away
+/// from without joining (see [`read_hook_stdin`]). `out` receives the result (JSON with
+/// `--json`, prose otherwise); `err` receives diagnostics only.
 pub fn run(
     args: impl IntoIterator<Item = OsString>,
     env: &dyn Fn(&str) -> Option<OsString>,
     cwd: &Path,
-    stdin: &mut dyn Read,
+    stdin: Box<dyn Read + Send>,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> u8 {
@@ -195,19 +212,26 @@ fn unreachable_standalone() -> Result<Client, ClientError> {
 }
 
 /// Forwards one hook event, verbatim from `stdin`, as a `hook` request - decision Q10 and
-/// `docs/architecture/decisions.md` §19. Always exits 0 and never writes to stdout: a hook that
-/// blocked or failed the agent's own tool call would be strictly worse than one that silently
-/// did nothing, so every failure here - a read error, invalid JSON, no host reachable, a refusal
-/// - is a diagnostic on stderr and nothing more.
-fn hook(session: &mut Session, args: &HookArgs, stdin: &mut dyn Read, err: &mut dyn Write) -> u8 {
-    let mut raw = Vec::new();
-    if let Err(error) = stdin.read_to_end(&mut raw) {
+/// `docs/architecture/decisions.md` §19. Always exits 0, within a bounded time
+/// ([`MAX_HOOK_PAYLOAD_BYTES`] bytes, [`HOOK_STDIN_DEADLINE`] wall-clock for the read;
+/// [`HOOK_CALL_TIMEOUT`] for the RPC once a payload is in hand), and never writes to stdout: a
+/// hook that blocked or failed the agent's own tool call would be strictly worse than one that
+/// silently did nothing, so every failure here - a read that never finishes, invalid JSON, no
+/// host reachable, a refusal - is a diagnostic on stderr and nothing more.
+fn hook(
+    session: &mut Session,
+    args: &HookArgs,
+    stdin: Box<dyn Read + Send>,
+    err: &mut dyn Write,
+) -> u8 {
+    let Some(raw) = read_hook_stdin(stdin, MAX_HOOK_PAYLOAD_BYTES, HOOK_STDIN_DEADLINE) else {
         let _ = writeln!(
             err,
-            "jerry: could not read the hook payload from stdin: {error}"
+            "jerry: timed out reading the hook payload from stdin after {HOOK_STDIN_DEADLINE:?}; \
+             the hook is skipped"
         );
         return exit::DONE;
-    }
+    };
     // Nothing is ever lost: a payload that isn't JSON (or is empty) still reaches the host, as
     // the text Claude Code (or whatever invoked this) actually sent.
     let payload = serde_json::from_slice(&raw).unwrap_or_else(
@@ -221,6 +245,32 @@ fn hook(session: &mut Session, args: &HookArgs, stdin: &mut dyn Read, err: &mut 
     // has already written any diagnostic to `err`.
     let _ = session.call(request, err);
     exit::DONE
+}
+
+/// Reads `stdin` up to `cap` bytes (a longer payload is silently truncated, never an error - a
+/// hook must never fail over its own size), bounded overall by `deadline`. A pipe that never
+/// sends EOF - or never sends anything at all - would otherwise block `read_to_end` forever, so
+/// the read runs on its own thread and this function only waits up to `deadline` for it to
+/// finish. On expiry that thread is deliberately abandoned rather than joined: there is no
+/// portable way to cancel a thread blocked in a `read` syscall, and joining it would just move
+/// the hang here instead of removing it.
+fn read_hook_stdin(
+    mut stdin: Box<dyn Read + Send>,
+    cap: u64,
+    deadline: Duration,
+) -> Option<Vec<u8>> {
+    let (sender, receiver) = mpsc::channel();
+    let spawned = thread::Builder::new()
+        .name("jerry-hook-stdin".to_owned())
+        .spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stdin.by_ref().take(cap).read_to_end(&mut buf);
+            let _ = sender.send(buf);
+        });
+    if spawned.is_err() {
+        return None;
+    }
+    receiver.recv_timeout(deadline).ok()
 }
 
 fn status(session: &mut Session, json: bool, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
@@ -616,8 +666,12 @@ mod run_tests {
     use std::collections::HashMap;
     use std::ffi::OsString;
     use std::fs;
+    use std::io::Read;
     use std::path::{Path, PathBuf};
+    use std::time::Duration;
     use test_support::{add_worktree, commit, git_output, seed_empty_repo, seed_repo, TempDir};
+
+    use super::MAX_HOOK_PAYLOAD_BYTES;
 
     fn env(pairs: &[(&str, &Path)]) -> impl Fn(&str) -> Option<OsString> {
         let map: HashMap<String, OsString> = pairs
@@ -662,8 +716,10 @@ mod run_tests {
     ) -> (u8, String, String) {
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let mut cursor = stdin;
-        let code = run(args(list), env, cwd, &mut cursor, &mut out, &mut err);
+        // Owned (a copy of `stdin`), not a borrow of it: `run` now takes stdin by value, since
+        // `hook`'s bounded read moves it onto its own thread.
+        let reader: Box<dyn Read + Send> = Box::new(std::io::Cursor::new(stdin.to_vec()));
+        let code = run(args(list), env, cwd, reader, &mut out, &mut err);
         (
             code,
             String::from_utf8(out).expect("utf8 stdout"),
@@ -1013,5 +1069,63 @@ mod run_tests {
         assert_eq!(code, 0);
         assert!(out.is_empty());
         host.shutdown_and_join();
+    }
+
+    /// Blocks forever in `read` - stands in for a stdin pipe that never sends EOF (and never
+    /// sends anything at all), without a `thread::sleep`: the block is a real, indefinite
+    /// `Receiver::recv` on a channel this test never sends into, only drops.
+    struct NeverEndingReader(std::sync::mpsc::Receiver<()>);
+
+    impl Read for NeverEndingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            // `recv` returning at all (a message, or every sender dropped) would mean this
+            // reader stopped blocking on its own - which must never be what lets `hook` return
+            // in this test; only `read_hook_stdin`'s own deadline may.
+            match self.0.recv() {
+                Ok(()) => panic!("nothing ever sends into this channel"),
+                Err(_) => panic!("the sender must outlive this call, or the read didn't block"),
+            }
+        }
+    }
+
+    #[test]
+    fn read_hook_stdin_truncates_rather_than_erroring_on_an_oversized_payload() {
+        let oversized = vec![b'a'; 100];
+        let cap = 10;
+        let read = super::read_hook_stdin(
+            Box::new(std::io::Cursor::new(oversized)),
+            cap,
+            Duration::from_secs(5),
+        )
+        .expect("a reader that only ever returns real bytes must not hit the deadline");
+        assert_eq!(
+            read.len(),
+            cap as usize,
+            "an oversized payload must be truncated, never rejected as an error"
+        );
+        assert!(read.iter().all(|&byte| byte == b'a'));
+    }
+
+    #[test]
+    fn read_hook_stdin_gives_up_within_the_deadline_when_stdin_never_sends_eof() {
+        // The sender is held for this call's whole duration so `NeverEndingReader::read` really
+        // is blocked, not merely fast - `read_hook_stdin` must still return by its own deadline
+        // regardless, and the reader thread it abandoned is left for the process to clean up.
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let started = std::time::Instant::now();
+        let deadline = Duration::from_millis(50);
+        let read = super::read_hook_stdin(
+            Box::new(NeverEndingReader(receiver)),
+            MAX_HOOK_PAYLOAD_BYTES,
+            deadline,
+        );
+        assert_eq!(
+            read, None,
+            "a stdin that never sends EOF must be given up on, not waited for"
+        );
+        assert!(
+            started.elapsed() >= deadline,
+            "giving up may not happen before the deadline it is supposed to honour"
+        );
     }
 }

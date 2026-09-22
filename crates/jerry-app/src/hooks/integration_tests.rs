@@ -97,14 +97,16 @@ fn run_jerry_hook(
     let socket_str = socket.to_str().expect("utf8 socket path");
     let agent_str = agent_id.to_string();
     let env = fake_env(&[(SOCKET_ENV, socket_str), (AGENT_ENV, &agent_str)]);
-    let mut stdin = payload;
     let mut out = Vec::new();
     let mut err = Vec::new();
+    // Owned: `jerry_cli::run` takes stdin by value now, since `hook`'s bounded read moves it
+    // onto its own thread rather than borrowing it.
+    let stdin: Box<dyn std::io::Read + Send> = Box::new(std::io::Cursor::new(payload.to_vec()));
     let code = jerry_cli::run(
         ["jerry", "hook", event].map(OsString::from),
         &env,
         cwd,
-        &mut stdin,
+        stdin,
         &mut out,
         &mut err,
     );
