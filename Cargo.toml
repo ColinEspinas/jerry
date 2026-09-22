@@ -6,6 +6,7 @@ members = [
     "crates/jerry-lsp",
     "crates/jerry-core",
     "crates/jerry-host",
+    "crates/jerry-cli",
     "crates/jerry-app",
     # Dev-dependency only, and deliberately gpui-free so the core crates can use it too
     # (docs/architecture/decisions.md §1, docs/testing.md).
@@ -56,6 +57,8 @@ serde_json = "1"
 # Channel and oneshot primitives the host and app share for channel-woken tasks
 # (decisions.md §16); the same 0.3 line Zed pins, already resolved through gpui.
 futures = "0.3"
+# The `jerry` command line; the same 4.4 line Zed pins.
+clap = { version = "4.4", features = ["derive", "wrap_help"] }
 
 # Debug info is the bulk of a debug `target/` on MSVC, and almost none of it is ever read: a
 # backtrace or a debugger session wants this workspace's own frames, not `aws-lc-sys`' or a

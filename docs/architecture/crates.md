@@ -83,16 +83,16 @@ call into `jerry-git` directly (109 times in `graph_view/render.rs` alone) and o
 `git` itself (`sidebar/render.rs:6534`) instead of going through a Command. Fixing this is tracked
 work, not done in this pass.
 
-## `jerry-cli` (planned, not yet created)
+## `jerry-cli`
 
-**Scope.** A `clap` binary dispatching the same `Command`/`Query` types the GPUI view uses.
+**Scope.** The `jerry` command: what agents and humans type. Deliberately shallow. `clap` builds a
+`Request`, the transport decides whether a live Jerry serves this repository (`JERRY_HOST_SOCKET`,
+then `--instance`, then the registry), the `Report` becomes an exit code and output. Git-locality
+requests run in-process when no host serves the repository; anything else needs one.
 
-**Owns.** Argument parsing and output formatting only. No business logic — if logic ends up here
-that the view also needs, it belongs in the application layer instead.
+**Owns.** Argument parsing, the bi-mode choice as a pure function, the exit-code contract (0 done,
+1 action required, 2 usage, 3 refused, 4 no instance, 5 failed), and output: JSON only with
+`--json`, prose otherwise, diagnostics always on stderr. The whole binary is tested through
+`jerry_cli::run` without spawning it.
 
-**Does not own.** Any `gpui` dependency, ever. This crate is the proof that the application layer
-is genuinely UI-agnostic; if building it needs a `gpui` import, the application layer isn't done.
-
-**Prerequisite:** the two mechanical blockers in `overview.md` (glob imports, adapter calls from
-`render.rs`) — this crate can't exist meaningfully until the Command/Query surface it would dispatch
-actually exists.
+**Does not own.** Any logic the GUI also needs (that is `jerry-core`), any `gpui`.
