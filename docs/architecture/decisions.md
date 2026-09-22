@@ -638,8 +638,9 @@ real, executable path (§7's `jerry` binary) to hand `jerry-git`, so `GIT_SEQUEN
 and `AmendHeadMessage { message }` are Git-locality Commands, all `Invocability::Denied` to
 agents (git already gives an agent a rebase); `RebaseStatus` is a Query mirroring
 `jerry_git::rebase::rebase_status`. `RebaseStart::validate` splits a real `rebase_preflight` out
-of `start_interactive_rebase` (refusing `rebase-already-in-progress` without touching git, mirroring
-`merge_preflight`'s split from `attempt_merge`), and `RebaseContinue`/`RebaseSkip`/`RebaseAbort`/
+of `start_interactive_rebase` (refusing `rebase-already-in-progress` and `rebase-worktree-dirty`
+without touching git, mirroring `merge_preflight`'s split from `attempt_merge`), and
+`RebaseContinue`/`RebaseSkip`/`RebaseAbort`/
 `AmendHeadMessage` all validate against `rebase_status`'s real on-disk state
 (`rebase-not-in-progress`/`rebase-not-stopped`) rather than in-memory assumptions. Every outcome
 and plan row is mirrored onto the wire (`RebaseOutcomeReport`, `RebasePlanEntryWire`,

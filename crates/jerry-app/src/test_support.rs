@@ -102,6 +102,18 @@ pub(crate) fn open_test_app_with_settings(
     })
 }
 
+/// A real, dispatched `RebaseStart` needs `jerry_core::jerry_binary::locate` to find a real,
+/// executable `jerry` - called at the top of every fixture that goes on to start a real rebase,
+/// so a missing binary fails right here with an actionable cause instead of as a confusing
+/// downstream state assertion once the rebase never ran.
+pub(crate) fn assert_real_jerry_binary_available() {
+    assert!(
+        jerry_core::jerry_binary::locate().is_some(),
+        "no real `jerry` binary found next to this test binary - run `cargo build -p jerry-cli` \
+         first"
+    );
+}
+
 #[cfg(test)]
 mod test_window_fixture_tests {
     use crate::rail::repo::canonical_repo_path;

@@ -536,3 +536,13 @@ fn rebase_preflight_refuses_while_a_rebase_is_already_in_progress() {
         "{err:?}"
     );
 }
+
+#[test]
+fn rebase_preflight_refuses_a_dirty_worktree() {
+    let repo = seed_empty_repo();
+    commit(repo.path(), "a.txt", "1", "commit 1");
+    std::fs::write(repo.path().join("dirty.txt"), "uncommitted").expect("write dirty file");
+
+    let err = rebase_preflight(repo.path()).expect_err("a dirty worktree must refuse");
+    assert!(matches!(err, Error::RebaseWorktreeDirty { .. }), "{err:?}");
+}

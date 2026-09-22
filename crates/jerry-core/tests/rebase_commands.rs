@@ -3,14 +3,10 @@
 //! top of `jerry_git::rebase`, already covered for real by `jerry-git`'s own
 //! `tests/rebase_editor.rs`.
 //!
-//! Lives here, not in `src/commands.rs`'s own `#[cfg(test)]` module, for the same reason
-//! `jerry-git`'s equivalent tests do: `RebaseStart::execute` needs `jerry_binary::locate` to find
-//! a real, executable file, and `CARGO_BIN_EXE_<name>` is only reliable for an integration test -
-//! verified against this crate's own build (a cross-crate dev-dependency, and a `--lib` unit test
-//! referencing this exact same-package `[[bin]]`, both failed to see the environment variable at
-//! all). `ensure_jerry_binary()` copies this crate's own `jerry_core_test_jerry` `[[bin]]`
-//! (`src/bin/test_jerry.rs`) to sit beside this test binary's own executable, matching the real
-//! sibling-of-`current_exe` layout `jerry_binary::locate` looks for.
+//! An integration test, not `src/commands.rs`'s own `#[cfg(test)]` module, so `RebaseStart::
+//! execute`'s `jerry_binary::locate` call finds a real, executable file - see this crate's
+//! `Cargo.toml` and `docs/architecture/decisions.md` §20 for why. `ensure_jerry_binary()` copies
+//! this crate's own `jerry_core_test_jerry` `[[bin]]` next to this test binary's own executable.
 
 // An integration test file is its own crate root - `src/lib.rs`'s crate-level
 // `cfg_attr(test, allow(...))` does not reach here, so it is repeated (CLAUDE.md's

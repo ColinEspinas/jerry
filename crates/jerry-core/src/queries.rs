@@ -71,8 +71,8 @@ impl Query for MergeStatusQuery {
     }
 }
 
-/// Is a rebase stopped at the caller's worktree, and where. What the graph pane's rebase mode
-/// reconstructs its `Stopped`/`Planning` phase from after dispatching a mutation.
+/// Is a rebase stopped at the caller's worktree, and where - the on-disk state a CLI or agent
+/// reads directly, without dispatching a mutation first.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RebaseStatusQuery {}
 
