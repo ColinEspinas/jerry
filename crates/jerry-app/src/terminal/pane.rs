@@ -1577,13 +1577,13 @@ impl TerminalPane {
                 return; // the pane was dropped before the process finished starting
             }
 
-            // Wakes exactly when jerry-pty's reader thread (or its dedicated exit-wait thread -
-            // see `docs/architecture/decisions.md` §8's amendment) has something ready, rather
-            // than draining a channel on a fixed interval. Keeps running until the stream itself
-            // ends (every sender dropped), not just until the first `Exited` item, since a
-            // `Bytes` chunk racing that item (see `jerry_pty::run_wait_loop`'s docs) must still
-            // reach the grid.
+            // Wakes exactly when jerry-pty's reader thread (or, on Windows, its independent
+            // exit-wait thread - see `docs/architecture/decisions.md` §8) has something ready,
+            // rather than draining a channel on a fixed interval. `Exited` ends this loop: it is
+            // `jerry_pty`'s stream's terminal item (guaranteed last on unix; see `PtyOutput`'s
+            // docs for Windows' narrower guarantee).
             while let Some(item) = output.next().await {
+                let mut exited = false;
                 let updated = this.update(cx, |this, cx| match item {
                     PtyOutput::Bytes(chunk) => {
                         this.grid.append_bytes(&chunk);
@@ -1635,11 +1635,12 @@ impl TerminalPane {
                         this.grid.mark_ended();
                         cx.emit(TerminalPaneEvent::ProcessExited { clean });
                         cx.notify();
+                        exited = true;
                     }
                 });
 
-                if updated.is_err() {
-                    break; // the pane entity was dropped
+                if updated.is_err() || exited {
+                    break; // the pane entity was dropped, or the process it watched exited
                 }
             }
         });

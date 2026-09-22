@@ -254,10 +254,16 @@ descendants, with the direct kill as backstop (an orphaned tree was how npm `.cm
 real `node.exe` survived, #468). There is no self-pipe either: `WSAPoll` accepts only sockets
 and a ConPTY master is a named pipe, so the reader blocks until `master` itself drops, *not* when
 the child is reaped - the reader's own EOF must never be read as "the child exited" on this
-platform. Callers instead await `PtyOutput::Exited` on the output channel (see this entry's
-2026-09-22 amendment below), a real signal independent of the reader. These paths are
-`#[cfg(windows)]`, never `#[cfg(not(unix))]`, so an unsupported non-unix target fails to compile
-instead of silently inheriting Windows semantics.
+platform. `portable-pty` exposes no way to interrupt that blocked read from another thread either
+(no overlapped I/O, no `CancelIoEx`/`CancelSynchronousIo` equivalent - verified against
+`portable-pty-0.9.0/src/win/{conpty,psuedocon}.rs`, which read/close synchronously with nothing
+else), so unlike unix (see the 2026-09-22 amendment below), Windows's `run_wait_loop` still sends
+`Exited` on the output channel directly rather than handing it to the reader: **`Exited` is not
+guaranteed to be the stream's last item on Windows** - a `Bytes` chunk the reader was already
+blocked reading may still arrive after it. Callers that need a definitive final answer on this
+platform should keep draining until the stream itself ends, not stop at the first `Exited`. These
+paths are `#[cfg(windows)]`, never `#[cfg(not(unix))]`, so an unsupported non-unix target fails to
+compile instead of silently inheriting Windows semantics.
 
 **Amended 2026-09-22 (#504):** The output channel is now `futures::channel::mpsc` rather than
 `std::sync::mpsc::sync_channel`, so a GPUI task can `.await` it instead of `crates/jerry-app`
@@ -265,15 +271,36 @@ polling it on a timer — the reader thread drives its `Sender` with
 `futures::executor::block_on(tx.send(chunk))`, which blocks exactly like the old `sync_channel`
 did once the bounded channel fills, preserving this entry's backpressure contract unchanged.
 Process exit is now an item on that same channel (`PtyOutput::Bytes(Vec<u8>) | Exited(ExitStatus)`),
-produced by one new dedicated thread (`run_wait_loop`) that owns the `portable_pty::Child` handle
-for the rest of the session and makes the one blocking `Child::wait()` call — a real,
-platform-uniform exit signal (on Windows, `portable-pty`'s own `WaitForSingleObject` on the
-process handle) that replaced the Windows-only independent `try_wait` poll this entry originally
-called for and, on unix, the `eof_poll_decision` retry dance that used to bound the race between
-observing pty EOF and the child actually being reaped. `PtySession::try_wait` stays (now a
-non-blocking peek at whether that thread has finished, via `JoinHandle::is_finished`), but nothing
-in `crates/jerry-app` calls it anymore. `PtySession::pid`/`killer` are cached/cloned at spawn time,
-before `child` moves to that thread, so `process_id()`/`kill()` don't need it back.
+produced by a dedicated thread (`run_wait_loop`) that owns the `portable_pty::Child` handle for the
+rest of the session and makes the one blocking `Child::wait()` call — a real, platform-uniform exit
+signal (on Windows, `portable-pty`'s own `WaitForSingleObject` on the process handle) that replaced
+the Windows-only independent `try_wait` poll this entry originally called for and, on unix, the
+`eof_poll_decision` retry dance that used to bound the race between observing pty EOF and the child
+actually being reaped. `PtySession::try_wait` stays (now a non-blocking peek at whether that thread
+has finished, via `JoinHandle::is_finished`), but nothing in `crates/jerry-app` calls it anymore.
+`PtySession::pid`/`killer` are cached/cloned at spawn time, before `child` moves to that thread, so
+`process_id()`/`kill()` don't need it back.
+
+**Exit ordering, unix only:** an initial version had `run_wait_loop` send `Exited` on the output
+channel directly on every platform, racing the reader thread's own trailing `Bytes` sends - both
+threads held a `Sender` with no ordering between them, so a chunk read just before real exit could
+arrive after `Exited`. Observed for real on Linux CI: a 200,000-line counting test lost the last
+few hundred lines, and a grid built by draining "until `Exited`" (the natural way to read a
+terminal stream) missed content that had, in fact, already been written. Fixed on unix by giving
+the reader thread sole ownership of `output_tx` - `run_wait_loop` no longer sends on it at all.
+Instead it hands its `ExitStatus` to the reader over a one-shot `std::sync::mpsc` channel and wakes
+it via a second self-pipe (`exit_read`/`exit_write`, alongside the existing shutdown one). On that
+wake the reader (`drain_final_output`) does a final bounded drain - `filedescriptor::poll` with a
+zero timeout, a genuine non-blocking readiness check, not a real-EOF wait - so an orphaned
+descendant still holding the pty slave open cannot make this hang: the drain stops the moment
+nothing is immediately available, then sends `Exited`. `PtyOutput::Exited` is therefore guaranteed
+the stream's last item on unix, after every `Bytes` chunk the child wrote. `crates/jerry-app`'s
+`TerminalPane` and this crate's own test drains now treat it as terminal again (stopping at the
+first `Exited`) rather than draining past it. Windows keeps the original, racing design (see this
+entry's Windows paragraph): `portable-pty` gives no way to wake a blocked ConPTY read short of
+closing the whole pseudo console, which this session's `PtySession::master` field is still needed
+for (`resize()`) while the process is alive, so there is no thread that could safely own and drop
+it the moment `Child::wait` returns.
 
 One more consequence, GPUI-specific: `crates/jerry-app`'s tests that spawn a real `TerminalPane`
 must call `cx.background_executor().allow_parking()` first (done once, centrally, in
