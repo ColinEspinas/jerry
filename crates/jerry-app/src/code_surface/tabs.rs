@@ -2056,6 +2056,12 @@ mod terminal_link_click_tests {
             .expect("a fresh test window has one real, active shell agent");
 
         pane.update(cx, |pane, cx| {
+            // Reset first, in the same `update`: the real startup shell this pane is also
+            // running now wakes and drains the moment it has real output, rather than on a
+            // polling interval (`docs/architecture/decisions.md` §8's amendment), so its own
+            // banner/prompt could otherwise land before the lines this test's click-position
+            // math depends on land at a known row.
+            pane.reset_grid_for_test(cx);
             pane.inject_bytes_for_test(
                 b"first line\r\nsecond line\r\nsee src/main.rs:1 for it",
                 cx,

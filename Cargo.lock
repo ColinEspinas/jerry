@@ -4364,6 +4364,7 @@ dependencies = [
  "anyhow",
  "dunce",
  "env_logger",
+ "futures",
  "gpui",
  "gpui_platform",
  "image",
@@ -4443,6 +4444,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "filedescriptor",
+ "futures",
  "libc",
  "log",
  "nix",

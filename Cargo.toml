@@ -41,6 +41,11 @@ dbg_macro = "warn"
 gpui = { git = "https://github.com/zed-industries/zed", rev = "7b030b500810b04cf5fb4aa5973be99a502d9f36" }
 anyhow = "1"
 thiserror = "1"
+# `jerry-pty`'s awaitable output channel (`futures::channel::mpsc`) and the `crates/jerry-app`
+# terminal pane task that awaits it (`futures::StreamExt::next`) - matching
+# `vendor/zed/Cargo.toml`'s own `futures = "0.3.32"` pin (already resolved to 0.3.33
+# transitively via `gpui` itself, so this adds no new version to the lock file).
+futures = "0.3"
 # Real config-file (de)serialization for `crate::settings_store::Settings`. Pinned to
 # the exact major versions `vendor/zed/Cargo.toml` itself pins (`serde = "1.0.221"`,
 # `toml = "0.8"`), matching this project's established "same versions Zed verified against"

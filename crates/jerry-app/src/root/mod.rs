@@ -2687,7 +2687,7 @@ impl AdeApp {
         // be *skipped* instead - the centre pane has no repo-scoping of its own, so doing
         // nothing here would leave whatever was left's terminal rendering right alongside `id`'s
         // own, unrelated rail rows.
-        self.agents.clear_active(cx);
+        self.agents.clear_active();
         self.selected = None;
         self.worktree_selection_notice = None;
         // Still seeded synchronously from this repo's own already-known worktree list (see the
