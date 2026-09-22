@@ -24,9 +24,7 @@ pub const PROMPT_MAX_CHARS: usize = 120;
 /// The largest hook payload Jerry will parse at all. Claude Code payloads are small - the real
 /// ones captured were a few hundred bytes - but `tool_input.content` on a `Write` carries an
 /// entire file, and `tool_output` an entire command's output, so the honest upper bound is "as
-/// big as whatever the model just did". This is the parse-side guard; the listener enforces the
-/// same limit on the wire (see `crate::hooks::server`) so an oversized body is never even
-/// buffered.
+/// big as whatever the model just did".
 pub const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
 
 /// What one hook event tells Jerry about the agent's *state* - the whole reason the payload is
@@ -81,7 +79,7 @@ pub struct EditedFile {
     pub phase: EditPhase,
     /// Exactly the path string the payload carried, **not** normalised here. Every real capture
     /// on this machine held an absolute path, but a relative one is a real shape too (see
-    /// `crate::hooks::server`'s own tests), and which worktree it belongs to is not a question
+    /// `crate::hooks::inbox`'s own tests), and which worktree it belongs to is not a question
     /// this module can answer - `crate::provenance::flow` resolves it against the agent's own
     /// `cwd`, which is the only place both halves are known.
     pub path: String,
@@ -754,7 +752,7 @@ mod tests {
 
     #[test]
     fn a_notification_is_classified_as_a_nudge_and_every_lifecycle_event_as_a_transition() {
-        // The classification `crate::hooks::server::merge_nudge` acts on. Getting `idle_prompt`
+        // The classification `crate::hooks::inbox::merge_nudge` acts on. Getting `idle_prompt`
         // wrong here is what erased the review boundary one minute after every finished turn, and
         // getting `permission_prompt` wrong is what replaced every real permission question with
         // a constant - see `EventKind`'s own docs for both, observed live.

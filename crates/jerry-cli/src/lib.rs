@@ -10,20 +10,22 @@ pub mod cli;
 pub mod exit;
 pub mod transport;
 
-use crate::cli::{Cli, Command, MergeArgs};
+use crate::cli::{Cli, Command, HookArgs, MergeArgs};
 use crate::transport::{ChooseError, Transport};
 use clap::Parser;
 use jerry_core::client::{Client, ClientError};
 use jerry_core::registry::{runtime_dir_for, Os, Registry};
 use jerry_core::wire::rpc_code;
 use jerry_core::{
-    execute_locally, AgentId, AppCommand, AppQuery, Call, Caller, ConflictKind, Ctx,
+    execute_locally, AgentId, AppCommand, AppQuery, Call, Caller, ConflictKind, Ctx, HookEvent,
     LocalDispatchError, MergeAbort, MergeAttempt, MergeAttemptOutcome, MergeComplete,
     MergeStatusOutcome, MergeStatusQuery, Report, Request, RpcError, StageResolved,
 };
 use std::ffi::OsString;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
 /// The identity Jerry injects into an agent's environment.
@@ -36,12 +38,32 @@ pub const SOCKET_ENV: &str = "JERRY_HOST_SOCKET";
 /// How long a connected call may take end to end. A merge can legitimately run for seconds.
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Runs one invocation and returns its exit code. `out` receives the result (JSON with
+/// `jerry hook`'s own budget: it runs inline with an agent's tool call, so it must never hold
+/// that call open for anywhere near as long as an interactive command may.
+const HOOK_CALL_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The largest hook payload `jerry hook` will read off stdin before giving up on the rest -
+/// mirrors `crate::hooks::event::MAX_PAYLOAD_BYTES` in the app (a `Write`'s `tool_input.content`
+/// can carry a whole file), and stays well under `jerry_core::wire::MAX_FRAME_BYTES` (16 MiB) so
+/// a maximal payload is still one the host's own frame limit will accept.
+const MAX_HOOK_PAYLOAD_BYTES: u64 = 1024 * 1024;
+
+/// How long `jerry hook` will wait for stdin to finish (or hit [`MAX_HOOK_PAYLOAD_BYTES`])
+/// before giving up on the payload entirely. Separate from [`HOOK_CALL_TIMEOUT`]: that bounds
+/// the RPC once a payload is in hand, this bounds getting one in the first place - a stdin pipe
+/// that never sends EOF must not hang the agent's tool call either.
+const HOOK_STDIN_DEADLINE: Duration = Duration::from_secs(3);
+
+/// Runs one invocation and returns its exit code. `stdin` is read only by `hook`, and only up to
+/// [`MAX_HOOK_PAYLOAD_BYTES`]/[`HOOK_STDIN_DEADLINE`] - owned, not borrowed, because bounding a
+/// blocking read with a deadline means reading it on a thread this call may have to walk away
+/// from without joining (see [`read_hook_stdin`]). `out` receives the result (JSON with
 /// `--json`, prose otherwise); `err` receives diagnostics only.
 pub fn run(
     args: impl IntoIterator<Item = OsString>,
     env: &dyn Fn(&str) -> Option<OsString>,
     cwd: &Path,
+    stdin: Box<dyn Read + Send>,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> u8 {
@@ -58,6 +80,15 @@ pub fn run(
     let ctx = match Ctx::from_cwd(cwd, caller) {
         Ok(ctx) => ctx,
         Err(error) => {
+            // A hook must never fail the agent's tool call, this diagnosis included.
+            if matches!(cli.command, Command::Hook(_)) {
+                let _ = writeln!(
+                    err,
+                    "jerry: {} is not inside a git repository ({error}); the hook is skipped",
+                    cwd.display()
+                );
+                return exit::DONE;
+            }
             let _ = writeln!(
                 err,
                 "jerry: {} is not inside a git repository ({error})",
@@ -68,16 +99,28 @@ pub fn run(
     };
     let transport = match choose_transport(&cli, env, &ctx, err) {
         Ok(transport) => transport,
-        Err(code) => return code,
+        Err(code) => {
+            return if matches!(cli.command, Command::Hook(_)) {
+                exit::DONE
+            } else {
+                code
+            }
+        }
+    };
+    let timeout = match &cli.command {
+        Command::Hook(_) => HOOK_CALL_TIMEOUT,
+        _ => CALL_TIMEOUT,
     };
     let mut session = Session {
         transport,
         ctx,
         client: None,
+        timeout,
     };
     match &cli.command {
         Command::Status => status(&mut session, cli.json, out, err),
         Command::Merge(args) => merge(&mut session, args, cli.json, out, err),
+        Command::Hook(args) => hook(&mut session, args, stdin, err),
     }
 }
 
@@ -87,6 +130,9 @@ struct Session {
     transport: Transport,
     ctx: Ctx,
     client: Option<Client>,
+    /// Bounds every connected call as a whole - short for `hook` (it runs inline with an
+    /// agent's tool call), the ordinary [`CALL_TIMEOUT`] for everything else.
+    timeout: Duration,
 }
 
 impl Session {
@@ -110,8 +156,8 @@ impl Session {
             Transport::Host(_) | Transport::Socket(_) => {
                 if self.client.is_none() {
                     let connected = match &self.transport {
-                        Transport::Host(descriptor) => Client::connect_to(descriptor, CALL_TIMEOUT),
-                        Transport::Socket(socket) => Client::connect(socket, CALL_TIMEOUT),
+                        Transport::Host(descriptor) => Client::connect_to(descriptor, self.timeout),
+                        Transport::Socket(socket) => Client::connect(socket, self.timeout),
                         Transport::Standalone => unreachable_standalone(),
                     };
                     match connected {
@@ -163,6 +209,68 @@ fn unreachable_standalone() -> Result<Client, ClientError> {
     Err(ClientError::Params(serde::de::Error::custom(
         "standalone transports never connect",
     )))
+}
+
+/// Forwards one hook event, verbatim from `stdin`, as a `hook` request - decision Q10 and
+/// `docs/architecture/decisions.md` §19. Always exits 0, within a bounded time
+/// ([`MAX_HOOK_PAYLOAD_BYTES`] bytes, [`HOOK_STDIN_DEADLINE`] wall-clock for the read;
+/// [`HOOK_CALL_TIMEOUT`] for the RPC once a payload is in hand), and never writes to stdout: a
+/// hook that blocked or failed the agent's own tool call would be strictly worse than one that
+/// silently did nothing, so every failure here - a read that never finishes, invalid JSON, no
+/// host reachable, a refusal - is a diagnostic on stderr and nothing more.
+fn hook(
+    session: &mut Session,
+    args: &HookArgs,
+    stdin: Box<dyn Read + Send>,
+    err: &mut dyn Write,
+) -> u8 {
+    let Some(raw) = read_hook_stdin(stdin, MAX_HOOK_PAYLOAD_BYTES, HOOK_STDIN_DEADLINE) else {
+        let _ = writeln!(
+            err,
+            "jerry: timed out reading the hook payload from stdin after {HOOK_STDIN_DEADLINE:?}; \
+             the hook is skipped"
+        );
+        return exit::DONE;
+    };
+    // Nothing is ever lost: a payload that isn't JSON (or is empty) still reaches the host, as
+    // the text Claude Code (or whatever invoked this) actually sent.
+    let payload = serde_json::from_slice(&raw).unwrap_or_else(
+        |_| serde_json::json!({ "raw": String::from_utf8_lossy(&raw).into_owned() }),
+    );
+    let request = Request::Hook(HookEvent {
+        event: args.event.clone(),
+        payload,
+    });
+    // The `Report`, if any, carries nothing an agent's tool call needs to see; `session.call`
+    // has already written any diagnostic to `err`.
+    let _ = session.call(request, err);
+    exit::DONE
+}
+
+/// Reads `stdin` up to `cap` bytes (a longer payload is silently truncated, never an error - a
+/// hook must never fail over its own size), bounded overall by `deadline`. A pipe that never
+/// sends EOF - or never sends anything at all - would otherwise block `read_to_end` forever, so
+/// the read runs on its own thread and this function only waits up to `deadline` for it to
+/// finish. On expiry that thread is deliberately abandoned rather than joined: there is no
+/// portable way to cancel a thread blocked in a `read` syscall, and joining it would just move
+/// the hang here instead of removing it.
+fn read_hook_stdin(
+    mut stdin: Box<dyn Read + Send>,
+    cap: u64,
+    deadline: Duration,
+) -> Option<Vec<u8>> {
+    let (sender, receiver) = mpsc::channel();
+    let spawned = thread::Builder::new()
+        .name("jerry-hook-stdin".to_owned())
+        .spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stdin.by_ref().take(cap).read_to_end(&mut buf);
+            let _ = sender.send(buf);
+        });
+    if spawned.is_err() {
+        return None;
+    }
+    receiver.recv_timeout(deadline).ok()
 }
 
 fn status(session: &mut Session, json: bool, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
@@ -558,8 +666,12 @@ mod run_tests {
     use std::collections::HashMap;
     use std::ffi::OsString;
     use std::fs;
+    use std::io::Read;
     use std::path::{Path, PathBuf};
+    use std::time::Duration;
     use test_support::{add_worktree, commit, git_output, seed_empty_repo, seed_repo, TempDir};
+
+    use super::MAX_HOOK_PAYLOAD_BYTES;
 
     fn env(pairs: &[(&str, &Path)]) -> impl Fn(&str) -> Option<OsString> {
         let map: HashMap<String, OsString> = pairs
@@ -591,9 +703,23 @@ mod run_tests {
         env: &dyn Fn(&str) -> Option<OsString>,
         cwd: &Path,
     ) -> (u8, String, String) {
+        invoke_with_stdin(list, env, cwd, b"")
+    }
+
+    /// [`invoke`], with `stdin` fed to the invocation - the only commands that ever read it are
+    /// under `Command::Hook`.
+    fn invoke_with_stdin(
+        list: &[&str],
+        env: &dyn Fn(&str) -> Option<OsString>,
+        cwd: &Path,
+        stdin: &[u8],
+    ) -> (u8, String, String) {
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run(args(list), env, cwd, &mut out, &mut err);
+        // Owned (a copy of `stdin`), not a borrow of it: `run` now takes stdin by value, since
+        // `hook`'s bounded read moves it onto its own thread.
+        let reader: Box<dyn Read + Send> = Box::new(std::io::Cursor::new(stdin.to_vec()));
+        let code = run(args(list), env, cwd, reader, &mut out, &mut err);
         (
             code,
             String::from_utf8(out).expect("utf8 stdout"),
@@ -768,5 +894,238 @@ mod run_tests {
         assert_eq!(code, 0);
         assert!(out.contains("status"), "{out}");
         assert!(out.contains("merge"), "{out}");
+        assert!(
+            !out.contains("hook"),
+            "hook is Jerry's own generated entry, not part of the CLI's stable, documented \
+             surface: {out}"
+        );
+    }
+
+    /// A socket path short enough for every platform's `sun_path`, removed on drop.
+    struct SocketPath {
+        path: PathBuf,
+        _temp: Option<tempfile::TempDir>,
+    }
+
+    impl Drop for SocketPath {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+
+    fn socket_path(tag: &str) -> SocketPath {
+        if cfg!(windows) {
+            let dir = jerry_core::registry::runtime_dir().expect("runtime dir");
+            fs::create_dir_all(&dir).expect("runtime dir");
+            SocketPath {
+                path: dir.join(format!("hook-cli-{}-{tag}.sock", std::process::id())),
+                _temp: None,
+            }
+        } else {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            SocketPath {
+                path: temp.path().join(format!("{tag}.sock")),
+                _temp: Some(temp),
+            }
+        }
+    }
+
+    #[test]
+    fn hook_never_touches_stdout_and_always_exits_zero_even_with_no_jerry_reachable() {
+        let repo = seed_empty_repo();
+        let env = env(&[]);
+        let (code, out, err) = invoke_with_stdin(
+            &["hook", "PreToolUse"],
+            &env,
+            repo.path(),
+            br#"{"tool_name":"Bash"}"#,
+        );
+        assert_eq!(
+            code, 0,
+            "a hook must never fail the agent's tool call: {err}"
+        );
+        assert!(out.is_empty(), "a hook must never print to stdout: {out:?}");
+    }
+
+    #[test]
+    fn hook_is_hidden_from_help_but_still_a_real_subcommand() {
+        let repo = seed_empty_repo();
+        let env = env(&[]);
+        let (code, out, _) = invoke(&["--help"], &env, repo.path());
+        assert_eq!(code, 0);
+        assert!(
+            !out.contains("hook"),
+            "hook is not part of the CLI's stable, documented surface: {out}"
+        );
+        let (code, _, _) = invoke_with_stdin(&["hook", "Stop"], &env, repo.path(), b"{}");
+        assert_eq!(code, 0, "hidden from help must not mean unparseable");
+    }
+
+    #[test]
+    fn hook_forwards_the_event_and_the_parsed_payload_to_the_host_as_an_agent_call() {
+        let repo = seed_empty_repo();
+        let host = jerry_host::Host::start().expect("host");
+        let socket = socket_path("forward");
+        host.listen(&socket.path).expect("listen");
+        let id = jerry_core::AgentId::from("9");
+        host.agents()
+            .register(id.clone(), repo.path().to_path_buf());
+        let mut events = host.client().subscribe();
+        let env = env(&[
+            (crate::SOCKET_ENV, socket.path.as_path()),
+            (AGENT_ENV, Path::new("9")),
+        ]);
+
+        let (code, out, err) = invoke_with_stdin(
+            &["hook", "PreToolUse"],
+            &env,
+            repo.path(),
+            br#"{"tool_name":"Bash","tool_input":{"command":"cargo test"}}"#,
+        );
+        assert_eq!(code, 0, "stderr: {err}");
+        assert!(out.is_empty());
+
+        // `try_recv` removes the message it returns, so it is polled and captured in the same
+        // step - calling it again afterwards would consume a second, unsent message instead of
+        // re-reading the first.
+        let mut received = None;
+        assert!(
+            test_support::wait_until(std::time::Duration::from_secs(5), || {
+                received = events.try_recv().ok();
+                received.is_some()
+            }),
+            "the host must have fanned out an event/hook notification"
+        );
+        match received.expect("received") {
+            jerry_core::Message::Notification { method, params } => {
+                assert_eq!(method, "event/hook");
+                assert_eq!(params["agent"], serde_json::json!("9"));
+                assert_eq!(params["event"], serde_json::json!("PreToolUse"));
+                assert_eq!(params["payload"]["tool_name"], serde_json::json!("Bash"));
+            }
+            other => panic!("expected a notification, got {other:?}"),
+        }
+        host.shutdown_and_join();
+    }
+
+    #[test]
+    fn hook_wraps_non_json_stdin_as_raw_text_instead_of_dropping_it() {
+        let repo = seed_empty_repo();
+        let host = jerry_host::Host::start().expect("host");
+        let socket = socket_path("raw");
+        host.listen(&socket.path).expect("listen");
+        let id = jerry_core::AgentId::from("3");
+        host.agents().register(id, repo.path().to_path_buf());
+        let mut events = host.client().subscribe();
+        let env = env(&[
+            (crate::SOCKET_ENV, socket.path.as_path()),
+            (AGENT_ENV, Path::new("3")),
+        ]);
+
+        let (code, out, err) = invoke_with_stdin(
+            &["hook", "Notification"],
+            &env,
+            repo.path(),
+            b"not json at all",
+        );
+        assert_eq!(code, 0, "stderr: {err}");
+        assert!(out.is_empty());
+
+        let mut received = None;
+        assert!(test_support::wait_until(
+            std::time::Duration::from_secs(5),
+            || {
+                received = events.try_recv().ok();
+                received.is_some()
+            }
+        ));
+        match received.expect("received") {
+            jerry_core::Message::Notification { params, .. } => {
+                assert_eq!(
+                    params["payload"],
+                    serde_json::json!({ "raw": "not json at all" }),
+                    "an unparseable payload must still reach the host, as the raw text"
+                );
+            }
+            other => panic!("expected a notification, got {other:?}"),
+        }
+        host.shutdown_and_join();
+    }
+
+    #[test]
+    fn hook_still_exits_zero_when_the_agent_identity_is_refused() {
+        let repo = seed_empty_repo();
+        let host = jerry_host::Host::start().expect("host");
+        let socket = socket_path("refused");
+        host.listen(&socket.path).expect("listen");
+        // Never registered with the host, so the call is a real FORBIDDEN - the exit code must
+        // still be 0, since a hook must never fail the agent's tool call over its own identity.
+        let env = env(&[
+            (crate::SOCKET_ENV, socket.path.as_path()),
+            (AGENT_ENV, Path::new("99")),
+        ]);
+
+        let (code, out, _err) = invoke_with_stdin(&["hook", "Stop"], &env, repo.path(), b"{}");
+        assert_eq!(code, 0);
+        assert!(out.is_empty());
+        host.shutdown_and_join();
+    }
+
+    /// Blocks forever in `read` - stands in for a stdin pipe that never sends EOF (and never
+    /// sends anything at all), without a `thread::sleep`: the block is a real, indefinite
+    /// `Receiver::recv` on a channel this test never sends into, only drops.
+    struct NeverEndingReader(std::sync::mpsc::Receiver<()>);
+
+    impl Read for NeverEndingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            // `recv` returning at all (a message, or every sender dropped) would mean this
+            // reader stopped blocking on its own - which must never be what lets `hook` return
+            // in this test; only `read_hook_stdin`'s own deadline may.
+            match self.0.recv() {
+                Ok(()) => panic!("nothing ever sends into this channel"),
+                Err(_) => panic!("the sender must outlive this call, or the read didn't block"),
+            }
+        }
+    }
+
+    #[test]
+    fn read_hook_stdin_truncates_rather_than_erroring_on_an_oversized_payload() {
+        let oversized = vec![b'a'; 100];
+        let cap = 10;
+        let read = super::read_hook_stdin(
+            Box::new(std::io::Cursor::new(oversized)),
+            cap,
+            Duration::from_secs(5),
+        )
+        .expect("a reader that only ever returns real bytes must not hit the deadline");
+        assert_eq!(
+            read.len(),
+            cap as usize,
+            "an oversized payload must be truncated, never rejected as an error"
+        );
+        assert!(read.iter().all(|&byte| byte == b'a'));
+    }
+
+    #[test]
+    fn read_hook_stdin_gives_up_within_the_deadline_when_stdin_never_sends_eof() {
+        // The sender is held for this call's whole duration so `NeverEndingReader::read` really
+        // is blocked, not merely fast - `read_hook_stdin` must still return by its own deadline
+        // regardless, and the reader thread it abandoned is left for the process to clean up.
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let started = std::time::Instant::now();
+        let deadline = Duration::from_millis(50);
+        let read = super::read_hook_stdin(
+            Box::new(NeverEndingReader(receiver)),
+            MAX_HOOK_PAYLOAD_BYTES,
+            deadline,
+        );
+        assert_eq!(
+            read, None,
+            "a stdin that never sends EOF must be given up on, not waited for"
+        );
+        assert!(
+            started.elapsed() >= deadline,
+            "giving up may not happen before the deadline it is supposed to honour"
+        );
     }
 }

@@ -249,6 +249,116 @@ impl AdeApp {
     }
 }
 
+/// Where the `jerry` CLI binary lives, for hook and skill injection (decision Q8,
+/// `docs/architecture/decisions.md` §17, §19): a sibling of this process's own executable, then
+/// `bin/jerry` next to it, then `PATH`. Neither found means `None`, so a caller never injects a
+/// command pointing at nothing.
+pub fn find_jerry_binary() -> Option<PathBuf> {
+    let current_exe = std::env::current_exe().ok()?;
+    locate_jerry_binary(&current_exe, jerry_pty::resolve_on_path)
+}
+
+/// [`find_jerry_binary`], with the executable path and the `PATH` lookup injected - the seam a
+/// test drives against a fake directory layout rather than this machine's real install.
+fn locate_jerry_binary(
+    current_exe: &Path,
+    resolve_on_path: impl FnOnce(&str) -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    let name = if cfg!(windows) { "jerry.exe" } else { "jerry" };
+    let dir = current_exe.parent()?;
+    let sibling = dir.join(name);
+    if sibling.is_file() {
+        return Some(sibling);
+    }
+    let nested = dir.join("bin").join(name);
+    if nested.is_file() {
+        return Some(nested);
+    }
+    resolve_on_path("jerry")
+}
+
+#[cfg(test)]
+mod find_jerry_binary_tests {
+    use super::locate_jerry_binary;
+    use std::path::PathBuf;
+
+    /// A real, empty file at `path` - `locate_jerry_binary` only accepts what really exists, so
+    /// a fake layout needs a real (if empty) file at each candidate to be meaningful.
+    fn touch(path: &std::path::Path) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent");
+        }
+        std::fs::write(path, b"").expect("write");
+    }
+
+    fn exe_name() -> &'static str {
+        if cfg!(windows) {
+            "jerry.exe"
+        } else {
+            "jerry"
+        }
+    }
+
+    #[test]
+    fn a_sibling_of_the_running_executable_wins_over_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let current_exe = temp.path().join("jerry-app-bin").join("current-exe");
+        touch(&current_exe);
+        let sibling = current_exe.with_file_name(exe_name());
+        touch(&sibling);
+
+        let found = locate_jerry_binary(&current_exe, |_| {
+            panic!("must not fall back to PATH when a sibling exists")
+        });
+        assert_eq!(found, Some(sibling));
+    }
+
+    #[test]
+    fn a_bin_subdirectory_next_to_the_executable_is_the_second_place_checked() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let current_exe = temp.path().join("current-exe");
+        touch(&current_exe);
+        let nested = temp.path().join("bin").join(exe_name());
+        touch(&nested);
+
+        let found = locate_jerry_binary(&current_exe, |_| {
+            panic!("must not fall back to PATH when bin/jerry exists")
+        });
+        assert_eq!(found, Some(nested));
+    }
+
+    #[test]
+    fn path_is_the_last_resort() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let current_exe = temp.path().join("current-exe");
+        touch(&current_exe);
+        let on_path = PathBuf::from("/usr/local/bin/jerry");
+
+        let found = locate_jerry_binary(&current_exe, |name| {
+            assert_eq!(name, "jerry");
+            Some(on_path.clone())
+        });
+        assert_eq!(found, Some(on_path));
+    }
+
+    #[test]
+    fn none_of_the_three_existing_is_a_real_none_not_a_broken_guess() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let current_exe = temp.path().join("current-exe");
+        touch(&current_exe);
+
+        assert_eq!(locate_jerry_binary(&current_exe, |_| None), None);
+    }
+
+    #[test]
+    fn an_executable_with_no_parent_directory_is_also_a_real_none() {
+        assert_eq!(
+            locate_jerry_binary(std::path::Path::new(""), |_| None),
+            None
+        );
+    }
+}
+
 #[cfg(test)]
 mod app_dispatch_tests {
     use super::HostRuntime;

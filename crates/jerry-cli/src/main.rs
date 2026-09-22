@@ -12,6 +12,9 @@ fn main() -> ExitCode {
         std::env::args_os(),
         &|key| std::env::var_os(key),
         &cwd,
+        // Owned, not `.lock()`'d: `hook`'s stdin read runs on its own thread so a deadline can
+        // bound it, which needs a `'static` handle it can move rather than a borrowed lock.
+        Box::new(std::io::stdin()),
         &mut std::io::stdout().lock(),
         &mut std::io::stderr().lock(),
     );

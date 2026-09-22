@@ -4405,10 +4405,12 @@ dependencies = [
  "anyhow",
  "dunce",
  "env_logger",
+ "futures",
  "gpui",
  "gpui_platform",
  "image",
  "imara-diff",
+ "jerry-cli",
  "jerry-core",
  "jerry-git",
  "jerry-host",
@@ -4456,6 +4458,7 @@ name = "jerry-cli"
 version = "0.2.0"
 dependencies = [
  "clap",
+ "futures",
  "jerry-core",
  "jerry-git",
  "jerry-host",

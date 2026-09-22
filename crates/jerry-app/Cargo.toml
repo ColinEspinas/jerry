@@ -222,6 +222,11 @@ tree-sitter-md = "0.5.3"
 # `<script>` content into this crate's TypeScript grammar - which is why these two land together.
 tree-sitter-html = "0.23.2"
 tree-sitter-css = "0.25.0"
+# `crate::hooks`'s notification-consuming task (`LocalClient::subscribe`'s
+# `mpsc::UnboundedReceiver`, awaited with `StreamExt::next`) - already resolved transitively via
+# `jerry-host`/`jerry-core`, so this promotes an already-locked crate to a direct dependency
+# rather than adding new version surface, at the exact version those two already pin.
+futures = { workspace = true }
 # GitHub issue #226's sound design module (`crate::sound`) - real audio playback for the app-start
 # chime and the agent-attention sounds, decoding both the bundled built-in library
 # (`assets/sounds/`) and anything the user drops in `~/.config/jerry/sounds/`. `rodio`, not
@@ -437,6 +442,10 @@ tempfile = "3"
 # Shared, gpui-free fixtures (real seeded repositories, argv-only `git`, bounded waits,
 # `ChildGuard`) - see `docs/testing.md`.
 test-support = { path = "../test-support" }
+# `hooks::integration_tests` drives the real `jerry hook` path in-process (no real `jerry` binary
+# is available to a unit test): `jerry_cli::run` against a real `jerry_host::Host` on a temp
+# socket, exactly as the generated `--settings` command would invoke it as a subprocess.
+jerry-cli = { path = "../jerry-cli" }
 # `test-support` unlocks GPUI's real interactive test harness (`#[gpui::test]`,
 # `TestAppContext`/`VisualTestContext` - a real window, real focus tracking, real action
 # dispatch/keystroke simulation, not a mock). Kept as a permanent dependency, not a temporary

@@ -39,13 +39,13 @@ pub struct Settings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentsSettings {
-    /// GitHub issue #479: whether Jerry writes its managed forwarder entries into
+    /// GitHub issue #479: whether Jerry writes its managed `jerry hook <event>` entries into
     /// `~/.cursor/hooks.json` so a Jerry-spawned `cursor-agent` reports real status into the rail
     /// and History. Off by default - an explicit, reversible opt-in, unlike Superset's own
     /// default-on equivalent (see issue #479's design comment for the incident report that
     /// argues for being stricter here) - because this genuinely writes into a file the user owns,
     /// even though the entries themselves are inert for any `cursor-agent` session Jerry didn't
-    /// spawn (`crate::hooks::cursor_hooks_file`'s forwarder scripts no-op without Jerry's own
+    /// spawn (`jerry hook` no-ops without Jerry's own `JERRY_AGENT_ID`/`JERRY_HOST_SOCKET`
     /// environment).
     pub cursor_hooks_enabled: bool,
 }

@@ -829,13 +829,13 @@ mod tests {
         // for the shell arm outright - this pins that.
         let extras = Some((
             vec!["--settings".to_owned(), "/tmp/jerry.json".to_owned()],
-            vec![("JERRY_HOOK_TOKEN".to_owned(), "secret".to_owned())],
+            vec![("JERRY_HOST_SOCKET".to_owned(), "/tmp/jerry.sock".to_owned())],
         ));
         let shell = ProcessKind::Shell.spec(PathBuf::from("/tmp"), None, extras);
         assert!(shell.args.is_empty(), "a shell must get no injected args");
         assert!(
             shell.env.is_empty(),
-            "a shell must never see the hook token"
+            "a shell must never see the hook environment"
         );
     }
 
@@ -845,14 +845,14 @@ mod tests {
         // silently does nothing.
         let extras = Some((
             vec!["--settings".to_owned(), "/tmp/jerry.json".to_owned()],
-            vec![("JERRY_HOOK_PORT".to_owned(), "5000".to_owned())],
+            vec![("JERRY_HOST_SOCKET".to_owned(), "/tmp/jerry.sock".to_owned())],
         ));
         let spec = ProcessKind::claude().spec(PathBuf::from("/tmp"), None, extras);
         assert_eq!(spec.program, PathBuf::from("claude"));
         assert_eq!(spec.args, vec!["--settings", "/tmp/jerry.json"]);
         assert_eq!(
             spec.env,
-            vec![("JERRY_HOOK_PORT".to_owned(), "5000".to_owned())]
+            vec![("JERRY_HOST_SOCKET".to_owned(), "/tmp/jerry.sock".to_owned())]
         );
     }
 
@@ -860,10 +860,11 @@ mod tests {
     fn cursor_gets_env_only_hook_extras_claude_keeps_its_settings_flag_and_codex_gets_neither() {
         // GitHub issue #479's real gate, exercised against a real `HookInjection` (not a
         // hand-built fake tuple) - `cursor-agent` has no `--settings`-equivalent flag, so it must
-        // never receive one, while still getting the same env triplet Claude does.
-        let temp = tempfile::tempdir().expect("tempdir");
-        let runtime = crate::hooks::HookRuntime::start(temp.path()).expect("runtime must start");
-        let injection = runtime.injection();
+        // never receive one, while still getting the same env pair Claude does.
+        let injection = crate::hooks::HookInjection::for_test(
+            PathBuf::from("/tmp/jerry-hook-settings.json"),
+            PathBuf::from("/tmp/jerry.sock"),
+        );
 
         let (claude_args, claude_env) = hook_extras_for(ProcessKind::claude(), Some(&injection), 1)
             .expect("claude must get extras");
@@ -871,7 +872,8 @@ mod tests {
             claude_args.iter().any(|arg| arg == "--settings"),
             "claude keeps its --settings flag: {claude_args:?}"
         );
-        assert!(claude_env.iter().any(|(key, _)| key == "JERRY_HOOK_PORT"));
+        assert!(claude_env.iter().any(|(key, _)| key == "JERRY_HOST_SOCKET"));
+        assert!(claude_env.iter().any(|(key, _)| key == "JERRY_AGENT_ID"));
 
         let (cursor_args, cursor_env) = hook_extras_for(ProcessKind::cursor(), Some(&injection), 1)
             .expect("cursor must get extras");
@@ -879,7 +881,7 @@ mod tests {
             cursor_args.is_empty(),
             "cursor-agent has no --settings-equivalent flag: {cursor_args:?}"
         );
-        assert!(cursor_env.iter().any(|(key, _)| key == "JERRY_HOOK_PORT"));
+        assert!(cursor_env.iter().any(|(key, _)| key == "JERRY_HOST_SOCKET"));
 
         assert!(
             hook_extras_for(ProcessKind::codex(), Some(&injection), 1).is_none(),
@@ -967,7 +969,7 @@ impl AdeApp {
                 .spawn(async move { mint_chat_id(binary, &mint_cwd) })
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
-                let hook_injection = this.hook_injection_for(ProcessKind::Agent(agent_kind));
+                let hook_injection = this.hook_injection_for(ProcessKind::Agent(agent_kind), cx);
                 let id = match chat_id {
                     Some(chat_id) => this.agents.spawn_resume(
                         agent_kind,

@@ -937,7 +937,7 @@ impl AdeApp {
         // GitHub issue #479: reconciles `~/.cursor/hooks.json` against the current
         // `agents.cursor_hooks_enabled` setting on every launch, not only when the setting is
         // first turned on - see `crate::hooks::flow::AdeApp::reconcile_cursor_hooks`'s own docs
-        // for why that self-heals a stale entry from an older forwarder version or a toggle
+        // for why that self-heals a stale entry from an older Jerry install or a toggle
         // flipped while the app was closed. Unconditional for the same reason the update check
         // above is: it has nothing to do with which (if any) repo is focused.
         this.reconcile_cursor_hooks(cx);
