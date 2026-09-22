@@ -925,7 +925,7 @@ mod tests {
 
     #[test]
     fn a_path_outside_the_worktree_is_refused_rather_than_recorded_under_it() {
-        // A hook payload is untrusted input off a socket (see `crate::hooks::server`'s threat
+        // A hook payload is untrusted input off a socket (see `crate::hooks::inbox`'s threat
         // model), and its `file_path` is a string the model chose.
         let worktree = Path::new("/repo/wt-a");
         assert_eq!(

@@ -538,3 +538,66 @@ test app runs an unpublished in-process host on the deterministic test executor,
 merge tests drive the real dispatch path without a socket. `MergeFlowState` keeps its shape:
 its `Conflicted` variant already isolates the cursor, and the outcome-versus-error split the
 plan asked for was already there.
+
+## 19. `jerry hook` replaces the curl forwarder; hook facts arrive as host notifications
+
+**Status:** Accepted (2026-09-22, issue #500; decision Q10 of the UI-optional plan).
+
+**Context:** `hooks/server.rs` was a hand-rolled HTTP/1.1 listener on loopback, and
+`hooks/settings_file.rs` generated a per-launch forwarder script (`sh` on Unix, PowerShell on
+Windows) that curled `http://127.0.0.1:$JERRY_HOOK_PORT/hook?event=…` with a bearer token from
+`JERRY_HOOK_TOKEN`. Both the port and the token were launch-specific, baked into the generated
+`--settings` file's environment at spawn time - so an agent that outlived a Jerry restart kept
+posting to a dead port and a token nobody would ever check again (issue #274's finding). §17
+already gave every launch a real `jerry` binary to inject as a sibling of the running app; this
+issue spends it on the hook side-channel, its first caller.
+
+**Decision:** A generated hook entry now runs `<located jerry> hook <Event>` directly - no
+forwarder script, no curl, no port, no token. `jerry hook`
+(`crates/jerry-cli/src/lib.rs::hook`) reads stdin whole, parses it as JSON (falling back to
+`{"raw": "<text>"}` so nothing already-broken payload is silently dropped), sends
+`Request::Hook(HookEvent { event, payload })` through the same `Session` every other subcommand
+uses (`JERRY_HOST_SOCKET` then registry discovery), and unconditionally exits 0 - a short,
+dedicated timeout (`HOOK_CALL_TIMEOUT`, a few seconds) rather than the interactive-command one,
+since a hook runs inline with the agent's own tool call. The injected environment shrinks to
+`JERRY_AGENT_ID` plus `JERRY_HOST_SOCKET` (`crate::hooks::settings_file::{AGENT_ENV,
+SOCKET_ENV}`); `crate::host::find_jerry_binary` (sibling of `current_exe`, then `bin/` next to
+it, then `PATH`) locates the binary named in the generated command, and hook injection is
+withheld - not offered with a broken command - when it can't be found, or while the session
+host is still starting (a real, transient window every launch passes through once, not counted
+against the existing "bring-up attempted once" gate in `hooks/flow.rs`).
+
+On the receiving end, `jerry-host`'s dispatcher (already built by #495/#496) fans a `hook`
+request out to every connected client as an `event/hook` notification
+(`{agent, cwd, event, payload}`); `crate::hooks::HookRuntime::start` now takes the host's
+`LocalClient` and a `Context<AdeApp>` and spawns one `cx.background_spawn` task
+(`crate::hooks::spawn_consumer`) that loops `while let Some(message) = events.next().await`,
+feeding each `event/hook` notification's `event`/`payload` through the unchanged
+`event::parse` into the same `HookInbox`/`EditLog` pair `HookListener` used - moved, verbatim
+pure logic, into the new `crate::hooks::inbox` module once `server.rs`'s TCP listener had
+nothing left to own. `HookRuntime`'s public surface (`signal_for`, `text_for`, `session_id_for`,
+`run_facts_for`, `drain_edits`, `forget`) is unchanged, so `flow.rs` and the rail's poll are
+untouched. `cursor_hooks_file.rs`'s managed entries move the same way, but its own
+own-entry-matching couldn't keep using a stable, Jerry-owned forwarder directory (there is no
+forwarder to own a directory for): entries are now matched structurally, by
+`jerry`/`jerry.exe` appearing right before ` hook ` in the quoted command
+(`is_managed_entry`/`MANAGED_MARKERS`), which also means `remove_managed_entries` no longer
+needs a locatable binary at all - turning the setting off must work even after the binary that
+wrote an entry can no longer be found.
+
+**Consequences:** No TCP listener anywhere in the workspace, and no token at rest, in
+environment, or on a command line - `settings_file`'s own
+`the_settings_file_carries_nothing_launch_specific_but_the_jerry_path_and_the_event_name` test
+pins exactly that. `hooks/integration_tests.rs` and `provenance/integration_tests.rs` drive
+`jerry_cli::run` in-process against a real `jerry_host::Host` on a temp socket rather than a
+real `jerry` binary (none is available to a unit test) - and, discovered while writing them,
+GPUI's deterministic `TestScheduler` panics ("your test is not deterministic") the instant a
+genuinely independent OS thread wakes a `cx.background_spawn` task, which a real socket's
+listener/dispatch threads eventually do once a subscriber exists. `jerry-host`'s own listener is
+real OS threads by design (§15), so a `#[gpui::test]` can drive the real socket transport
+(`jerry_cli::run` end to end) only as a plain, non-gpui test, and can drive the app's own
+`HookRuntime` consumer only through the in-process `LocalClient` (`Call::agent` submitted
+directly, exactly as a socket client's request would dispatch) - never both at once in the same
+test. `gpui::TestAppContext::executor().allow_parking()` exists as an escape hatch for exactly
+this (verified against `gpui`'s own `scheduler` crate), and is the fallback if a future test
+genuinely needs both in one place, but every hook test here is expressible without it.

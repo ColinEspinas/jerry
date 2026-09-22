@@ -31,6 +31,17 @@ pub enum Command {
     /// Merge this worktree's branch into the repository's base branch, through Jerry's own
     /// merge flow: conflicts stay on disk for you to resolve, then `--continue` finishes.
     Merge(MergeArgs),
+    /// Forwards one agent hook event, read from stdin, to the Jerry that spawned this agent.
+    /// Jerry's own generated hook entry, not a stable part of the CLI surface - hidden from
+    /// `--help` accordingly.
+    #[command(hide = true)]
+    Hook(HookArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct HookArgs {
+    /// The agent CLI's own event name, e.g. `PreToolUse`.
+    pub event: String,
 }
 
 #[derive(Debug, Args)]

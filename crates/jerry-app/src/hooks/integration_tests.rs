@@ -1,109 +1,286 @@
-//! End-to-end tests for the agent hook side-channel (GitHub issue #239 phase 2).
+//! End-to-end tests for the agent hook side-channel (GitHub issue #239 phase 2; decision Q10,
+//! `docs/architecture/decisions.md` §19: `jerry hook` replaces the curl forwarder).
 
-use std::path::Path;
-use std::time::{Duration, Instant};
+use std::collections::HashMap;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use gpui::{AppContext as _, TestAppContext};
 
 use crate::hooks::event::HookFact;
-use crate::hooks::server::HookListener;
-use crate::hooks::settings_file::{HookFiles, AGENT_ENV, PORT_ENV, TOKEN_ENV};
+use crate::hooks::settings_file::{AGENT_ENV, SOCKET_ENV};
 use crate::rail::status::{derive_status, HookSignal, ProcessSignal, Status, TerminalSignal};
+use crate::test_support::open_test_app;
 use crate::work_surface::agents::ProcessKind;
 
-/// A `Command` that runs `command` through the same shell Claude Code would - `sh -c` on Unix,
-/// and on Windows the PowerShell that `crate::hooks::settings_file::windows_hook_entry`'s
-/// `"shell": "powershell"` asks Claude Code for.
-#[cfg(not(windows))]
-fn shell_running(command: &str) -> std::process::Command {
-    let mut process = std::process::Command::new("/bin/sh");
-    process.arg("-c").arg(command);
-    process
+/// A registry directory this test's own host publishes into - short enough for every platform's
+/// socket path limit, removed on drop even when the test fails. Mirrors
+/// `crate::host::app_dispatch_tests`'s own identically-shaped helper.
+struct RegistryDir {
+    path: PathBuf,
+    _temp: Option<tempfile::TempDir>,
 }
 
-/// See the `#[cfg(not(windows))]` twin above.
-#[cfg(windows)]
-fn shell_running(command: &str) -> std::process::Command {
-    let mut process = std::process::Command::new("powershell.exe");
-    process
-        .arg("-NoProfile")
-        .arg("-NonInteractive")
-        .arg("-Command")
-        .arg(command);
-    process
-}
-
-/// The generated `command` string for `event`, read out of the real generated settings file rather
-/// than reconstructed - so these tests exercise the string Claude Code itself would run, including
-/// its platform-specific quoting.
-fn generated_command(files: &HookFiles, event: &str) -> String {
-    let settings: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(files.settings_path()).expect("read"))
-            .expect("valid JSON");
-    settings["hooks"][event][0]["hooks"][0]["command"]
-        .as_str()
-        .unwrap_or_else(|| panic!("a {event} command"))
-        .to_owned()
-}
-
-/// A real `PreToolUse` body, captured verbatim from a real `claude` 2.1.228 run on this machine.
-const REAL_PAYLOAD: &str = r#"{"session_id":"5a4bef04-9e59-4d75-874d-928b1f8c3958","cwd":"/tmp/capture","permission_mode":"default","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"cargo test --workspace","description":"Run the test suite"},"tool_use_id":"toolu_017yNzAHSe1j6rqbwMkN7gJc"}"#;
-
-/// Blocks until `check` passes or the deadline expires - the forwarder is a real subprocess and
-/// the listener a real thread, so the handoff is genuinely asynchronous.
-fn wait_for(check: impl FnMut() -> bool) -> bool {
-    test_support::wait_until(Duration::from_secs(10), check)
-}
-
-#[test]
-fn the_real_forwarder_script_delivers_a_real_payload_end_to_end() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let listener = HookListener::start().expect("the listener must bind a real loopback port");
-    let files = HookFiles::write_in(temp.path()).expect("the generated files must be written");
-
-    // The real generated script, named by the real generated settings file - read the command out
-    // of the settings rather than reconstructing it, so this exercises the path Claude Code would
-    // actually run.
-    let command = generated_command(&files, "PreToolUse");
-
-    let agent_id = 42;
-    let mut child = shell_running(&command)
-        .env(PORT_ENV, listener.port().to_string())
-        .env(TOKEN_ENV, listener.token())
-        .env(AGENT_ENV, agent_id.to_string())
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("the generated hook command must be runnable");
-    {
-        use std::io::Write;
-        let mut stdin = child.stdin.take().expect("stdin");
-        stdin
-            .write_all(REAL_PAYLOAD.as_bytes())
-            .expect("write the payload");
+impl Drop for RegistryDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
     }
-    let output = child.wait_with_output().expect("wait");
+}
+
+fn registry_dir(tag: &str) -> RegistryDir {
+    if cfg!(windows) {
+        let path = jerry_core::registry::runtime_dir()
+            .expect("runtime dir")
+            .join(format!("hook-e2e-{:x}-{tag}", std::process::id()));
+        RegistryDir { path, _temp: None }
+    } else {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        RegistryDir {
+            path: temp.path().join("r"),
+            _temp: Some(temp),
+        }
+    }
+}
+
+/// A bare socket path (not a `Registry` directory) short enough for every platform's `sun_path`,
+/// removed on drop even when the test fails - for the two `external` tests below, which bind a
+/// raw `jerry_host::Host::listen` rather than going through registry allocation.
+struct SocketPath {
+    path: PathBuf,
+    _temp: Option<tempfile::TempDir>,
+}
+
+impl Drop for SocketPath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn socket_path(tag: &str) -> SocketPath {
+    if cfg!(windows) {
+        let dir = jerry_core::registry::runtime_dir().expect("runtime dir");
+        std::fs::create_dir_all(&dir).expect("runtime dir exists");
+        SocketPath {
+            path: dir.join(format!("hook-e2e-{}-{tag}.sock", std::process::id())),
+            _temp: None,
+        }
+    } else {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        SocketPath {
+            path: temp.path().join(format!("{tag}.sock")),
+            _temp: Some(temp),
+        }
+    }
+}
+
+/// A fake environment lookup closed over `pairs` - `jerry_cli::run`'s own shape.
+fn fake_env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
+    let map: HashMap<String, OsString> = pairs
+        .iter()
+        .map(|(key, value)| ((*key).to_owned(), OsString::from(*value)))
+        .collect();
+    move |key: &str| map.get(key).cloned()
+}
+
+/// The real path a generated hook entry's `jerry hook <event>` invocation takes, driven
+/// in-process rather than as a real subprocess: no real `jerry` binary is available to a unit
+/// test, but `jerry_cli::run` *is* the real transport all the way down to a real socket. Returns
+/// `(exit code, stdout, stderr)`.
+fn run_jerry_hook(
+    event: &str,
+    socket: &Path,
+    agent_id: crate::work_surface::agents::AgentId,
+    cwd: &Path,
+    payload: &[u8],
+) -> (u8, Vec<u8>, Vec<u8>) {
+    let socket_str = socket.to_str().expect("utf8 socket path");
+    let agent_str = agent_id.to_string();
+    let env = fake_env(&[(SOCKET_ENV, socket_str), (AGENT_ENV, &agent_str)]);
+    let mut stdin = payload;
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let code = jerry_cli::run(
+        ["jerry", "hook", event].map(OsString::from),
+        &env,
+        cwd,
+        &mut stdin,
+        &mut out,
+        &mut err,
+    );
+    (code, out, err)
+}
+
+/// Real socket, real `jerry_host::Host` dispatch thread, real `jerry_cli::run` - deliberately a
+/// plain `#[test]`, never a `#[gpui::test]`. GPUI's deterministic test scheduler panics
+/// ("Detected activity on thread ..., but test scheduler is running on ...: your test is not
+/// deterministic") the moment a genuinely independent OS thread wakes a `cx.background_spawn`
+/// task - which a real socket's listener/dispatch threads always eventually do once a request
+/// actually completes. `crates/jerry-host`'s own accept loop is real OS threads by design
+/// (decisions.md §15: "`jerry-core` owns no threads. The listener, dispatch task and session
+/// table are `jerry-host`'s"), so this half of the contract - the wire transport - is proven
+/// here, against the host's real, thread-driven dispatch, exactly like `jerry-host`'s and
+/// `jerry-cli`'s own test suites already do. The other half - the app's own `HookRuntime`
+/// consumer task correctly recording what a notification carries - is proven separately below,
+/// through the app's in-process `LocalClient`, which never crosses a real thread boundary and so
+/// stays inside a `#[gpui::test]` safely.
+#[test]
+fn jerry_hook_reaches_a_real_host_over_a_real_socket_and_the_notification_can_be_recorded() {
+    let repo = test_support::seed_empty_repo();
+    let socket = socket_path("real-transport");
+    let host = jerry_host::Host::start().expect("host");
+    host.listen(&socket.path).expect("listen");
+    let agent_id: crate::work_surface::agents::AgentId = 42;
+    host.agents().register(
+        jerry_core::AgentId::from(agent_id.to_string()),
+        repo.path().to_path_buf(),
+    );
+    let mut events = host.client().subscribe();
+
+    // The real invocation a generated hook entry performs, with exactly the environment
+    // `HookInjection::spawn_extras`/`env_only` would have injected into the agent's own process.
+    let (code, out, err) = run_jerry_hook(
+        "PreToolUse",
+        &socket.path,
+        agent_id,
+        repo.path(),
+        br#"{"tool_name":"Bash","tool_input":{"command":"cargo test --workspace"}}"#,
+    );
+    assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
+    assert!(out.is_empty());
+
+    let mut received = None;
     assert!(
-        output.status.success(),
-        "the forwarder must always exit 0, got {:?}: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
+        test_support::wait_until(Duration::from_secs(5), || {
+            received = events.try_recv().ok();
+            received.is_some()
+        }),
+        "the host must have fanned out an event/hook notification"
+    );
+    let jerry_core::Message::Notification { method, params } = received.expect("received") else {
+        panic!("expected a notification");
+    };
+    assert_eq!(method, "event/hook");
+    assert_eq!(params["agent"], serde_json::json!(agent_id.to_string()));
+    assert_eq!(params["event"], serde_json::json!("PreToolUse"));
+
+    // Exactly what `HookRuntime`'s own consumer task does with each notification - the free
+    // function both it and this test call, so a change to the parsing/recording logic is caught
+    // here even though the consumer's own async plumbing cannot safely be driven by a real socket
+    // inside a deterministic test.
+    let inbox = std::sync::Mutex::new(crate::hooks::inbox::HookInbox::default());
+    let edits = std::sync::Mutex::new(crate::hooks::inbox::EditLog::default());
+    super::record_hook_notification(&inbox, &edits, params);
+    let inbox = inbox.into_inner().expect("lock");
+    let record = inbox
+        .get(agent_id)
+        .expect("the real round-tripped fact must have been recorded");
+    assert_eq!(record.report.fact, HookFact::Working);
+    assert_eq!(
+        record.report.activity.as_deref(),
+        Some("Bash: cargo test --workspace")
     );
 
-    assert!(
-        wait_for(|| listener.signal_for(agent_id).fact.is_some()),
-        "the real payload must reach the listener through the real script"
-    );
+    host.shutdown_and_join();
+}
 
-    // ...and the fact must actually change what the rail would show. This is the whole chain:
-    // script -> socket -> parser -> inbox -> status derivation.
-    let signal = listener.signal_for(agent_id);
+/// The app's own `HookRuntime` consumer task, driven through the same in-process `LocalClient`
+/// `AdeApp::dispatch` itself uses - so this stays fully inside GPUI's deterministic executor
+/// (see the plain test above for why a real socket cannot join this one). A real, socket-backed
+/// `HostRuntime` is still swapped in for `open_test_app`'s own unpublished default so
+/// `HookInjection::env_only`'s `JERRY_HOST_SOCKET` string names a real path, matching production;
+/// nothing here ever connects to that socket.
+#[gpui::test]
+async fn a_hook_dispatched_through_the_apps_own_host_reaches_its_hook_runtimes_consumer_task(
+    cx: &mut TestAppContext,
+) {
+    let repo = test_support::seed_empty_repo();
+    let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
+
+    let registry = registry_dir("host");
+    let (runtime, dispatch) =
+        crate::host::HostRuntime::start(registry.path.clone()).expect("host must start");
+    let socket = runtime.socket().to_path_buf();
+    let agent_id: crate::work_surface::agents::AgentId = 42;
+    let client = app.update(cx, |app, cx| {
+        cx.background_spawn(dispatch).detach();
+        if let Some(agents) = runtime.agents() {
+            agents.register(
+                jerry_core::AgentId::from(agent_id.to_string()),
+                repo.path().to_path_buf(),
+            );
+        }
+        app.adopt_host(runtime, cx);
+        app.host_runtime
+            .as_ref()
+            .and_then(crate::host::HostRuntime::client)
+            .expect("the just-adopted host has a client")
+    });
+
+    // The app's own `HookRuntime`, brought up exactly as `hook_injection_for` would - but
+    // without going through its `find_jerry_binary` gate, which reads this machine's real `PATH`
+    // and this test binary's real location rather than anything this test controls. The path
+    // only ever ends up embedded in generated text; it is never actually executed here.
+    let hook_settings_dir = tempfile::tempdir().expect("hook settings dir");
+    app.update(cx, |app, cx| {
+        app.hook_runtime = crate::hooks::HookRuntime::start(
+            hook_settings_dir.path(),
+            Path::new("jerry"),
+            socket,
+            client.clone(),
+            cx,
+        );
+        assert!(
+            app.hook_runtime.is_some(),
+            "the runtime must start against a real, reachable host"
+        );
+    });
+    // The consumer task's first poll is what actually calls `LocalClient::subscribe` and
+    // registers it with the host's fanout; without this, the request below could broadcast its
+    // notification before anything is listening for it, and the message is gone rather than
+    // queued for a subscriber that arrives later.
+    cx.run_until_parked();
+
+    // The same call a generated hook entry's `jerry hook <event>` performs over a real socket,
+    // submitted here directly through the in-process `LocalClient` instead - see the module docs
+    // for why a real socket cannot join a `#[gpui::test]`.
+    let report = client
+        .request(jerry_core::Call::agent(
+            repo.path(),
+            jerry_core::AgentId::from(agent_id.to_string()),
+            jerry_core::Request::Hook(jerry_core::HookEvent {
+                event: "PreToolUse".to_owned(),
+                payload: serde_json::json!({
+                    "tool_name": "Bash",
+                    "tool_input": { "command": "cargo test --workspace" },
+                }),
+            }),
+        ))
+        .await
+        .expect("the host must accept a registered agent's hook");
+    assert!(report.is_ok(), "{report:?}");
+
+    cx.run_until_parked();
+
+    let signal = app.read_with(cx, |app, _| {
+        app.hook_runtime
+            .as_ref()
+            .expect("runtime")
+            .signal_for(agent_id)
+    });
     assert_eq!(signal.fact, Some(HookFact::Working));
-    let (activity, question) = listener.text_for(agent_id);
+    let (activity, question) = app.read_with(cx, |app, _| {
+        app.hook_runtime
+            .as_ref()
+            .expect("runtime")
+            .text_for(agent_id)
+    });
     assert_eq!(activity.as_deref(), Some("Bash: cargo test --workspace"));
     assert_eq!(question, None);
 
-    // An agent this quiet would otherwise be reported as needing input; the hook fact is what
-    // makes it Run.
+    // ...and the fact must actually change what the rail would show. This is the whole new
+    // chain: a hook request -> the real host's fanout -> this app's own notification-consuming
+    // task -> the inbox -> status derivation.
     let long_quiet = ProcessSignal::Running {
         idle: Duration::from_secs(600),
     };
@@ -132,45 +309,34 @@ fn the_real_forwarder_script_delivers_a_real_payload_end_to_end() {
 }
 
 #[test]
-fn a_forwarder_run_outside_jerry_reaches_no_listener_at_all() {
-    // The safety property that makes the generated command harmless if a user ever copies it into
-    // their own settings: with no JERRY_* environment it must not post anywhere, even though a
-    // real listener is running and would happily accept a correctly-tokened request.
-    let temp = tempfile::tempdir().expect("temp dir");
-    let listener = HookListener::start().expect("listener");
-    let files = HookFiles::write_in(temp.path()).expect("files");
-    let command = generated_command(&files, "Stop");
+fn a_hook_from_an_unregistered_agent_is_refused_but_never_touches_stdout() {
+    // The safety property that makes the generated command harmless if it somehow ran with a
+    // stale or forged `JERRY_AGENT_ID`: the host refuses it (`FORBIDDEN`), and `jerry hook`
+    // still exits 0 having printed nothing, exactly as it must for a dead listener under the old
+    // transport. A plain test (real socket, real thread) for the same reason the transport test
+    // above is one - see its own docs.
+    let repo = test_support::seed_empty_repo();
+    let socket = socket_path("unregistered");
+    let host = jerry_host::Host::start().expect("host");
+    host.listen(&socket.path).expect("listen");
 
-    let mut child = shell_running(&command)
-        .env_remove(PORT_ENV)
-        .env_remove(TOKEN_ENV)
-        .env_remove(AGENT_ENV)
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn");
-    {
-        use std::io::Write;
-        let mut stdin = child.stdin.take().expect("stdin");
-        let _ = stdin.write_all(REAL_PAYLOAD.as_bytes());
-    }
-    assert!(child.wait().expect("wait").success());
-
-    assert!(
-        test_support::stays_false(Duration::from_millis(300), || (0..64)
-            .any(|id| listener.signal_for(id).fact.is_some())),
-        "an unconfigured forwarder must not report anything for any agent id"
+    let (code, out, _err) = run_jerry_hook(
+        "Stop",
+        &socket.path,
+        99,
+        repo.path(),
+        br#"{"hook_event_name":"Stop"}"#,
     );
-    for id in 0..64 {
-        assert_eq!(
-            listener.signal_for(id).fact,
-            None,
-            "an unconfigured forwarder must not report anything for any agent id"
-        );
-    }
+    assert_eq!(
+        code, 0,
+        "a hook must never fail even when the host refuses it"
+    );
+    assert!(out.is_empty());
+    host.shutdown_and_join();
 }
 
-/// Set `JERRY_REQUIRE_REAL_CLAUDE=1` to turn every "no usable `claude` here" skip below into a
-/// hard failure.
+/// Set `JERRY_REQUIRE_REAL_CLAUDE=1` to turn every "no usable `claude`/`jerry` here" skip below
+/// into a hard failure.
 const REQUIRE_REAL_CLAUDE_ENV: &str = "JERRY_REQUIRE_REAL_CLAUDE";
 
 /// Reports a skip, or panics if [`REQUIRE_REAL_CLAUDE_ENV`] demands a real run.
@@ -182,8 +348,19 @@ fn skip_or_fail(reason: &str) {
 }
 
 /// The real `claude` binary, if one is installed and looks usable.
-fn real_claude() -> Option<std::path::PathBuf> {
+fn real_claude() -> Option<PathBuf> {
     jerry_pty::resolve_on_path("claude")
+}
+
+/// The real `jerry` binary, if one is reachable - unlike the in-process tests above, the two
+/// tests below spawn a real `claude`, which then spawns a real *subprocess* for its hook, so
+/// only a real file on disk will do. Cargo sets `CARGO_BIN_EXE_jerry` for this crate's own test
+/// binary because `jerry-cli` is now a dev-dependency of `crate::hooks::integration_tests`'s own
+/// crate (`jerry-app`'s `Cargo.toml`); `PATH` is the fallback for a manual run.
+fn real_jerry_binary() -> Option<PathBuf> {
+    option_env!("CARGO_BIN_EXE_jerry")
+        .map(PathBuf::from)
+        .or_else(|| jerry_pty::resolve_on_path("jerry"))
 }
 
 /// Runs a real, minimal `claude` turn in `cwd` with `settings`, returning whether it succeeded.
@@ -227,74 +404,117 @@ fn run_real_claude(
     }
 }
 
-#[ignore = "external: claude; see docs/testing.md"]
+/// Drains every notification already buffered on `events`, returning the last one - a completed
+/// `claude` turn has already finished posting every hook it will ever post by the time
+/// `run_real_claude` returns, so there is nothing left to race.
+fn last_buffered(
+    events: &mut futures::channel::mpsc::UnboundedReceiver<jerry_core::Message>,
+) -> Option<jerry_core::Message> {
+    let mut last = None;
+    while let Ok(message) = events.try_recv() {
+        last = Some(message);
+    }
+    last
+}
+
+#[ignore = "external: claude, jerry; see docs/testing.md"]
 #[test]
-fn a_real_claude_session_reports_its_hooks_to_a_real_jerry_listener() {
-    let Some(binary) = real_claude() else {
+fn a_real_claude_session_reports_its_hooks_to_a_real_jerry_host() {
+    let Some(claude) = real_claude() else {
         skip_or_fail(
             "no `claude` binary on PATH - the hook transport itself is still covered by the \
-             non-`claude` end-to-end test above",
+             non-`claude` end-to-end tests above",
+        );
+        return;
+    };
+    let Some(jerry) = real_jerry_binary() else {
+        skip_or_fail(
+            "no `jerry` binary reachable - cannot generate a real, runnable settings file",
         );
         return;
     };
 
     let temp = tempfile::tempdir().expect("temp dir");
-    let listener = HookListener::start().expect("listener");
-    let files = HookFiles::write_in(temp.path()).expect("files");
+    let socket = socket_path("real-claude");
+    let host = jerry_host::Host::start().expect("host");
+    host.listen(&socket.path).expect("listen");
+    let agent_id = 7u64;
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&project).expect("create project");
+    host.agents().register(
+        jerry_core::AgentId::from(agent_id.to_string()),
+        project.clone(),
+    );
+    let mut events = host.client().subscribe();
 
     // Exactly what Jerry itself would pass - built from the real production helper rather than
     // hand-assembled, so a change to either the args or the env is caught here.
-    let agent_id = 7;
+    let files = crate::hooks::settings_file::HookFiles::write_in(temp.path(), &jerry)
+        .expect("files must write");
     let args = vec![
         "--settings".to_owned(),
         files.settings_path().to_string_lossy().into_owned(),
     ];
     let env = vec![
-        (PORT_ENV.to_owned(), listener.port().to_string()),
-        (TOKEN_ENV.to_owned(), listener.token().to_owned()),
         (AGENT_ENV.to_owned(), agent_id.to_string()),
+        (
+            SOCKET_ENV.to_owned(),
+            socket.path.to_string_lossy().into_owned(),
+        ),
     ];
 
-    let project = temp.path().join("project");
-    std::fs::create_dir_all(&project).expect("create project");
-
-    if !run_real_claude(&binary, &project, &args, &env, None) {
+    if !run_real_claude(&claude, &project, &args, &env, None) {
         return;
     }
 
+    let mut last = None;
     assert!(
-        wait_for(|| listener.signal_for(agent_id).fact.is_some()),
+        test_support::wait_until(Duration::from_secs(10), || {
+            last = last_buffered(&mut events).or(last.take());
+            last.is_some()
+        }),
         "a real `claude` session run with Jerry's generated --settings must report at least one hook"
     );
     // A completed `-p` turn ends with a real `Stop`.
-    assert_eq!(
-        listener.signal_for(agent_id).fact,
-        Some(HookFact::TurnEnded),
-        "the last event of a completed turn must be the turn boundary"
-    );
+    match last.expect("received") {
+        jerry_core::Message::Notification { method, params } => {
+            assert_eq!(method, "event/hook");
+            assert_eq!(params["agent"], serde_json::json!(agent_id.to_string()));
+            assert_eq!(
+                params["event"], "Stop",
+                "the last event of a completed turn must be the turn boundary"
+            );
+        }
+        other => panic!("expected a notification, got {other:?}"),
+    }
+    host.shutdown_and_join();
 }
 
-#[ignore = "external: claude; see docs/testing.md"]
+#[ignore = "external: claude, jerry; see docs/testing.md"]
 #[test]
 fn jerry_s_settings_file_does_not_disable_the_user_s_own_hooks() {
     // The regression this whole feature must not cause. `--settings` merging (rather than
     // replacing) hook arrays is a real behavioural dependency on Claude Code, verified
-    // empirically rather than inferred - see `crate::hooks::settings_file`'s module docs. If a
-    // future Claude Code release changed this to "replace", Jerry would silently switch off
-    // hooks its users configured themselves, and this test is what would catch it.
+    // empirically rather than inferred. If a future Claude Code release changed this to
+    // "replace", Jerry would silently switch off hooks its users configured themselves, and
+    // this test is what would catch it.
     //
     // Still Unix-only, and for a reason that is about the *test*, not about Jerry: the two
     // stand-in "user" hooks it plants are `echo ... >> <file>` shell commands, and it redirects
-    // `HOME` to keep the real `~/.claude` untouched. Neither has a one-line Windows equivalent
-    // (`USERPROFILE`, a different shell, a different settings location), and what is being pinned
-    // here is Claude Code's *merge* behaviour, which is a property of Claude Code rather than of
-    // the platform. The Windows-specific halves - the generated command, the forwarder, the
-    // transport - are covered by the two tests above, which do run there.
+    // `HOME` to keep the real `~/.claude` untouched. Neither has a one-line Windows equivalent,
+    // and what is being pinned here is Claude Code's *merge* behaviour, which is a property of
+    // Claude Code rather than of the platform.
     if !cfg!(unix) {
         return;
     }
-    let Some(binary) = real_claude() else {
+    let Some(claude) = real_claude() else {
         skip_or_fail("no `claude` binary on PATH - cannot verify --settings merge behaviour");
+        return;
+    };
+    let Some(jerry) = real_jerry_binary() else {
+        skip_or_fail(
+            "no `jerry` binary reachable - cannot generate a real, runnable settings file",
+        );
         return;
     };
 
@@ -319,16 +539,27 @@ fn jerry_s_settings_file_does_not_disable_the_user_s_own_hooks() {
     .expect("write project");
 
     // Jerry's real generated file, written outside the project exactly as in production.
-    let files = HookFiles::write_in(temp.path()).expect("files");
-    let listener = HookListener::start().expect("listener");
+    let files = crate::hooks::settings_file::HookFiles::write_in(temp.path(), &jerry)
+        .expect("files must write");
+    let socket = socket_path("merge-check");
+    let host = jerry_host::Host::start().expect("host");
+    host.listen(&socket.path).expect("listen");
+    let agent_id = 5u64;
+    host.agents().register(
+        jerry_core::AgentId::from(agent_id.to_string()),
+        project.clone(),
+    );
+    let mut events = host.client().subscribe();
     let args = vec![
         "--settings".to_owned(),
         files.settings_path().to_string_lossy().into_owned(),
     ];
     let env = vec![
-        (PORT_ENV.to_owned(), listener.port().to_string()),
-        (TOKEN_ENV.to_owned(), listener.token().to_owned()),
-        (AGENT_ENV.to_owned(), "5".to_owned()),
+        (AGENT_ENV.to_owned(), agent_id.to_string()),
+        (
+            SOCKET_ENV.to_owned(),
+            socket.path.to_string_lossy().into_owned(),
+        ),
     ];
 
     // A temp HOME so the real `~/.claude/settings.json` is never touched. Credentials are copied
@@ -342,7 +573,7 @@ fn jerry_s_settings_file_does_not_disable_the_user_s_own_hooks() {
         let _ = std::fs::copy(real_home.join(".claude.json"), home.join(".claude.json"));
     }
 
-    if !run_real_claude(&binary, &project, &args, &env, Some(&home)) {
+    if !run_real_claude(&claude, &project, &args, &env, Some(&home)) {
         return;
     }
 
@@ -356,9 +587,11 @@ fn jerry_s_settings_file_does_not_disable_the_user_s_own_hooks() {
         "the project's own .claude hook must still fire alongside Jerry's - got {fired:?}"
     );
     assert!(
-        wait_for(|| listener.signal_for(5).fact.is_some()),
+        test_support::wait_until(Duration::from_secs(10), || last_buffered(&mut events)
+            .is_some()),
         "and Jerry's own hooks must fire too - got {fired:?}"
     );
+    host.shutdown_and_join();
 }
 
 /// The end-to-end test that covers what a *user* does, through the objects a user's click really
@@ -368,27 +601,33 @@ fn jerry_s_settings_file_does_not_disable_the_user_s_own_hooks() {
 /// [`crate::hooks::HookRuntime`] brought up by the real lazy `hook_injection_for` gate - then
 /// asserts the fact comes back out of the app's own runtime under that agent's own real id.
 ///
-/// The tests above this one hand-assemble the `--settings` argument and the `JERRY_*` environment
-/// from the production helpers and hand them to a `std::process::Command`. That pins Claude
-/// Code's half of the contract and nothing at all of Jerry's: every step between a click and the
-/// child process - the lazy runtime bring-up, the Claude-only gate, whether the `AgentId` in the
-/// environment is the one the rail reads back, `ProcessKind::spec`, `TerminalSpec::env`,
-/// `jerry_pty`'s `CommandBuilder` - is skipped by all of them. This one skips none of it, which is
-/// the whole reason it exists: a regression anywhere along that chain would leave every other
-/// test in this file green.
-#[ignore = "external: claude; see docs/testing.md"]
+/// Needs a real, socket-listening host swapped in for the test app's own default
+/// (`HostRuntime::in_process`, which a spawned `jerry hook` subprocess has nothing to connect
+/// to) and a real, locatable `jerry` binary - both graceful skips, matching `real_claude()`'s own
+/// shape, rather than a hard requirement of this test file.
+#[ignore = "external: claude, jerry; see docs/testing.md"]
 #[gpui::test]
-fn a_claude_agent_spawned_through_the_real_app_path_really_reports_its_hooks(
+async fn a_claude_agent_spawned_through_the_real_app_path_really_reports_its_hooks(
     cx: &mut gpui::TestAppContext,
 ) {
-    if real_claude().is_none() {
+    let Some(_claude) = real_claude() else {
         skip_or_fail("no `claude` binary on PATH - the real spawn path cannot be exercised");
         return;
-    }
+    };
+    let Some(jerry) = real_jerry_binary() else {
+        skip_or_fail("no `jerry` binary reachable - hook injection would be silently disabled");
+        return;
+    };
 
     let repo = tempfile::tempdir().expect("tempdir");
     let (app, cx) =
         crate::root::focus::palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
+
+    let registry = registry_dir("real-app-path");
+    let (runtime, dispatch) =
+        crate::host::HostRuntime::start(registry.path.clone()).expect("host must start");
+    std::thread::spawn(move || futures::executor::block_on(dispatch));
+    app.update(cx, |app, cx| app.adopt_host(runtime, cx));
 
     let (id, pane) = app.update_in(cx, |app, window, cx| {
         app.new_agent(ProcessKind::claude(), window, cx);
@@ -404,24 +643,18 @@ fn a_claude_agent_spawned_through_the_real_app_path_really_reports_its_hooks(
     // The real command line and environment this spawn produced - asserted from the pane the app
     // itself built, not from a reconstruction of what it ought to have built.
     let spec = pane.read_with(cx, |pane, _| pane.spec_for_test().clone());
-    assert_eq!(spec.program, std::path::PathBuf::from("claude"));
+    assert_eq!(spec.program, PathBuf::from("claude"));
     assert_eq!(
         spec.args.first().map(String::as_str),
         Some("--settings"),
         "a real Claude spawn must carry the generated settings file, got {:?}",
         spec.args
     );
-    let settings_path = std::path::PathBuf::from(&spec.args[1]);
+    let settings_path = PathBuf::from(&spec.args[1]);
     assert!(
         settings_path.is_file(),
         "the settings path handed to `claude` must really exist on disk: {}",
         settings_path.display()
-    );
-    assert!(
-        settings_path
-            .with_file_name(crate::hooks::settings_file::FORWARDER_NAME)
-            .is_file(),
-        "the forwarder script the settings file names must really exist"
     );
     let injected: std::collections::HashMap<&str, &str> = spec
         .env
@@ -433,10 +666,16 @@ fn a_claude_agent_spawned_through_the_real_app_path_really_reports_its_hooks(
         Some(id.to_string().as_str()),
         "the environment must name the same agent id the rail reads this agent's status back under"
     );
-    assert!(injected.contains_key(PORT_ENV) && injected.contains_key(TOKEN_ENV));
+    assert!(
+        injected.contains_key(SOCKET_ENV),
+        "the environment must name the real host socket, or the spawned `jerry hook` has \
+         nothing to connect to"
+    );
     assert!(
         app.read_with(cx, |app, _| app.hook_runtime.is_some()),
-        "the lazy runtime must have been brought up by this spawn"
+        "the lazy runtime must have been brought up by this spawn, which needs a locatable \
+         `jerry` binary: {}",
+        jerry.display()
     );
 
     // Claude Code will not start a session in a directory it has never seen until a human answers
@@ -452,8 +691,8 @@ fn a_claude_agent_spawned_through_the_real_app_path_really_reports_its_hooks(
             std::thread::sleep(Duration::from_millis(50));
         }
     }
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
         pump(cx, 10);
         let asking = pane.read_with(cx, |pane, _| {
             pane.visible_text_lines()
@@ -468,7 +707,7 @@ fn a_claude_agent_spawned_through_the_real_app_path_really_reports_its_hooks(
     }
 
     // `SessionStart` fires as soon as the session really starts, so nothing has to be typed.
-    let started = Instant::now();
+    let started = std::time::Instant::now();
     let mut fact = None;
     while started.elapsed() < Duration::from_secs(90) && fact.is_none() {
         pump(cx, 4);

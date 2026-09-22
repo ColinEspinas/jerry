@@ -1,20 +1,18 @@
-//! The whole chain, end to end: a real hook request on the real loopback listener, a real file
-//! written between its two phases, a real `AdeApp` drain, and a real change set out the other side
-//! (GitHub issue #284).
+//! The whole chain, end to end: a real `jerry hook` invocation over a real host socket, a real
+//! file written between its two phases, a real `AdeApp` drain, and a real change set out the
+//! other side (GitHub issue #284).
 //!
 //! Everything else in this folder tests one link. `store`'s tests never see a socket, `change_set`'s
 //! never see an agent, `hooks::event`'s never see a file. This one skips no link, which is the
-//! whole reason it exists: the joins between them - the `AgentId` in the query string being the one
-//! the app can resolve to a worktree, the durable agent key being the one the change set reports,
-//! the drain running at all - are exactly what every other test in this folder assumes.
+//! whole reason it exists: the joins between them - the `AgentId` in the call envelope being the
+//! one the app can resolve to a worktree, the durable agent key being the one the change set
+//! reports, the drain running at all - are exactly what every other test in this folder assumes.
 
-use std::io::{Read, Write};
-use std::net::TcpStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use gpui::EntityInputHandler as _;
+use gpui::{AppContext as _, EntityInputHandler as _};
 
-use crate::hooks::settings_file::{PORT_ENV, TOKEN_ENV};
+use crate::hooks::settings_file::{AGENT_ENV, SOCKET_ENV};
 use crate::provenance::{AgentKey, Author};
 use crate::test_support::{open_test_app, temp_repo_with};
 use crate::work_surface::agents::ProcessKind;
@@ -36,7 +34,7 @@ impl UserApi {
 ";
 
 #[gpui::test]
-fn a_real_hook_edit_event_becomes_a_real_per_agent_attribution_on_a_real_change_set_row(
+async fn a_real_hook_edit_event_becomes_a_real_per_agent_attribution_on_a_real_change_set_row(
     cx: &mut gpui::TestAppContext,
 ) {
     let repo = temp_repo_with(|root| {
@@ -46,8 +44,50 @@ fn a_real_hook_edit_event_becomes_a_real_per_agent_attribution_on_a_real_change_
 
     let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
-    // A real Claude agent through the app's own path - which is also what brings the real hook
-    // listener up (`AdeApp::hook_injection_for`'s lazy, Claude-only gate).
+    // A real, socket-listening host swapped in for the test app's own default
+    // (`HostRuntime::in_process`, which a real `jerry hook` invocation has nothing to connect
+    // to), and the app's own `HookRuntime` brought up against it directly - bypassing
+    // `hook_injection_for`'s `find_jerry_binary` gate, which reads this machine's real `PATH`
+    // rather than anything this test controls. Once `hook_runtime` already exists,
+    // `hook_injection_for` (which the real spawn below still goes through) reuses it as-is.
+    //
+    // The dispatch loop runs on GPUI's own background executor (`cx.background_spawn`), not a
+    // raw `std::thread` - GPUI's deterministic test scheduler panics ("your test is not
+    // deterministic") the moment a genuinely independent OS thread wakes a `cx.background_spawn`
+    // task, which a raw-thread dispatch loop's own fan-out eventually does once `HookRuntime`'s
+    // consumer task subscribes to it. The hook calls below go through the same in-process
+    // `LocalClient` for the identical reason - see `hooks::integration_tests`'s own module docs
+    // for the full explanation and where the real-socket transport is proven instead.
+    let registry = registry_dir("provenance-e2e");
+    let (host_runtime, dispatch) =
+        crate::host::HostRuntime::start(registry.path.clone()).expect("host must start");
+    let socket = host_runtime.socket().to_path_buf();
+    let client = app.update(cx, |app, cx| {
+        cx.background_spawn(dispatch).detach();
+        app.adopt_host(host_runtime, cx);
+        app.host_runtime
+            .as_ref()
+            .and_then(crate::host::HostRuntime::client)
+            .expect("the just-adopted host has a client")
+    });
+    let hook_settings_dir = tempfile::tempdir().expect("hook settings dir");
+    app.update(cx, |app, cx| {
+        app.hook_runtime = crate::hooks::HookRuntime::start(
+            hook_settings_dir.path(),
+            Path::new("jerry"),
+            socket.clone(),
+            client.clone(),
+            cx,
+        );
+        assert!(
+            app.hook_runtime.is_some(),
+            "the runtime must start against a real host"
+        );
+    });
+
+    // A real Claude agent through the app's own path, which registers it with the real host's
+    // agent table (`Agents::spawn_inner`) and injects the real socket into its environment
+    // (`HookInjection::spawn_extras`).
     let spawned = app.update_in(cx, |app, window, cx| {
         app.new_agent(ProcessKind::claude(), window, cx);
         let agent = app.agents.iter().last()?;
@@ -61,44 +101,60 @@ fn a_real_hook_edit_event_becomes_a_real_per_agent_attribution_on_a_real_change_
                 crate::work_surface::agents::AgentKind::Claude,
                 agent.spawned_at_unix,
             ),
-            env.get(PORT_ENV)?.parse::<u16>().ok()?,
-            env.get(TOKEN_ENV)?.clone(),
+            env.get(AGENT_ENV)?.clone(),
+            env.get(SOCKET_ENV)?.clone(),
         ))
     });
     cx.run_until_parked();
 
-    let Some((id, cwd, key, port, token)) = spawned else {
-        // No listener means this machine could not bind loopback or write the forwarder - a real
-        // state `HookRuntime::start` degrades to, and not this test's subject.
-        eprintln!("skipping: no real hook runtime came up for a real Claude spawn");
-        return;
+    let Some((id, cwd, key, agent_env, socket_env)) = spawned else {
+        panic!("a real Claude spawn against a real host must always carry the hook environment");
     };
+    assert_eq!(agent_env, id.to_string());
+    assert_eq!(socket_env, socket.to_string_lossy());
     let key = AgentKey::new(key);
     let file = cwd.join("src/api/users.rs");
 
     // The real sequence of one `Edit` tool call, in the real order: the payload before the write,
-    // the write itself, then the payload after it. The bodies are the shape a real `claude`
-    // 2.1.228 sends (see `crate::hooks::event`'s own captured constants).
+    // the write itself, then the payload after it, submitted through the same in-process
+    // `LocalClient` a generated hook entry's `jerry hook <event>` would reach over a real socket
+    // (see the module docs above for why this test cannot use the real socket directly). The
+    // bodies are the shape a real `claude` 2.1.228 sends (see `crate::hooks::event`'s own
+    // captured constants).
+    // Built with `serde_json::json!`, not a hand-formatted string template: a real Windows path
+    // embeds backslashes (`C:\...`), which are not valid JSON escapes unless the serializer
+    // itself escapes them.
     let body = |event: &str| {
-        format!(
-            r#"{{"session_id":"5a4bef04","cwd":"{cwd}","hook_event_name":"{event}","tool_name":"Edit","tool_input":{{"file_path":"{file}","old_string":"orm","new_string":"QueryBuilder"}},"tool_use_id":"toolu_01"}}"#,
-            cwd = cwd.display(),
-            file = file.display()
-        )
+        serde_json::json!({
+            "session_id": "5a4bef04",
+            "cwd": cwd.display().to_string(),
+            "hook_event_name": event,
+            "tool_name": "Edit",
+            "tool_input": {
+                "file_path": file.display().to_string(),
+                "old_string": "orm",
+                "new_string": "QueryBuilder",
+            },
+            "tool_use_id": "toolu_01",
+        })
     };
-    post(
-        port,
-        &token,
-        &format!("event=PreToolUse&agent={id}"),
-        &body("PreToolUse"),
-    );
+    send_hook(&client, "PreToolUse", &agent_env, &cwd, body("PreToolUse")).await;
+    // The host answering the request only means `dispatch::handle` broadcast the notification -
+    // not that this app's own consumer task has already pulled it off the channel and taken its
+    // "before" snapshot. Without this, the snapshot could be taken *after* the write below,
+    // which is exactly the "diffs clean against itself" bug `AgentEdit::before`'s own docs warn
+    // about.
+    cx.run_until_parked();
     std::fs::write(&file, USERS_RS_AFTER).expect("the agent's own write");
-    post(
-        port,
-        &token,
-        &format!("event=PostToolUse&agent={id}"),
-        &body("PostToolUse"),
-    );
+    send_hook(
+        &client,
+        "PostToolUse",
+        &agent_env,
+        &cwd,
+        body("PostToolUse"),
+    )
+    .await;
+    cx.run_until_parked();
 
     app.update(cx, |app, cx| {
         app.apply_agent_edits(cx);
@@ -207,21 +263,56 @@ fn a_real_save_through_jerrys_own_editor_flips_exactly_its_own_lines_to_you(
     });
 }
 
-/// A real HTTP POST to the real listener, exactly as the forwarder script makes it.
-fn post(port: u16, token: &str, query: &str, body: &str) {
-    let request = format!(
-        "POST /hook?{query} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\n\
-         Content-Length: {}\r\n\r\n{body}",
-        body.len()
-    );
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the real listener");
-    stream
-        .write_all(request.as_bytes())
-        .expect("write the request");
-    let mut response = String::new();
-    let _ = stream.read_to_string(&mut response);
-    assert!(
-        response.starts_with("HTTP/1.1 204"),
-        "the listener must accept a real hook request, got: {response}"
-    );
+/// A registry directory this test's own host publishes into - short enough for every platform's
+/// socket path limit, removed on drop even when the test fails. Mirrors
+/// `crate::host::app_dispatch_tests`'s own identically-shaped helper.
+struct RegistryDir {
+    path: PathBuf,
+    _temp: Option<tempfile::TempDir>,
+}
+
+impl Drop for RegistryDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+fn registry_dir(tag: &str) -> RegistryDir {
+    if cfg!(windows) {
+        let path = jerry_core::registry::runtime_dir()
+            .expect("runtime dir")
+            .join(format!("provenance-e2e-{:x}-{tag}", std::process::id()));
+        RegistryDir { path, _temp: None }
+    } else {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        RegistryDir {
+            path: temp.path().join("r"),
+            _temp: Some(temp),
+        }
+    }
+}
+
+/// The call a generated hook entry's `jerry hook <event>` performs, submitted directly through
+/// the app's own in-process `LocalClient` rather than a real socket - see this file's module
+/// docs for why a real socket cannot join a `#[gpui::test]`. `agent_id` is the exact
+/// `JERRY_AGENT_ID` text a real spawn's environment carries (`AgentId::to_string()`).
+async fn send_hook(
+    client: &jerry_host::LocalClient,
+    event: &str,
+    agent_id: &str,
+    cwd: &Path,
+    payload: serde_json::Value,
+) {
+    let report = client
+        .request(jerry_core::Call::agent(
+            cwd,
+            jerry_core::AgentId::from(agent_id),
+            jerry_core::Request::Hook(jerry_core::HookEvent {
+                event: event.to_owned(),
+                payload,
+            }),
+        ))
+        .await
+        .expect("the host must accept a registered agent's hook");
+    assert!(report.is_ok(), "{report:?}");
 }

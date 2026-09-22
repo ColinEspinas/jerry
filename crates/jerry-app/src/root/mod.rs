@@ -487,12 +487,13 @@ pub struct AdeApp {
     /// a double-click starting two overlapping `git write-tree` runs against the same worktree,
     /// mirroring [`Self::worktree_history_op_in_flight`]'s own single-flight discipline.
     pub(crate) review_mark_in_flight: Option<AgentId>,
-    /// The live agent-hook side-channel for this launch (GitHub issue #239 phase 2): a loopback
-    /// listener plus the generated `--settings`/forwarder files every Claude agent is spawned
-    /// against. `None` when hook support couldn't start (an unsupported platform, a loopback that
-    /// wouldn't bind, an unwritable temp directory) *or* for the many tests that never opted into
-    /// it - in both cases every agent simply falls back to the Phase 1 terminal-title and
-    /// quiescence signals, which is exactly the pre-phase-2 behaviour.
+    /// The live agent-hook side-channel for this launch (GitHub issue #239 phase 2; decision Q10,
+    /// `docs/architecture/decisions.md` §19): the generated `--settings` file every Claude agent
+    /// is spawned against, plus the task consuming `event/hook` notifications from the session
+    /// host. `None` when hook support couldn't start (an unsupported platform, an unwritable temp
+    /// directory, no locatable `jerry` binary, no session host yet) *or* for the many tests that
+    /// never opted into it - in both cases every agent simply falls back to the Phase 1
+    /// terminal-title and quiescence signals, which is exactly the pre-phase-2 behaviour.
     pub(crate) hook_runtime: Option<crate::hooks::HookRuntime>,
     /// Whether bring-up of [`Self::hook_runtime`] has already been attempted, so a *failed*
     /// attempt is not silently retried on every subsequent Claude spawn - see

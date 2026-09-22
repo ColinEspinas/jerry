@@ -56,7 +56,7 @@ pub struct PersistedAgentStatus {
     /// payload (GitHub issue #227, `crate::hooks::event::HookReport::prompt`).
     pub title: Option<String>,
     /// How many turns this run really completed - one per `Stop`
-    /// (`crate::hooks::server::HookRecord::turns`). `0` for a run that ended inside its first
+    /// (`crate::hooks::inbox::HookRecord::turns`). `0` for a run that ended inside its first
     /// turn, and for every record written before this field existed; the reader treats zero as
     /// "not known" rather than printing `0 turns`.
     #[serde(default)]

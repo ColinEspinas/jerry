@@ -12,6 +12,7 @@ fn main() -> ExitCode {
         std::env::args_os(),
         &|key| std::env::var_os(key),
         &cwd,
+        &mut std::io::stdin().lock(),
         &mut std::io::stdout().lock(),
         &mut std::io::stderr().lock(),
     );

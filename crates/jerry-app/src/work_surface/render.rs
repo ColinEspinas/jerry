@@ -123,7 +123,7 @@ impl AdeApp {
         // `--settings` file and told, through its environment, where to report its hooks. Taken as
         // an owned snapshot because `self.agents.spawn` borrows `self.agents` mutably - see
         // `crate::hooks::HookRuntime::injection`.
-        let hook_injection = self.hook_injection_for(kind);
+        let hook_injection = self.hook_injection_for(kind, cx);
         let id = self.agents.spawn(
             kind,
             cwd,
@@ -564,7 +564,7 @@ impl AdeApp {
         // A respawned agent is a freshly spawned one in every other respect, so it gets the same
         // real hook injection - otherwise "Retry" would silently produce an agent whose status
         // fell back to the quiescence heuristic.
-        let hook_injection = self.hook_injection_for(kind);
+        let hook_injection = self.hook_injection_for(kind, cx);
         let respawned = self.agents.spawn(
             kind,
             cwd,
@@ -1661,7 +1661,7 @@ impl AdeApp {
                     this.spawn_with_minted_chat_id(kind, cwd, cx);
                     return;
                 }
-                let hook_injection = this.hook_injection_for(ProcessKind::Agent(kind));
+                let hook_injection = this.hook_injection_for(ProcessKind::Agent(kind), cx);
                 let id = this.agents.spawn(
                     ProcessKind::Agent(kind),
                     cwd,
@@ -3181,9 +3181,10 @@ mod tab_scoping_tests {
         let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
 
         let hook_temp = crate::test_support::temp_root();
-        let runtime = crate::hooks::HookRuntime::start(hook_temp.path())
-            .expect("the hook runtime must start in a test sandbox");
-        let injection = runtime.injection();
+        let injection = crate::hooks::HookInjection::for_test(
+            hook_temp.path().join("jerry-hook-settings.json"),
+            PathBuf::from("/tmp/jerry.sock"),
+        );
         let session_id = "5af4c210-34fa-4ab2-9c35-f6ceab76551c".to_owned();
 
         let pane = app.update_in(cx, |app, window, cx| {

@@ -51,7 +51,7 @@ impl AdeApp {
         // GitHub issue #239 phase 2's injection, exactly as a fresh spawn would get it - a
         // resumed conversation is exactly as real an agent as a new one, and should keep
         // reporting its status through the same hook side-channel.
-        let hook_injection = self.hook_injection_for(process_kind);
+        let hook_injection = self.hook_injection_for(process_kind, cx);
         let font_size = self.settings.appearance.terminal_font_size;
         let shell_override = self.settings.terminal.shell_override();
         let id = match (past.kind, past.session_id.clone()) {
@@ -94,10 +94,11 @@ impl AdeApp {
         true
     }
 
-    /// The hook injection for an agent about to be spawned, bringing the listener up on first use.
+    /// The hook injection for an agent about to be spawned, bringing the runtime up on first use.
     pub(crate) fn hook_injection_for(
         &mut self,
         kind: crate::work_surface::agents::ProcessKind,
+        cx: &mut Context<Self>,
     ) -> Option<crate::hooks::HookInjection> {
         use crate::work_surface::agents::{AgentKind, ProcessKind};
         let wants_injection = match kind {
@@ -114,23 +115,50 @@ impl AdeApp {
         }
         // Bring-up is attempted exactly once per `AdeApp`. Keyed on a `tried` flag rather than on
         // `hook_runtime.is_none()`, because those differ precisely in the failure case: without
-        // it, an instance that cannot start a runtime re-ran the whole attempt - a `bind`, a
-        // directory sweep, a `mkdir`, two file writes - on the UI thread on *every* subsequent
-        // Claude spawn, and re-logged the same warning each time, for a condition (no usable
-        // loopback, an unwritable temp directory) that will not have changed since the last try.
-        if !self.hook_runtime_tried {
-            self.hook_runtime_tried = true;
-            self.hook_runtime = crate::hooks::HookRuntime::start(&std::env::temp_dir());
+        // it, an instance that cannot start a runtime re-ran the whole attempt on the UI thread
+        // on *every* subsequent Claude spawn, and re-logged the same warning each time, for a
+        // condition that will not have changed since the last try.
+        //
+        // The one exception: the session host still starting is *not* counted as an attempt.
+        // Every launch passes through a real, transient window where `Self::start_host`'s async
+        // bring-up (`crate::host`) has not finished yet, and unlike an unwritable temp directory
+        // or a missing `jerry` binary, that resolves itself within moments - burning the one shot
+        // on it would permanently disable hook injection for the whole session over a race.
+        if self.hook_runtime.is_none() && !self.hook_runtime_tried {
+            let ready = self.host_runtime.as_ref().and_then(|runtime| {
+                runtime
+                    .client()
+                    .map(|client| (client, runtime.socket().to_path_buf()))
+            });
+            if let Some((client, host_socket)) = ready {
+                self.hook_runtime_tried = true;
+                match crate::host::find_jerry_binary() {
+                    Some(jerry_binary) => {
+                        self.hook_runtime = crate::hooks::HookRuntime::start(
+                            &std::env::temp_dir(),
+                            &jerry_binary,
+                            host_socket,
+                            client,
+                            cx,
+                        );
+                    }
+                    None => log::warn!(
+                        "could not locate the `jerry` binary next to this executable, under its \
+                         bin/, or on PATH - agent hook injection is disabled; agent status will \
+                         use the terminal-title and quiescence signals only"
+                    ),
+                }
+            }
         }
         self.hook_runtime
             .as_ref()
-            .map(|runtime| runtime.injection())
+            .map(crate::hooks::HookRuntime::injection)
     }
 
     /// Reconciles `~/.cursor/hooks.json` against the current `agents.cursor_hooks_enabled`
     /// setting (GitHub issue #479): installs Jerry's managed entries when it's on, removes them
     /// when it's off. Called once at startup (`Self::start_update_check_loop`'s own call site in
-    /// `crate::root::state`) so a stale entry from an older forwarder version, or a toggle flipped
+    /// `crate::root::state`) so a stale entry from an older Jerry install, or a toggle flipped
     /// while the app was closed, self-heals - and again immediately whenever the setting itself
     /// flips, so turning it on or off has a real, immediate effect rather than "next restart".
     /// Every real filesystem call happens on the background executor
@@ -148,19 +176,27 @@ impl AdeApp {
         }
         let enabled = self.settings.agents.cursor_hooks_enabled;
         cx.background_spawn(async move {
-            let (Some(hooks_json), Some(forwarder)) = (
-                crate::hooks::cursor_hooks_file::hooks_json_path(),
-                crate::hooks::cursor_hooks_file::forwarder_path(),
-            ) else {
+            let Some(hooks_json) = crate::hooks::cursor_hooks_file::hooks_json_path() else {
                 log::warn!("could not resolve a home directory - Cursor agent hooks are skipped");
                 return;
             };
             let result = if enabled {
-                crate::hooks::cursor_hooks_file::ensure_forwarder_written(&forwarder).and_then(
-                    |()| crate::hooks::cursor_hooks_file::install(&hooks_json, &forwarder),
-                )
+                match crate::host::find_jerry_binary() {
+                    Some(jerry_binary) => {
+                        crate::hooks::cursor_hooks_file::install(&hooks_json, &jerry_binary)
+                    }
+                    None => {
+                        log::warn!(
+                            "could not locate the `jerry` binary - Cursor agent hooks are skipped"
+                        );
+                        return;
+                    }
+                }
             } else {
-                crate::hooks::cursor_hooks_file::remove_managed_entries(&hooks_json, &forwarder)
+                // Removal needs no `jerry_binary`: matching is structural (see
+                // `cursor_hooks_file`'s own docs), so a toggle can be turned off even when the
+                // binary that wrote an entry can no longer be found.
+                crate::hooks::cursor_hooks_file::remove_managed_entries(&hooks_json)
             };
             if let Err(err) = result {
                 log::warn!("could not reconcile {}: {err}", hooks_json.display());
@@ -237,7 +273,7 @@ impl AdeApp {
             activity: Option<String>,
             question: Option<String>,
             session_id: Option<String>,
-            run_facts: crate::hooks::server::RunFacts,
+            run_facts: crate::hooks::inbox::RunFacts,
         }
 
         let entries: Vec<RecordedEntry> = recordable

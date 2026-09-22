@@ -2,7 +2,7 @@
 //! `crate::hooks::event` produces for Claude Code (GitHub issue #479). Kept as a real second
 //! parser rather than teaching `event::parse` a second schema: Cursor's field names, casing and
 //! per-event shape don't match Claude's at all, so unifying them would only be indirection -
-//! everything downstream (`crate::hooks::server`'s inbox/edit recording,
+//! everything downstream (`crate::hooks::inbox`'s inbox/edit recording,
 //! `crate::hooks::flow::AdeApp::record_agent_statuses`, History) reads the shared [`HookReport`]
 //! type and doesn't know or care which parser produced it.
 //!
@@ -85,7 +85,7 @@ pub fn parse(event_name: &str, payload: &[u8]) -> Option<HookReport> {
         // `text` (the assistant's final message, what Claude gets for free on
         // `Stop.last_assistant_message`), but threading it onto the following `stop` needs
         // per-agent state kept across two calls, and `parse()` is pure with no memory of the last
-        // payload. That pairing lives in the *caller* instead (`crate::hooks::server`'s
+        // payload. That pairing lives in the *caller* instead (`crate::hooks::inbox`'s
         // `edits`/`inbox`, keyed by `AgentId`), so `text` is dropped here rather than this module
         // growing a second, parallel state-tracking mechanism. `HookFact::Working`, not a fifth
         // variant, since the agent genuinely is still mid-turn.
