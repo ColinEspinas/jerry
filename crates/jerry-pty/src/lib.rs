@@ -534,6 +534,17 @@ fn resolve_cwd(cwd: Option<PathBuf>) -> Result<PathBuf, PtyError> {
 /// does not need it repeated on the channel), and otherwise, once `exit_read` fires, hands off to
 /// [`drain_final_output`] for a bounded final drain and the `Exited` item - see that function's
 /// docs for why this is what makes `Exited` a real "nothing more is coming" guarantee.
+///
+/// The master fd reaching real EOF/hangup - Linux reports this as an `EIO` read error, macOS as an
+/// `Ok(0)` read (`filedescriptor::poll` itself differs too: macOS's `poll` is `select`-backed and
+/// reports the fd as read-ready rather than `POLLHUP`, see `filedescriptor::unix::macos`) - is
+/// *not* treated as the stream ending: the direct child closes its last fd to the slave (hence the
+/// master hangs up) as part of exiting, which routinely happens before [`run_wait_loop`]'s
+/// `Child::wait()` call returns and wakes `exit_read`. Stopping here would drop `Exited` on
+/// exactly the common case this crate exists to get right - see the "a quiet child" scenario in
+/// `docs/architecture/decisions.md` §8. Once the master is confirmed closed this way, the loop
+/// stops polling/reading it (avoiding a busy-spin on Linux, where `POLLHUP` stays set) and waits
+/// out `shutdown_read`/`exit_read` instead via [`await_exit_after_master_closed`].
 #[cfg(unix)]
 fn run_reader_loop(
     mut reader: Box<dyn Read + Send>,
@@ -580,7 +591,17 @@ fn run_reader_loop(
         }
 
         match reader.read(&mut buf) {
-            Ok(0) => break,
+            Ok(0) => {
+                await_exit_after_master_closed(
+                    shutdown_fd,
+                    exit_fd,
+                    &mut reader,
+                    master_fd,
+                    &exit_status_rx,
+                    &mut output_tx,
+                );
+                break;
+            }
             Ok(n) => {
                 let chunk = PtyOutput::Bytes(buf[..n].to_vec());
                 // Blocks this thread - and so, transitively, `read`, the kernel pty buffer, and
@@ -591,7 +612,59 @@ fn run_reader_loop(
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => break,
+            Err(_) => {
+                // Linux's `EIO` on a hungup pty master lands here.
+                await_exit_after_master_closed(
+                    shutdown_fd,
+                    exit_fd,
+                    &mut reader,
+                    master_fd,
+                    &exit_status_rx,
+                    &mut output_tx,
+                );
+                break;
+            }
+        }
+    }
+}
+
+/// Waits for whichever of `shutdown_fd`/`exit_fd` fires once the master fd has already gone away -
+/// reached from [`run_reader_loop`] on `EIO`/`Ok(0)`. Only these two fds remain, so there is
+/// nothing to busy-spin on; `exit_fd` firing still routes through the ordinary
+/// [`drain_final_output`] (which itself tolerates an already-closed master, finding nothing to
+/// drain and going straight to the exit status), and `shutdown_fd` firing still skips `Exited`,
+/// matching [`run_reader_loop`]'s own priority between the two.
+#[cfg(unix)]
+fn await_exit_after_master_closed(
+    shutdown_fd: RawFd,
+    exit_fd: RawFd,
+    reader: &mut Box<dyn Read + Send>,
+    master_fd: RawFd,
+    exit_status_rx: &mpsc::Receiver<ExitStatus>,
+    output_tx: &mut futures_mpsc::Sender<PtyOutput>,
+) {
+    loop {
+        let mut pfds = [
+            filedescriptor::pollfd {
+                fd: shutdown_fd,
+                events: filedescriptor::POLLIN,
+                revents: 0,
+            },
+            filedescriptor::pollfd {
+                fd: exit_fd,
+                events: filedescriptor::POLLIN,
+                revents: 0,
+            },
+        ];
+        if filedescriptor::poll(&mut pfds, None).is_err() {
+            return;
+        }
+        if pfds[0].revents != 0 {
+            return;
+        }
+        if pfds[1].revents != 0 {
+            drain_final_output(reader, master_fd, exit_status_rx, output_tx);
+            return;
         }
     }
 }

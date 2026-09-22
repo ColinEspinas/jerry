@@ -301,6 +301,18 @@ the drain stops the moment nothing is immediately available, then sends `Exited`
 `TerminalPane` and this crate's own test drains treat `Exited` as terminal (stopping at the first
 one) rather than draining past it.
 
+A quiet child (nothing left holding the slave open) routinely reaches real pty EOF/hangup on its
+own *before* `run_wait_loop`'s `Child::wait()` returns and wakes `exit_read` - a fast `wait()` for
+the parent still has to wait out process-table bookkeeping the kernel already did at child exit,
+including closing the child's fds. Linux reports that as an `EIO` read error; macOS - whose
+`filedescriptor::poll` is `select`-backed rather than real `poll(2)`, and so reports the fd as
+plain read-ready instead of `POLLHUP` - as an `Ok(0)` read. Earlier code treated either as the
+stream ending and returned from the reader thread immediately, which is exactly backwards: nothing
+had signalled `exit_read` yet, so `Exited` was simply never sent and the guarantee above did not
+hold on either platform. The reader now treats `EIO`/`Ok(0)` as "master done, not thread done": it
+stops polling/reading the master fd (avoiding a busy spin against Linux's still-set `POLLHUP`) and
+blocks on `[shutdown_read, exit_read]` alone until one fires, then proceeds exactly as above.
+
 *Windows* (a strong heuristic, not a hard guarantee, and documented as such): `PeekNamedPipe`
 against a real handle to the ConPTY output pipe was considered and is not reachable at all (see the
 Windows paragraph above for what was actually checked) - but even a real handle would only have
