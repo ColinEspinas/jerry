@@ -2,10 +2,12 @@
 //! (`docs/architecture/decisions.md` §14/§24): `jerry-host`, detached from `jerry-app` or
 //! `jerry-cli`. Windows escapes via `CREATE_BREAKAWAY_FROM_JOB`; unix via a new process group,
 //! so nothing in the spawning process's own job/session can drag the child down with it.
-
-// Windows-only: every call here is either a safe `std` wrapper (`creation_flags`) or a Win32
-// FFI query, each with its own SAFETY comment - see CLAUDE.md's Rust standards.
-#![cfg_attr(windows, allow(unsafe_code))]
+//!
+//! Every call here is a safe `std` wrapper (`creation_flags`/`process_group`) - no `unsafe`, and
+//! this crate stays that way (CLAUDE.md's Rust standards). Detecting *why* a spawn failed - a
+//! forbidding job, read via Win32 FFI - is `jerry-app`'s/`jerry-host`'s own
+//! `job_object::breakaway_is_forbidden_for_current_process`, the two places that FFI is
+//! sanctioned; a caller of `jerry_core::host_spawn::spawn_or_connect_with` injects it.
 
 use std::ffi::OsStr;
 use std::process::{Command, Stdio};
@@ -47,52 +49,6 @@ pub fn new_detached_command(program: impl AsRef<OsStr>) -> Command {
     command
 }
 
-/// Windows only: whether the job this process currently belongs to (if any) forbids
-/// `CREATE_BREAKAWAY_FROM_JOB` - read directly from the OS rather than guessed from a failed
-/// spawn's error code, exactly as `docs/architecture/decisions.md` §14's spike proved.
-/// `Ok(false)` also covers "not in a job at all", since nothing then forbids anything.
-#[cfg(windows)]
-pub fn breakaway_is_forbidden_for_current_process() -> std::io::Result<bool> {
-    use windows_sys::core::BOOL;
-    use windows_sys::Win32::System::JobObjects::{
-        IsProcessInJob, JobObjectExtendedLimitInformation, QueryInformationJobObject,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
-    };
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-
-    let mut in_any_job: BOOL = 0;
-    // SAFETY: `GetCurrentProcess` returns this process's own valid pseudo-handle; a null job
-    // handle asks "in any job at all"; `in_any_job` addresses a live, uniquely borrowed stack
-    // `BOOL` the callee writes exactly once.
-    let ok = unsafe { IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &mut in_any_job) };
-    if ok == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    if in_any_job == 0 {
-        return Ok(false);
-    }
-
-    let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-    // SAFETY: a null job handle queries the calling process's own job (confirmed above to be a
-    // member of exactly one); the buffer pointer addresses a live, uniquely borrowed stack value
-    // sized exactly to `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`, which the callee writes into and
-    // does not retain past the call. The return-length pointer is null: the exact size asked for
-    // is already known.
-    let ok = unsafe {
-        QueryInformationJobObject(
-            std::ptr::null_mut(),
-            JobObjectExtendedLimitInformation,
-            std::ptr::from_mut(&mut info).cast(),
-            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            std::ptr::null_mut(),
-        )
-    };
-    if ok == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(info.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_BREAKAWAY_OK == 0)
-}
-
 #[cfg(test)]
 mod detached_command_tests {
     use super::new_detached_command;
@@ -114,19 +70,5 @@ mod detached_command_tests {
             "`git --version` must exit 0, got {:?}",
             output.status
         );
-    }
-}
-
-#[cfg(all(test, windows))]
-mod breakaway_detection_tests {
-    use super::breakaway_is_forbidden_for_current_process;
-
-    /// nextest gives every test its own process, so this test's own job membership (if any) is
-    /// whatever the test harness itself set up - never a job this test created, so the exact
-    /// answer is unknown, but the OS query must at least succeed rather than error.
-    #[test]
-    fn querying_this_process_own_job_information_succeeds_on_real_windows() {
-        breakaway_is_forbidden_for_current_process()
-            .expect("IsProcessInJob/QueryInformationJobObject must succeed for this process");
     }
 }

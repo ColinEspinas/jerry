@@ -515,6 +515,55 @@ greps `jerry_git::`/`jerry_pty::`/`jerry_lsp::` and its baseline counts are unch
 rename moves no call. Older entries in this file were rewritten to the new names in the same PR;
 `CHANGELOG.md` keeps the names each release shipped with, and the table above is the map.
 
+## 14. Windows spike: a session host can outlive the app (GitHub issue #494)
+
+**Status:** Accepted - all four points pass on real Windows 11 hardware. The spike branch itself
+(`spike/494-windows-host-survival`) never merged and issue #494 stayed open; this entry exists so
+the later citations of "§14" throughout `jerry-pty`, `jerry-host` and decisions.md §24 resolve to
+something real rather than a dangling reference. Condensed from the spike's own findings - see
+`crates/jerry-app/src/windows_host_survival_spike.rs` on that branch for the full multi-process
+test harness, not reproduced here.
+
+**Context:** Stage 3 of the `jerry-core`/`jerry-cli`/`jerry-host` overhaul needs `jerry-host` to
+survive the app that spawned it - a restart, a crash, an update. Decision §11's kill-on-close job
+kills *everything* when Jerry dies, by design, the opposite of what a surviving host needs, so
+before any of stage 3 was built this had to be proven possible on Windows at all.
+
+**Decision - the four points, and what exactly passed:**
+
+1. **PASS** - a process inside a kill-on-close job survives its own exit's job-close by spawning a
+   child with `CREATE_BREAKAWAY_FROM_JOB`. The exact shape: `creation_flags` *replaces* rather than
+   ORs into whatever a prior call set, so every flag that must survive has to be repeated in the
+   same call - `CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB | CREATE_NEW_PROCESS_GROUP` together
+   (`jerry_pty::new_detached_command`, §24). The parent then returns, its job's last handle closes
+   with it, and the child - polled by a real Win32 liveness check
+   (`OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, ..)` +
+   `WaitForSingleObject(handle, 0)`) - is still running afterward.
+2. **PASS** - a job that forbids breakaway is detected and reported as a typed error, never a
+   silent in-job fallback spawn. Detection is a real, second Win32 read distinct from interpreting
+   the failed spawn's OS error code: `IsProcessInJob(GetCurrentProcess(), null, &mut in_any_job)`
+   to confirm the process is jobbed at all, then `QueryInformationJobObject(null,
+   JobObjectExtendedLimitInformation, &mut info, ..)` with a **null job handle**, which answers for
+   the calling process's own job with no handle to it needed -
+   `info.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_BREAKAWAY_OK == 0` is the forbidding
+   case (`jerry_app::job_object::breakaway_is_forbidden_for_current_process`, §24).
+3. **PASS** - the surviving child gives its *own* descendants a fresh kill-on-close job,
+   independent of whatever job (if any) contains it - the same job-object creation/assignment
+   pair decision §11 already uses, reused unmodified and now proven to also work for a process
+   that arrived at its current state via breakaway rather than at cold start.
+4. **PASS** - the host spawns a ConPTY session through `jerry_pty::spawn` (unmodified), the
+   original parent has already exited, and a third process keeps reading live output and can
+   resize it. One real Windows-specific snag, not a claim failure: ConPTY's own startup Device
+   Status Report query (`\x1b[6n`) withholds further output until answered, exactly as
+   `jerry_pty::pty_session_tests` already documents for its own Windows tests.
+
+**Consequences:** Stage 3 proceeds without a Windows-specific fallback design - the same
+`CREATE_BREAKAWAY_FROM_JOB` + self-owned job + `jerry_pty::spawn` shape this spike proved is real
+`jerry-host` architecture (§24), not a spike-only trick. A process that escaped a job via
+breakaway is not reachable by anything in its spawner's own process (no `Drop`, no `ChildGuard`,
+no tree-kill) - real `jerry-host` needs its own idle/linger self-check for exactly this reason
+(§24's `Host::run_lifecycle`), not as an afterthought.
+
 ## 15. `jerry-core` is a contract crate: JSON-RPC 2.0 on the wire, `Locality` on every action, no threads
 
 **Status:** Accepted (2026-09-22, issue #495; decisions Q3, Q4 and Q10 of the UI-optional plan).
@@ -1186,14 +1235,34 @@ that proof.
   timer in this crate (§16): idleness is inherently about elapsed time, nothing else to wake on.
 - **Control-plane additions to `jerry-core`:** `AppCommand::Shutdown` (`Locality::Session`,
   `Invocability::Denied`, modeled exactly like `SessionSpawn`/`SessionKill` - never actually
-  reaches `Command::execute`, `jerry-host`'s dispatcher special-cases it and calls `Inner::
-  request_shutdown` directly) and `Method::Subscribe`/`Request::Subscribe` (`event/subscribe`, the
-  one client-to-host method in the `event/` namespace - every other `Event(_)` name stays
-  host-to-client only, refused as an incoming request exactly as before). Both have real fixtures
-  (`fixtures/request-command-shutdown.json`, `fixtures/request-subscribe.json`) and round-trip
-  through `Call::examples`'s existing mechanical fixture test; `Shutdown` appears in the MCP tool
-  catalogue (denied to agents, same as every other Session-locality command), `Subscribe` does not
-  (`crate::mcp::tool_for` excludes it - it opens a stream, not a typed call/response).
+  reaches `Command::execute`, `jerry-host`'s dispatcher special-cases it) and `Method::Subscribe`/
+  `Request::Subscribe` (`event/subscribe`, the one client-to-host method in the `event/`
+  namespace - every other `Event(_)` name stays host-to-client only, refused as an incoming
+  request exactly as before). Both have real fixtures (`fixtures/request-command-shutdown.json`,
+  `fixtures/request-subscribe.json`) and round-trip through `Call::examples`'s existing mechanical
+  fixture test; `Shutdown` appears in the MCP tool catalogue (denied to agents, same as every
+  other Session-locality command), `Subscribe` does not (`crate::mcp::tool_for` excludes it - it
+  opens a stream, not a typed call/response). Deliberately, `dispatch::handle`'s `Shutdown` arm
+  does **not** call `Inner::request_shutdown` itself - see "The `Shutdown` reply must be written
+  before the wake it causes" below for why that call moved to each transport instead.
+- **The `Shutdown` reply must be written before the wake it causes.** The first cut called
+  `Inner::request_shutdown` inside `dispatch::handle`, synchronously, before the reply had even
+  been handed to the socket's writer thread - a real bug caught by CI (Linux only; macOS/Windows
+  happened to flush first): `Host::run_lifecycle` woke, `main`'s `Host::shutdown` ran, and
+  `Inner::close_connections` could sever the requesting socket before its own `Report::Ok` had
+  been written, so the client saw `Frame(Closed)` instead of its answer. Fixed by moving the
+  trigger to each transport, once it has actually seen its own reply go out: `LocalClient::call`
+  fires it right after `Inner::submit` resolves (no separate flush step to race for an in-process
+  caller); `listener::serve`'s reader thread instead records the pending response's `RequestId` in
+  a small `Mutex<Option<RequestId>>` shared with the writer thread, and the writer thread - the
+  one place that knows `write_frame` (which flushes) has actually completed for that exact
+  message - fires the wake immediately after, never before. Regression-tested by
+  `lifecycle_tests::a_shutdown_reply_always_arrives_before_the_socket_closes`, which repeats the
+  real spawn-a-host-and-shut-it-down sequence ~20 times against a real socket, since a single pass
+  rarely reproduces a thread-scheduling race. `Host::shutdown` called directly (not through the
+  `Shutdown` command at all) now also calls `Inner::request_shutdown` itself, so the same "wakes
+  a concurrently running `run_lifecycle`" guarantee holds for that path too
+  (`lifecycle_tests::calling_shutdown_directly_also_wakes_a_concurrently_running_lifecycle_loop`).
 - **`event/subscribe` gates the fanout, in `jerry-host`'s listener, not the dispatcher.** Every
   socket connection used to become a fanout sink automatically on accept
   (`Fanout::subscribe_socket`, unconditionally, in `listener::serve`); now a connection is a sink
@@ -1212,15 +1281,35 @@ that proof.
   connects), or spawns `jerry-host --repo --registry-dir` detached and polls the registry by real
   connect attempts (never a bare timer) up to `spawn_deadline`. One implementation, not two: both
   `jerry host start` and (once wired - see below) `jerry-app`'s own `HostRuntime` are meant to call
-  this, so the real `CREATE_BREAKAWAY_FROM_JOB`/process-group FFI is written once.
-- **The Windows detached spawn itself, in `jerry_pty::new_detached_command`/`breakaway_is_forbidden_
-  for_current_process`** (promoted from a throwaway spike file to production `jerry-pty` API,
-  §14's exact findings): `CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB | CREATE_NEW_PROCESS_GROUP`
-  on Windows (`creation_flags` *replaces*, so `CREATE_NO_WINDOW` is repeated rather than assumed
-  from `jerry_pty::new_std_command`); `process_group(0)` plus closed stdio on unix. A spawn failure
-  is inspected for a forbidding job via a real `IsProcessInJob`/`QueryInformationJobObject` read
-  (§14 point 2, not guessed from the OS error code) and surfaced as `SpawnOrConnectError::
-  BreakawayForbidden` - never a silent in-job fallback spawn.
+  this.
+- **`jerry-core` stays free of this workspace's Win32 job-object FFI entirely - CLAUDE.md's
+  unsafe list is unchanged.** `jerry_pty::new_detached_command` sets `CREATE_BREAKAWAY_FROM_JOB`/
+  `CREATE_NEW_PROCESS_GROUP` on Windows and `process_group(0)` on unix - both safe `std` wrapper
+  calls, no `unsafe` - but *detecting* a forbidding job needs the real
+  `IsProcessInJob`/`QueryInformationJobObject` read (§14 point 2), which is `unsafe` FFI. An
+  earlier draft put that read in `jerry-pty` itself; moved instead to
+  `jerry_app::job_object::breakaway_is_forbidden_for_current_process`, alongside the sanctioned
+  kill-on-close job code CLAUDE.md's unsafe list already names, and to `jerry-host`'s own
+  `job_object.rs` as the second sanctioned home if that binary ever needs the same check for
+  itself. `host_spawn::spawn_or_connect_with` takes this as an injected `breakaway_forbidden: impl
+  Fn() -> bool` closure, called only once a real spawn attempt has already failed, to classify
+  that failure - never to decide whether to attempt the spawn. The public `spawn_or_connect`
+  passes `|| false` (a plain `jerry host start` from a shell has no job of its own worth
+  checking); a caller that can tell injects its own `job_object::
+  breakaway_is_forbidden_for_current_process` instead and gets the specific
+  `SpawnOrConnectError::BreakawayForbidden`, never a silent in-job fallback spawn.
+- **`Registry::claim` closes the gap between `resolve` answering `None` and a caller actually
+  spawning.** Without it, two callers racing `spawn_or_connect` for the same repository could both
+  see no live host and both spawn one. `claim(repo, max_age)` creates `<hash-of-repo>.spawning` via
+  `create_new` - exactly one racing caller gets `Ok(true)` and proceeds to spawn; the rest get
+  `Ok(false)` and wait for the winner's descriptor instead (`spawn_and_wait`'s own
+  `wait_for_descriptor` helper, reused either way). A claim older than the spawn deadline is
+  stale - its holder must have died mid-spawn - and is swept and retried, the same "sweep on
+  discovery" pattern `Registry::resolve` already uses for dead descriptors. The hash is a plain
+  FNV-1a over the canonical repo path, not `RandomState` (per-process keyed, unsuitable - two
+  processes must compute the same file name) or `DefaultHasher` (no cross-version stability
+  guarantee). `registry_tests::exactly_one_of_two_concurrent_claims_for_the_same_repository_wins`
+  is the regression test: two real threads racing `claim` against one registry directory.
 - **`jerry_core::jerry_binary::locate_named`**, generalizing the existing `jerry`-only lookup to
   any sibling binary (`jerry`, `jerry-host`) by the same three tiers (sibling, `bin/`, one
   directory up); `locate()` is now `locate_named("jerry")`.

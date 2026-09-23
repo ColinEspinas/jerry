@@ -8,11 +8,11 @@ use crate::{HostError, Inner};
 use futures::executor::block_on;
 use jerry_core::client::{Listener, Stream};
 use jerry_core::wire::{read_frame, rpc_code, write_frame, FrameError};
-use jerry_core::{Call, Message, Report, RpcError};
+use jerry_core::{Call, Message, Report, RequestId, RpcError};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 pub(crate) struct Listening {
@@ -78,13 +78,33 @@ fn serve(inner: Arc<Inner>, stream: Stream) {
     // `jerry` CLI call) must not count toward `Inner::is_idle`'s "connected client" half, nor
     // receive events it never asked for. `event/subscribe`, below, opts a connection in.
 
+    // Set by the reader thread, just before queuing a `Shutdown` command's own successful
+    // response, to that response's id - the one thing the writer thread (the only place that
+    // knows a message has actually been written and flushed) needs to recognize it as the
+    // reply to wait for before waking `Host::run_lifecycle`. Waking any earlier would race
+    // `Host::shutdown`'s own connection teardown against this reply still being in flight - a
+    // real bug on Linux, where the close reliably won that race.
+    let pending_shutdown_reply: Arc<Mutex<Option<RequestId>>> = Arc::new(Mutex::new(None));
+
+    let writer_inner = Arc::clone(&inner);
+    let writer_pending = Arc::clone(&pending_shutdown_reply);
     let writer = thread::Builder::new()
         .name("jerry-host-writer".into())
         .spawn(move || {
             for message in inbox {
+                let is_the_awaited_shutdown_reply = match &message {
+                    Message::Response { id, .. } => {
+                        let mut pending = crate::lock(&writer_pending);
+                        pending.as_ref() == Some(id) && pending.take().is_some()
+                    }
+                    _ => false,
+                };
                 if let Err(error) = write_frame(&mut writer_stream, &message) {
                     log::debug!("jerry-host: connection write ended: {error}");
                     break;
+                }
+                if is_the_awaited_shutdown_reply {
+                    writer_inner.request_shutdown();
                 }
             }
         });
@@ -131,13 +151,20 @@ fn serve(inner: Arc<Inner>, stream: Stream) {
                     continue;
                 }
                 let result = match Call::from_wire(&method, params) {
-                    Ok(call) => match block_on(inner.submit(call)) {
-                        Ok(result) => result,
-                        Err(_cancelled) => Err(RpcError::new(
-                            rpc_code::SHUTTING_DOWN,
-                            "the host dropped the request",
-                        )),
-                    },
+                    Ok(call) => {
+                        let is_shutdown = crate::dispatch::is_shutdown(&call);
+                        let dispatched = match block_on(inner.submit(call)) {
+                            Ok(result) => result,
+                            Err(_cancelled) => Err(RpcError::new(
+                                rpc_code::SHUTTING_DOWN,
+                                "the host dropped the request",
+                            )),
+                        };
+                        if is_shutdown && dispatched.is_ok() {
+                            *crate::lock(&pending_shutdown_reply) = Some(id.clone());
+                        }
+                        dispatched
+                    }
                     Err(error) => Err(error),
                 };
                 // A response is never dropped for a full backlog: block until the writer

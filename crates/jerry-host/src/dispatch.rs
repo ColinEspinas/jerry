@@ -99,15 +99,18 @@ pub(crate) fn handle(inner: &Inner, call: Call) -> Result<Value, RpcError> {
                 },
             })
         }
-        // `jerry host stop` / a human's own "restart sessions" action: signals the lifecycle
-        // loop (`Host::run_lifecycle`) directly, bypassing the idle/linger check entirely -
-        // `Host::shutdown` already kills every live session the same way an idle timeout would.
-        Request::Command(AppCommand::Shutdown(_)) => {
-            inner.request_shutdown();
-            to_value(Report::Ok {
-                outcome: Value::Null,
-            })
-        }
+        // `jerry host stop` / a human's own "restart sessions" action. Deliberately does *not*
+        // call `Inner::request_shutdown` here: this function has no notion of "has the caller's
+        // own transport actually delivered this Report yet" - a socket caller's reply is still
+        // queued for an async writer thread when `handle` returns, and waking `Host::
+        // run_lifecycle` immediately races that write against `Host::shutdown`'s own
+        // `close_connections` (a real bug: the socket closed before the reply reached the
+        // client). Each transport triggers the wake itself, only once it knows its own reply
+        // truly went out - see `LocalClient::call` and `listener::serve`'s reader thread, both
+        // driven by `Self::is_shutdown`.
+        Request::Command(AppCommand::Shutdown(_)) => to_value(Report::Ok {
+            outcome: Value::Null,
+        }),
         _ => {
             let requested_by = caller.clone();
             let ctx = match Ctx::from_cwd(&call.cwd, caller) {
@@ -275,4 +278,11 @@ fn to_value(report: Report) -> Result<Value, RpcError> {
             format!("the report does not serialize: {error}"),
         )
     })
+}
+
+/// Whether `call` is the `Shutdown` command - the one thing a transport must check for itself,
+/// after its own reply has genuinely gone out, before it may wake `Host::run_lifecycle`. See
+/// `Self::handle`'s own `Shutdown` arm for why this cannot live inside `handle` itself.
+pub(crate) fn is_shutdown(call: &Call) -> bool {
+    matches!(call.request, Request::Command(AppCommand::Shutdown(_)))
 }

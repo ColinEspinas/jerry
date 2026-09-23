@@ -11,7 +11,7 @@ use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// The tightest `sun_path` is macOS's 104 bytes (Linux and Windows allow 108); 100 leaves room
 /// for the terminator on every platform.
@@ -240,6 +240,50 @@ impl Registry {
         })
     }
 
+    /// Claims the right to spawn a host for `repo`: creates `<key>.spawning` via `create_new`,
+    /// so exactly one of several racing callers wins it (`docs/architecture/decisions.md` §24 -
+    /// `resolve` seeing `Resolution::None` and then spawning has no claim step between the two,
+    /// which let two concurrent callers both spawn a host for the same repository). `Ok(true)`
+    /// means this call holds the claim and should spawn; `Ok(false)` means a fresh claim already
+    /// exists and this call should wait for its holder's descriptor instead of spawning its own.
+    /// A claim older than `max_age` is stale - its holder must have died mid-spawn - and is swept
+    /// exactly like a dead descriptor already is, then retried once.
+    pub fn claim(&self, repo: &Path, max_age: Duration) -> Result<bool, RegistryError> {
+        let repo = fs::canonicalize(repo).map_err(|source| RegistryError::Io {
+            path: repo.to_path_buf(),
+            source,
+        })?;
+        let path = self.claim_path(&repo);
+        if try_create_claim(&path)? {
+            return Ok(true);
+        }
+        if !claim_is_fresh(&path, max_age) {
+            remove_if_present(&path)?;
+            return try_create_claim(&path);
+        }
+        Ok(false)
+    }
+
+    /// Releases a claim this process holds - a no-op if it is already gone (published, swept as
+    /// stale, or never held). Every `Self::claim` caller must call this exactly once, win or
+    /// lose the race, once it either spawns and publishes or gives up waiting.
+    pub fn release_claim(&self, repo: &Path) -> Result<(), RegistryError> {
+        let repo = fs::canonicalize(repo).map_err(|source| RegistryError::Io {
+            path: repo.to_path_buf(),
+            source,
+        })?;
+        remove_if_present(&self.claim_path(&repo))
+    }
+
+    /// A short, deterministic file name for `canonical_repo`'s claim - the same repository, from
+    /// any process, must hash to the same path for `Self::claim` to arbitrate between them at
+    /// all. Not `Registry::allocate`'s own random name: that identifies *a* new instance, this
+    /// identifies *the* claim for one specific repository.
+    fn claim_path(&self, canonical_repo: &Path) -> PathBuf {
+        let digest = fnv1a64(canonical_repo.to_string_lossy().as_bytes());
+        self.dir.join(format!("{digest:016x}.spawning"))
+    }
+
     fn read_entries(&self) -> Result<Vec<(PathBuf, Descriptor)>, RegistryError> {
         let read = fs::read_dir(&self.dir).map_err(|source| RegistryError::Io {
             path: self.dir.clone(),
@@ -282,6 +326,49 @@ pub fn probe(socket: &Path) -> Liveness {
         Ok(_) => Liveness::Live,
         Err(_) => Liveness::Dead,
     }
+}
+
+/// Creates `path` only if it does not already exist - the one atomic primitive `Registry::claim`
+/// needs, so two processes racing this call can never both get `Ok(true)`.
+fn try_create_claim(path: &Path) -> Result<bool, RegistryError> {
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(_file) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(source) => Err(RegistryError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// Whether `path`'s claim was created within `max_age`. Unreadable metadata (the claim was
+/// removed - its holder published and released it - between `try_create_claim` failing and this
+/// check) counts as *not* fresh: `Registry::claim` then retries creating it, which is correct
+/// either way - the previous holder is done either way, whether it finished or just vanished.
+fn claim_is_fresh(path: &Path, max_age: Duration) -> bool {
+    fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .map(|modified| modified.elapsed().unwrap_or(Duration::ZERO) <= max_age)
+        .unwrap_or(false)
+}
+
+/// A plain FNV-1a over `bytes` - deterministic across processes and Rust versions (unlike
+/// `std::collections::hash_map::DefaultHasher`, which offers no such guarantee, or `RandomState`,
+/// which is keyed per-process by design), so every caller claiming the same repository computes
+/// the same file name.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
 }
 
 fn remove_if_present(path: &Path) -> Result<(), RegistryError> {
@@ -362,6 +449,7 @@ mod registry_tests {
     use std::ffi::OsString;
     use std::fs;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
         let map: HashMap<String, OsString> = pairs
@@ -435,6 +523,87 @@ mod registry_tests {
                 _temp: Some(temp),
             }
         }
+    }
+
+    /// The regression `docs/architecture/decisions.md` §24 names: two threads racing
+    /// `Registry::claim` for the same repository must not both win it - the gap between
+    /// `resolve` answering `None` and a caller actually spawning a host.
+    #[test]
+    fn exactly_one_of_two_concurrent_claims_for_the_same_repository_wins() {
+        let test = short_registry("claim-race");
+        let repo = test_support::seed_empty_repo();
+        let registry = &test.registry;
+        let repo_path = repo.path();
+
+        let barrier = std::sync::Barrier::new(2);
+        let results: Vec<bool> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+
+                        registry
+                            .claim(repo_path, Duration::from_secs(5))
+                            .expect("claim")
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("thread"))
+                .collect()
+        });
+
+        let winners = results.iter().filter(|&&won| won).count();
+        assert_eq!(
+            winners, 1,
+            "exactly one of two concurrent claimants must win: {results:?}"
+        );
+    }
+
+    #[test]
+    fn releasing_a_claim_lets_a_later_caller_win_it() {
+        let test = short_registry("claim-release");
+        let repo = test_support::seed_empty_repo();
+        let registry = &test.registry;
+
+        assert!(registry
+            .claim(repo.path(), Duration::from_secs(5))
+            .expect("first claim"));
+        assert!(
+            !registry
+                .claim(repo.path(), Duration::from_secs(5))
+                .expect("second claim"),
+            "a live claim must refuse a second claimant"
+        );
+
+        registry.release_claim(repo.path()).expect("release");
+        assert!(
+            registry
+                .claim(repo.path(), Duration::from_secs(5))
+                .expect("reclaim"),
+            "releasing a claim must let the next caller win it"
+        );
+    }
+
+    #[test]
+    fn a_stale_claim_is_swept_and_reclaimed() {
+        let test = short_registry("claim-stale");
+        let repo = test_support::seed_empty_repo();
+        let registry = &test.registry;
+
+        assert!(registry
+            .claim(repo.path(), Duration::from_secs(5))
+            .expect("first claim"));
+        // A `max_age` of zero makes the claim just created immediately stale, without a real
+        // wait - `claim_is_fresh` compares `modified.elapsed()` against it, and any real elapsed
+        // duration is greater than zero.
+        assert!(
+            registry
+                .claim(repo.path(), Duration::ZERO)
+                .expect("second claim sees the first as stale"),
+            "a claim older than max_age must be swept and reclaimed, not block forever"
+        );
     }
 
     #[test]

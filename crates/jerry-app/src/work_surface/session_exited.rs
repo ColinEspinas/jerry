@@ -44,9 +44,13 @@ impl AdeApp {
     /// `event/session-exited`'s own handler: resolves which open agent (if any) the host's
     /// session id belongs to, marks that agent's pane exited (`TerminalPane::
     /// mark_exited_from_event` - a no-op if a `SessionHandle`-backed pane already recorded its
-    /// own exit from `PtyOutput::Exited`), and forgets it from the host's agent table. A no-op
-    /// for a session this instance never attached to a pane (another client's session, or one
-    /// already closed).
+    /// own exit from `PtyOutput::Exited`), and forgets it from the host's agent table. When no
+    /// agent matches yet, the status is recorded instead of dropped
+    /// (`Agents::note_unmatched_session_exit`): a process short-lived enough (`sh -c exit`) can
+    /// exit before `Agents::set_host_session_id` itself has run, particularly on Linux, and that
+    /// method applies the exit - agent-table and pane alike - the moment it does. Still a genuine
+    /// no-op for a session this instance never spawns at all (another client's session on the
+    /// same host).
     fn handle_session_exited(&mut self, params: Value, cx: &mut Context<Self>) {
         let Some(session_id) = params
             .get("id")
@@ -56,6 +60,10 @@ impl AdeApp {
             return;
         };
         let Some(id) = self.agents.agent_for_host_session(&session_id) else {
+            self.agents.note_unmatched_session_exit(
+                session_id,
+                params.get("status").cloned().unwrap_or(Value::Null),
+            );
             return;
         };
         if let Some(pane) = self.agents.pane_for(id) {
@@ -71,8 +79,10 @@ impl AdeApp {
 /// signal is present - `portable_pty::ExitStatus::with_signal` has no way to also carry the
 /// original exit code, so only whether the process exited cleanly (`success()`, checked
 /// elsewhere) round-trips exactly; a missing/malformed `status` becomes a plain, honest failure
-/// (`with_exit_code(1)`) rather than a fabricated success.
-fn exit_status_from_wire(status: Option<&Value>) -> ExitStatus {
+/// (`with_exit_code(1)`) rather than a fabricated success. `pub(crate)`: also how
+/// `crate::work_surface::agents::Agents::set_host_session_id` marks a pane exited when it applies
+/// an exit `Self::handle_session_exited` had to record as pending (see that method's own docs).
+pub(crate) fn exit_status_from_wire(status: Option<&Value>) -> ExitStatus {
     let Some(status) = status else {
         return ExitStatus::with_exit_code(1);
     };

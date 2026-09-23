@@ -69,26 +69,37 @@ pub fn spawn_or_connect(
     timeout: Duration,
     spawn_deadline: Duration,
 ) -> Result<Outcome, SpawnOrConnectError> {
+    // No breakaway-forbidden detection by default: that needs this workspace's sanctioned Win32
+    // job-object FFI, which this crate stays free of (`docs/architecture/decisions.md` §24) - a
+    // caller that can tell (`jerry-app`'s or `jerry-host`'s own `job_object::
+    // breakaway_is_forbidden_for_current_process`) injects it through `spawn_or_connect_with`
+    // instead. A plain `jerry host start` from a shell, with no job of its own, has nothing
+    // useful to inject here anyway.
     spawn_or_connect_with(
         registry_dir,
         repo,
         timeout,
         spawn_deadline,
         jerry_binary::locate_named,
+        || false,
     )
 }
 
-/// [`spawn_or_connect`], with the `jerry-host` binary lookup injected - the seam a test drives
-/// against a fake layout rather than this machine's real one, since `jerry_binary::locate_named`
-/// finds a real, workspace-built `jerry-host` the moment anything else in the same `cargo
-/// nextest run --workspace` has built it, which a "no binary exists" test cannot otherwise rely
-/// on staying false.
-fn spawn_or_connect_with(
+/// [`spawn_or_connect`], with the `jerry-host` binary lookup and the breakaway-forbidden check
+/// injected. `locate_host_binary` is the seam a test drives against a fake layout rather than
+/// this machine's real one, since `jerry_binary::locate_named` finds a real, workspace-built
+/// `jerry-host` the moment anything else in the same `cargo nextest run --workspace` has built
+/// it, which a "no binary exists" test cannot otherwise rely on staying false. `breakaway_
+/// forbidden` is called only once a real spawn attempt has already failed, to classify that
+/// failure - never to decide whether to attempt the spawn at all - so a caller with nothing
+/// useful to say here can always pass `|| false` and just get [`SpawnOrConnectError::Spawn`].
+pub fn spawn_or_connect_with(
     registry_dir: PathBuf,
     repo: &Path,
     timeout: Duration,
     spawn_deadline: Duration,
     locate_host_binary: impl Fn(&str) -> Option<PathBuf>,
+    breakaway_forbidden: impl Fn() -> bool,
 ) -> Result<Outcome, SpawnOrConnectError> {
     let registry = Registry::open(registry_dir.clone())?;
     match registry.resolve(repo)? {
@@ -100,6 +111,7 @@ fn spawn_or_connect_with(
             timeout,
             spawn_deadline,
             locate_host_binary,
+            breakaway_forbidden,
         ),
     }
 }
@@ -112,34 +124,64 @@ fn connect_or_flag(descriptor: Descriptor, timeout: Duration) -> Result<Outcome,
     Ok(Outcome::Connected { client, descriptor })
 }
 
-/// Spawns `jerry-host --repo <repo> --registry-dir <registry_dir>` detached (survives this
-/// process's own exit, even from inside a kill-on-close job - `jerry_pty::new_detached_command`,
-/// §14), then polls the registry for its descriptor.
+/// Claims the right to spawn `jerry-host --repo <repo> --registry-dir <registry_dir>` detached
+/// (survives this process's own exit, even from inside a kill-on-close job -
+/// `jerry_pty::new_detached_command`, §14) - `Registry::claim` is what keeps two concurrent
+/// callers from both spawning one (decision Q15: one host per repository) - then either spawns
+/// it or, having lost the claim to a concurrent caller, waits for that caller's descriptor
+/// instead. Either way, polls the registry for the descriptor by real connect attempts.
 fn spawn_and_wait(
     registry_dir: PathBuf,
     repo: &Path,
     timeout: Duration,
     deadline: Duration,
     locate_host_binary: impl Fn(&str) -> Option<PathBuf>,
+    breakaway_forbidden: impl Fn() -> bool,
 ) -> Result<Outcome, SpawnOrConnectError> {
-    let binary = locate_host_binary("jerry-host").ok_or(SpawnOrConnectError::BinaryNotFound)?;
-    let mut command = jerry_pty::new_detached_command(&binary);
-    command
-        .arg("--repo")
-        .arg(repo)
-        .arg("--registry-dir")
-        .arg(&registry_dir);
-    if let Err(error) = command.spawn() {
-        #[cfg(windows)]
-        {
-            if jerry_pty::breakaway_is_forbidden_for_current_process().unwrap_or(false) {
-                return Err(SpawnOrConnectError::BreakawayForbidden);
-            }
-        }
-        return Err(SpawnOrConnectError::Spawn(error));
+    let registry = Registry::open(registry_dir.clone())?;
+    if !registry.claim(repo, deadline)? {
+        // Lost the race: someone else's claim is fresh, so their spawn is already in flight -
+        // wait for their descriptor rather than spawning a second host for the same repository.
+        return wait_for_descriptor(&registry, repo, timeout, deadline);
     }
 
-    let registry = Registry::open(registry_dir)?;
+    let spawned = locate_host_binary("jerry-host")
+        .ok_or(SpawnOrConnectError::BinaryNotFound)
+        .and_then(|binary| {
+            let mut command = jerry_pty::new_detached_command(&binary);
+            command
+                .arg("--repo")
+                .arg(repo)
+                .arg("--registry-dir")
+                .arg(&registry_dir);
+            command.spawn().map_err(|error| {
+                if breakaway_forbidden() {
+                    SpawnOrConnectError::BreakawayForbidden
+                } else {
+                    SpawnOrConnectError::Spawn(error)
+                }
+            })
+        });
+    if let Err(error) = spawned {
+        let _ = registry.release_claim(repo);
+        return Err(error);
+    }
+
+    let outcome = wait_for_descriptor(&registry, repo, timeout, deadline);
+    let _ = registry.release_claim(repo);
+    outcome
+}
+
+/// Polls the registry for `repo`'s descriptor by real connect attempts - a real check each
+/// iteration (`Registry::resolve` reads the descriptor file and probes the socket), not a bare
+/// timer loop. There is no channel or event to wait on instead: a freshly spawned process
+/// writing a file is not something the OS gives a cross-platform notification for.
+fn wait_for_descriptor(
+    registry: &Registry,
+    repo: &Path,
+    timeout: Duration,
+    deadline: Duration,
+) -> Result<Outcome, SpawnOrConnectError> {
     let started = Instant::now();
     loop {
         if let Resolution::One(descriptor) = registry.resolve(repo)? {
@@ -148,11 +190,6 @@ fn spawn_and_wait(
         if started.elapsed() >= deadline {
             return Err(SpawnOrConnectError::NeverAppeared(deadline));
         }
-        // A real connect-attempt cadence (`Registry::resolve` reads the descriptor file and
-        // probes the socket), not a bare timer loop - the descriptor genuinely is not there yet
-        // between attempts, with no channel or event this process could wait on instead: a
-        // freshly spawned process writing a file is not something the OS gives a notification
-        // for that every target platform's registry directory supports uniformly.
         std::thread::sleep(Duration::from_millis(50));
     }
 }
@@ -162,6 +199,7 @@ mod spawn_or_connect_tests {
     use super::{spawn_or_connect, spawn_or_connect_with, Outcome, SpawnOrConnectError};
     use crate::client::Listener;
     use crate::registry::{Descriptor, Registry};
+    use std::path::PathBuf;
     use std::time::Duration;
     use test_support::seed_empty_repo;
 
@@ -265,12 +303,57 @@ mod spawn_or_connect_tests {
             Duration::from_secs(5),
             Duration::from_millis(200),
             |_name| None,
+            || false,
         )
         .expect_err("no host and no binary to spawn one with");
         assert!(
             matches!(err, SpawnOrConnectError::BinaryNotFound),
             "{err:?}"
         );
+    }
+
+    /// The `breakaway_forbidden` injection point: it is consulted only once a real spawn
+    /// attempt has already failed (a nonexistent binary path is a real, guaranteed failure), and
+    /// its answer alone decides `BreakawayForbidden` vs. the generic `Spawn` error - this crate
+    /// itself has no opinion, and never touches Win32 FFI to form one
+    /// (`docs/architecture/decisions.md` §24).
+    #[test]
+    fn a_forbidding_job_is_reported_as_breakaway_forbidden_when_the_injected_check_says_so() {
+        let test = short_registry("breakaway");
+        let repo = seed_empty_repo();
+        let fake_binary = PathBuf::from("/definitely/does/not/exist/jerry-host");
+        let err = spawn_or_connect_with(
+            test.registry.dir().to_path_buf(),
+            repo.path(),
+            Duration::from_secs(5),
+            Duration::from_millis(200),
+            move |_name| Some(fake_binary.clone()),
+            || true,
+        )
+        .expect_err("a nonexistent binary path always fails to spawn");
+        assert!(
+            matches!(err, SpawnOrConnectError::BreakawayForbidden),
+            "{err:?}"
+        );
+    }
+
+    /// The same failed spawn, with the injected check saying breakaway is not the reason - the
+    /// generic error, not a false `BreakawayForbidden`.
+    #[test]
+    fn a_spawn_failure_is_generic_when_the_injected_check_says_breakaway_is_not_the_reason() {
+        let test = short_registry("generic-spawn-failure");
+        let repo = seed_empty_repo();
+        let fake_binary = PathBuf::from("/definitely/does/not/exist/jerry-host");
+        let err = spawn_or_connect_with(
+            test.registry.dir().to_path_buf(),
+            repo.path(),
+            Duration::from_secs(5),
+            Duration::from_millis(200),
+            move |_name| Some(fake_binary.clone()),
+            || false,
+        )
+        .expect_err("a nonexistent binary path always fails to spawn");
+        assert!(matches!(err, SpawnOrConnectError::Spawn(_)), "{err:?}");
     }
 
     #[test]
