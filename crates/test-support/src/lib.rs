@@ -19,11 +19,13 @@
 
 mod child;
 mod git;
+mod job_object;
 mod repo;
 mod wait;
 
 pub use child::ChildGuard;
 pub use git::{commit, commit_at, git, git_output, git_try, git_with_env, write_file};
+pub use job_object::adopt_this_process;
 pub use repo::{
     add_worktree, seed_bare_remote, seed_commits, seed_empty_repo, seed_empty_repo_at, seed_repo,
     seed_repo_at, seed_three_commits,

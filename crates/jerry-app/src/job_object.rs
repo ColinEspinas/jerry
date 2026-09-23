@@ -126,6 +126,7 @@ mod kill_on_close_job_tests {
     use windows_sys::core::BOOL;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
     /// A real child that blocks until killed: `pause` reads from a stdin pipe whose write end
     /// this test holds open, so nothing ever arrives.
@@ -137,6 +138,43 @@ mod kill_on_close_job_tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         ChildGuard::spawn(&mut command).expect("cmd.exe must spawn")
+    }
+
+    /// GitHub issue #534's own question: is a real ConPTY-spawned child actually a member of the
+    /// job, or does portable-pty's pseudo-console machinery escape it the way `conhost.exe`
+    /// historically could? [`blocked_child`] above spawns through `jerry_pty::new_std_command` (a
+    /// bare `std::process::Command`, no pseudo-console); this pins the real
+    /// [`jerry_pty::spawn`] path every terminal pane actually uses.
+    #[test]
+    fn a_conpty_spawned_child_is_also_inside_the_job() {
+        let job = adopt_this_process_returning_job()
+            .expect("adopting the test process must succeed on real Windows");
+        let mut session = jerry_pty::spawn(jerry_pty::SpawnOptions::new("cmd"))
+            .expect("a bare cmd.exe must spawn via ConPTY");
+        let pid = session
+            .process_id()
+            .expect("a freshly spawned session must report a pid");
+
+        // SAFETY: `pid` came from a session that just spawned successfully and is still owned by
+        // `session`, so the process is live; the handle is closed right after this one query.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        assert!(
+            !handle.is_null(),
+            "OpenProcess on the live child must succeed"
+        );
+        let mut inside: BOOL = 0;
+        // SAFETY: both handles are live for the call and the out-pointer addresses a live,
+        // uniquely borrowed stack `BOOL` the callee writes exactly once.
+        let ok = unsafe { IsProcessInJob(handle, job, &mut inside) };
+        // SAFETY: `handle` came from a successful `OpenProcess` above and is closed exactly once.
+        unsafe { CloseHandle(handle) };
+        assert!(ok != 0, "IsProcessInJob must succeed for a live child");
+        assert!(
+            inside != 0,
+            "a ConPTY-spawned child must be inside the same job as its spawning process"
+        );
+
+        let _ = session.kill();
     }
 
     /// The kernel property the whole fix rests on: no destructor, no `taskkill`, just the last

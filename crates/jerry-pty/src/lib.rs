@@ -1339,6 +1339,7 @@ mod pty_session_tests {
 
     /// Prints `text` and exits.
     fn echo_command(text: &str) -> SpawnOptions {
+        test_support::adopt_this_process();
         if cfg!(windows) {
             SpawnOptions::new("cmd.exe").arg("/c").arg("echo").arg(text)
         } else {
@@ -1348,6 +1349,7 @@ mod pty_session_tests {
 
     /// Prints every integer from 1 to `n` on its own line, then exits.
     fn counting_command(n: usize) -> SpawnOptions {
+        test_support::adopt_this_process();
         if cfg!(windows) {
             SpawnOptions::new("cmd.exe")
                 .arg("/c")
@@ -1359,7 +1361,12 @@ mod pty_session_tests {
 
     /// Stays alive and lets whatever is written to the pty come back out of it - `cat` on unix,
     /// and on Windows the shell itself, since ConPTY does the echoing rather than the child.
+    ///
+    /// The Windows arm is a bare, argument-less `cmd.exe` - an interactive shell with nothing
+    /// telling it to exit, exactly the process shape GitHub issue #534 found orphaned by the
+    /// thousand, so this (and [`long_lived_command`] below) is where adoption matters most.
     fn stdin_echoing_command() -> SpawnOptions {
+        test_support::adopt_this_process();
         if cfg!(windows) {
             SpawnOptions::new("cmd.exe")
         } else {
@@ -1367,8 +1374,10 @@ mod pty_session_tests {
         }
     }
 
-    /// Stays alive for a couple of seconds without needing input.
+    /// Stays alive for a couple of seconds without needing input. See
+    /// [`stdin_echoing_command`]'s own docs for why its bare Windows arm needs adoption too.
     fn long_lived_command() -> SpawnOptions {
+        test_support::adopt_this_process();
         if cfg!(windows) {
             SpawnOptions::new("cmd.exe")
         } else {
@@ -1378,6 +1387,7 @@ mod pty_session_tests {
 
     /// Exits successfully, immediately.
     fn quick_exit_command() -> SpawnOptions {
+        test_support::adopt_this_process();
         if cfg!(windows) {
             SpawnOptions::new("cmd.exe").arg("/c").arg("exit")
         } else {
@@ -2152,6 +2162,7 @@ mod pty_session_tests {
     /// working directory. A `/c`-style one-shot races ConPTY teardown on Windows: the child can
     /// exit before its output is pumped, leaving only ConPTY's own `ESC[6n` probe behind.
     fn pwd_shell_command() -> (SpawnOptions, &'static str) {
+        test_support::adopt_this_process();
         if cfg!(windows) {
             (SpawnOptions::new("cmd.exe"), "cd\r\n")
         } else {
