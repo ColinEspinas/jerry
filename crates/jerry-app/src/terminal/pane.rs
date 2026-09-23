@@ -664,6 +664,14 @@ pub struct TerminalPane {
     /// used to be able to treat as already settled by teardown time). [`Self::attach_session`]
     /// checks this and shuts a late-arriving session straight back down instead of running it.
     doomed: bool,
+    /// Set by [`Self::take_session_for_teardown`] the moment it actually hands a session off -
+    /// distinct from `self.session.is_none()` alone, which is equally true of a pane whose
+    /// `SessionSpawn` genuinely never attached yet. Without this, [`Self::teardown_still_pending`]
+    /// could not tell "still waiting to attach" from "already torn down", and a second caller
+    /// dooming the same already-torn-down pane (`Agents::close` on a tab a worktree discard's own
+    /// orphaned-agent cleanup already tore down, since both now go through the same doom-poll-
+    /// shutdown sequence) would poll forever for a session that will never arrive.
+    torn_down: bool,
     /// The process's exit status, once it has exited - captured the moment a
     /// [`jerry_pty::PtyOutput::Exited`] item arrives on [`Self::session`]'s output stream, real
     /// on every platform (`run_wait_loop`'s dedicated thread in `jerry-pty` blocks on the
@@ -805,6 +813,7 @@ impl TerminalPane {
             _test_host: None,
             spawn_error: None,
             doomed: false,
+            torn_down: false,
             exit_status: None,
             activity_at: None,
             attention_ping_at: None,
@@ -1014,16 +1023,25 @@ impl TerminalPane {
         self._task = None;
         self.doomed = true;
         cx.notify();
-        self.session.take()
+        let session = self.session.take();
+        if session.is_some() {
+            self.torn_down = true;
+        }
+        session
     }
 
     /// Whether [`Self::take_session_for_teardown`] has claimed this pane but its `SessionSpawn`
     /// dispatch had not yet resolved (to either a real attach or a spawn failure) at the time -
-    /// the worktree discard flow's signal to keep polling rather than proceed, so a process that
-    /// attaches after the fact is still shut down before the real `git worktree remove` runs
-    /// (GitHub issue #470).
+    /// a caller doing the doom-poll-shutdown sequence (`crate::work_surface::agents::
+    /// collect_doomed_sessions`, GitHub issue #470/#530)'s signal to keep polling rather than
+    /// give up, so a process that attaches after the fact is still shut down. `false` once
+    /// [`Self::take_session_for_teardown`] has already handed a session off - not just once
+    /// `self.session` happens to be `None` again, which a second, later doomer (a tab close
+    /// after a worktree discard's own orphaned-agent cleanup already tore it down) would
+    /// otherwise misread as "still waiting to attach" and poll forever for a session that will
+    /// never arrive.
     pub(crate) fn teardown_still_pending(&self) -> bool {
-        self.doomed && self.session.is_none() && self.spawn_error.is_none()
+        self.doomed && self.session.is_none() && self.spawn_error.is_none() && !self.torn_down
     }
 
     /// `true` while a child process is alive (spawned and not yet observed to have exited).
@@ -1689,6 +1707,15 @@ impl TerminalPane {
     #[cfg(test)]
     pub(crate) fn font_size_px_for_test(&self) -> f32 {
         self.font_size_px
+    }
+
+    /// Test-only seam: this pane's own host dispatch client, for a test that wants to prove the
+    /// host `Self::resize_to`'s own `SessionResize` dispatch went through is still genuinely
+    /// reachable, not merely that `Self::resize_latch` was latched optimistically - see
+    /// `scrollback_pane_tests::a_settled_pane_can_still_reach_its_host_through_the_same_client_a_resize_used`.
+    #[cfg(test)]
+    pub(crate) fn host_client_for_test(&self) -> Option<LocalClient> {
+        self.host_client.clone()
     }
 
     /// Test-only seam: the real [`TerminalSpec`] this pane was constructed with - lets a test
@@ -5082,6 +5109,67 @@ mod scrollback_pane_tests {
             pane.read_with(cx, |pane, _| pane.settled_real_size),
             "once the resize really reached the live pty, the pane is settled and the one-time \
              discard has run"
+        );
+        release(cx, pane);
+    }
+
+    /// `TerminalPane::resize_to`'s own `SessionResize` dispatch is a detached background task
+    /// (`docs/architecture/decisions.md` §23's control plane) - a failed request there only ever
+    /// logs a warning, so `Self::settled_real_size`'s own optimistic latch (set the moment the
+    /// dispatch is sent, not once it succeeds - see `ResizeLatch::session_resize_succeeded`'s own
+    /// docs) proves the resize was *asked for*, never that it actually reached a live host. This
+    /// proves the host side directly: settling below already sent at least one real
+    /// `SessionResize` through the pane's `host_client`, so dispatching a second, independent
+    /// real request through that same client and getting a real `Report::Ok` back is what the
+    /// throwaway host dropping immediately after spawn (before `TerminalPane::_test_host` kept it
+    /// alive - GitHub issue #530) would have made fail with `SHUTTING_DOWN` instead.
+    #[gpui::test]
+    fn a_settled_pane_can_still_reach_its_host_through_the_same_client_a_resize_used(
+        cx: &mut TestAppContext,
+    ) {
+        // A real, reliably-present blocking command, not `new_pane`'s own `"cat"` - unavailable
+        // in this real spawn's own `CreateProcessW` environment on at least one real Windows
+        // machine this was verified against, the same reason `crate::test_support`'s own `ui`-
+        // tier stub (GitHub issue #530) uses this exact pair instead.
+        #[cfg(windows)]
+        let pane = super::pty_pane_fixtures::spawn_pane(cx, "cmd", &["/d", "/c", "more"]);
+        #[cfg(not(windows))]
+        let pane = super::pty_pane_fixtures::spawn_pane(cx, "sh", &["-c", "cat >/dev/null"]);
+        let client = pane
+            .read_with(cx, |pane, _| pane.host_client_for_test())
+            .expect("a settled real-session pane has a real host client");
+
+        let result: std::rc::Rc<std::cell::RefCell<Option<Result<Report, jerry_core::RpcError>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let recorder = std::rc::Rc::clone(&result);
+        pane.update(cx, |_pane, cx| {
+            cx.spawn(async move |_this, _cx| {
+                let report = client
+                    .request(Call::human(
+                        std::env::temp_dir(),
+                        Request::Query(jerry_core::AppQuery::Status(Default::default())),
+                    ))
+                    .await;
+                *recorder.borrow_mut() = Some(report);
+            })
+            .detach();
+        });
+        cx.run_until_parked();
+
+        let report = result
+            .borrow_mut()
+            .take()
+            .expect("the dispatch must have completed by the time the executor parked");
+        // `Ok(_)` alone, not `Ok(Report::Ok { .. })`: a *reached* host answering this particular
+        // query with `Report::Error` (this test's `cwd` is a plain temp dir, not a real repo, so
+        // `StatusQuery` genuinely cannot resolve one) is still proof the round trip itself
+        // succeeded. A pre-`TerminalPane::_test_host` dropped-out-from-under-it host answers
+        // every request with `Err(RpcError { code: "shutting-down", .. })` instead - the one
+        // outcome this actually rules out.
+        assert!(
+            report.is_ok(),
+            "the pane's own host client must still reach a live host after settling - got \
+             {report:?}"
         );
         release(cx, pane);
     }

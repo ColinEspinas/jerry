@@ -4,13 +4,17 @@
 //! worktree" - see its module docs - this is that one layer up.
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use gpui::{App, AppContext as _, Context, Entity, Focusable as _, Subscription, Window};
+use gpui::{
+    App, AppContext as _, AsyncApp, Context, Entity, Focusable as _, Subscription, WeakEntity,
+    Window,
+};
 
 use crate::root::AdeApp;
 use crate::terminal::pane::{
-    TerminalPane, TerminalPaneEvent, TerminalSpec, TERMINAL_COLS, TERMINAL_ROWS,
+    SessionAdapter, TerminalPane, TerminalPaneEvent, TerminalSpec, TERMINAL_COLS, TERMINAL_ROWS,
 };
 use jerry_core::{AppCommand, Report, Request, SessionSpawn};
 
@@ -313,6 +317,11 @@ pub struct Agents {
     /// here (rather than detached) so it is cancelled, not orphaned, if this collection (and so
     /// the `AdeApp` that owns it) drops before a spawn resolves.
     _spawn_tasks: crate::root::task_pool::TaskPool,
+    /// [`Self::close`]'s own doom-poll-shutdown task, one per close - the same lifecycle
+    /// reasoning as [`Self::_spawn_tasks`], kept in a separate pool since it is a different
+    /// concern (`crate::root::task_pool::TaskPool`'s own docs list several such pools on
+    /// `AdeApp` for exactly this reason).
+    _close_tasks: crate::root::task_pool::TaskPool,
 }
 
 impl Agents {
@@ -325,6 +334,7 @@ impl Agents {
             host_agents: None,
             binary_overrides: HashMap::new(),
             _spawn_tasks: crate::root::task_pool::TaskPool::default(),
+            _close_tasks: crate::root::task_pool::TaskPool::default(),
         }
     }
 
@@ -744,7 +754,29 @@ impl Agents {
                 });
                 return;
             };
-            let _ = spawn_pane.update(cx, |pane, cx| pane.attach_session(handle, client, cx));
+            let attach_outcome = spawn_pane.update(cx, |pane, cx| {
+                pane.attach_session(handle.clone(), client, cx)
+            });
+            if attach_outcome.is_err() {
+                // The pane entity itself is already gone - not just doomed, which `TerminalPane::
+                // attach_session` already handles on its own by leaving the session for whichever
+                // caller is already polling `TerminalPane::take_session_for_teardown` to pick up
+                // and shut down. Nothing will ever reach this session through a pane again, so
+                // this task must kill it itself rather than silently drop the handle: unlike the
+                // old direct `jerry_pty::spawn`, `SessionManager` keeps a session's real process
+                // alive independent of any pane, so dropping the handle alone leaks it (GitHub
+                // issue #530's own regression).
+                cx.background_executor()
+                    .spawn(async move {
+                        if let Err(err) = handle.shutdown() {
+                            log::warn!(
+                                "failed to shut down a session whose pane was already gone by \
+                                 attach time: {err}"
+                            );
+                        }
+                    })
+                    .detach();
+            }
         });
         self._spawn_tasks.push(spawn_task);
         id
@@ -884,11 +916,6 @@ impl Agents {
         self.active = None;
     }
 
-    /// Forgets `id`'s entry in the host's agent table (`Self::host_agents`) without touching its
-    /// tab or process - for `crate::work_surface::session_exited`'s reaction to an
-    /// `event/session-exited` notification, which must stop `AgentsQuery` listing an agent whose
-    /// process has genuinely ended even while [`Self::close`]'s "an unclean exit keeps its tab
-    /// open" policy leaves the tab itself in place. A no-op with no host table yet.
     /// Test-only: the host agent table's own ids right now, straight from
     /// `jerry_host::AgentTable::list` - the same underlying state `AgentsQuery` answers from
     /// (`crate::work_surface::session_exited`'s own coverage), without a full dispatch round
@@ -901,9 +928,26 @@ impl Agents {
             .unwrap_or_default()
     }
 
+    /// Forgets `id`'s entry in the host's agent table (`Self::host_agents`) without touching its
+    /// tab or process - for `crate::work_surface::session_exited`'s reaction to an
+    /// `event/session-exited` notification, which must stop `AgentsQuery` listing an agent whose
+    /// process has genuinely ended even while [`Self::close`]'s "an unclean exit keeps its tab
+    /// open" policy leaves the tab itself in place. A no-op with no host table yet.
     pub fn forget_host_agent(&self, id: AgentId) {
         if let Some(table) = &self.host_agents {
             table.forget(&host_agent_id(id));
+        }
+    }
+
+    /// Removes `session_id`'s entry from the host's session table entirely
+    /// (`jerry_host::AgentTable::forget_session`) - the real id `SessionSpawn` minted, distinct
+    /// from [`Self::forget_host_agent`]'s synthetic `agent:<id>` key. Without a caller ever doing
+    /// this, every session this host ever spawned stayed in the table (dead `PtySession` record
+    /// and all) until the host itself exited, and `jerry sessions` listed every one of them
+    /// forever (GitHub issue #530's own follow-up). A no-op with no host table yet.
+    pub fn forget_session(&self, session_id: &jerry_core::SessionId) {
+        if let Some(table) = &self.host_agents {
+            table.forget_session(session_id);
         }
     }
 
@@ -916,9 +960,14 @@ impl Agents {
         }
     }
 
-    /// Closes a tab: tears down its `PtySession` via `TerminalPane::shutdown` before dropping
-    /// the `Entity<TerminalPane>`, so closing a tab never just hides it while its process
-    /// leaks.
+    /// Closes a tab: dooms its pane's session (the same doom-poll-shutdown sequence
+    /// [`crate::worktree_history::flow::AdeApp::execute_discard_worktree_path`] uses, via
+    /// [`collect_doomed_sessions`]) before dropping the `Entity<TerminalPane>`, so closing a tab
+    /// never just hides it while its process leaks - including one whose `SessionSpawn` dispatch
+    /// was still in flight at the moment of the close (GitHub issue #530's own follow-up: without
+    /// this, that session would attach after the fact and run unsupervised forever, and its dead
+    /// entry would never leave the host's session table either - see [`Self::forget_host_agent`]
+    /// and `jerry_host::AgentTable::forget_session`).
     pub fn close(
         &mut self,
         id: AgentId,
@@ -930,13 +979,33 @@ impl Agents {
             return;
         };
         let cwd = self.agents[index].cwd.clone();
+        let pane = self.agents[index].pane.clone();
         if let Some(table) = &self.host_agents {
             table.forget(&host_agent_id(id));
         }
-
-        self.agents[index]
-            .pane
-            .update(cx, |pane, cx| pane.shutdown(cx));
+        let host_agents = self.host_agents.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let sessions = collect_doomed_sessions(vec![pane], &this, cx).await;
+            let session_ids: Vec<jerry_core::SessionId> = sessions
+                .iter()
+                .map(|session| session.id().clone())
+                .collect();
+            cx.background_executor()
+                .spawn(async move {
+                    for session in sessions {
+                        if let Err(err) = session.shutdown() {
+                            log::warn!("failed to shut down a closed tab's session: {err}");
+                        }
+                    }
+                })
+                .await;
+            if let Some(table) = host_agents {
+                for session_id in session_ids {
+                    table.forget_session(&session_id);
+                }
+            }
+        });
+        self._close_tasks.push(task);
         self.agents.remove(index);
 
         let sibling_indices: Vec<usize> = self
@@ -970,6 +1039,70 @@ impl Agents {
             }
         }
     }
+}
+
+/// Marks every pane in `panes` doomed and collects its session for teardown - the real,
+/// already-attached ones immediately (`TerminalPane::take_session_for_teardown`), and any still
+/// in flight `SessionSpawn` dispatch by polling `TerminalPane::teardown_still_pending` until it
+/// settles, so a spawn that resolves after the caller stopped waiting for it is never left
+/// running unsupervised (GitHub issue #470/#530's own regressions). Shared by [`Agents::close`]
+/// and `crate::worktree_history::flow::AdeApp::execute_discard_worktree_path`, whose own callers
+/// shut each returned session down (and forget it, where that applies) themselves, off the UI
+/// thread - this only collects them.
+///
+/// A real, scheduled no-op is what each poll attempt yields on, never
+/// `cx.background_executor().timer()`: GPUI's test scheduler only ever advances its simulated
+/// clock against an explicit `advance_clock`, so a `timer()` would never resolve under it; a real
+/// background task is what `run_until_parked` already blocks on.
+pub(crate) async fn collect_doomed_sessions(
+    panes: Vec<Entity<TerminalPane>>,
+    this: &WeakEntity<AdeApp>,
+    cx: &mut AsyncApp,
+) -> Vec<Arc<dyn SessionAdapter>> {
+    let mut doomed_sessions = Vec::with_capacity(panes.len());
+    let mut pending_panes = Vec::new();
+    for pane in panes {
+        let outcome = this.update(cx, |_this, cx| {
+            pane.update(cx, |pane, cx| pane.take_session_for_teardown(cx))
+        });
+        match outcome {
+            Ok(Some(session)) => doomed_sessions.push(session),
+            Ok(None) => pending_panes.push(pane),
+            Err(_) => break, // the app itself was dropped
+        }
+    }
+
+    const POLL_ATTEMPTS: u32 = 10_000;
+    for pane in pending_panes {
+        for attempt in 0..POLL_ATTEMPTS {
+            let resolved = this.update(cx, |_this, cx| {
+                pane.update(cx, |pane, cx| {
+                    (
+                        pane.take_session_for_teardown(cx),
+                        pane.teardown_still_pending(),
+                    )
+                })
+            });
+            let Ok((session, still_pending)) = resolved else {
+                break; // the app itself was dropped
+            };
+            if let Some(session) = session {
+                doomed_sessions.push(session);
+                break;
+            }
+            if !still_pending {
+                break; // resolved to a spawn failure - nothing left to shut down
+            }
+            if attempt + 1 == POLL_ATTEMPTS {
+                log::warn!(
+                    "a doomed pane's SessionSpawn never settled before its owner stopped \
+                     waiting for it - it may still be starting after the fact"
+                );
+            }
+            cx.background_executor().spawn(async {}).await;
+        }
+    }
+    doomed_sessions
 }
 
 /// Real wall-clock seconds since the Unix epoch, for [`Agent::spawned_at_unix`]. Mirrors

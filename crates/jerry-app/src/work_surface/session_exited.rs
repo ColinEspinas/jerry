@@ -100,21 +100,32 @@ mod tests {
                 cx,
             )
         });
-        cx.run_until_parked();
+        // Checked before any `run_until_parked` at all, deliberately: `Agents::spawn_inner`'s own
+        // `spawn_resolved` registers this agent-table entry synchronously, inside the same
+        // `update_in` call above, before the `SessionSpawn` dispatch task that starts the real,
+        // genuinely-exiting process even runs - so nothing async has had a chance to race this
+        // read yet. A post-drain read here raced the real exit on Linux: the child could exit and
+        // its `event/session-exited` be processed - forgetting the agent - inside the very same
+        // `run_until_parked` this sanity check would have shared with the wait loop below, making
+        // an already-empty table look like the registration itself never happened.
+        let registered = app.read_with(cx, |app, _| app.agents.host_agent_ids_for_test());
         assert_eq!(
-            app.read_with(cx, |app, _| app.agents.host_agent_ids_for_test().len()),
+            registered.len(),
             1,
-            "sanity check: the real spawn must have registered one agent-table entry"
+            "sanity check: the real spawn must have registered one agent-table entry - got \
+             {registered:?}"
         );
 
         let forgotten = test_support::wait_until(Duration::from_secs(30), || {
             cx.run_until_parked();
             app.read_with(cx, |app, _| app.agents.host_agent_ids_for_test().is_empty())
         });
+        let remaining = app.read_with(cx, |app, _| app.agents.host_agent_ids_for_test());
         assert!(
             forgotten,
             "the host agent table must stop listing this agent once its real exit's \
-             event/session-exited notification reaches this instance's own subscriber"
+             event/session-exited notification reaches this instance's own subscriber - still \
+             has {remaining:?}"
         );
     }
 }

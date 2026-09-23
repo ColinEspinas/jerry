@@ -150,66 +150,17 @@ impl AdeApp {
             .iter_for_cwd(worktree_path.clone())
             .map(|agent| agent.pane.clone())
             .collect();
-        let mut doomed_sessions = Vec::with_capacity(doomed_panes.len());
-        // A pane whose own `SessionSpawn` dispatch had not yet resolved when this ran - the
-        // control-plane spawn genuinely crosses the host (`docs/architecture/decisions.md` §23),
-        // unlike the direct `jerry_pty::spawn` this used to be able to treat as already settled
-        // by teardown time - so its session isn't here to take yet. Polled below, before the
-        // real discard, rather than left to attach and run unsupervised after the fact.
-        let mut pending_panes = Vec::new();
-        for pane in doomed_panes {
-            match pane.update(cx, |pane, cx| pane.take_session_for_teardown(cx)) {
-                Some(session) => doomed_sessions.push(session),
-                None => pending_panes.push(pane),
-            }
-        }
         let doomed_lsp_clients = self.take_lsp_clients_for_root(&worktree_path);
 
         let discarded_path = worktree_path.clone();
         let task = cx.spawn(async move |this, cx| {
             // GitHub issue #470's guarantee - every process this app started in the worktree is
-            // confirmed dead before the directory is deleted - only holds if this waits out a
-            // pending pane's spawn too. Each yield below is a real scheduled no-op task, never a
-            // `timer()`: GPUI's test scheduler only ever advances its simulated clock against an
-            // explicit `advance_clock`, which nothing here (nor a caller relying on a plain
-            // `cx.run_until_parked()`) provides - a pending `timer()` would simply never resolve.
-            // A real background task, by contrast, is exactly what `run_until_parked` already
-            // blocks on with `TerminalPane::new`'s own `#[cfg(test)] allow_parking()` in force
-            // (`vendor/zed/crates/scheduler/src/test_scheduler.rs`'s `park`/`step` - parking is
-            // what lets the deterministic scheduler genuinely wait on a real OS thread's, i.e. the
-            // host dispatch round trip's own, completion instead of treating it as merely not-yet-
-            // ready). Bounded all the same, generously, against a spawn that never resolves at all
-            // (host gone, dispatch itself failed).
-            const POLL_ATTEMPTS: u32 = 10_000;
-            for pane in pending_panes {
-                for attempt in 0..POLL_ATTEMPTS {
-                    let resolved = this.update(cx, |_this, cx| {
-                        pane.update(cx, |pane, cx| {
-                            (
-                                pane.take_session_for_teardown(cx),
-                                pane.teardown_still_pending(),
-                            )
-                        })
-                    });
-                    let Ok((session, still_pending)) = resolved else {
-                        break; // the app itself was dropped
-                    };
-                    if let Some(session) = session {
-                        doomed_sessions.push(session);
-                        break;
-                    }
-                    if !still_pending {
-                        break; // resolved to a spawn failure - nothing left to shut down
-                    }
-                    if attempt + 1 == POLL_ATTEMPTS {
-                        log::warn!(
-                            "a doomed pane's SessionSpawn never settled before its worktree was \
-                             discarded - it may still be starting after the fact"
-                        );
-                    }
-                    cx.background_executor().spawn(async {}).await;
-                }
-            }
+            // confirmed dead before the directory is deleted - only holds if a pane whose own
+            // `SessionSpawn` was still in flight is waited out too, which is what this collects:
+            // a real background task is what `run_until_parked` blocks on; a `timer()` never
+            // resolves under the deterministic scheduler.
+            let doomed_sessions =
+                crate::work_surface::agents::collect_doomed_sessions(doomed_panes, &this, cx).await;
             let result = cx
                 .background_executor()
                 .spawn(async move {

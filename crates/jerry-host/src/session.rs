@@ -297,6 +297,17 @@ impl SessionManager {
         lock(&self.entries).remove(&agent_session_id(agent_id));
     }
 
+    /// Removes `id`'s entry from this table entirely - unlike [`Self::record_exit`] (which keeps
+    /// the record, `exit` set, so `SessionsQuery` can still report it once), this is the app
+    /// telling this table it has no further interest in `id` at all. Without a caller ever doing
+    /// this, every session this host ever spawned stayed in the table (dead `PtySession` and all)
+    /// until the host itself exited - GitHub issue #530's own follow-up, once `Agents::close`
+    /// already knew which real `SessionId` a closed tab's process was
+    /// (`crate::work_surface::agents::Agent::host_session_id`).
+    pub(crate) fn forget_session(&self, id: &SessionId) {
+        lock(&self.entries).remove(id);
+    }
+
     pub(crate) fn worktree_of_agent(&self, agent_id: &AgentId) -> Option<PathBuf> {
         lock(&self.entries)
             .get(&agent_session_id(agent_id))
@@ -328,6 +339,14 @@ impl SessionManager {
     /// thread [`Self::spawn`] started, the moment it observes a real `Exited` item. A no-op for
     /// an id that has since been forgotten (an `AgentTable`-only entry `forget_agent` already
     /// removed, or a race with a very short-lived session).
+    ///
+    /// Drops this entry's own `Arc<SessionHandle>` (and so, once nothing else - a still-attached
+    /// pane - holds one too, the real `PtySession` underneath it): the process is confirmed dead
+    /// by definition of this being called at all, so there is nothing left for that handle to do,
+    /// and holding it forever would keep a dead `PtySession` around for the record's own natural
+    /// lifetime instead of just the exit status this call already captures. The record itself
+    /// (`entry.record`, with `exit` now set) is left in the table so `SessionsQuery` can still
+    /// report the exit once - [`Self::forget_session`] is the real removal.
     fn record_exit(&self, id: &SessionId, status: &jerry_pty::ExitStatus) {
         let wire = exit_status_wire(status);
         let recorded = {
@@ -335,6 +354,7 @@ impl SessionManager {
             match entries.get_mut(id) {
                 Some(entry) => {
                     entry.record.exit = Some(wire.clone());
+                    entry.handle = None;
                     true
                 }
                 None => false,

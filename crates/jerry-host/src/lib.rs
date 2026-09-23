@@ -16,7 +16,7 @@ pub use session::{SessionError, SessionHandle, SessionManager, SessionSpawnError
 use futures::channel::{mpsc, oneshot};
 use jerry_core::client::Stream;
 use jerry_core::wire::rpc_code;
-use jerry_core::{AgentId, Call, Message, Report, RpcError};
+use jerry_core::{AgentId, Call, Message, Report, RpcError, SessionId};
 use serde_json::Value;
 use std::future::Future;
 use std::io;
@@ -76,6 +76,14 @@ impl AgentTable {
 
     pub fn forget(&self, id: &AgentId) {
         self.0.forget_agent(id);
+    }
+
+    /// [`SessionManager::forget_session`] - the real `SessionId` a spawn minted, distinct from
+    /// [`Self::forget`]'s synthetic `agent:<id>` key (`crate::work_surface::agents::Agents::close`
+    /// needs both: the synthetic key for a `ProcessKind::Agent`'s `AgentTable`-compatibility
+    /// registration, this for the real session `SessionSpawn` created).
+    pub fn forget_session(&self, id: &SessionId) {
+        self.0.forget_session(id);
     }
 
     pub fn worktree_of(&self, id: &AgentId) -> Option<PathBuf> {
