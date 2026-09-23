@@ -96,6 +96,28 @@ impl SessionHandle {
         lock(&self.process).process_id()
     }
 
+    /// `jerry_pty::PtySession::pause` - real `SIGSTOP`, unix only (see that method's own docs for
+    /// the platform scope). In-process, like [`Self::write_input`]: pausing a pane's own process
+    /// is not an authorization concern the way spawn/resize/kill are, so it stays off the control
+    /// plane too.
+    pub fn pause(&self) -> Result<(), PtyError> {
+        lock(&self.process).pause()
+    }
+
+    /// `jerry_pty::PtySession::resume` - the real `SIGCONT` counterpart to [`Self::pause`].
+    pub fn resume(&self) -> Result<(), PtyError> {
+        lock(&self.process).resume()
+    }
+
+    /// `jerry_pty::PtySession::shutdown`: blocks until this session's whole process tree is
+    /// confirmed dead and reaped, unlike [`SessionManager::kill`]'s non-blocking signal-only
+    /// contract. For a caller that must be certain the process is gone before proceeding (the
+    /// worktree-discard flow, GitHub issue #470, before removing a directory a live child's cwd
+    /// would otherwise keep locked on Windows) - call off the UI thread.
+    pub fn shutdown(&self) -> Result<(), PtyError> {
+        lock(&self.process).shutdown()
+    }
+
     /// The same live process [`SessionManager::resize`]/[`SessionManager::kill`] act on - private
     /// to this module: any other caller acts through those, or through this handle's own
     /// data-plane methods above, never by reaching into the process directly.

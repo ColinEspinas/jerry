@@ -4704,20 +4704,76 @@ mod terminal_action_tests {
     /// Places `text` at a fixed, addressed grid position in the active agent's pane, well below
     /// where a freshly-spawned shell's own prompt lands, so the row this test then selects can't
     /// be overwritten by real shell output arriving in the background.
+    ///
+    /// Waits out a freshly (re)mounted pane's own settle before seeding, then retries the whole
+    /// reset+inject+select cycle until a real drain leaves it untouched - neither is optional:
+    ///
+    /// A pane newly promoted to [`Agents::active`] paints for the first time with no measured
+    /// [`TerminalPane::content_bounds`] yet, so its first render sizes off the whole window
+    /// (`Self::maybe_resize_pty`'s own fallback) before a deferred `canvas()` prepaint callback
+    /// measures its real, smaller content box a frame later and forces a second grid resize
+    /// (GitHub issue #375's settle). *Any* grid resize - like a screen clear
+    /// (`crate::terminal::grid::selection_tests::clearing_the_screen_drops_the_selection_without_
+    /// this_module_doing_anything`) - genuinely drops `alacritty_terminal`'s own live selection as
+    /// a side effect, so seeding before this settle is done is seeding onto a selection about to
+    /// be thrown away regardless of what this injects. Waiting for [`TerminalPane::grid_dimensions`]
+    /// to stop changing rules that out - a structural fact, unaffected by selection state, so it is
+    /// a real, race-free settle signal rather than a fixed number of polls hoping to outlast it.
+    ///
+    /// Separately, a freshly attached real session can *still* be mid-round-trip on its own
+    /// control-plane `SessionResize` once the pty exists (`docs/architecture/decisions.md` §23) -
+    /// ConPTY answers that by repainting its whole screen from the real child process, which can
+    /// land *after* a single post-settle injection and silently overwrite row 9 the same way. The
+    /// retry loop below covers that: any miss re-seeds and resets the streak, rather than trusting
+    /// the round trip to be over just because it hasn't landed yet.
     fn seed_active_pane(app: &gpui::Entity<AdeApp>, cx: &mut gpui::VisualTestContext, text: &str) {
         let pane = app
             .read_with(cx, |app, _| app.agents.active().map(|s| s.pane.clone()))
             .expect("a fresh test window has one real, active shell agent");
-        pane.update(cx, |pane, cx| {
-            // Reset first, in the same `update`: the real shell this pane is also running now
-            // wakes and drains the moment it has real output, rather than on a polling interval
-            // (`docs/architecture/decisions.md` §8's amendment), so its own banner/prompt could
-            // otherwise land on row 9 (or scroll it) between this injection and the selection
-            // this test depends on landing on fixed coordinates.
-            pane.reset_grid_for_test(cx);
-            pane.inject_bytes_for_test(format!("\x1b[10;1H{text}").as_bytes(), cx);
-            pane.select_cells_for_test(9, 0..text.chars().count());
+        // A freshly spawned agent's pane paints for the first time only once *something* calls
+        // `cx.notify()` on `AdeApp` itself (only its own render picks which agent's pane is
+        // mounted at all) - the production path is `AdeApp::after_agent_spawn`, which this
+        // test's own direct `Agents::spawn` call deliberately bypasses (see the dispatch comment
+        // below). Without a forced first paint here, the dimensions poll below would just read
+        // the still-unmounted pane's frozen constructor defaults as "already settled".
+        app.update_in(cx, |_app, _window, cx| cx.notify());
+        cx.run_until_parked();
+
+        let mut previous_dimensions = None;
+        let dimensions_settled = pump_until(cx, |cx| {
+            let current = pane.read_with(cx, |pane, _| pane.grid_dimensions());
+            let stable = previous_dimensions == Some(current);
+            previous_dimensions = Some(current);
+            stable
         });
+        assert!(
+            dimensions_settled,
+            "the pane's grid dimensions never stopped changing within {PTY_ROUND_TRIP:?}"
+        );
+
+        let reseed = |cx: &mut gpui::VisualTestContext| {
+            pane.update(cx, |pane, cx| {
+                pane.reset_grid_for_test(cx);
+                pane.inject_bytes_for_test(format!("\x1b[10;1H{text}").as_bytes(), cx);
+                pane.select_cells_for_test(9, 0..text.chars().count());
+            });
+        };
+        reseed(cx);
+        let mut consecutive_clean = 0;
+        let settled = pump_until(cx, |cx| {
+            if pane.read_with(cx, |pane, _| pane.selected_text_for_test()) == Some(text.to_string())
+            {
+                consecutive_clean += 1;
+            } else {
+                consecutive_clean = 0;
+                reseed(cx);
+            }
+            consecutive_clean >= 3
+        });
+        assert!(
+            settled,
+            "the seeded selection never survived a real drain within {PTY_ROUND_TRIP:?}"
+        );
     }
 
     #[gpui::test]
@@ -4825,6 +4881,15 @@ mod terminal_action_tests {
         cx.run_until_parked();
         seed_active_pane(&app, cx, "active-agent-text");
 
+        // `Agents::spawn` alone (unlike the real `AdeApp::new_agent` this deliberately bypasses,
+        // to isolate copy's own active-agent routing from spawn's other side effects) never moves
+        // `Window::focus` - see `Agents::focus_active`'s own docs for why that is a caller's job.
+        // Left unfocused, `Window::focus` is still the first (now unmounted) agent's stale handle,
+        // and dispatch from a focus handle absent from the current rendered frame does not fall
+        // back to the root the way dispatching from no focus at all does.
+        app.update_in(cx, |app, window, cx| {
+            app.agents.focus_active(window, cx);
+        });
         cx.dispatch_action(TerminalCopy);
 
         let text = cx.update(|_window, cx| cx.read_from_clipboard().and_then(|item| item.text()));

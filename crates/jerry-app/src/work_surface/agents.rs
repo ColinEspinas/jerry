@@ -9,7 +9,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use gpui::{App, AppContext as _, Context, Entity, Focusable as _, Subscription, Window};
 
 use crate::root::AdeApp;
-use crate::terminal::pane::{TerminalPane, TerminalPaneEvent, TerminalSpec};
+use crate::terminal::pane::{
+    TerminalPane, TerminalPaneEvent, TerminalSpec, TERMINAL_COLS, TERMINAL_ROWS,
+};
+use jerry_core::{AppCommand, Report, Request, SessionSpawn};
 
 /// Which agent CLI a real agent runs. Never a bare shell - see [`ProcessKind`] for the type that
 /// also covers a plain interactive terminal.
@@ -278,6 +281,11 @@ pub struct Agent {
     /// `None` for any Cursor pane whose id could not be minted at spawn time - an agent with no
     /// id is simply not resumable, which is what the run-history footer already says.
     pub session_id: Option<String>,
+    /// The host's own PTY session id for this agent's process, once `Agents::spawn_inner`'s
+    /// `SessionSpawn` dispatch resolves - distinct from [`Self::session_id`] (a CLI conversation
+    /// id). `None` until attach, and briefly `None` again for a spawn that failed. What
+    /// `crate::work_surface::session_exited` looks an incoming `event/session-exited` up by.
+    pub host_session_id: Option<jerry_core::SessionId>,
     /// Keeps [`Agents::spawn`]'s subscription to this agent's pane (see [`TerminalPaneEvent`])
     /// alive for this agent's lifetime - never read, only held.
     _pane_subscription: Subscription,
@@ -298,6 +306,10 @@ pub struct Agents {
     /// every close forgets, so `jerry` calls from an agent classify as that agent and stay
     /// confined to its worktree. Plain shells carry no `JERRY_AGENT_ID` and are never entered.
     host_agents: Option<jerry_host::AgentTable>,
+    /// [`Self::spawn_inner`]'s own `SessionSpawn`-dispatch-then-attach task, one per spawn - held
+    /// here (rather than detached) so it is cancelled, not orphaned, if this collection (and so
+    /// the `AdeApp` that owns it) drops before a spawn resolves.
+    _spawn_tasks: crate::root::task_pool::TaskPool,
 }
 
 impl Agents {
@@ -308,6 +320,7 @@ impl Agents {
             active_by_cwd: HashMap::new(),
             next_id: 0,
             host_agents: None,
+            _spawn_tasks: crate::root::task_pool::TaskPool::default(),
         }
     }
 
@@ -495,6 +508,25 @@ impl Agents {
         }
     }
 
+    /// Records the host's own PTY session id a pane attached to - see [`Agent::host_session_id`].
+    /// A no-op for an id that isn't open (the pane could have been closed in the interval between
+    /// `SessionSpawn` dispatch and this resolving).
+    pub fn set_host_session_id(&mut self, id: AgentId, session_id: jerry_core::SessionId) {
+        if let Some(agent) = self.agents.iter_mut().find(|agent| agent.id == id) {
+            agent.host_session_id = Some(session_id);
+        }
+    }
+
+    /// The open agent whose process the host knows as `session_id`, if any - the reverse of
+    /// [`Self::set_host_session_id`]. What `crate::work_surface::session_exited` resolves an
+    /// incoming `event/session-exited` notification's `id` against.
+    pub fn agent_for_host_session(&self, session_id: &jerry_core::SessionId) -> Option<AgentId> {
+        self.agents
+            .iter()
+            .find(|agent| agent.host_session_id.as_ref() == Some(session_id))
+            .map(|agent| agent.id)
+    }
+
     /// The conversation id this pane is attached to, if it was known at spawn time - `None` for
     /// every kind whose id arrives through hooks instead (see [`Agent::session_id`]).
     pub fn session_id_for(&self, id: AgentId) -> Option<&str> {
@@ -524,6 +556,57 @@ impl Agents {
     ) -> AgentId {
         let id = self.next_id;
         self.next_id += 1;
+        let hook_extras = hook_extras_for(kind, hooks, id);
+        let extras = if leading_args.is_empty() {
+            hook_extras
+        } else {
+            let (mut hook_args, env) = hook_extras.unwrap_or_default();
+            leading_args.append(&mut hook_args);
+            Some((leading_args, env))
+        };
+        let spec = kind.spec(cwd.clone(), shell_override, extras);
+        self.spawn_resolved(id, kind, cwd, terminal_font_size_px, spec, window, cx)
+    }
+
+    /// Test-only: [`Self::spawn_inner`], but with an explicit [`TerminalSpec`] rather than one
+    /// resolved from a [`ProcessKind`] - lets a test exercise agent-table-scoped behaviour
+    /// (`crate::work_surface::session_exited`'s own coverage) against a real, genuinely-exiting
+    /// process, without requiring a real `claude`/`codex`/`cursor-agent` binary this workspace's
+    /// own nextest mitigation deliberately keeps off `PATH`. `kind` is still recorded and still
+    /// registered in the host's agent table exactly as [`Self::spawn_inner`] would for a real
+    /// [`ProcessKind::Agent`] - the same "downstream code cannot tell the difference" honesty
+    /// [`Self::set_kind_for_test`]'s own docs describe.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_with_explicit_command_for_test(
+        &mut self,
+        kind: ProcessKind,
+        cwd: PathBuf,
+        terminal_font_size_px: f32,
+        spec: TerminalSpec,
+        window: &mut Window,
+        cx: &mut Context<AdeApp>,
+    ) -> AgentId {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.spawn_resolved(id, kind, cwd, terminal_font_size_px, spec, window, cx)
+    }
+
+    /// The shared tail of [`Self::spawn_inner`] and (in tests)
+    /// [`Self::spawn_with_explicit_command_for_test`]: everything that only needs an already-
+    /// allocated `id` and an already-resolved `spec`, regardless of where either came from -
+    /// table registration, the pane and its tab, and the `SessionSpawn` dispatch/attach task.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_resolved(
+        &mut self,
+        id: AgentId,
+        kind: ProcessKind,
+        cwd: PathBuf,
+        terminal_font_size_px: f32,
+        spec: TerminalSpec,
+        window: &mut Window,
+        cx: &mut Context<AdeApp>,
+    ) -> AgentId {
         if let Some(table) = &self.host_agents {
             if let ProcessKind::Agent(agent_kind) = kind {
                 table.register(
@@ -534,16 +617,7 @@ impl Agents {
             }
         }
 
-        let hook_extras = hook_extras_for(kind, hooks, id);
-        let extras = if leading_args.is_empty() {
-            hook_extras
-        } else {
-            let (mut hook_args, env) = hook_extras.unwrap_or_default();
-            leading_args.append(&mut hook_args);
-            Some((leading_args, env))
-        };
-        let spec = kind.spec(cwd.clone(), shell_override, extras);
-        let pane = cx.new(|cx| TerminalPane::new(spec, terminal_font_size_px, cx));
+        let pane = cx.new(|cx| TerminalPane::new(spec.clone(), terminal_font_size_px, cx));
         let pane_subscription = cx.subscribe_in(
             &pane,
             window,
@@ -562,6 +636,8 @@ impl Agents {
             },
         );
 
+        let spawn_pane = pane.downgrade();
+        let spawn_cwd = cwd.clone();
         self.agents.push(Agent {
             id,
             kind,
@@ -570,10 +646,92 @@ impl Agents {
             spawned_at: Instant::now(),
             spawned_at_unix: unix_now(),
             session_id: None,
+            host_session_id: None,
             _pane_subscription: pane_subscription,
         });
         self.active = Some(id);
         self.active_by_cwd.insert(cwd, id);
+
+        // Dispatches `SessionSpawn` through the host and attaches this pane to the real
+        // `SessionHandle` once it resolves (`docs/architecture/decisions.md` §23) - the tab
+        // itself appears immediately, above; the real process attaches asynchronously, exactly
+        // as it always has, just through the host rather than a direct `jerry_pty::spawn` call.
+        let spawn_task = cx.spawn(async move |this, cx| {
+            let dispatch = this.update(cx, |this, cx| {
+                this.dispatch(
+                    spawn_cwd,
+                    Request::Command(AppCommand::SessionSpawn(SessionSpawn {
+                        program: spec.program.clone(),
+                        args: spec.args.clone(),
+                        env: spec.env.clone(),
+                        rows: TERMINAL_ROWS,
+                        cols: TERMINAL_COLS,
+                    })),
+                    cx,
+                )
+            });
+            let Ok(dispatch) = dispatch else {
+                return; // the app itself was dropped before this could even be asked
+            };
+            let outcome = match dispatch.await {
+                Ok(Report::Ok { outcome }) => outcome,
+                Ok(other) => {
+                    let _ = spawn_pane.update(cx, |pane, cx| {
+                        pane.mark_spawn_failed(
+                            format!("failed to start {}: {other:?}", spec.program.display()),
+                            cx,
+                        )
+                    });
+                    return;
+                }
+                Err(error) => {
+                    let _ = spawn_pane.update(cx, |pane, cx| {
+                        pane.mark_spawn_failed(
+                            format!(
+                                "failed to start {}: {}",
+                                spec.program.display(),
+                                error.message
+                            ),
+                            cx,
+                        )
+                    });
+                    return;
+                }
+            };
+            let Some(session_id) = outcome
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(jerry_core::SessionId::from)
+            else {
+                let _ = spawn_pane.update(cx, |pane, cx| {
+                    pane.mark_spawn_failed(
+                        "internal error: the host's session-spawn outcome had no id".to_string(),
+                        cx,
+                    )
+                });
+                return;
+            };
+            let attached = this.update(cx, |this, _cx| {
+                let handle = this
+                    .sessions()
+                    .and_then(|sessions| sessions.handle_for(&session_id));
+                this.agents.set_host_session_id(id, session_id.clone());
+                (handle, this.host_client())
+            });
+            let Ok((Some(handle), client)) = attached else {
+                let _ = spawn_pane.update(cx, |pane, cx| {
+                    pane.mark_spawn_failed(
+                        "internal error: the session host could not hand back this session's \
+                         adapter"
+                            .to_string(),
+                        cx,
+                    )
+                });
+                return;
+            };
+            let _ = spawn_pane.update(cx, |pane, cx| pane.attach_session(handle, client, cx));
+        });
+        self._spawn_tasks.push(spawn_task);
         id
     }
 
@@ -686,6 +844,29 @@ impl Agents {
     /// [`Self::activate_for_worktree`] would have picked before this call ever ran.
     pub fn clear_active(&mut self) {
         self.active = None;
+    }
+
+    /// Forgets `id`'s entry in the host's agent table (`Self::host_agents`) without touching its
+    /// tab or process - for `crate::work_surface::session_exited`'s reaction to an
+    /// `event/session-exited` notification, which must stop `AgentsQuery` listing an agent whose
+    /// process has genuinely ended even while [`Self::close`]'s "an unclean exit keeps its tab
+    /// open" policy leaves the tab itself in place. A no-op with no host table yet.
+    /// Test-only: the host agent table's own ids right now, straight from
+    /// `jerry_host::AgentTable::list` - the same underlying state `AgentsQuery` answers from
+    /// (`crate::work_surface::session_exited`'s own coverage), without a full dispatch round
+    /// trip. Empty with no host table yet.
+    #[cfg(test)]
+    pub(crate) fn host_agent_ids_for_test(&self) -> Vec<jerry_core::AgentId> {
+        self.host_agents
+            .as_ref()
+            .map(|table| table.list().into_iter().map(|(id, _)| id).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn forget_host_agent(&self, id: AgentId) {
+        if let Some(table) = &self.host_agents {
+            table.forget(&host_agent_id(id));
+        }
     }
 
     /// Moves keyboard focus onto the currently active agent's terminal pane, if there is
