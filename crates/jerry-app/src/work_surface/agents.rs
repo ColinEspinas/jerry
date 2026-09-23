@@ -717,6 +717,13 @@ impl Agents {
                         env: spec.env.clone(),
                         rows: TERMINAL_ROWS,
                         cols: TERMINAL_COLS,
+                        // Still `None` here: this call site still registers an agent's identity
+                        // separately, through the in-process `AgentTable` shortcut just above
+                        // (`Self::host_agents`) - moving that association onto this field instead,
+                        // and retiring the shortcut, is `Hosts`' own per-repository follow-up
+                        // (`docs/architecture/decisions.md` §24), since a real, separate
+                        // `jerry-host` process has no shortcut left to reach into.
+                        agent: None,
                     })),
                     cx,
                 )

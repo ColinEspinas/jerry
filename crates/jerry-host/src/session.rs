@@ -383,10 +383,40 @@ impl SessionManager {
         }
     }
 
+    /// The worktree a real session's own `SessionSpawn` associated `agent_id` with
+    /// (`SessionSpawn::agent`) - `confine`'s own lookup, keyed by the same identity `jerry
+    /// hook`/every other agent call carries. Prefers a still-live entry over an exited one so a
+    /// dead session's stale record cannot keep confining an id a fresh spawn has already reused.
     pub(crate) fn worktree_of_agent(&self, agent_id: &AgentId) -> Option<PathBuf> {
-        lock(&self.entries)
-            .get(&agent_session_id(agent_id))
+        let entries = lock(&self.entries);
+        let matches = || {
+            entries.values().filter(|entry| {
+                entry
+                    .record
+                    .agent
+                    .as_ref()
+                    .is_some_and(|agent| &agent.agent_id == agent_id)
+            })
+        };
+        matches()
+            .find(|entry| entry.record.exit.is_none())
+            .or_else(|| matches().next())
             .map(|entry| entry.record.worktree.clone())
+    }
+
+    /// Whether `agent_id` already names a real, still-running session - [`SessionSpawn::agent`]'s
+    /// own denial rule (decisions.md §24): two live sessions must never answer to the same agent
+    /// identity, since `confine`'s lookup above would then have to guess which one a hook call
+    /// meant.
+    pub(crate) fn agent_is_live(&self, agent_id: &AgentId) -> bool {
+        lock(&self.entries).values().any(|entry| {
+            entry.record.exit.is_none()
+                && entry
+                    .record
+                    .agent
+                    .as_ref()
+                    .is_some_and(|agent| &agent.agent_id == agent_id)
+        })
     }
 
     pub(crate) fn agent_count(&self) -> usize {

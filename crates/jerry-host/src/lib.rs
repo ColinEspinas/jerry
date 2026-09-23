@@ -566,6 +566,109 @@ mod host_dispatch_tests {
         host.shutdown_and_join();
     }
 
+    fn spawn_command(agent_id: AgentId) -> Request {
+        Request::Command(AppCommand::SessionSpawn(jerry_core::SessionSpawn {
+            program: if cfg!(windows) { "cmd" } else { "sh" }.into(),
+            args: if cfg!(windows) {
+                vec!["/c".into(), "echo hi".into()]
+            } else {
+                vec!["-c".into(), "echo hi".into()]
+            },
+            env: Vec::new(),
+            rows: 24,
+            cols: 80,
+            agent: Some(jerry_core::SessionAgentInfo {
+                kind: "Claude".into(),
+                agent_id,
+            }),
+        }))
+    }
+
+    /// The confinement path `SessionSpawn::agent` replaces the separate `AgentTable::register`
+    /// call for: a session spawned with a real agent association is confined to its own worktree
+    /// the moment it exists, through the real `command/session-spawn` dispatch - never a second,
+    /// separate in-process registration step with its own window for a hook to arrive first.
+    #[test]
+    fn a_session_spawned_with_an_agent_is_confined_to_its_worktree_through_the_real_command_path() {
+        let repo = seed_empty_repo();
+        let host = Host::start().expect("host");
+        let client = host.client();
+        let id = AgentId::from("agent-confined-1");
+
+        let spawned = block_on(client.request(Call::human(repo.path(), spawn_command(id.clone()))))
+            .expect("spawn dispatched");
+        assert!(spawned.is_ok(), "{spawned:?}");
+
+        let hook = Request::Hook(HookEvent {
+            event: "PostToolUse".into(),
+            payload: serde_json::json!({ "tool_name": "Edit" }),
+        });
+        let report = block_on(client.request(Call::agent(repo.path(), id.clone(), hook.clone())))
+            .expect("the spawning worktree accepts its own agent's hook");
+        assert!(report.is_ok(), "{report:?}");
+
+        let elsewhere = seed_empty_repo();
+        let confined = block_on(client.call(Call::agent(elsewhere.path(), id, hook)))
+            .expect_err("a hook from outside the spawned worktree is confined");
+        assert_eq!(confined.code, rpc_code::CONFINED);
+        host.shutdown_and_join();
+    }
+
+    /// [`SessionSpawn::agent`]'s own denial rule: two live sessions must never answer to the same
+    /// agent identity - `Report::Denied` with `agent-id-taken`, never a silent second registration
+    /// that would leave confinement unable to tell which session a later hook call meant.
+    #[test]
+    fn a_second_spawn_reusing_a_live_agent_id_is_denied() {
+        let repo = seed_empty_repo();
+        let host = Host::start().expect("host");
+        let client = host.client();
+        let id = AgentId::from("agent-reused-1");
+
+        let sleep = if cfg!(windows) {
+            "ping -n 30 127.0.0.1 >NUL"
+        } else {
+            "sleep 30"
+        };
+        let first = jerry_core::SessionSpawn {
+            program: if cfg!(windows) { "cmd" } else { "sh" }.into(),
+            args: if cfg!(windows) {
+                vec!["/c".into(), sleep.into()]
+            } else {
+                vec!["-c".into(), sleep.into()]
+            },
+            env: Vec::new(),
+            rows: 24,
+            cols: 80,
+            agent: Some(jerry_core::SessionAgentInfo {
+                kind: "Claude".into(),
+                agent_id: id.clone(),
+            }),
+        };
+        let spawned = block_on(client.request(Call::human(
+            repo.path(),
+            Request::Command(AppCommand::SessionSpawn(first)),
+        )))
+        .expect("first spawn dispatched");
+        let Report::Ok { outcome } = spawned else {
+            panic!("expected ok, got {spawned:?}")
+        };
+        let first_id = outcome["id"].clone();
+
+        let second = block_on(client.request(Call::human(repo.path(), spawn_command(id))))
+            .expect("second spawn dispatched, even though it is refused");
+        match second {
+            Report::Denied { code, .. } => assert_eq!(code, "agent-id-taken"),
+            other => panic!("expected denied, got {other:?}"),
+        }
+
+        // Cleanup: kill the still-sleeping first session so this test does not leak it.
+        let kill = Request::Command(AppCommand::SessionKill(jerry_core::SessionKill {
+            id: jerry_core::SessionId::from(first_id.as_str().expect("id string").to_owned()),
+        }));
+        let _ = block_on(client.request(Call::human(repo.path(), kill)));
+        host.shutdown_and_join();
+    }
+
     #[test]
     fn a_hook_event_is_fanned_out_to_every_subscriber() {
         let repo = seed_empty_repo();

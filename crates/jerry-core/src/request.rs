@@ -544,6 +544,10 @@ impl Request {
                     env: Vec::new(),
                     rows: 24,
                     cols: 80,
+                    agent: Some(crate::session::SessionAgentInfo {
+                        kind: "Claude".into(),
+                        agent_id: crate::AgentId::from("agent-1"),
+                    }),
                 })),
             ),
             (

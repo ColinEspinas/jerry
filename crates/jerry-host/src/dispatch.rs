@@ -59,6 +59,14 @@ pub(crate) fn handle(inner: &Inner, call: Call) -> Result<Value, RpcError> {
         // `execute_locally` (decisions.md §23).
         Request::Query(AppQuery::Sessions(_)) => to_value(Report::ok(&inner.sessions().list())),
         Request::Command(AppCommand::SessionSpawn(command)) => {
+            if let Some(agent) = &command.agent {
+                if inner.sessions().agent_is_live(&agent.agent_id) {
+                    return to_value(Report::Denied {
+                        code: "agent-id-taken".into(),
+                        reason: format!("agent {} already has a live session", agent.agent_id),
+                    });
+                }
+            }
             to_value(match spawn_session(inner, &call.cwd, command.clone()) {
                 Ok(outcome) => Report::ok(&outcome),
                 Err(error) => Report::Error { error },
@@ -168,7 +176,7 @@ fn spawn_session(
     }
     let (id, _handle) = inner
         .sessions()
-        .spawn(cwd.to_path_buf(), None, options)
+        .spawn(cwd.to_path_buf(), command.agent, options)
         .map_err(|error| Error::new("session-spawn-failed", error.to_string()))?;
     Ok(SessionSpawnOutcome { id })
 }
