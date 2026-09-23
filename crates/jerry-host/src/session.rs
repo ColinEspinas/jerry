@@ -7,6 +7,7 @@
 //! both kinds of entry, so a caller checking agent confinement and one listing sessions never see
 //! two different tables.
 
+use crate::data_plane::{DataPlane, DataPlaneBindError};
 use crate::fanout::Fanout;
 use futures::channel::mpsc as futures_mpsc;
 use futures::executor::block_on;
@@ -38,6 +39,16 @@ pub enum SessionError {
     Pty(#[from] PtyError),
 }
 
+/// [`SessionManager::attach`]'s errors - see `command/session-attach`'s own docs
+/// (`jerry_core::session::SessionAttach`) for how each maps onto the wire.
+#[derive(Debug, thiserror::Error)]
+pub enum SessionAttachError {
+    #[error("no session with id {0}")]
+    NotFound(SessionId),
+    #[error("session {0} already has an attached client")]
+    AlreadyAttached(SessionId),
+}
+
 /// [`jerry_core::ExitStatusWire`]'s conversion from the real `jerry_pty::ExitStatus` - a free
 /// function, not a `From` impl, since neither type is local to this crate (the orphan rule).
 fn exit_status_wire(status: &jerry_pty::ExitStatus) -> ExitStatusWire {
@@ -57,6 +68,11 @@ struct Entry {
     /// to whichever client asks - `SessionHandle::take_output`'s own `Option::take` is what
     /// actually enforces single-consumer, not this table.
     handle: Option<Arc<SessionHandle>>,
+    /// This session's real data-plane socket (`crate::data_plane`, decisions.md §24) - `Some`
+    /// exactly when `handle` is, bound the moment [`SessionManager::spawn`] starts the session and
+    /// shut down (socket file removed) by [`SessionManager::forget_session`] or
+    /// [`SessionManager::shutdown_all`].
+    data_plane: Option<Arc<DataPlane>>,
 }
 
 /// The data-plane adapter handed to the one attaching client at spawn time (decisions.md §23):
@@ -131,14 +147,18 @@ pub struct SessionManager {
     entries: Arc<Mutex<HashMap<SessionId, Entry>>>,
     fanout: Fanout,
     next_id: Arc<AtomicU64>,
+    /// Where every session's own [`DataPlane`] binds its socket - the same directory the host's
+    /// own control-plane socket and registry descriptor live under.
+    sockets_dir: PathBuf,
 }
 
 impl SessionManager {
-    pub(crate) fn new(fanout: Fanout) -> Self {
+    pub(crate) fn new(fanout: Fanout, sockets_dir: PathBuf) -> Self {
         Self {
             entries: Arc::new(Mutex::new(HashMap::new())),
             fanout,
             next_id: Arc::new(AtomicU64::new(0)),
+            sockets_dir,
         }
     }
 
@@ -169,6 +189,7 @@ impl SessionManager {
             .take_output()
             .ok_or(SessionSpawnError::NoOutputStream)?;
         let id = self.next_session_id();
+        let process_id = session.process_id();
         let (relay_tx, relay_rx) = futures_mpsc::channel(RELAY_CHANNEL_CAPACITY);
         let record = SessionRecord {
             id: id.clone(),
@@ -177,10 +198,13 @@ impl SessionManager {
             agent,
             started_at: unix_now(),
             exit: None,
+            process_id,
         };
+        let process = Arc::new(Mutex::new(session));
+        let data_plane = DataPlane::bind(&self.sockets_dir, Arc::clone(&process))?;
         let handle = Arc::new(SessionHandle {
             id: id.clone(),
-            process: Arc::new(Mutex::new(session)),
+            process,
             output: Mutex::new(Some(relay_rx)),
         });
         lock(&self.entries).insert(
@@ -188,11 +212,43 @@ impl SessionManager {
             Entry {
                 record,
                 handle: Some(Arc::clone(&handle)),
+                data_plane: Some(Arc::clone(&data_plane)),
             },
         );
-        spawn_relay(id.clone(), raw_output, relay_tx, self.clone())
+        spawn_relay(id.clone(), raw_output, relay_tx, data_plane, self.clone())
             .map_err(SessionSpawnError::Relay)?;
         Ok((id, handle))
+    }
+
+    /// [`crate::data_plane::DataPlane`]'s own socket path for an already-spawned session -
+    /// `command/session-attach`'s real answer (`docs/architecture/decisions.md` §24). Checked
+    /// against the socket layer's own `attached` flag as an earlier, friendlier rejection of the
+    /// common case; the socket layer itself is what actually enforces "exactly one attach at a
+    /// time" (`crate::data_plane`'s own module docs) against a race with this check.
+    pub fn attach(&self, id: &SessionId) -> Result<PathBuf, SessionAttachError> {
+        let entries = lock(&self.entries);
+        let entry = entries
+            .get(id)
+            .ok_or_else(|| SessionAttachError::NotFound(id.clone()))?;
+        let data_plane = entry
+            .data_plane
+            .as_ref()
+            .ok_or_else(|| SessionAttachError::NotFound(id.clone()))?;
+        if data_plane.attached() {
+            return Err(SessionAttachError::AlreadyAttached(id.clone()));
+        }
+        Ok(data_plane.socket_path().to_path_buf())
+    }
+
+    /// [`crate::data_plane::DataPlane::buffered_len`] for the session's own pre-attach buffer -
+    /// `0` for an unknown id, matching `DataPlane`'s own test-only accessor.
+    #[cfg(test)]
+    pub(crate) fn buffered_len_for_test(&self, id: &SessionId) -> usize {
+        lock(&self.entries)
+            .get(id)
+            .and_then(|entry| entry.data_plane.as_ref())
+            .map(|data_plane| data_plane.buffered_len())
+            .unwrap_or(0)
     }
 
     /// Hands back the same handle [`Self::spawn`] returned, for a caller that only has the
@@ -249,16 +305,26 @@ impl SessionManager {
     /// the real, expected case, not hundreds, so parallelizing this would add real complexity for
     /// no real win.
     pub fn shutdown_all(&self) {
-        let handles: Vec<Arc<SessionHandle>> = lock(&self.entries)
+        let sessions: Vec<(Arc<SessionHandle>, Option<Arc<DataPlane>>)> = lock(&self.entries)
             .values()
-            .filter_map(|entry| entry.handle.clone())
+            .filter_map(|entry| {
+                entry
+                    .handle
+                    .clone()
+                    .map(|handle| (handle, entry.data_plane.clone()))
+            })
             .collect();
-        for handle in handles {
+        for (handle, data_plane) in sessions {
             if let Err(err) = handle.shutdown() {
                 log::warn!(
                     "jerry-host: failed to shut down session {} during host shutdown: {err}",
                     handle.id()
                 );
+            }
+            // The process is confirmed dead by the line above; nothing will ever attach to its
+            // data plane again, so its socket goes with it rather than lingering as a stale file.
+            if let Some(data_plane) = data_plane {
+                data_plane.shutdown();
             }
         }
     }
@@ -283,12 +349,14 @@ impl SessionManager {
             agent: Some(SessionAgentInfo { kind, agent_id }),
             started_at: unix_now(),
             exit: None,
+            process_id: None,
         };
         lock(&self.entries).insert(
             id,
             Entry {
                 record,
                 handle: None,
+                data_plane: None,
             },
         );
     }
@@ -305,7 +373,14 @@ impl SessionManager {
     /// already knew which real `SessionId` a closed tab's process was
     /// (`crate::work_surface::agents::Agent::host_session_id`).
     pub(crate) fn forget_session(&self, id: &SessionId) {
-        lock(&self.entries).remove(id);
+        // Torn down explicitly, not just left to `Arc<DataPlane>`'s own `Drop`: the session's
+        // relay thread may still hold a clone briefly after this call (draining its last item),
+        // and a stale socket file must not outlive the app's own stated "no further interest".
+        if let Some(entry) = lock(&self.entries).remove(id) {
+            if let Some(data_plane) = entry.data_plane {
+                data_plane.shutdown();
+            }
+        }
     }
 
     pub(crate) fn worktree_of_agent(&self, agent_id: &AgentId) -> Option<PathBuf> {
@@ -371,14 +446,17 @@ impl SessionManager {
 
 /// [`SessionManager::spawn`]'s errors: a real `jerry_pty` failure, a freshly spawned session with
 /// no output stream (never actually observed - `jerry_pty::spawn` always leaves one, see
-/// `PtySession::take_output`'s own docs - but handled honestly rather than `unwrap`ped), or a
-/// failure to start the relay thread that observes this session's exit.
+/// `PtySession::take_output`'s own docs - but handled honestly rather than `unwrap`ped), a failure
+/// to bind this session's own data-plane socket, or a failure to start the relay thread that
+/// observes this session's exit.
 #[derive(Debug, thiserror::Error)]
 pub enum SessionSpawnError {
     #[error(transparent)]
     Pty(#[from] PtyError),
     #[error("a freshly spawned session had no output stream")]
     NoOutputStream,
+    #[error(transparent)]
+    DataPlane(#[from] DataPlaneBindError),
     #[error("could not start this session's exit-observing relay thread: {0}")]
     Relay(io::Error),
 }
@@ -392,22 +470,28 @@ fn agent_session_id(agent_id: &AgentId) -> SessionId {
 
 /// Drains `raw` (the real `jerry_pty::PtySession` output stream) on a dedicated thread, forwarding
 /// every item to `relay_tx` in the exact order received - preserving `jerry_pty`'s own
-/// Exited-last contract (`docs/architecture/decisions.md` §8's amendment) - and recording the
-/// session's exit on `manager` the moment `Exited` is observed, before forwarding it downstream.
-/// Ends the moment `Exited` is forwarded, or the moment the downstream receiver (the attached
-/// client) is dropped, whichever comes first.
+/// Exited-last contract (`docs/architecture/decisions.md` §8's amendment) - pushing every
+/// `Bytes` chunk to `data_plane` (its own buffer-and-relay to whichever client is attached, or
+/// none yet), and recording the session's exit on `manager` and `data_plane` the moment `Exited`
+/// is observed, before forwarding it downstream. Ends the moment `Exited` is forwarded, or the
+/// moment the downstream receiver (the attached client) is dropped, whichever comes first.
 fn spawn_relay(
     id: SessionId,
     mut raw: futures_mpsc::Receiver<PtyOutput>,
     mut relay_tx: futures_mpsc::Sender<PtyOutput>,
+    data_plane: Arc<DataPlane>,
     manager: SessionManager,
 ) -> io::Result<()> {
     thread::Builder::new()
         .name("jerry-host-session-relay".into())
         .spawn(move || {
             while let Some(item) = block_on(raw.next()) {
-                if let PtyOutput::Exited(status) = &item {
-                    manager.record_exit(&id, status);
+                match &item {
+                    PtyOutput::Bytes(chunk) => data_plane.push(chunk),
+                    PtyOutput::Exited(status) => {
+                        manager.record_exit(&id, status);
+                        data_plane.mark_exited();
+                    }
                 }
                 let exited = matches!(item, PtyOutput::Exited(_));
                 if block_on(relay_tx.send(item)).is_err() || exited {
@@ -529,7 +613,7 @@ mod session_manager_tests {
 
     #[test]
     fn spawn_delivers_bytes_then_exit_and_kill_is_observed_the_same_way() {
-        let manager = SessionManager::new(Fanout::default());
+        let manager = SessionManager::new(Fanout::default(), crate::default_sockets_dir());
         let (id, handle) = manager
             .spawn(PathBuf::from("/repo"), None, shell_options("echo hello"))
             .expect("spawn");
@@ -556,7 +640,7 @@ mod session_manager_tests {
 
     #[test]
     fn a_second_spawn_in_the_same_worktree_gets_a_distinct_id() {
-        let manager = SessionManager::new(Fanout::default());
+        let manager = SessionManager::new(Fanout::default(), crate::default_sockets_dir());
         let (first, first_handle) = manager
             .spawn(PathBuf::from("/repo"), None, shell_options("echo one"))
             .expect("first spawn");
@@ -574,7 +658,7 @@ mod session_manager_tests {
 
     #[test]
     fn killing_a_live_session_is_observed_as_a_real_exit() {
-        let manager = SessionManager::new(Fanout::default());
+        let manager = SessionManager::new(Fanout::default(), crate::default_sockets_dir());
         let sleep = if cfg!(windows) {
             "ping -n 30 127.0.0.1 >NUL"
         } else {
@@ -595,7 +679,7 @@ mod session_manager_tests {
 
     #[test]
     fn resizing_or_killing_an_unknown_id_is_a_real_typed_error() {
-        let manager = SessionManager::new(Fanout::default());
+        let manager = SessionManager::new(Fanout::default(), crate::default_sockets_dir());
         let unknown = jerry_core::SessionId::from("no-such-session");
         assert!(matches!(
             manager.resize(&unknown, 24, 80),
@@ -609,7 +693,7 @@ mod session_manager_tests {
 
     #[test]
     fn an_agent_table_registration_is_listed_but_cannot_be_resized_or_killed() {
-        let manager = SessionManager::new(Fanout::default());
+        let manager = SessionManager::new(Fanout::default(), crate::default_sockets_dir());
         let agent_id = jerry_core::AgentId::from("agent-1");
         manager.register_agent(agent_id.clone(), PathBuf::from("/repo"), "Claude".into());
 
@@ -636,5 +720,250 @@ mod session_manager_tests {
 
         manager.forget_agent(&agent_id);
         assert!(manager.worktree_of_agent(&agent_id).is_none());
+    }
+}
+
+/// [`SessionManager::attach`] and the real per-session socket it hands back
+/// (`crate::data_plane`, `docs/architecture/decisions.md` §24): a real interactive shell, driven
+/// entirely over the socket - never `SessionHandle::write_input`/`take_output` directly, which
+/// would prove nothing about the data plane actually reachable through `command/session-attach`.
+#[cfg(test)]
+mod data_plane_tests {
+    use super::SessionManager;
+    use crate::fanout::Fanout;
+    use jerry_core::client::Stream;
+    use jerry_pty::SpawnOptions;
+    use std::io::{Read, Write};
+    use std::path::PathBuf;
+    use std::time::Duration;
+    use test_support::wait_until;
+
+    /// A real, interactive shell (no script, no `-c`/`/c`): reads commands from its stdin - here,
+    /// the data-plane socket - for as long as it stays open, exactly like a real terminal tab.
+    fn interactive_shell_options() -> SpawnOptions {
+        if cfg!(windows) {
+            SpawnOptions::new("cmd")
+        } else {
+            SpawnOptions::new("sh")
+        }
+    }
+
+    #[cfg(windows)]
+    const CURSOR_POSITION_QUERY: &[u8] = b"\x1b[6n";
+    #[cfg(windows)]
+    const CURSOR_POSITION_REPORT: &[u8] = b"\x1b[1;1R";
+
+    /// ConPTY's startup Device Status Report query (see `session_manager_tests::
+    /// answer_cursor_position_query`'s identical docs) - answered here over the raw socket
+    /// itself, since a bare test client is exactly as VT-blind as a bare `SessionHandle` is.
+    #[cfg(windows)]
+    fn answer_cursor_position_query(stream: &mut Stream, seen: &[u8], answered: &mut bool) {
+        if !*answered
+            && seen
+                .windows(CURSOR_POSITION_QUERY.len())
+                .any(|window| window == CURSOR_POSITION_QUERY)
+        {
+            let _ = stream.write_all(CURSOR_POSITION_REPORT);
+            *answered = true;
+        }
+    }
+    #[cfg(not(windows))]
+    fn answer_cursor_position_query(_stream: &mut Stream, _seen: &[u8], _answered: &mut bool) {}
+
+    /// Writes `line` followed by a real line ending, as if a user had typed it and pressed enter.
+    fn write_line(stream: &mut Stream, line: &str) {
+        stream
+            .write_all(format!("{line}\r\n").as_bytes())
+            .expect("write a line to the data-plane socket");
+    }
+
+    /// Reads from `stream` (a short per-call timeout, so a stalled connection cannot hang this
+    /// past `overall_timeout`) until `needle` appears in the accumulated bytes, answering the
+    /// Windows cursor-position query along the way. Panics with what was actually seen if the
+    /// deadline passes first - a real failure, not a silent false negative.
+    fn read_until_contains(
+        stream: &mut Stream,
+        needle: &[u8],
+        overall_timeout: Duration,
+    ) -> Vec<u8> {
+        stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("set a short per-read timeout");
+        let mut collected = Vec::new();
+        let mut answered = false;
+        let deadline = std::time::Instant::now() + overall_timeout;
+        let mut buf = [0u8; 4096];
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {:?} in {:?}",
+                String::from_utf8_lossy(needle),
+                String::from_utf8_lossy(&collected)
+            );
+            match stream.read(&mut buf) {
+                Ok(0) => panic!(
+                    "the connection closed before {:?} ever appeared in {:?}",
+                    String::from_utf8_lossy(needle),
+                    String::from_utf8_lossy(&collected)
+                ),
+                Ok(n) => {
+                    collected.extend_from_slice(&buf[..n]);
+                    answer_cursor_position_query(stream, &collected, &mut answered);
+                    if collected
+                        .windows(needle.len())
+                        .any(|window| window == needle)
+                    {
+                        return collected;
+                    }
+                }
+                Err(ref error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(error) => panic!("read error: {error}"),
+            }
+        }
+    }
+
+    /// Whether `stream` has been closed from the other end - a real `Ok(0)`/error observed
+    /// within the short per-call timeout [`read_until_contains`] also uses, not assumed.
+    fn is_closed(stream: &mut Stream) -> bool {
+        let mut buf = [0u8; 4096];
+        match stream.read(&mut buf) {
+            Ok(0) => true,
+            Ok(_) => false,
+            Err(ref error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                false
+            }
+            Err(_) => true,
+        }
+    }
+
+    #[test]
+    fn attach_over_the_real_socket_carries_bytes_both_ways_and_the_host_closes_it_on_exit() {
+        let manager = SessionManager::new(Fanout::default(), crate::default_sockets_dir());
+        let (id, _handle) = manager
+            .spawn(PathBuf::from("/repo"), None, interactive_shell_options())
+            .expect("spawn");
+
+        let socket = manager.attach(&id).expect("attach");
+        let mut stream = Stream::connect(&socket).expect("connect to the data-plane socket");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("set read timeout");
+
+        // Real input, over the socket - never `SessionHandle::write_input` - is what makes the
+        // shell produce this marker, proving the client-to-host direction is real.
+        write_line(&mut stream, "echo jerry-data-plane-marker");
+        read_until_contains(
+            &mut stream,
+            b"jerry-data-plane-marker",
+            Duration::from_secs(15),
+        );
+
+        write_line(&mut stream, "exit");
+
+        assert!(
+            wait_until(Duration::from_secs(15), || is_closed(&mut stream)),
+            "the host must close the data-plane socket once the session exits"
+        );
+        assert!(
+            wait_until(Duration::from_secs(5), || manager
+                .list()
+                .iter()
+                .find(|record| record.id == id)
+                .and_then(|record| record.exit.as_ref())
+                .is_some()),
+            "the manager's own record must reflect the observed exit"
+        );
+    }
+
+    #[test]
+    fn a_second_attach_is_denied_until_the_first_disconnects() {
+        let manager = SessionManager::new(Fanout::default(), crate::default_sockets_dir());
+        let sleep = if cfg!(windows) {
+            "ping -n 30 127.0.0.1 >NUL"
+        } else {
+            "sleep 30"
+        };
+        let (id, _handle) = manager
+            .spawn(PathBuf::from("/repo"), None, shell_options_for_test(sleep))
+            .expect("spawn");
+
+        let socket = manager.attach(&id).expect("first attach");
+        let first = Stream::connect(&socket).expect("first connection");
+
+        assert!(
+            wait_until(Duration::from_secs(5), || manager.attach(&id).is_err()),
+            "a second attach must be denied once a real connection is live"
+        );
+        assert!(matches!(
+            manager.attach(&id),
+            Err(super::SessionAttachError::AlreadyAttached(_))
+        ));
+
+        drop(first);
+        assert!(
+            wait_until(Duration::from_secs(5), || manager.attach(&id).is_ok()),
+            "a second attach must succeed again once the first connection disconnects"
+        );
+
+        manager.kill(&id).expect("kill");
+    }
+
+    #[test]
+    fn output_produced_before_any_client_attaches_is_still_delivered() {
+        let manager = SessionManager::new(Fanout::default(), crate::default_sockets_dir());
+        let (id, _handle) = manager
+            .spawn(
+                PathBuf::from("/repo"),
+                None,
+                shell_options_for_test("echo jerry-pre-attach-marker"),
+            )
+            .expect("spawn");
+
+        // A real, deterministic wait on the pre-attach buffer actually holding something -
+        // never a blind sleep - before this test's own client ever attaches. On Windows this is
+        // ConPTY's own startup handshake bytes (its Device Status Report query among them, see
+        // `answer_cursor_position_query`'s docs): those are pushed immediately, unlike the
+        // `echo` command's own output, which - per `docs/architecture/decisions.md` §23 - ConPTY
+        // withholds until something answers that query, which nothing does here on purpose.
+        assert!(
+            wait_until(Duration::from_secs(10), || manager
+                .buffered_len_for_test(&id)
+                > 0),
+            "sanity check: the session must have produced some output before anyone attaches"
+        );
+
+        let socket = manager.attach(&id).expect("a late attach is still allowed");
+        let mut stream = Stream::connect(&socket).expect("connect to the data-plane socket");
+        // The very first bytes delivered are the buffer snapshot itself, so this needle is
+        // whatever the buffer already held the moment this connection registered - real,
+        // pre-attach output, not anything produced by this client's own connection.
+        read_until_contains(&mut stream, pre_attach_needle(), Duration::from_secs(10));
+    }
+
+    /// What [`output_produced_before_any_client_attaches_is_still_delivered`] looks for - see
+    /// that test's own docs for why this differs by platform.
+    #[cfg(windows)]
+    fn pre_attach_needle() -> &'static [u8] {
+        CURSOR_POSITION_QUERY
+    }
+    #[cfg(not(windows))]
+    fn pre_attach_needle() -> &'static [u8] {
+        b"jerry-pre-attach-marker"
+    }
+
+    /// [`session_manager_tests::shell_options`]'s exact one-shot-script shape, duplicated here
+    /// only because that helper lives in a sibling test module and this one needs its own
+    /// interactive-vs-one-shot distinction to stay explicit at each call site.
+    fn shell_options_for_test(script: &str) -> SpawnOptions {
+        if cfg!(windows) {
+            SpawnOptions::new("cmd").args(["/c", script])
+        } else {
+            SpawnOptions::new("sh").args(["-c", script])
+        }
     }
 }

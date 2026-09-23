@@ -296,8 +296,11 @@ fn remove_if_present(path: &Path) -> Result<(), RegistryError> {
 }
 
 /// Distinct on every call within a process: a per-process counter mixed with the clock and the
-/// pid through the standard library's randomly keyed hasher.
-fn fresh_u32() -> u32 {
+/// pid through the standard library's randomly keyed hasher. `pub`: also how `jerry-host` names
+/// its own per-session data-plane sockets (`docs/architecture/decisions.md` §24), which need the
+/// exact same "distinct even across concurrent `SessionManager`s in one test process" guarantee
+/// this registry already relies on for instance names.
+pub fn fresh_u32() -> u32 {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

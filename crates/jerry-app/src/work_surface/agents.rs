@@ -16,7 +16,10 @@ use crate::root::AdeApp;
 use crate::terminal::pane::{
     SessionAdapter, TerminalPane, TerminalPaneEvent, TerminalSpec, TERMINAL_COLS, TERMINAL_ROWS,
 };
-use jerry_core::{AppCommand, Report, Request, SessionSpawn};
+use jerry_core::{
+    AppCommand, AppQuery, Call, Report, Request, SessionAttach, SessionKill, SessionSpawn,
+    SessionsQuery,
+};
 
 /// Which agent CLI a real agent runs. Never a bare shell - see [`ProcessKind`] for the type that
 /// also covers a plain interactive terminal.
@@ -541,6 +544,16 @@ impl Agents {
             .map(|agent| agent.id)
     }
 
+    /// The pane a still-open tab owns, by [`AgentId`] - `crate::work_surface::session_exited`'s
+    /// own use: once it has resolved an `event/session-exited` notification's id via
+    /// [`Self::agent_for_host_session`], this is how it reaches the real pane to mark exited.
+    pub fn pane_for(&self, id: AgentId) -> Option<Entity<TerminalPane>> {
+        self.agents
+            .iter()
+            .find(|agent| agent.id == id)
+            .map(|agent| agent.pane.clone())
+    }
+
     /// The conversation id this pane is attached to, if it was known at spawn time - `None` for
     /// every kind whose id arrives through hooks instead (see [`Agent::session_id`]).
     pub fn session_id_for(&self, id: AgentId) -> Option<&str> {
@@ -684,7 +697,7 @@ impl Agents {
         let spawn_task = cx.spawn(async move |this, cx| {
             let dispatch = this.update(cx, |this, cx| {
                 this.dispatch(
-                    spawn_cwd,
+                    spawn_cwd.clone(),
                     Request::Command(AppCommand::SessionSpawn(SessionSpawn {
                         program: program.clone(),
                         args: args.clone(),
@@ -736,39 +749,161 @@ impl Agents {
                 });
                 return;
             };
-            let attached = this.update(cx, |this, _cx| {
-                let handle = this
-                    .sessions()
-                    .and_then(|sessions| sessions.handle_for(&session_id));
+            let client = this.update(cx, |this, _cx| {
                 this.agents.set_host_session_id(id, session_id.clone());
-                (handle, this.host_client())
+                this.host_client()
             });
-            let Ok((Some(handle), client)) = attached else {
+            let Ok(Some(client)) = client else {
                 let _ = spawn_pane.update(cx, |pane, cx| {
                     pane.mark_spawn_failed(
-                        "internal error: the session host could not hand back this session's \
-                         adapter"
+                        "internal error: no session host is reachable to attach this session"
                             .to_string(),
                         cx,
                     )
                 });
                 return;
             };
+
+            // `command/session-attach` (decisions.md §24): the real per-session data-plane
+            // socket, the one execution path regardless of whether `client` is local or reaches
+            // a genuine out-of-process host.
+            let attach_dispatch = this.update(cx, |this, cx| {
+                this.dispatch(
+                    spawn_cwd.clone(),
+                    Request::Command(AppCommand::SessionAttach(SessionAttach {
+                        id: session_id.clone(),
+                    })),
+                    cx,
+                )
+            });
+            let Ok(attach_dispatch) = attach_dispatch else {
+                return;
+            };
+            let socket = match attach_dispatch.await {
+                Ok(Report::Ok { outcome }) => outcome
+                    .get("socket")
+                    .and_then(serde_json::Value::as_str)
+                    .map(PathBuf::from),
+                Ok(other) => {
+                    let _ = spawn_pane.update(cx, |pane, cx| {
+                        pane.mark_spawn_failed(
+                            format!("failed to attach the session's data plane: {other:?}"),
+                            cx,
+                        )
+                    });
+                    return;
+                }
+                Err(error) => {
+                    let _ = spawn_pane.update(cx, |pane, cx| {
+                        pane.mark_spawn_failed(
+                            format!(
+                                "failed to attach the session's data plane: {}",
+                                error.message
+                            ),
+                            cx,
+                        )
+                    });
+                    return;
+                }
+            };
+            let Some(socket) = socket else {
+                let _ = spawn_pane.update(cx, |pane, cx| {
+                    pane.mark_spawn_failed(
+                        "internal error: the host's session-attach outcome had no socket"
+                            .to_string(),
+                        cx,
+                    )
+                });
+                return;
+            };
+
+            // `process_id()` (used for CPU/memory sampling, `status_bar::process_stats`) answers
+            // from a `SessionsQuery` rather than its own control-plane round trip - see
+            // `SessionRecord::process_id`'s own docs. Best-effort: a failure here still leaves a
+            // perfectly usable session, just with no pid to sample.
+            let sessions_dispatch = this.update(cx, |this, cx| {
+                this.dispatch(
+                    spawn_cwd.clone(),
+                    Request::Query(AppQuery::Sessions(SessionsQuery::default())),
+                    cx,
+                )
+            });
+            let process_id = match sessions_dispatch {
+                Ok(task) => match task.await {
+                    Ok(Report::Ok { outcome }) => outcome.as_array().and_then(|entries| {
+                        entries
+                            .iter()
+                            .find(|entry| {
+                                entry.get("id").and_then(serde_json::Value::as_str)
+                                    == Some(session_id.to_string().as_str())
+                            })
+                            .and_then(|entry| entry.get("process_id"))
+                            .and_then(serde_json::Value::as_u64)
+                            .map(|pid| pid as u32)
+                    }),
+                    _ => None,
+                },
+                Err(_) => None,
+            };
+
+            let kill_client = client.clone();
+            let kill_cwd = spawn_cwd.clone();
+            let kill_session_id = session_id.clone();
+            let connected = cx
+                .background_spawn(async move {
+                    crate::terminal::socket_adapter::SocketSessionAdapter::connect(
+                        &socket,
+                        kill_session_id.clone(),
+                        process_id,
+                        move || {
+                            let call = Call::human(
+                                kill_cwd.clone(),
+                                Request::Command(AppCommand::SessionKill(SessionKill {
+                                    id: kill_session_id.clone(),
+                                })),
+                            );
+                            match futures::executor::block_on(kill_client.request(call)) {
+                                Ok(Report::Ok { .. }) => Ok(()),
+                                Ok(Report::Denied { code, reason }) => {
+                                    Err(format!("{code}: {reason}"))
+                                }
+                                Ok(Report::Error { error }) => {
+                                    Err(format!("{}: {}", error.code, error.message))
+                                }
+                                Err(error) => Err(format!("{}: {}", error.code, error.message)),
+                            }
+                        },
+                    )
+                })
+                .await;
+            let session: Arc<dyn SessionAdapter> = match connected {
+                Ok(adapter) => Arc::new(adapter),
+                Err(error) => {
+                    let _ = spawn_pane.update(cx, |pane, cx| {
+                        pane.mark_spawn_failed(
+                            format!("failed to connect to the session's data plane: {error}"),
+                            cx,
+                        )
+                    });
+                    return;
+                }
+            };
+
             let attach_outcome = spawn_pane.update(cx, |pane, cx| {
-                pane.attach_session(handle.clone(), client, cx)
+                pane.attach_session(session.clone(), Some(client), cx)
             });
             if attach_outcome.is_err() {
                 // The pane entity itself is already gone - not just doomed, which `TerminalPane::
                 // attach_session` already handles on its own by leaving the session for whichever
                 // caller is already polling `TerminalPane::take_session_for_teardown` to pick up
                 // and shut down. Nothing will ever reach this session through a pane again, so
-                // this task must kill it itself rather than silently drop the handle: unlike the
+                // this task must kill it itself rather than silently drop the adapter: unlike the
                 // old direct `jerry_pty::spawn`, `SessionManager` keeps a session's real process
-                // alive independent of any pane, so dropping the handle alone leaks it (GitHub
+                // alive independent of any pane, so dropping the adapter alone leaks it (GitHub
                 // issue #530's own regression).
                 cx.background_executor()
                     .spawn(async move {
-                        if let Err(err) = handle.shutdown() {
+                        if let Err(err) = session.shutdown() {
                             log::warn!(
                                 "failed to shut down a session whose pane was already gone by \
                                  attach time: {err}"

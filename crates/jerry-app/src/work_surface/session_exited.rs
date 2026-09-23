@@ -1,16 +1,21 @@
 //! Reacts to the host's `event/session-exited` notification (`docs/architecture/decisions.md`
-//! §23): the control-plane signal every subscribed client sees, unlike a pane's own data-plane
-//! byte stream (`crate::terminal::pane::SessionAdapter::take_output`), which only the one
-//! attached pane observes. Forgets the exited process from the host's agent table so
+//! §23, §24): the control-plane signal every subscribed client sees, unlike a pane's own
+//! data-plane byte stream (`crate::terminal::pane::SessionAdapter::take_output`), which only the
+//! one attached pane observes. Forgets the exited process from the host's agent table so
 //! `AgentsQuery` stops listing it, even while [`crate::work_surface::agents::Agents::close`]'s
-//! "an unclean exit keeps its tab open" policy leaves the pane itself in place. Owns no state of
-//! its own - see `crate::work_surface::worktree_created`, the identical pattern this mirrors.
+//! "an unclean exit keeps its tab open" policy leaves the pane itself in place, and marks the
+//! pane itself exited (`TerminalPane::mark_exited_from_event`) - the real exit signal for a
+//! session attached over its data-plane socket
+//! (`crate::terminal::socket_adapter::SocketSessionAdapter`), whose byte stream never carries one
+//! of its own. Owns no state of its own - see `crate::work_surface::worktree_created`, the
+//! identical pattern this mirrors.
 
 use crate::root::AdeApp;
 use futures::channel::mpsc;
 use futures::StreamExt;
 use gpui::{Context, Task};
 use jerry_core::Message;
+use jerry_pty::ExitStatus;
 use serde_json::Value;
 
 /// Drains `events` for as long as the returned `Task` is held - see
@@ -37,9 +42,12 @@ pub(crate) fn spawn_consumer(
 
 impl AdeApp {
     /// `event/session-exited`'s own handler: resolves which open agent (if any) the host's
-    /// session id belongs to and forgets it from the host's agent table. A no-op for a session
-    /// this instance never attached to a pane (another client's session, or one already closed).
-    fn handle_session_exited(&mut self, params: Value, _cx: &mut Context<Self>) {
+    /// session id belongs to, marks that agent's pane exited (`TerminalPane::
+    /// mark_exited_from_event` - a no-op if a `SessionHandle`-backed pane already recorded its
+    /// own exit from `PtyOutput::Exited`), and forgets it from the host's agent table. A no-op
+    /// for a session this instance never attached to a pane (another client's session, or one
+    /// already closed).
+    fn handle_session_exited(&mut self, params: Value, cx: &mut Context<Self>) {
         let Some(session_id) = params
             .get("id")
             .and_then(Value::as_str)
@@ -47,10 +55,36 @@ impl AdeApp {
         else {
             return;
         };
-        if let Some(id) = self.agents.agent_for_host_session(&session_id) {
-            self.agents.forget_host_agent(id);
+        let Some(id) = self.agents.agent_for_host_session(&session_id) else {
+            return;
+        };
+        if let Some(pane) = self.agents.pane_for(id) {
+            let status = exit_status_from_wire(params.get("status"));
+            pane.update(cx, |pane, cx| pane.mark_exited_from_event(status, cx));
         }
+        self.agents.forget_host_agent(id);
     }
+}
+
+/// The reverse of `jerry_host::session::exit_status_wire`: reconstructs a real
+/// `jerry_pty::ExitStatus` from the wire shape `event/session-exited` carries. Lossy when a
+/// signal is present - `portable_pty::ExitStatus::with_signal` has no way to also carry the
+/// original exit code, so only whether the process exited cleanly (`success()`, checked
+/// elsewhere) round-trips exactly; a missing/malformed `status` becomes a plain, honest failure
+/// (`with_exit_code(1)`) rather than a fabricated success.
+fn exit_status_from_wire(status: Option<&Value>) -> ExitStatus {
+    let Some(status) = status else {
+        return ExitStatus::with_exit_code(1);
+    };
+    if let Some(signal) = status.get("signal").and_then(Value::as_str) {
+        return ExitStatus::with_signal(signal);
+    }
+    let code = status
+        .get("code")
+        .and_then(Value::as_u64)
+        .map(|code| code as u32)
+        .unwrap_or(1);
+    ExitStatus::with_exit_code(code)
 }
 
 #[cfg(test)]

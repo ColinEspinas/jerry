@@ -72,7 +72,10 @@ fn main() -> ExitCode {
         }
     };
 
-    let host = match Host::start() {
+    // Every session's own data-plane socket binds alongside the registry, not
+    // `jerry_host::default_sockets_dir`'s own fallback - real production and `--registry-dir`
+    // test isolation alike depend on both living under the exact same directory.
+    let host = match Host::start_at(registry.dir().to_path_buf()) {
         Ok(host) => host,
         Err(error) => {
             eprintln!("jerry-host: could not start: {error}");

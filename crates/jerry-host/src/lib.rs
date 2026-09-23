@@ -6,6 +6,7 @@
 // Only production code is held to `unwrap_used`/`expect_used` (`CLAUDE.md`).
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+mod data_plane;
 mod dispatch;
 mod fanout;
 mod listener;
@@ -216,9 +217,19 @@ pub struct Host {
 
 impl Host {
     /// Starts the host with its own dispatch thread, for a process that has no executor of
-    /// its own (the standalone host binary, tests).
+    /// its own (the standalone host binary, tests). Every session's data-plane socket
+    /// (`crate::data_plane`) binds under [`default_sockets_dir`]; [`Self::start_at`] is the
+    /// explicit-directory twin production callers that already track a registry directory use.
     pub fn start() -> Result<Host, HostError> {
-        let (host, dispatch) = Host::start_detached();
+        Host::start_at(default_sockets_dir())
+    }
+
+    /// [`Self::start`], binding every session's data-plane socket under `sockets_dir` instead of
+    /// [`default_sockets_dir`] - what `jerry-host`'s own `main` and `jerry-app`'s `HostRuntime`
+    /// call, since both already resolve the exact registry directory their descriptor lives
+    /// under and a session's socket belongs alongside it, not scattered to a second default.
+    pub fn start_at(sockets_dir: PathBuf) -> Result<Host, HostError> {
+        let (host, dispatch) = Host::start_detached(sockets_dir);
         let dispatcher = thread::Builder::new()
             .name("jerry-host-dispatch".into())
             .spawn(move || futures::executor::block_on(dispatch))
@@ -234,18 +245,21 @@ impl Host {
     /// it on its own executor: the app spawns it on GPUI's background executor, and a GPUI
     /// test drives it deterministically. Blocking git work runs wherever `spawn` puts it.
     pub fn start_with(spawn: impl FnOnce(DispatchFuture)) -> Host {
-        let (host, dispatch) = Host::start_detached();
+        let (host, dispatch) = Host::start_detached(default_sockets_dir());
         spawn(dispatch);
         host
     }
 
     /// Builds the host and hands back its dispatch loop for the caller to spawn wherever it
     /// lives: the app puts it on GPUI's background executor, and a GPUI test drives it
-    /// deterministically. Blocking git work runs wherever the loop runs.
-    pub fn start_detached() -> (Host, DispatchFuture) {
+    /// deterministically. Blocking git work runs wherever the loop runs. Every session's
+    /// data-plane socket (`crate::data_plane`) binds under `sockets_dir` - production callers
+    /// pass the same directory their registry descriptor lives under; a throwaway test host that
+    /// has none in scope uses [`default_sockets_dir`] via [`Self::start`]/[`Self::start_with`].
+    pub fn start_detached(sockets_dir: PathBuf) -> (Host, DispatchFuture) {
         let (jobs, mut receiver) = mpsc::unbounded::<Job>();
         let fanout = fanout::Fanout::default();
-        let sessions = SessionManager::new(fanout.clone());
+        let sessions = SessionManager::new(fanout.clone(), sockets_dir);
         let agents = sessions.agent_table();
         // Paired eagerly, here, rather than when `Self::run_lifecycle` is first called: a
         // `Shutdown` command dispatched the instant this host starts accepting connections must
@@ -373,6 +387,18 @@ impl Host {
             }
         }
     }
+}
+
+/// Where a session's data-plane socket (`crate::data_plane`) binds when nothing more specific is
+/// in scope (every `Host::start`/`Host::start_with` test call site, and any other throwaway
+/// host): the same real runtime directory the registry itself resolves, falling back to a
+/// plain temp subdirectory only if that lookup fails - an unset `$XDG_RUNTIME_DIR`/
+/// `%LOCALAPPDATA%`, see `jerry_core::registry::runtime_dir`'s own docs for when that happens.
+/// Matches this workspace's existing test convention of binding real, short-lived sockets under
+/// the real runtime directory on platforms where a nested tempdir would not fit
+/// `MAX_SOCKET_PATH_BYTES` (see e.g. `crate::listener::socket_tests::socket_path`).
+pub fn default_sockets_dir() -> PathBuf {
+    jerry_core::registry::runtime_dir().unwrap_or_else(|_| std::env::temp_dir().join("jerry-run"))
 }
 
 /// How long an idle [`Host`] lingers before [`Host::run_lifecycle`] lets it exit - long enough

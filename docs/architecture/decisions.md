@@ -1144,10 +1144,12 @@ not folded into this one as a partial pass. Tracked as issue #532's own scope, n
 ## 24. `jerry-host` becomes its own process: the binary, spawn-or-connect, lifecycle, version
 gating
 
-**Status:** Accepted, partially landed (2026-09-23, issue #506; plan decisions Q7, Q15, Q20, and
-§14's spike). The real protocol/process pieces below are shipped and tested; `jerry-app`'s own
-production dispatch is **not yet cut over** to them - see "What did not move, and why" before
-assuming decision 3's "no production path constructs a `Host`" already holds.
+**Status:** Accepted, partially landed (2026-09-23, issue #506; 2026-09-23, issue #507's own data
+plane; plan decisions Q7, Q15, Q20, and §14's spike). The real protocol/process pieces below, and
+the data plane in the amendment further down, are shipped and tested; `jerry-app`'s `HostRuntime`
+still only ever constructs an **in-process** `Host` for its control-plane dispatch - see "What
+still has not moved" before assuming decision 3's "no production path constructs a `Host`"
+already holds for the *control* plane, as distinct from the *data* plane, which now does.
 
 **Context:** Through #505 (§23), the session host is a real, well-factored dispatcher and session
 table, but it still runs *inside* `jerry-app`'s own process (`HostRuntime`, §16's `pending_dispatch`
@@ -1235,29 +1237,114 @@ that proof.
   (staged, installed by `install.sh`, and covered by `codesign --deep`'s existing bundle-wide
   signing pass on macOS - no per-binary script changes needed there beyond staging the file).
 
-**What did not move, and why - the exact remaining work for decision 4 and the rest of decision
-3's cutover:**
+**Amended 2026-09-23 (#507, part 1 - the data plane and its app-side adapter, landed real and
+tested; the control-plane cutover below did not move in this same pass):**
+
+- **`command/session-attach`, in `jerry_core::session`** (`SessionAttach`/`SessionAttachOutcome`):
+  `Locality::Session`, `Invocability::Denied`, modeled like `SessionSpawn` - never actually reaches
+  `Command::execute`, `jerry-host`'s dispatcher special-cases it. Answers `{ socket: PathBuf }`,
+  the path to a real, already-listening per-session socket; a second attach while one is live
+  answers `Report::Denied { code: "session-already-attached", .. }`. Has a real fixture
+  (`fixtures/request-command-session-attach.json`) and round-trips through `Call::examples`'s
+  mechanical test like every other variant. `SessionRecord` gained a `process_id: Option<u32>`
+  field (set once, at spawn, from the real `PtySession`) so a caller can resolve a session's pid
+  from `SessionsQuery` instead of a control-plane round trip of its own.
+- **The data-plane socket itself, in `jerry-host`'s new `crate::data_plane` module**: one real
+  AF_UNIX/named-pipe socket per session, bound the moment `SessionManager::spawn` starts the
+  session (named `d-<pid>-<fresh_u32>.sock` under the same directory the host's own control socket
+  lives in - `SessionManager::new` now takes a `sockets_dir`, and `Host::start_detached`/
+  `Host::start_at` thread it through; `Host::start`/`Host::start_with` keep their old,
+  parameterless shape via a new `jerry_host::default_sockets_dir()` fallback for the many test call
+  sites that never cared before). From the moment a client connects, the byte stream is raw and
+  bidirectional - the session's own relay thread (`crate::session::spawn_relay`) pushes every
+  `PtyOutput::Bytes` chunk to the data plane the same instant it forwards it on the existing
+  `SessionHandle` path, and a connected socket's reader thread forwards its own bytes straight to
+  `PtySession::write_input`. Output produced before any client attaches is buffered in a bounded
+  (**256 KiB**, a named constant, `PRE_ATTACH_BUFFER_CAP_BYTES`), drop-oldest ring, replayed to
+  whichever connection attaches next - including one that attaches *after* the session has already
+  exited, draining the tail and then closing, rather than only covering the narrower "attaches a
+  moment late" case. "Exactly one attach at a time" is enforced for real at the socket layer (a
+  second real connection while one is already being served is accepted and dropped immediately),
+  with `SessionManager::attach`'s own `Report::Denied` an earlier, friendlier rejection of the
+  common case - a real TOCTOU gap between the two is possible in principle and is closed by the
+  socket layer, not papered over. The host closes the connection once the session exits and every
+  already-buffered byte has been delivered (`DataPlane::mark_exited` drops the live sink, which is
+  what makes the writer thread finish draining and close). Tested against a real shell, driven
+  entirely over the socket (never `SessionHandle::write_input`/`take_output` directly, which would
+  prove nothing about the path a real client actually takes): `session::data_plane_tests` in
+  `crates/jerry-host` covers bytes both ways and a real close-on-exit, a second attach denied until
+  the first disconnects and allowed again after, and pre-attach buffering (the real ConPTY startup
+  handshake bytes on Windows, since nothing answers a one-shot command's own Device Status Report
+  query with nobody attached - see that module's own docs for why the test differs by platform
+  there).
+- **`SocketSessionAdapter`, in `crates/jerry-app/src/terminal/socket_adapter.rs`**: the second
+  implementer of `crate::terminal::pane::SessionAdapter` besides `jerry_host::SessionHandle`'s
+  in-process one - a reader thread forwarding socket bytes as `PtyOutput::Bytes` items into a
+  channel (channel-woken, never polled), `write_input` writing straight to the socket, `process_id`
+  answered from the `SessionRecord::process_id` a caller resolved via `SessionsQuery` before
+  constructing it (never its own round trip), and `shutdown` dispatching `command/session-kill`
+  through a caller-injected closure before closing its own connection. `pause`/`resume` answer a
+  real, honest error rather than a silent no-op: pausing a session's real process is not yet a
+  control-plane command an out-of-process session can ask its host for. Unit-tested against a real
+  socket pair with no `jerry-host` involved (`socket_session_adapter_tests`): bytes in order,
+  `write_input` reaching the peer, `shutdown` calling the injected kill and still closing when that
+  kill itself fails, and the stream simply ending (no synthesized `Exited`) when the host closes
+  its side. `jerry_pty::PtyError` gained one new variant, `Remote(String)`, for exactly this
+  adapter's socket-I/O and kill-dispatch failures - it has no real `PtySession` to report any of
+  the other variants for.
+- **`Agents::spawn_inner` now attaches over the socket, not `SessionManager::handle_for`.** Once
+  `SessionSpawn` resolves, it dispatches `command/session-attach` and (best-effort)
+  `query/sessions`, connects a `SocketSessionAdapter` off the UI thread (`cx.background_spawn`),
+  and attaches that - the same `TerminalPane::attach_session` call site as before, now handed
+  `Arc<dyn SessionAdapter>` from either implementer. This is real for *every* session today, not
+  only an eventual out-of-process one: `HostRuntime::in_process()`'s host still binds a real
+  per-session socket exactly like a real `jerry-host` would (`command/session-attach` never
+  special-cases "am I in-process"), so this is already jerry-app's one production attach path,
+  ahead of the control-plane cutover below.
+- **The exit signal moved to the control plane.** A `SocketSessionAdapter`'s own byte stream never
+  carries a synthesized `PtyOutput::Exited` (there is no real `ExitStatus` to give it - see that
+  module's own docs); `crate::work_surface::session_exited`'s handler now also resolves the pane
+  for the host session id that exited and calls the new `TerminalPane::mark_exited_from_event`
+  (reconstructing a real `jerry_pty::ExitStatus` from the wire's `ExitStatusWire`, lossy only when
+  a signal is present, since `portable_pty::ExitStatus::with_signal` cannot also carry the original
+  code). A no-op once a pane already has no live session, so a `SessionHandle`-backed pane's own
+  `PtyOutput::Exited` handling and this event reaching the same pane is safe rather than
+  double-firing `TerminalPaneEvent::ProcessExited`.
+
+**What still has not moved, and why - the exact remaining work for decision 4 and the rest of
+decision 3's cutover:**
 
 `jerry-app`'s `HostRuntime` still only ever constructs an **in-process** `Host`
 (`HostRuntime::start`/`HostRuntime::in_process`, unchanged); `AdeApp::dispatch` still reaches it
 through `jerry_host::LocalClient`, never `jerry_core::client::Client` over a socket to an external
 process. This issue's own plan text called for `HostRuntime::in_process`/the in-app `Host` to
 become `#[cfg(test)]`-only and for spawn-or-connect to be jerry-app's one production path - that
-step is **not done**, and is deferred deliberately rather than shipped half-wired, for one
-concrete reason: `TerminalPane`'s data-plane attachment (`SessionManager::handle_for`,
-`SessionAdapter`, §23's "attach" seam) only works because the session table it reaches is *in the
-same process*. Issue #507's own per-session socket (`SessionAttach`, a `SocketSessionAdapter` over
-a raw byte pipe) is what a real, out-of-process host's PTY output requires - without it, cutting
-`AdeApp::dispatch` over to always spawn-or-connect to an external process would leave every
-terminal pane with no way to read its own session's bytes: a control plane that looks wired up
-with a data plane quietly broken behind it, exactly what CLAUDE.md's "no fake functionality" rule
-forbids shipping. Decisions 2 and 3's *app-side* half are therefore deferred alongside decision 4,
-not because they are hard on their own, but because they are load-bearing on it. Concretely still
-open, all in `jerry-app`:
+step is **still not done**. Unlike the previous amendment's own reasoning (the data plane was the
+genuine blocker), what remains is a real, separate piece of work, deferred for a different, equally
+concrete reason surfaced while landing the data plane above: `jerry-host` itself serves exactly one
+repository per process (`--repo <path>`, singular; a stage-3 host's own `Descriptor.repos` is
+always a one-element list - see that field's own docs), while `jerry-app`'s single `HostRuntime`
+today serves *every* repository the app has open on one shared connection (`Descriptor.repos` as a
+growing list, `HostRuntime::serve`). Cutting `AdeApp::dispatch` over to real spawn-or-connect
+therefore is not a drop-in transport swap: it needs one `HostRuntime`-equivalent connection *per
+open repository* (decision Q15), each independently spawned-or-connected, with `AdeApp::dispatch`
+routing a call by which repository its `cwd` belongs to - and `crate::hooks::HookRuntime`, which
+today assumes exactly one host connection for the whole app's hook forwarding, would need the same
+per-repository treatment to stay correct for a second simultaneously open repository. That is a
+real architectural change to `AdeApp`'s own repo/host bookkeeping, not a few lines behind the
+existing `HostRuntime::client()`/`host_client()` call sites, and attempting it inside this same
+change risked exactly what CLAUDE.md's "no fake functionality" rule forbids: a control-plane cutover
+rushed to compile rather than verified correct across every existing repo-scoped test. Concretely
+still open, all in `jerry-app`:
 
-- `HostRuntime` gains a real spawn-or-connect entry point per opened repository, calling
-  `jerry_core::host_spawn::spawn_or_connect` off the UI thread (`cx.background_spawn`), with the
-  registry liveness/version check already in `host_spawn::Outcome`.
+- `AdeApp` tracks one `HostRuntime`-equivalent connection per open repository (not the single
+  shared one it has today), each brought up via `jerry_core::host_spawn::spawn_or_connect` off the
+  UI thread (`cx.background_spawn`), established before that repository's own first `SessionSpawn`
+  (the ffc97b9 rule) - naturally so once bring-up and first-spawn are both scoped to the same
+  repository instead of racing a single shared one.
+- `AdeApp::dispatch` (and `crate::hooks::HookRuntime`'s own hook forwarding) resolves which open
+  repository a `cwd` belongs to and routes through *that* repository's connection, rather than one
+  shared connection for the whole app.
 - A visible, per-repository error state for `Outcome::VersionMismatch` ("Jerry host for `<repo>`
   speaks protocol X, this app speaks Y") with a real "Restart sessions" action that sends
   `Shutdown` to the old host (now that the request exists) and re-spawns.
@@ -1265,13 +1352,15 @@ open, all in `jerry-app`:
   `SpawnOrConnectError::BreakawayForbidden` - never an in-process fallback (already true of
   `host_spawn` itself; `jerry-app` needs only to surface it, not silently swallow or retry
   differently).
-- Once #507 lands the data-plane socket, flipping `AdeApp::dispatch`/`TerminalPane::attach_session`
-  onto it and only then making `HostRuntime::in_process`/the in-app `Host` genuinely test-only,
-  closing this issue's own "one execution path" DoD together with #507's.
+- Only once all of the above lands does `HostRuntime::in_process`/the in-app `Host` become
+  genuinely `#[cfg(test)]`-only, closing this issue's own "one execution path" DoD for the control
+  plane - the data plane already closed its own half, per the amendment above.
 
 The `LocalClient`/in-process `Host` seam this issue's plan called `#[cfg(test)]`-only is therefore
-still jerry-app's real production path today, unchanged by this issue - existing UI tests, the
-in-process dispatch tests in `crates/jerry-app/src/host.rs`, and every terminal pane still work
-exactly as before. `jerry-app`'s own `find_jerry_binary` (`crates/jerry-app/src/host.rs`) was not
-extended to locate `jerry-host` either, tracking the same deferral: nothing in the app spawns one
-yet, so nothing needs to find one yet.
+still jerry-app's real production path for the *control* plane today - existing UI tests, the
+in-process dispatch tests in `crates/jerry-app/src/host.rs`, and every terminal pane's control-plane
+calls (`SessionSpawn`/`SessionResize`/`SessionKill`/`SessionAttach`) still work exactly as before,
+now additionally proven to also carry the *data* plane over a real socket rather than an in-process
+handle. `jerry-app`'s own `find_jerry_binary` (`crates/jerry-app/src/host.rs`) was not extended to
+locate `jerry-host` either, tracking the same deferral: nothing in the app spawns one yet, so
+nothing needs to find one yet.
