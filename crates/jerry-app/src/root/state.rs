@@ -38,18 +38,14 @@ impl AdeApp {
     ) -> Self {
         let settings_path = settings_store::settings_toml_path();
         let settings = settings_store::Settings::load_or_init();
-        let mut app = Self::new_with_settings(
+        Self::new_with_settings(
             repo_path,
             use_remembered_repo,
             settings,
             settings_path,
             window,
             cx,
-        );
-        // Only a real instance publishes itself; test apps build through `new_with_settings`
-        // and must never leave sockets in the registry.
-        app.start_host(cx);
-        app
+        )
     }
 
     /// The real constructor - takes an already-resolved [`Settings`] and its optional source
@@ -357,7 +353,7 @@ impl AdeApp {
             review_mark_in_flight: None,
             hook_runtime,
             hook_runtime_tried: false,
-            host_runtime: None,
+            hosts: crate::host::Hosts::default(),
             agent_status_state,
             agent_status_path,
             agent_status_owned: std::collections::BTreeSet::new(),
@@ -748,17 +744,12 @@ impl AdeApp {
             window_active: true,
             sound_player: crate::sound::player::SoundPlayer::new(),
         };
-        // The session host's cheap, synchronous half - the session table, fanout and dispatch
-        // loop, no filesystem or socket I/O - is up from this line on, in every caller
-        // (`Self::new` and every test through this same constructor): a pane spawned below
-        // (`Self::spawn_initial_shell_for_opened_repo`, deferred until the worktree fetch lands)
-        // always has a real, dispatchable host underneath it, never a race against `Self::
-        // start_host`'s slower registry/socket work (decisions.md §23). `Self::new` upgrades this
-        // very runtime to a discoverable one in place once that work completes
-        // (`Self::publish_host`); a test app stays exactly this unpublished, as it already did via
-        // `crate::test_support`'s own `adopt_host(HostRuntime::in_process(), ...)` call before it
-        // moved here.
-        this.adopt_host(crate::host::HostRuntime::in_process(), cx);
+        // `this.hosts` starts genuinely empty here - no repository connects until `Self::add_repo`
+        // (below, for `resolved_repo_path`, and for every repository added afterwards) calls
+        // `Self::open_repo_host` for it (decisions.md §24). A pane spawned before that connection
+        // resolves (`Self::spawn_initial_shell_for_opened_repo`, deferred until the worktree fetch
+        // lands anyway) reaches a dispatch that honestly answers `NEEDS_HOST` rather than racing
+        // an in-process fallback that no longer exists in production.
         // GitHub issue #45 ("Input blink only on focused input or file") / a live follow-up
         // report of missing carets: `graph_state.branches_filter_focus_handle` (added later, in
         // Revision R12's git graph tab), `new_file_focus_handle`, and (GitHub issue #241)

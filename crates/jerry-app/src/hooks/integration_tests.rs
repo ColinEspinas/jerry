@@ -6,7 +6,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use gpui::{AppContext as _, TestAppContext};
+use gpui::TestAppContext;
 
 use crate::hooks::event::HookFact;
 use crate::hooks::settings_file::{AGENT_ENV, SOCKET_ENV};
@@ -201,25 +201,23 @@ async fn a_hook_dispatched_through_the_apps_own_host_reaches_its_hook_runtimes_c
     let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
 
     let registry = registry_dir("host");
-    let (runtime, dispatch) =
-        crate::host::HostRuntime::start(registry.path.clone()).expect("host must start");
-    let socket = runtime.socket().to_path_buf();
+    let instance = jerry_core::registry::Registry::open(registry.path.clone())
+        .expect("registry")
+        .allocate()
+        .expect("instance");
+    let host = jerry_host::Host::start_at(registry.path.clone()).expect("host must start");
+    host.listen(&instance.socket).expect("listen");
+    let socket = instance.socket;
     let agent_id: crate::work_surface::agents::AgentId = 42;
-    let client = app.update(cx, |app, cx| {
-        cx.background_spawn(dispatch).detach();
-        if let Some(agents) = runtime.agents() {
-            agents.register(
-                jerry_core::AgentId::from(agent_id.to_string()),
-                repo.path().to_path_buf(),
-                "Claude".into(),
-            );
-        }
-        app.adopt_host(runtime, cx);
-        app.host_runtime
-            .as_ref()
-            .and_then(crate::host::HostRuntime::client)
-            .expect("the just-adopted host has a client")
-    });
+    host.agents().register(
+        jerry_core::AgentId::from(agent_id.to_string()),
+        repo.path().to_path_buf(),
+        "Claude".into(),
+    );
+    // `HookRuntime`'s own `client` is `host`'s in-process `LocalClient` - the identical seam
+    // `AdeApp::dispatch` would reach through `Hosts` for a real repository, not exercised through
+    // `app` at all here since this test drives the hook call and the runtime bring-up directly.
+    let client = host.client();
 
     // The app's own `HookRuntime`, brought up exactly as `hook_injection_for` would - but
     // without going through its `find_jerry_binary` gate, which reads this machine's real `PATH`
@@ -630,10 +628,19 @@ async fn a_claude_agent_spawned_through_the_real_app_path_really_reports_its_hoo
         crate::root::focus::palette_focus_tests::open_test_app(cx, repo.path().to_path_buf());
 
     let registry = registry_dir("real-app-path");
-    let (runtime, dispatch) =
-        crate::host::HostRuntime::start(registry.path.clone()).expect("host must start");
-    std::thread::spawn(move || futures::executor::block_on(dispatch));
-    app.update(cx, |app, cx| app.adopt_host(runtime, cx));
+    let instance = jerry_core::registry::Registry::open(registry.path.clone())
+        .expect("registry")
+        .allocate()
+        .expect("instance");
+    let host = jerry_host::Host::start_at(registry.path.clone()).expect("host must start");
+    host.listen(&instance.socket).expect("listen");
+    // In-process, not `for_test_remote`: this test exercises `hook_injection_for`'s own real lazy
+    // bring-up, which finds a repository's connection through `any_in_process_host_client_and_
+    // socket` - real only for an in-process one (`crate::host`'s own docs).
+    let repo_host = crate::host::RepoHost::for_test_in_process(host, instance.socket);
+    app.update(cx, |app, cx| {
+        app.adopt_repo_host_for_test(repo.path().to_path_buf(), repo_host, cx);
+    });
     // Every `ui`-tier fixture stubs every agent kind's binary (GitHub issue #530) - undo it here,
     // since this is the one test that must really exec `claude` for its own real path to mean
     // anything.

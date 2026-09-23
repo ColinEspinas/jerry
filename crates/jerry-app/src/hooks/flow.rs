@@ -120,16 +120,13 @@ impl AdeApp {
         // condition that will not have changed since the last try.
         //
         // The one exception: the session host still starting is *not* counted as an attempt.
-        // Every launch passes through a real, transient window where `Self::start_host`'s async
-        // bring-up (`crate::host`) has not finished yet, and unlike an unwritable temp directory
-        // or a missing `jerry` binary, that resolves itself within moments - burning the one shot
+        // Every launch passes through a real, transient window where `Self::open_repo_host`'s
+        // async connect (`crate::host`) has not resolved yet, and unlike an unwritable temp
+        // directory or a missing `jerry` binary, that resolves itself within moments - burning
+        // the one shot
         // on it would permanently disable hook injection for the whole session over a race.
         if self.hook_runtime.is_none() && !self.hook_runtime_tried {
-            let ready = self.host_runtime.as_ref().and_then(|runtime| {
-                runtime
-                    .client()
-                    .map(|client| (client, runtime.socket().to_path_buf()))
-            });
+            let ready = self.any_in_process_host_client_and_socket();
             if let Some((client, host_socket)) = ready {
                 self.hook_runtime_tried = true;
                 match crate::host::find_jerry_binary() {

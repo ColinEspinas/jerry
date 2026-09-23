@@ -710,7 +710,7 @@ impl Agents {
         let spawn_task = cx.spawn(async move |this, cx| {
             let dispatch = this.update(cx, |this, cx| {
                 this.dispatch(
-                    spawn_cwd,
+                    spawn_cwd.clone(),
                     Request::Command(AppCommand::SessionSpawn(SessionSpawn {
                         program: program.clone(),
                         args: args.clone(),
@@ -771,10 +771,10 @@ impl Agents {
             };
             let attached = this.update(cx, |this, _cx| {
                 let handle = this
-                    .sessions()
+                    .sessions_for(&spawn_cwd)
                     .and_then(|sessions| sessions.handle_for(&session_id));
                 this.agents.set_host_session_id(id, session_id.clone());
-                (handle, this.host_client())
+                (handle, this.host_client_for(&spawn_cwd))
             });
             let Ok((Some(handle), client)) = attached else {
                 let _ = spawn_pane.update(cx, |pane, cx| {

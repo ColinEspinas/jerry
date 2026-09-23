@@ -7,20 +7,22 @@
 //! `futures::executor::block_on` over an *executor-driven* future deadlocks GPUI's single-threaded
 //! test scheduler; blocking on a plain `std::sync::mpsc` reply from an independent thread does not).
 //! Owns nothing about *which* repository or session this connection is for - `crate::host` is
-//! where that bookkeeping lives.
+//! where that bookkeeping lives. Also has [`subscribe_remote`]: a *second*, dedicated connection
+//! per repository carrying only `event/*` push notifications, the real out-of-process twin of
+//! `jerry_host::LocalClient::subscribe` - real socket I/O bridged to a channel from a bare OS
+//! thread, the same shape as everywhere else in this codebase that crosses that boundary.
 //!
-//! Real and independently tested (below, including the exact GPUI-scheduler deadlock this module
-//! exists to make impossible), but not yet wired into `crate::host::Hosts`/`AdeApp::dispatch`.
-//! That per-repository bookkeeping (`Hosts { by_repo: HashMap<PathBuf, RepoHost> }`, the
-//! cwd-to-common-dir cache, per-repo event consumers, `HookRuntime`'s own simplification, the
-//! error-banner UI, and `SocketSessionAdapter`'s production wiring through this) is its own,
-//! larger follow-up; `docs/architecture/decisions.md` §24 has the exact remaining scope.
-#![allow(dead_code)]
+//! `HookRuntime`'s own simplification, the error-banner UI, and `SocketSessionAdapter`'s
+//! production wiring are `crate::host`'s own remaining follow-ups - `docs/architecture/
+//! decisions.md` §24 has the exact scope.
 
-use jerry_core::client::{Client, ClientError};
-use jerry_core::wire::rpc_code;
-use jerry_core::{Call, Report, RpcError};
+use futures::channel::mpsc;
+use futures::SinkExt;
+use jerry_core::client::{Client, ClientError, Stream};
+use jerry_core::wire::{read_frame, rpc_code, write_frame};
+use jerry_core::{Call, Message, Report, RequestId, RpcError};
 use std::io;
+use std::path::Path;
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 
@@ -89,6 +91,50 @@ fn client_error_to_rpc(error: ClientError) -> RpcError {
         }
         other => RpcError::new(rpc_code::INTERNAL_ERROR, other.to_string()),
     }
+}
+
+/// Opens a *second*, dedicated connection to `socket`, sends `event/subscribe`, and forwards
+/// every `event/*` notification received afterwards into the returned channel from a bare OS
+/// thread - the real out-of-process twin of `jerry_host::LocalClient::subscribe`. The initial
+/// `event/subscribe` acknowledgement is consumed here, never forwarded; nothing arriving after it
+/// is ever a `Response`, since this connection never sends a second request.
+pub(crate) fn subscribe_remote(socket: &Path) -> io::Result<mpsc::UnboundedReceiver<Message>> {
+    let mut stream = Stream::connect(socket)?;
+    write_frame(
+        &mut stream,
+        &Message::Request {
+            id: RequestId::Number(0),
+            method: "event/subscribe".to_owned(),
+            params: serde_json::Value::Null,
+        },
+    )
+    .map_err(io::Error::other)?;
+    match read_frame(&mut stream).map_err(io::Error::other)? {
+        Message::Response { result: Ok(_), .. } => {}
+        other => {
+            return Err(io::Error::other(format!(
+                "unexpected event/subscribe reply: {other:?}"
+            )))
+        }
+    }
+    let (mut sender, receiver) = mpsc::unbounded();
+    thread::Builder::new()
+        .name("jerry-app-repo-host-events".into())
+        .spawn(move || loop {
+            match read_frame(&mut stream) {
+                Ok(Message::Notification { method, params }) => {
+                    let item = Message::Notification { method, params };
+                    if futures::executor::block_on(sender.send(item)).is_err() {
+                        break;
+                    }
+                }
+                // A stray response (there should never be one - this connection sends no
+                // further requests) or a malformed frame: neither is an `event/*` to forward.
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        })?;
+    Ok(receiver)
 }
 
 #[cfg(test)]
