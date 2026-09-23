@@ -7,17 +7,20 @@
 //! its own - see `crate::work_surface::worktree_created`, the identical pattern this mirrors.
 
 use crate::root::AdeApp;
+use futures::channel::mpsc;
 use futures::StreamExt;
 use gpui::{Context, Task};
-use jerry_host::LocalClient;
+use jerry_core::Message;
 use serde_json::Value;
 
-/// Subscribes to `client`'s notifications for as long as the returned `Task` is held - see
+/// Drains `events` for as long as the returned `Task` is held - see
 /// `crate::work_surface::worktree_created::spawn_consumer`'s own docs, which this copies exactly
 /// but for `event/session-exited`.
-pub(crate) fn spawn_consumer(client: LocalClient, cx: &mut Context<AdeApp>) -> Task<()> {
+pub(crate) fn spawn_consumer(
+    mut events: mpsc::UnboundedReceiver<Message>,
+    cx: &mut Context<AdeApp>,
+) -> Task<()> {
     cx.spawn(async move |this, cx| {
-        let mut events = client.subscribe();
         while let Some(message) = events.next().await {
             let jerry_core::Message::Notification { method, params } = message else {
                 continue;
