@@ -86,11 +86,7 @@ impl DataPlane {
         // differ from `sockets_dir`, has no other code path that guarantees this directory
         // exists yet - unlike `Registry::open`'s own directory, nothing else creates it first.
         jerry_core::registry::ensure_private_dir(sockets_dir)?;
-        let socket = sockets_dir.join(format!(
-            "d-{:x}-{:08x}.sock",
-            std::process::id(),
-            fresh_u32()
-        ));
+        let socket = sockets_dir.join(socket_file_name(std::process::id(), fresh_u32()));
         let len = socket.as_os_str().len();
         if len > MAX_SOCKET_PATH_BYTES {
             return Err(DataPlaneBindError::Bind {
@@ -201,6 +197,13 @@ impl Drop for DataPlane {
     }
 }
 
+/// A session's data-plane socket file name - two bytes longer than [`jerry_core::registry::
+/// Registry::allocate`]'s own `<pid:x>-<u32:08x>.sock` (the `"d-"` prefix), which is the margin
+/// [`bind`]'s own `MAX_SOCKET_PATH_BYTES` check exists to catch per-session rather than assume.
+fn socket_file_name(pid: u32, fresh: u32) -> String {
+    format!("d-{pid:x}-{fresh:08x}.sock")
+}
+
 /// Serves exactly one connection to completion: replays the buffer snapshot, then relays new
 /// pushes and forwards the client's own bytes to `process` until either side closes. A second
 /// connection arriving while one is already being served is accepted and dropped immediately -
@@ -277,4 +280,62 @@ fn serve_one(state: &Arc<DataPlane>, stream: Stream, process: &Arc<Mutex<PtySess
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod socket_length_tests {
+    use super::socket_file_name;
+    use jerry_core::registry::{runtime_dir_for, Os, MAX_SOCKET_PATH_BYTES};
+    use std::collections::HashMap;
+    use std::ffi::OsString;
+
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
+        let map: HashMap<String, OsString> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), OsString::from(*v)))
+            .collect();
+        move |key: &str| map.get(key).cloned()
+    }
+
+    /// The real regression behind PR #538's macOS failure: a *test's own* extra nested directory
+    /// pushed a socket path over the limit, not a genuine production shape - but nothing had ever
+    /// checked the production shape itself. Computed against each platform's own worst-case
+    /// environment (the longest real `$TMPDIR`/`$XDG_RUNTIME_DIR` shape macOS/Linux are known to
+    /// use, a maximal `u32` pid and a maximal `fresh_u32`) rather than a literal number, so a
+    /// future change to any of `runtime_dir_for`'s directory shapes or this file name's own format
+    /// fails here instead of only in a real, hard-to-reproduce CI run on one specific OS.
+    #[test]
+    fn every_platforms_runtime_dir_leaves_real_margin_for_a_data_plane_socket() {
+        let cases = [
+            (
+                Os::Windows,
+                vec![("LOCALAPPDATA", r"C:\Users\someone\AppData\Local")],
+            ),
+            (
+                Os::MacOs,
+                vec![
+                    (
+                        "TMPDIR",
+                        "/private/var/folders/36/0123456789abcdefghijklmnop/T/",
+                    ),
+                    ("USER", "someuser"),
+                ],
+            ),
+            (Os::Unix, vec![("XDG_RUNTIME_DIR", "/run/user/4294967295")]),
+        ];
+        // The file name's own worst case: an 8-hex-digit pid (`u32::MAX`) and `fresh_u32`'s own
+        // `{:08x}` is already fixed-width.
+        let worst_case_name = socket_file_name(u32::MAX, u32::MAX);
+        for (os, pairs) in cases {
+            let dir = runtime_dir_for(os, &env(&pairs)).expect("runtime dir");
+            let socket = dir.join(&worst_case_name);
+            let len = socket.as_os_str().len();
+            assert!(
+                len <= MAX_SOCKET_PATH_BYTES,
+                "{os:?}: {} is {len} bytes, over the {MAX_SOCKET_PATH_BYTES}-byte limit - a real \
+                 session spawn on this platform would fail to bind its data-plane socket",
+                socket.display()
+            );
+        }
+    }
 }
