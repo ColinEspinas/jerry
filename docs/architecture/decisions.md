@@ -726,8 +726,9 @@ real, executable path (§7's `jerry` binary) to hand `jerry-git`, so `GIT_SEQUEN
 and `AmendHeadMessage { message }` are Git-locality Commands, all `Invocability::Denied` to
 agents (git already gives an agent a rebase); `RebaseStatus` is a Query mirroring
 `jerry_git::rebase::rebase_status`. `RebaseStart::validate` splits a real `rebase_preflight` out
-of `start_interactive_rebase` (refusing `rebase-already-in-progress` without touching git, mirroring
-`merge_preflight`'s split from `attempt_merge`), and `RebaseContinue`/`RebaseSkip`/`RebaseAbort`/
+of `start_interactive_rebase` (refusing `rebase-already-in-progress` and `rebase-worktree-dirty`
+without touching git, mirroring `merge_preflight`'s split from `attempt_merge`), and
+`RebaseContinue`/`RebaseSkip`/`RebaseAbort`/
 `AmendHeadMessage` all validate against `rebase_status`'s real on-disk state
 (`rebase-not-in-progress`/`rebase-not-stopped`) rather than in-memory assumptions. Every outcome
 and plan row is mirrored onto the wire (`RebaseOutcomeReport`, `RebasePlanEntryWire`,
@@ -736,9 +737,9 @@ directly — the same reasoning §18 already gives for `ConflictKind` — with `
 ways so the app can keep building its in-memory plan and reading `RebasePhase` in terms of
 `jerry_git::rebase`'s own plain-data types, converting only at the dispatch boundary.
 `RebaseStart::execute` locates the `jerry` binary itself (`jerry_core::jerry_binary::locate`, a
-sibling of `std::env::current_exe`, then `bin/jerry` next to it — no `PATH` fallback, unlike
-`crate::host::find_jerry_binary` in `jerry-app`, so this crate adds no `jerry-pty` dependency),
-refusing `jerry-binary-not-found` rather than guessing when neither exists.
+sibling of `std::env::current_exe`, then `bin/jerry` next to it, then `jerry` one directory up —
+no `PATH` fallback, unlike `crate::host::find_jerry_binary` in `jerry-app`, so this crate adds no
+`jerry-pty` dependency), refusing `jerry-binary-not-found` rather than guessing when none exist.
 
 `graph_view/rebase.rs` dispatches every mutation through `AdeApp::dispatch`, the same idiom
 `merge/flow.rs` established: `start_rebase`/`skip_rebase` share `run_rebase_op` (dispatch, apply
@@ -754,13 +755,25 @@ spawnable `jerry` for a test — turned out reliable only for a `[[bin]]` of the
 referenced from an integration test (`tests/*.rs`), not from a `--lib` unit test referencing it,
 and not across a dev-dependency cycle back through `jerry-core`/`jerry-cli` either (both were
 tried and both failed to see the environment variable at compile time, verified against this
-issue's own build). `jerry-git` and `jerry-core` each grew a minimal, same-package `[[bin]]`
-purely for this (`jerry_git_test_editor`, `jerry_core_test_jerry`) and moved every test that needs
-a real spawn into `tests/rebase_editor.rs`/`tests/rebase_commands.rs`; what stayed in each crate's
-`--lib` module is what never spawns anything (pure classification, and sidecar-file tests that
-call `run_editor`/`run_sequence_editor` directly). This mechanism runs on every platform `jerry`
-does — verified directly against this Windows checkout, both the quoted-path editor-hook spawn
-(§7) and every one of `jerry-git`'s 15 real-rebase integration tests, previously Unix-only.
+issue's own build). `jerry-git` grew a minimal, same-package `[[bin]]` purely for this
+(`jerry_git_test_editor`) and moved every test that needs a real spawn into
+`tests/rebase_editor.rs`; what stayed in `--lib` is what never spawns anything (pure
+classification, and sidecar-file tests that call `run_editor`/`run_sequence_editor` directly).
+`jerry-core` tried the identical shape (`jerry_core_test_jerry`) first and hit a real, worse bug:
+on Windows, cargo places a `[[bin]]`'s own unhashed `target/debug/deps/` copy under the *same
+name* the top-level uplifted binary gets, so a helper copied to
+`current_exe().parent().join("jerry.exe")` from inside an integration test (whose own executable
+already lives in that same `deps/` directory) silently overwrote `jerry-cli`'s real
+`deps/jerry.exe` — and the next build then uplifted that corruption to `target/debug/jerry.exe`,
+breaking the real CLI for every other consumer, not just this test. `jerry-core`'s own `[[bin]]`
+and its copy mechanism were deleted outright; `jerry_binary::locate` instead gained a third tier
+(one directory up from `current_exe`, the layout an integration test's own executable — nested
+one level under wherever a `[[bin]]` gets uplifted to — actually has), so `jerry-core`'s tests
+find the real `jerry` `cargo build -p jerry-cli` produces directly, asserting that up front
+(`assert_real_jerry_binary_available`, the same shape `jerry-app`'s own helper of that name
+uses) rather than copying anything. This mechanism runs on every platform `jerry` does —
+verified directly against this Windows checkout, both the quoted-path editor-hook spawn (§7) and
+every one of `jerry-git`'s 15 real-rebase integration tests, previously Unix-only.
 `jerry-cli`'s hidden `git-sequence-editor`/`git-editor` subcommands are the only part of this
 issue's CLI surface; `jerry rebase` itself is out of scope; `jerry-git` promotes from a
 `jerry-cli` dev-dependency to a normal one so those two subcommands can call
