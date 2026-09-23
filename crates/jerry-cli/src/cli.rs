@@ -35,6 +35,8 @@ pub enum Command {
     Wt(WtArgs),
     /// List the agents Jerry is currently supervising.
     Agents,
+    /// List every PTY session Jerry is currently tracking, agents and plain terminal tabs alike.
+    Sessions,
     /// Run an MCP server on stdio, exposing every Command/Query as a tool - see
     /// `crates/jerry-cli/skill/SKILL.md`'s "MCP" section.
     Mcp,

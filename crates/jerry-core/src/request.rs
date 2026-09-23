@@ -13,8 +13,11 @@ use crate::commands::{
 };
 use crate::ctx::Ctx;
 use crate::method::Method;
-use crate::queries::{AgentsQuery, MergeStatusQuery, RebaseStatusQuery, StatusQuery};
+use crate::queries::{
+    AgentsQuery, MergeStatusQuery, RebaseStatusQuery, SessionsQuery, StatusQuery,
+};
 use crate::report::Report;
+use crate::session::{SessionId, SessionKill, SessionResize, SessionSpawn};
 use crate::wire::{rpc_code, RpcError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -44,6 +47,9 @@ pub enum AppCommand {
     RebaseAbort(RebaseAbort),
     AmendHeadMessage(AmendHeadMessage),
     WorktreeCreate(WorktreeCreate),
+    SessionSpawn(SessionSpawn),
+    SessionResize(SessionResize),
+    SessionKill(SessionKill),
 }
 
 /// Every Query a client can send.
@@ -54,6 +60,7 @@ pub enum AppQuery {
     MergeStatus(MergeStatusQuery),
     RebaseStatus(RebaseStatusQuery),
     Agents(AgentsQuery),
+    Sessions(SessionsQuery),
 }
 
 /// The kebab-case names of every `AppCommand` variant, for method lookup and tool listing.
@@ -67,12 +74,21 @@ pub const COMMAND_NAMES: &[&str] = &[
     "rebase-continue",
     "rebase-skip",
     "rebase-start",
+    "session-kill",
+    "session-resize",
+    "session-spawn",
     "stage-resolved",
     "worktree-create",
 ];
 
 /// The kebab-case names of every `AppQuery` variant.
-pub const QUERY_NAMES: &[&str] = &["agents", "merge-status", "rebase-status", "status"];
+pub const QUERY_NAMES: &[&str] = &[
+    "agents",
+    "merge-status",
+    "rebase-status",
+    "sessions",
+    "status",
+];
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Request {
@@ -108,6 +124,9 @@ macro_rules! each_command {
             AppCommand::RebaseAbort($c) => $body,
             AppCommand::AmendHeadMessage($c) => $body,
             AppCommand::WorktreeCreate($c) => $body,
+            AppCommand::SessionSpawn($c) => $body,
+            AppCommand::SessionResize($c) => $body,
+            AppCommand::SessionKill($c) => $body,
         }
     };
 }
@@ -126,6 +145,9 @@ impl AppCommand {
             AppCommand::RebaseAbort(_) => RebaseAbort::NAME,
             AppCommand::AmendHeadMessage(_) => AmendHeadMessage::NAME,
             AppCommand::WorktreeCreate(_) => WorktreeCreate::NAME,
+            AppCommand::SessionSpawn(_) => SessionSpawn::NAME,
+            AppCommand::SessionResize(_) => SessionResize::NAME,
+            AppCommand::SessionKill(_) => SessionKill::NAME,
         }
     }
 
@@ -176,6 +198,9 @@ impl AppCommand {
                 "Create a sibling git worktree on a new branch, optionally starting an agent in \
                  it."
             }
+            AppCommand::SessionSpawn(_) => "Spawn a new PTY session, owned by this host.",
+            AppCommand::SessionResize(_) => "Resize a live session's pty.",
+            AppCommand::SessionKill(_) => "Kill a live session's process tree.",
         }
     }
 
@@ -194,6 +219,9 @@ impl AppCommand {
             AppCommand::RebaseAbort(_) => schema_of::<RebaseAbort>(),
             AppCommand::AmendHeadMessage(_) => schema_of::<AmendHeadMessage>(),
             AppCommand::WorktreeCreate(_) => schema_of::<WorktreeCreate>(),
+            AppCommand::SessionSpawn(_) => schema_of::<SessionSpawn>(),
+            AppCommand::SessionResize(_) => schema_of::<SessionResize>(),
+            AppCommand::SessionKill(_) => schema_of::<SessionKill>(),
         }
     }
 
@@ -214,6 +242,7 @@ macro_rules! each_query {
             AppQuery::MergeStatus($q) => $body,
             AppQuery::RebaseStatus($q) => $body,
             AppQuery::Agents($q) => $body,
+            AppQuery::Sessions($q) => $body,
         }
     };
 }
@@ -225,6 +254,7 @@ impl AppQuery {
             AppQuery::MergeStatus(_) => MergeStatusQuery::NAME,
             AppQuery::RebaseStatus(_) => RebaseStatusQuery::NAME,
             AppQuery::Agents(_) => AgentsQuery::NAME,
+            AppQuery::Sessions(_) => SessionsQuery::NAME,
         }
     }
 
@@ -250,6 +280,10 @@ impl AppQuery {
                 "Report whether a rebase is stopped in this worktree, and where."
             }
             AppQuery::Agents(_) => "List every agent the connected Jerry is currently supervising.",
+            AppQuery::Sessions(_) => {
+                "List every PTY session the connected Jerry is currently tracking, agents and \
+                 plain terminal tabs alike."
+            }
         }
     }
 
@@ -261,6 +295,7 @@ impl AppQuery {
             AppQuery::MergeStatus(_) => schema_of::<MergeStatusQuery>(),
             AppQuery::RebaseStatus(_) => schema_of::<RebaseStatusQuery>(),
             AppQuery::Agents(_) => schema_of::<AgentsQuery>(),
+            AppQuery::Sessions(_) => schema_of::<SessionsQuery>(),
         }
     }
 
@@ -431,6 +466,34 @@ impl Request {
             (
                 "request-query-agents",
                 Request::Query(AppQuery::Agents(AgentsQuery::default())),
+            ),
+            (
+                "request-command-session-spawn",
+                Request::Command(AppCommand::SessionSpawn(SessionSpawn {
+                    program: "bash".into(),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    rows: 24,
+                    cols: 80,
+                })),
+            ),
+            (
+                "request-command-session-resize",
+                Request::Command(AppCommand::SessionResize(SessionResize {
+                    id: SessionId::from("session-1"),
+                    rows: 40,
+                    cols: 120,
+                })),
+            ),
+            (
+                "request-command-session-kill",
+                Request::Command(AppCommand::SessionKill(SessionKill {
+                    id: SessionId::from("session-1"),
+                })),
+            ),
+            (
+                "request-query-sessions",
+                Request::Query(AppQuery::Sessions(SessionsQuery::default())),
             ),
         ]
     }

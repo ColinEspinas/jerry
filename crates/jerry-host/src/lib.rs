@@ -1,7 +1,7 @@
 //! The session host: the one place a `Call` is authorized and executed. Owns the dispatch
-//! thread, the socket listener, the table of agents it spawned, and the notification fan-out.
-//! Every task here wakes on a channel, never on a timer. Sessions and the hook store are not
-//! here yet; a request needing them is answered `NEEDS_HOST`. Zero `gpui`.
+//! thread, the socket listener, the session table (`crate::session`, every PTY it spawned or is
+//! tracking) and the notification fan-out. Every task here wakes on a channel, never on a timer.
+//! The hook store is not here yet; a request needing it is answered `NEEDS_HOST`. Zero `gpui`.
 
 // Only production code is held to `unwrap_used`/`expect_used` (`CLAUDE.md`).
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
@@ -9,13 +9,15 @@
 mod dispatch;
 mod fanout;
 mod listener;
+mod session;
+
+pub use session::{SessionError, SessionHandle, SessionManager, SessionSpawnError};
 
 use futures::channel::{mpsc, oneshot};
 use jerry_core::client::Stream;
 use jerry_core::wire::rpc_code;
-use jerry_core::{AgentId, Call, Message, Report, RpcError};
+use jerry_core::{AgentId, Call, Message, Report, RpcError, SessionId};
 use serde_json::Value;
-use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::net::Shutdown;
@@ -58,36 +60,51 @@ pub struct AgentRecord {
 /// The agents this host spawned, by the identity it injected as `JERRY_AGENT_ID`. Shared by the
 /// app, which registers and forgets, and the dispatcher, which classifies callers against it and
 /// answers `AgentsQuery` from it.
-#[derive(Clone, Default)]
-pub struct AgentTable(Arc<Mutex<HashMap<AgentId, AgentRecord>>>);
+///
+/// A thin view over [`SessionManager`] (`docs/architecture/decisions.md` §23) - kept as its own
+/// type, rather than every caller reaching for `SessionManager` directly, only because its public
+/// shape (`register`/`forget`/`worktree_of`/`list`) predates the session table and `jerry-app`
+/// still calls exactly this during its own migration to it. There is exactly one underlying
+/// table: constructing one from scratch is not offered - see [`SessionManager::agent_table`].
+#[derive(Clone)]
+pub struct AgentTable(SessionManager);
 
 impl AgentTable {
     pub fn register(&self, id: AgentId, worktree: PathBuf, kind: String) {
-        lock(&self.0).insert(id, AgentRecord { worktree, kind });
+        self.0.register_agent(id, worktree, kind);
     }
 
     pub fn forget(&self, id: &AgentId) {
-        lock(&self.0).remove(id);
+        self.0.forget_agent(id);
+    }
+
+    /// [`SessionManager::forget_session`] - the real `SessionId` a spawn minted, distinct from
+    /// [`Self::forget`]'s synthetic `agent:<id>` key (`crate::work_surface::agents::Agents::close`
+    /// needs both: the synthetic key for a `ProcessKind::Agent`'s `AgentTable`-compatibility
+    /// registration, this for the real session `SessionSpawn` created).
+    pub fn forget_session(&self, id: &SessionId) {
+        self.0.forget_session(id);
     }
 
     pub fn worktree_of(&self, id: &AgentId) -> Option<PathBuf> {
-        lock(&self.0).get(id).map(|record| record.worktree.clone())
+        self.0.worktree_of_agent(id)
     }
 
     pub fn len(&self) -> usize {
-        lock(&self.0).len()
+        self.0.agent_count()
     }
 
     pub fn is_empty(&self) -> bool {
-        lock(&self.0).is_empty()
+        self.len() == 0
     }
 
     /// Every agent this host is tracking right now, for `AgentsQuery` - the dispatcher's own
     /// answer for a request `execute_locally` can never resolve on its own (§15).
     pub fn list(&self) -> Vec<(AgentId, AgentRecord)> {
-        lock(&self.0)
-            .iter()
-            .map(|(id, record)| (id.clone(), record.clone()))
+        self.0
+            .agent_entries()
+            .into_iter()
+            .map(|(id, worktree, kind)| (id, AgentRecord { worktree, kind }))
             .collect()
     }
 }
@@ -105,6 +122,7 @@ struct Job {
 pub(crate) struct Inner {
     jobs: Mutex<Option<mpsc::UnboundedSender<Job>>>,
     agents: AgentTable,
+    sessions: SessionManager,
     fanout: fanout::Fanout,
     /// One handle per live socket connection, so shutdown can close them under their threads.
     connections: Mutex<Vec<Stream>>,
@@ -131,6 +149,10 @@ impl Inner {
 
     pub(crate) fn agents(&self) -> &AgentTable {
         &self.agents
+    }
+
+    pub(crate) fn sessions(&self) -> &SessionManager {
+        &self.sessions
     }
 
     pub(crate) fn fanout(&self) -> &fanout::Fanout {
@@ -196,10 +218,14 @@ impl Host {
     /// deterministically. Blocking git work runs wherever the loop runs.
     pub fn start_detached() -> (Host, DispatchFuture) {
         let (jobs, mut receiver) = mpsc::unbounded::<Job>();
+        let fanout = fanout::Fanout::default();
+        let sessions = SessionManager::new(fanout.clone());
+        let agents = sessions.agent_table();
         let inner = Arc::new(Inner {
             jobs: Mutex::new(Some(jobs)),
-            agents: AgentTable::default(),
-            fanout: fanout::Fanout::default(),
+            agents,
+            sessions,
+            fanout,
             connections: Mutex::new(Vec::new()),
             shutting_down: AtomicBool::new(false),
         });
@@ -228,6 +254,14 @@ impl Host {
         self.inner.agents.clone()
     }
 
+    /// The session table (`docs/architecture/decisions.md` §23): the same one `SessionSpawn`/
+    /// `SessionResize`/`SessionKill`/`SessionsQuery` act on. An in-process caller attaches to a
+    /// spawned session's data-plane adapter through [`SessionManager::handle_for`] here, never
+    /// through `Call`/`Report` - see that method's own docs.
+    pub fn sessions(&self) -> SessionManager {
+        self.inner.sessions.clone()
+    }
+
     pub fn client(&self) -> LocalClient {
         LocalClient {
             inner: Arc::clone(&self.inner),
@@ -253,6 +287,14 @@ impl Host {
     pub fn shutdown(&self) -> ShutdownHandles {
         self.inner.shutting_down.store(true, Ordering::SeqCst);
         lock(&self.inner.jobs).take();
+        // Before the fanout/listener teardown below, and before `lock(&self.dispatcher).take()`
+        // orphans the dispatch loop that would otherwise still be able to answer a `SessionKill`:
+        // a `TerminalPane` dropping no longer kills its own session's real process (§23's Part
+        // B moved that process into this table instead), so nothing else does either unless this
+        // does it here. Real, bounded per-session kills - each session's own relay thread is
+        // still alive to observe and broadcast its `event/session-exited`, which a live fanout
+        // is what lets any local subscriber still see.
+        self.inner.sessions().shutdown_all();
         let accept = lock(&self.listening)
             .as_mut()
             .and_then(listener::Listening::stop);
@@ -566,5 +608,98 @@ mod host_dispatch_tests {
         let err = block_on(client.call(Call::human(repo.path(), status()))).expect_err("down");
         assert_eq!(err.code, rpc_code::SHUTTING_DOWN);
         host.shutdown_and_join();
+    }
+}
+
+/// GitHub issue #530's regression, discovered once every spawn started going through the host
+/// (decisions.md §23's Part B): before that, dropping a `TerminalPane` dropped its `PtySession`,
+/// whose `Drop` killed the child. Now `SessionManager` owns it, so nothing did on host shutdown -
+/// `Host::shutdown`'s own new `sessions().shutdown_all()` call is what closes this.
+#[cfg(test)]
+mod host_shutdown_tests {
+    use super::Host;
+    use std::path::PathBuf;
+    use std::time::Duration;
+    use test_support::wait_until;
+
+    /// A real process that blocks until its stdin closes - genuinely still running by the time
+    /// shutdown reaches it, the same idiom `crate::session::session_manager_tests`'s own
+    /// `shell_options` helper uses for a real, short-lived command.
+    fn blocking_shell_options() -> jerry_pty::SpawnOptions {
+        if cfg!(windows) {
+            jerry_pty::SpawnOptions::new("cmd").args(["/d", "/c", "more"])
+        } else {
+            jerry_pty::SpawnOptions::new("sh").args(["-c", "cat >/dev/null"])
+        }
+    }
+
+    /// `crate::hooks::settings_file::process_is_alive` in `jerry-app`'s exact pair - "does this
+    /// pid still exist", real per platform - copied rather than shared across a crate boundary
+    /// for this one test module. See that function's own docs for why each branch's FFI is sound.
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    fn process_is_alive(pid: u32) -> bool {
+        // SAFETY: `kill` with signal 0 performs only an existence/permission check. It has no
+        // effect on the target process, and takes no pointers, so there is nothing to invalidate.
+        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        if result == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().kind() == std::io::ErrorKind::PermissionDenied
+    }
+
+    /// The Windows twin of the `kill(pid, 0)` check above - see that twin's docs.
+    #[cfg(windows)]
+    #[allow(unsafe_code)]
+    fn process_is_alive(pid: u32) -> bool {
+        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0};
+        use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        // SAFETY: `OpenProcess` takes only scalars and returns a handle (null on failure). It
+        // borrows no memory from this process, so there is nothing for it to invalidate.
+        let handle =
+            unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
+        if handle.is_null() {
+            // `ERROR_INVALID_PARAMETER` is Win32's real "there is no process with that id". Every
+            // other failure is reported as alive, because a wrong "dead" is the only answer here
+            // that would let this test pass without the process really being gone.
+            return std::io::Error::last_os_error().raw_os_error()
+                != Some(ERROR_INVALID_PARAMETER as i32);
+        }
+        // SAFETY: `handle` was just returned by a successful `OpenProcess` and has not been
+        // closed, so it is a valid handle this thread owns. A zero timeout makes this a poll.
+        let state = unsafe { WaitForSingleObject(handle, 0) };
+        // SAFETY: same handle, still owned here, closed exactly once and never used after.
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        state != WAIT_OBJECT_0
+    }
+
+    #[test]
+    fn shutting_down_the_host_kills_and_confirms_dead_every_live_session() {
+        let host = Host::start().expect("host");
+        let (_id, handle) = host
+            .sessions()
+            .spawn(PathBuf::from("/repo"), None, blocking_shell_options())
+            .expect("spawn");
+        let pid = handle
+            .process_id()
+            .expect("a real spawned session has a real pid");
+        assert!(
+            process_is_alive(pid),
+            "sanity check: the freshly spawned process must be alive before shutdown"
+        );
+
+        host.shutdown_and_join();
+
+        assert!(
+            wait_until(Duration::from_secs(5), || !process_is_alive(pid)),
+            "shutting down the host must kill and confirm dead every session it still owns a \
+             real process for, not just tear down the socket/fanout around it"
+        );
     }
 }

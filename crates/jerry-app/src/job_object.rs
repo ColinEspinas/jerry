@@ -21,12 +21,15 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 /// Puts this process in a fresh kill-on-close job so every child it ever spawns dies with it,
-/// however it dies. Call once, before anything can spawn.
+/// however it dies. Call once, before anything can spawn - idempotent (a `ui`-tier test app can
+/// call this once per test in the same process, GitHub issue #530), so a later call is a no-op
+/// rather than nesting a second job or re-logging.
 ///
 /// Failure is logged and non-fatal: without the job, cleanup degrades to the `Drop`-time tree
 /// kills that already exist, which is exactly the pre-#482 behavior.
 pub fn adopt_this_process() {
-    match adopt_this_process_returning_job() {
+    static ADOPTED: std::sync::Once = std::sync::Once::new();
+    ADOPTED.call_once(|| match adopt_this_process_returning_job() {
         Ok(_job) => {
             // The handle is deliberately never closed. This process is a member of a
             // kill-on-close job, so closing the last handle would terminate Jerry itself; the
@@ -39,7 +42,7 @@ pub fn adopt_this_process() {
                  force-killed Jerry will outlive it"
             );
         }
-    }
+    });
 }
 
 /// [`adopt_this_process`]'s fallible core, returning the job handle so a test can query

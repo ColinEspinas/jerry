@@ -293,7 +293,7 @@ impl AdeApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.agents.set_active(id, cx);
+        self.agents.set_active(id);
         self.prune_confirm_armed = false;
         // If the git graph tab was showing, this leaves it (without closing its tab) - see
         // `crate::graph_view::render::AdeApp::leave_graph_tab`'s own docs for why this must run
@@ -3532,76 +3532,6 @@ mod tab_scoping_tests {
     }
 
     #[gpui::test]
-    fn only_the_active_agents_pane_polls_at_the_foreground_cadence(cx: &mut TestAppContext) {
-        let repo = crate::test_support::temp_root();
-        let wt_empty = crate::test_support::temp_root();
-        let (app, cx) = crate::test_support::open_test_app(cx, repo.path().to_path_buf());
-
-        let foreground_ids =
-            |app: &gpui::Entity<AdeApp>, cx: &mut TestAppContext| -> Vec<AgentId> {
-                app.read_with(cx, |app, cx| {
-                    app.agents
-                        .iter()
-                        .filter(|s| s.pane.read(cx).is_foreground())
-                        .map(|s| s.id)
-                        .collect()
-                })
-            };
-
-        let (first_id, second_id) = app.update_in(cx, |app, window, cx| {
-            let first_id = app.agents.active_id().expect("initial shell agent");
-            let second_id = app.agents.spawn(
-                ProcessKind::Shell,
-                repo.path().to_path_buf(),
-                12.0,
-                None,
-                None,
-                window,
-                cx,
-            );
-            (first_id, second_id)
-        });
-
-        assert_eq!(
-            foreground_ids(&app, cx),
-            vec![second_id],
-            "after spawn, only the newly active agent's pane may be foreground"
-        );
-
-        app.update_in(cx, |app, window, cx| {
-            app.select_agent(first_id, window, cx);
-        });
-        assert_eq!(
-            foreground_ids(&app, cx),
-            vec![first_id],
-            "selecting a tab must promote exactly that pane and demote the previous one"
-        );
-
-        app.update_in(cx, |app, window, cx| {
-            app.agents.close(first_id, false, window, cx);
-        });
-        assert_eq!(
-            foreground_ids(&app, cx),
-            vec![second_id],
-            "closing the active tab must hand the foreground cadence to the promoted sibling"
-        );
-
-        // Switching to a worktree with no agents: nothing is active, nothing is watchable -
-        // every pane must be background.
-        app.update(cx, |app, _cx| {
-            app.worktrees = vec![worktree_item(wt_empty.path().to_path_buf(), "empty")];
-        });
-        app.update_in(cx, |app, window, cx| {
-            app.select_worktree(0, window, cx);
-        });
-        assert_eq!(
-            foreground_ids(&app, cx),
-            Vec::<AgentId>::new(),
-            "with no active agent, no pane may keep the foreground cadence"
-        );
-    }
-
-    #[gpui::test]
     fn dragging_a_file_or_graph_tab_between_two_agent_tabs_interleaves_them(
         cx: &mut TestAppContext,
     ) {
@@ -4036,6 +3966,14 @@ mod tab_scoping_tests {
                 .expect("the real startup shell agent")
         });
         cx.run_until_parked();
+        // A real Windows `cmd.exe` sets its own OSC 0 title (its own full executable path) as
+        // part of its ConPTY startup handshake - genuinely, not a fixture artifact - and the
+        // pane's output task now processes that the moment it arrives rather than only on a
+        // polling interval (`docs/architecture/decisions.md` §8's amendment), so by the time
+        // `run_until_parked` above returns it may already have landed. Clearing it explicitly is
+        // what actually puts this pane in the "no title set yet" state this test means to exercise.
+        set_live_title(&app, cx, shell_id, "");
+        cx.run_until_parked();
 
         let program = app.read_with(cx, |app, cx| {
             app.agents
@@ -4166,6 +4104,14 @@ mod tab_scoping_tests {
                 cx,
             )
         });
+        cx.run_until_parked();
+        // A real Windows `cmd.exe` sets its own OSC 0 title (its own full executable path) as
+        // part of its ConPTY startup handshake - genuinely, not a fixture artifact - and the
+        // pane's output task now processes that the moment it arrives rather than only on a
+        // polling interval (`docs/architecture/decisions.md` §8's amendment), so by the time
+        // `run_until_parked` above returns it may already have landed. Clearing it explicitly is
+        // what actually puts this pane in the "titleless" state this test means to exercise.
+        set_live_title(&app, cx, shell_id, "");
         cx.run_until_parked();
 
         let (label, program) = app.read_with(cx, |app, cx| {
@@ -4758,14 +4704,76 @@ mod terminal_action_tests {
     /// Places `text` at a fixed, addressed grid position in the active agent's pane, well below
     /// where a freshly-spawned shell's own prompt lands, so the row this test then selects can't
     /// be overwritten by real shell output arriving in the background.
+    ///
+    /// Waits out a freshly (re)mounted pane's own settle before seeding, then retries the whole
+    /// reset+inject+select cycle until a real drain leaves it untouched - neither is optional:
+    ///
+    /// A pane newly promoted to [`Agents::active`] paints for the first time with no measured
+    /// [`TerminalPane::content_bounds`] yet, so its first render sizes off the whole window
+    /// (`Self::maybe_resize_pty`'s own fallback) before a deferred `canvas()` prepaint callback
+    /// measures its real, smaller content box a frame later and forces a second grid resize
+    /// (GitHub issue #375's settle). *Any* grid resize - like a screen clear
+    /// (`crate::terminal::grid::selection_tests::clearing_the_screen_drops_the_selection_without_
+    /// this_module_doing_anything`) - genuinely drops `alacritty_terminal`'s own live selection as
+    /// a side effect, so seeding before this settle is done is seeding onto a selection about to
+    /// be thrown away regardless of what this injects. Waiting for [`TerminalPane::grid_dimensions`]
+    /// to stop changing rules that out - a structural fact, unaffected by selection state, so it is
+    /// a real, race-free settle signal rather than a fixed number of polls hoping to outlast it.
+    ///
+    /// Separately, a freshly attached real session can *still* be mid-round-trip on its own
+    /// control-plane `SessionResize` once the pty exists (`docs/architecture/decisions.md` §23) -
+    /// ConPTY answers that by repainting its whole screen from the real child process, which can
+    /// land *after* a single post-settle injection and silently overwrite row 9 the same way. The
+    /// retry loop below covers that: any miss re-seeds and resets the streak, rather than trusting
+    /// the round trip to be over just because it hasn't landed yet.
     fn seed_active_pane(app: &gpui::Entity<AdeApp>, cx: &mut gpui::VisualTestContext, text: &str) {
         let pane = app
             .read_with(cx, |app, _| app.agents.active().map(|s| s.pane.clone()))
             .expect("a fresh test window has one real, active shell agent");
-        pane.update(cx, |pane, cx| {
-            pane.inject_bytes_for_test(format!("\x1b[10;1H{text}").as_bytes(), cx);
-            pane.select_cells_for_test(9, 0..text.chars().count());
+        // A freshly spawned agent's pane paints for the first time only once *something* calls
+        // `cx.notify()` on `AdeApp` itself (only its own render picks which agent's pane is
+        // mounted at all) - the production path is `AdeApp::after_agent_spawn`, which this
+        // test's own direct `Agents::spawn` call deliberately bypasses (see the dispatch comment
+        // below). Without a forced first paint here, the dimensions poll below would just read
+        // the still-unmounted pane's frozen constructor defaults as "already settled".
+        app.update_in(cx, |_app, _window, cx| cx.notify());
+        cx.run_until_parked();
+
+        let mut previous_dimensions = None;
+        let dimensions_settled = pump_until(cx, |cx| {
+            let current = pane.read_with(cx, |pane, _| pane.grid_dimensions());
+            let stable = previous_dimensions == Some(current);
+            previous_dimensions = Some(current);
+            stable
         });
+        assert!(
+            dimensions_settled,
+            "the pane's grid dimensions never stopped changing within {PTY_ROUND_TRIP:?}"
+        );
+
+        let reseed = |cx: &mut gpui::VisualTestContext| {
+            pane.update(cx, |pane, cx| {
+                pane.reset_grid_for_test(cx);
+                pane.inject_bytes_for_test(format!("\x1b[10;1H{text}").as_bytes(), cx);
+                pane.select_cells_for_test(9, 0..text.chars().count());
+            });
+        };
+        reseed(cx);
+        let mut consecutive_clean = 0;
+        let settled = pump_until(cx, |cx| {
+            if pane.read_with(cx, |pane, _| pane.selected_text_for_test()) == Some(text.to_string())
+            {
+                consecutive_clean += 1;
+            } else {
+                consecutive_clean = 0;
+                reseed(cx);
+            }
+            consecutive_clean >= 3
+        });
+        assert!(
+            settled,
+            "the seeded selection never survived a real drain within {PTY_ROUND_TRIP:?}"
+        );
     }
 
     #[gpui::test]
@@ -4873,6 +4881,15 @@ mod terminal_action_tests {
         cx.run_until_parked();
         seed_active_pane(&app, cx, "active-agent-text");
 
+        // `Agents::spawn` alone (unlike the real `AdeApp::new_agent` this deliberately bypasses,
+        // to isolate copy's own active-agent routing from spawn's other side effects) never moves
+        // `Window::focus` - see `Agents::focus_active`'s own docs for why that is a caller's job.
+        // Left unfocused, `Window::focus` is still the first (now unmounted) agent's stale handle,
+        // and dispatch from a focus handle absent from the current rendered frame does not fall
+        // back to the root the way dispatching from no focus at all does.
+        app.update_in(cx, |app, window, cx| {
+            app.agents.focus_active(window, cx);
+        });
         cx.dispatch_action(TerminalCopy);
 
         let text = cx.update(|_window, cx| cx.read_from_clipboard().and_then(|item| item.text()));

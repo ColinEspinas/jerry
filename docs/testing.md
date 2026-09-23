@@ -149,6 +149,18 @@ a signal the subject already emits: perturbing nothing beats polling coarsely.
 `crate::root::focus::palette_focus_tests::open_test_app` is a re-export of the first, kept so the
 ~500 call sites that still name it keep resolving while they are migrated (GitHub issue #425).
 
+Neither ever lets a `ui`-tier test launch a real agent CLI (GitHub issue #530): both stub every
+`AgentKind`'s binary via `Agents::override_binary` with a process that idles on its own stdin and
+exits 0 once it closes, so `ProcessKind::Agent(...)` spawns something real and observable (a live
+pid, a process that goes away when its pane does) without ever being `claude`/`codex`/
+`cursor-agent`. `TerminalSpec::program`/`args` still name the kind's real binary and real computed
+arguments (`--resume <id>`, a generated `--settings <path>`) - only the actual OS spawn is
+substituted, via `TerminalSpec::spawn_override` - so a test asserting on the spec via
+`TerminalPane::spec_for_test` still pins Jerry's own argument construction. The one test that
+genuinely needs the real thing (`hooks::integration_tests`'s `external`-tier
+`a_claude_agent_spawned_through_the_real_app_path_really_reports_its_hooks`) undoes the override
+for `AgentKind::Claude` with `Agents::clear_binary_override` before it spawns.
+
 ## Running tests
 
 `cargo nextest run --workspace` is part of the pre-commit gate (`CLAUDE.md`, `/check`) and runs on

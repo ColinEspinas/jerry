@@ -7,11 +7,12 @@
 //! confinement keep an agent from acting outside its lane by accident; they are guardrails, not
 //! a sandbox against a process that chooses to lie about who it is.
 
+use crate::session::SessionError;
 use crate::Inner;
 use jerry_core::wire::rpc_code;
 use jerry_core::{
-    execute_locally, permits, AppCommand, AppQuery, Call, Caller, Ctx, LocalDispatchError, Message,
-    Report, Request, RpcError,
+    execute_locally, permits, AppCommand, AppQuery, Call, Caller, Ctx, Error, LocalDispatchError,
+    Message, Report, Request, RpcError, SessionSpawnOutcome,
 };
 use serde_json::Value;
 use std::fs;
@@ -53,6 +54,39 @@ pub(crate) fn handle(inner: &Inner, call: Call) -> Result<Value, RpcError> {
         // one process with a real session table answers directly from it, exactly like `Hook`
         // above.
         Request::Query(AppQuery::Agents(_)) => to_value(Report::ok(&agents_entries(inner))),
+        // `SessionsQuery`/`SessionSpawn`/`SessionResize`/`SessionKill` are the same shape:
+        // `Locality::Session`, answered directly from `inner.sessions()` rather than through
+        // `execute_locally` (decisions.md §23).
+        Request::Query(AppQuery::Sessions(_)) => to_value(Report::ok(&inner.sessions().list())),
+        Request::Command(AppCommand::SessionSpawn(command)) => {
+            to_value(match spawn_session(inner, &call.cwd, command.clone()) {
+                Ok(outcome) => Report::ok(&outcome),
+                Err(error) => Report::Error { error },
+            })
+        }
+        Request::Command(AppCommand::SessionResize(command)) => to_value(
+            match inner
+                .sessions()
+                .resize(&command.id, command.rows, command.cols)
+            {
+                Ok(()) => Report::Ok {
+                    outcome: Value::Null,
+                },
+                Err(error) => Report::Error {
+                    error: session_error_to_wire(error),
+                },
+            },
+        ),
+        Request::Command(AppCommand::SessionKill(command)) => {
+            to_value(match inner.sessions().kill(&command.id) {
+                Ok(()) => Report::Ok {
+                    outcome: Value::Null,
+                },
+                Err(error) => Report::Error {
+                    error: session_error_to_wire(error),
+                },
+            })
+        }
         _ => {
             let requested_by = caller.clone();
             let ctx = match Ctx::from_cwd(&call.cwd, caller) {
@@ -89,6 +123,43 @@ fn agents_entries(inner: &Inner) -> Vec<jerry_core::AgentsEntry> {
             worktree: record.worktree,
         })
         .collect()
+}
+
+/// `SessionSpawn`'s real execution: builds `jerry_pty::SpawnOptions` from the wire command and
+/// the caller's own `cwd` (the new session's worktree - never a field on the command itself, so
+/// a caller cannot ask to spawn into somewhere its own confinement wouldn't otherwise reach), and
+/// hands it to `inner.sessions()`. The returned handle is not part of this outcome - see
+/// `SessionManager::handle_for`'s own docs for how an in-process caller attaches to it.
+fn spawn_session(
+    inner: &Inner,
+    cwd: &Path,
+    command: jerry_core::SessionSpawn,
+) -> Result<SessionSpawnOutcome, Error> {
+    let mut options = jerry_pty::SpawnOptions::new(command.program)
+        .args(command.args)
+        .cwd(cwd.to_path_buf())
+        .size(command.rows, command.cols);
+    for (key, value) in command.env {
+        options = options.env(key, value);
+    }
+    let (id, _handle) = inner
+        .sessions()
+        .spawn(cwd.to_path_buf(), None, options)
+        .map_err(|error| Error::new("session-spawn-failed", error.to_string()))?;
+    Ok(SessionSpawnOutcome { id })
+}
+
+fn session_error_to_wire(error: SessionError) -> Error {
+    match error {
+        SessionError::NotFound(id) => {
+            Error::new("session-not-found", format!("no session with id {id}"))
+        }
+        SessionError::NotOwned(id) => Error::new(
+            "session-not-owned",
+            format!("session {id} has no process this host owns"),
+        ),
+        SessionError::Pty(source) => Error::new("session-pty-error", source.to_string()),
+    }
 }
 
 /// After a successful `command/worktree-create`, the agent spawn is the host's own reaction to

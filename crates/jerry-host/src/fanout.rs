@@ -4,7 +4,7 @@
 
 use futures::channel::mpsc;
 use jerry_core::Message;
-use std::sync::{mpsc as std_mpsc, Mutex, PoisonError};
+use std::sync::{mpsc as std_mpsc, Arc, Mutex, PoisonError};
 
 /// How many undelivered notifications a socket client may fall behind before it is dropped.
 pub(crate) const SOCKET_BACKLOG: usize = 64;
@@ -17,10 +17,14 @@ enum Sink {
     Socket(std_mpsc::SyncSender<Message>),
 }
 
-#[derive(Default)]
+/// A cheap, `Clone`-able handle: `Inner` and `crate::session::SessionManager` each hold one and
+/// broadcast on the same underlying sink list - a session's own exit-observing relay thread
+/// (`SessionManager::spawn`) publishes `event/session-exited` this way, with no back-reference to
+/// `Inner` at all.
+#[derive(Default, Clone)]
 pub(crate) struct Fanout {
-    sinks: Mutex<Vec<(SinkId, Sink)>>,
-    next_id: Mutex<u64>,
+    sinks: Arc<Mutex<Vec<(SinkId, Sink)>>>,
+    next_id: Arc<Mutex<u64>>,
 }
 
 impl Fanout {

@@ -150,20 +150,21 @@ impl AdeApp {
             .iter_for_cwd(worktree_path.clone())
             .map(|agent| agent.pane.clone())
             .collect();
-        let mut doomed_sessions = Vec::with_capacity(doomed_panes.len());
-        for pane in doomed_panes {
-            if let Some(session) = pane.update(cx, |pane, cx| pane.take_session_for_teardown(cx)) {
-                doomed_sessions.push(session);
-            }
-        }
         let doomed_lsp_clients = self.take_lsp_clients_for_root(&worktree_path);
 
         let discarded_path = worktree_path.clone();
         let task = cx.spawn(async move |this, cx| {
+            // GitHub issue #470's guarantee - every process this app started in the worktree is
+            // confirmed dead before the directory is deleted - only holds if a pane whose own
+            // `SessionSpawn` was still in flight is waited out too, which is what this collects:
+            // a real background task is what `run_until_parked` blocks on; a `timer()` never
+            // resolves under the deterministic scheduler.
+            let doomed_sessions =
+                crate::work_surface::agents::collect_doomed_sessions(doomed_panes, &this, cx).await;
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    for mut session in doomed_sessions {
+                    for session in doomed_sessions {
                         if let Err(err) = session.shutdown() {
                             log::warn!("failed to shut down a doomed agent session: {err}");
                         }

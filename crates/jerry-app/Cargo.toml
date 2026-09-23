@@ -30,6 +30,11 @@ jerry-core = { path = "../jerry-core" }
 jerry-host = { path = "../jerry-host" }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+# `crate::terminal::pane`'s poll-free output loop awaits `jerry_pty::PtyOutput` directly
+# (`futures::StreamExt::next`) instead of draining a channel on a timer - see
+# `docs/architecture/decisions.md` §8's amendment - and `crate::hooks`'s notification-consuming
+# task (`LocalClient::subscribe`'s `mpsc::UnboundedReceiver`) awaits the same way.
+futures = { workspace = true }
 env_logger = "0.11"
 log = "0.4"
 # Real ANSI/grid terminal emulation, replacing step 3's hand-rolled plain-text scan (see
@@ -222,11 +227,6 @@ tree-sitter-md = "0.5.3"
 # `<script>` content into this crate's TypeScript grammar - which is why these two land together.
 tree-sitter-html = "0.23.2"
 tree-sitter-css = "0.25.0"
-# `crate::hooks`'s notification-consuming task (`LocalClient::subscribe`'s
-# `mpsc::UnboundedReceiver`, awaited with `StreamExt::next`) - already resolved transitively via
-# `jerry-host`/`jerry-core`, so this promotes an already-locked crate to a direct dependency
-# rather than adding new version surface, at the exact version those two already pin.
-futures = { workspace = true }
 # GitHub issue #226's sound design module (`crate::sound`) - real audio playback for the app-start
 # chime and the agent-attention sounds, decoding both the bundled built-in library
 # (`assets/sounds/`) and anything the user drops in `~/.config/jerry/sounds/`. `rodio`, not

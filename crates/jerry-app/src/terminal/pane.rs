@@ -10,15 +10,18 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::mpsc::TryRecvError;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures::StreamExt;
 use gpui::{
     canvas, div, font, prelude::*, px, rgb, BorderStyle, Bounds, ClickEvent, Context, EventEmitter,
     FocusHandle, Focusable, FontWeight, KeyDownEvent, Keystroke, Modifiers, Pixels,
     ScrollWheelEvent, Size, Task, Window,
 };
-use jerry_pty::{ExitStatus, PtyError, PtySession, SpawnOptions};
+use jerry_core::{AppCommand, Call, Report, Request, SessionResize};
+use jerry_host::{LocalClient, SessionHandle};
+use jerry_pty::{ExitStatus, PtyError, PtyOutput};
 
 use crate::root::scrollbar::{self, ScrollableHandle};
 use crate::root::widgets::text_tooltip;
@@ -32,79 +35,10 @@ use crate::terminal::mouse::{
 use crate::terminal::osc::Progress;
 use crate::theme;
 
-/// How often the poll task of the *globally active* agent's pane (see
-/// [`TerminalPane::set_foreground`]; every other pane uses [`BACKGROUND_POLL_INTERVAL`]) wakes
-/// up to drain any pty output that has arrived and, if there was any, re-render.
-const POLL_INTERVAL: Duration = Duration::from_millis(8);
-
-/// [`POLL_INTERVAL`]'s counterpart for a pane whose agent is *not* the globally active tab
-/// (see [`TerminalPane::set_foreground`]) - nobody can see a background pane's output live, so
-/// polling it twice per frame buys nothing. 33ms (the pre-tightening interval, ~30 drains/s)
-/// keeps a background agent's status/activity signal fresh to within a frame or two while
-/// capping how much foreground-thread work each background pane can generate.
-const BACKGROUND_POLL_INTERVAL: Duration = Duration::from_millis(33);
-
-/// Defensive cap on how many output *bytes* a single poll tick will drain and decode on the
-/// GPUI foreground thread. Without a cap, a firehose child (`yes`, a chatty build tool) could
-/// hand the poll loop the full contents of `jerry-pty`'s bounded output channel (~1MB) to
-/// decode in a single tick, on the same thread responsible for input handling and
-/// re-rendering. Capping the per-tick budget spreads that cost across ticks instead - whatever
-/// isn't drained is still sitting in the channel (jerry-pty's reader thread backpressures) and
-/// gets picked up next tick.
-const MAX_BYTES_PER_TICK: usize = 256 * 1024;
-
-/// [`MAX_BYTES_PER_TICK`]'s counterpart for a background pane (see
-/// [`BACKGROUND_POLL_INTERVAL`]'s docs for the measured multi-pane regression this split
-/// fixes). 32KiB per 33ms tick caps a background pane's *delivered* throughput at ~1MB/s -
-/// deliberately about what the pre-tightening cadence delivered (the old 64-chunk cap measured
-/// ~0.8MB/s against a real firehose), so a wall of background agents can never generate more
-/// aggregate foreground decode work than the app handled before the tightening. The child
-/// isn't harmed: `jerry-pty`'s bounded channel backpressures it, exactly as it did for every
-/// pane pre-tightening, and the pane returns to the full [`MAX_BYTES_PER_TICK`] budget the
-/// moment its tab becomes active again.
-const BACKGROUND_MAX_BYTES_PER_TICK: usize = 32 * 1024;
-
-/// The poll cadence - (sleep interval, per-tick drain byte budget) - for one tick of
-/// [`TerminalPane::spawn_process`]'s loop, given whether this pane's agent is the globally
-/// active tab and whether pty EOF is already pending.
-fn tick_cadence(is_foreground: bool, eof_pending: bool) -> (Duration, usize) {
-    if is_foreground || eof_pending {
-        (POLL_INTERVAL, MAX_BYTES_PER_TICK)
-    } else {
-        (BACKGROUND_POLL_INTERVAL, BACKGROUND_MAX_BYTES_PER_TICK)
-    }
-}
-
 /// Initial pty size used for the spawned shell, before the first real resize (see
 /// `maybe_resize_pty`) has a chance to run during the first render.
-const TERMINAL_ROWS: u16 = 48;
-const TERMINAL_COLS: u16 = 160;
-
-/// How many [`POLL_INTERVAL`] ticks (~10s total) [`TerminalPane`]'s poll loop keeps retrying
-/// `PtySession::try_wait` after observing pty EOF before giving up - see
-/// [`eof_poll_decision`]'s docs for the race this bounds.
-const MAX_EOF_POLL_TICKS: u32 = (10_000 / POLL_INTERVAL.as_millis()) as u32;
-
-/// Decides what a poll tick should do once pty EOF has been observed (the output channel's
-/// `TryRecvError::Disconnected`) but the child's exit status hasn't been confirmed yet, given
-/// this tick's own non-blocking `PtySession::try_wait` result.
-fn eof_poll_decision(
-    try_wait_result: Result<Option<ExitStatus>, ()>,
-    ticks_pending: u32,
-) -> Option<ExitStatus> {
-    match try_wait_result {
-        Ok(Some(status)) => Some(status),
-        Ok(None) | Err(()) => {
-            if ticks_pending >= MAX_EOF_POLL_TICKS {
-                Some(ExitStatus::with_signal(
-                    "gave up waiting for exit status after EOF",
-                ))
-            } else {
-                None
-            }
-        }
-    }
-}
+pub(crate) const TERMINAL_ROWS: u16 = 48;
+pub(crate) const TERMINAL_COLS: u16 = 160;
 
 /// The terminal body's default/fallback font size and line height - the designed 12px/19 mono.
 /// Set
@@ -153,6 +87,14 @@ pub struct TerminalSpec {
     /// environment rather than replacing it, which is what makes this safe to use for a couple
     /// of variables without having to reconstruct a whole environment).
     pub env: Vec<(String, String)>,
+    /// Test-only escape hatch (GitHub issue #530): when set, the real OS spawn execs this
+    /// `(program, args)` pair instead of [`Self::program`]/[`Self::args`], which keep naming
+    /// whatever the real kind logic decided (`claude`, a leading `--resume <id>`, a generated
+    /// `--settings <path>`) so `spec_for_test()`-based assertions on that construction stay
+    /// meaningful even though nothing real ever runs. Set only by
+    /// `crate::work_surface::agents::Agents`'s per-kind test override; always `None` in
+    /// production.
+    pub(crate) spawn_override: Option<(PathBuf, Vec<String>)>,
 }
 
 impl TerminalSpec {
@@ -166,6 +108,7 @@ impl TerminalSpec {
             program,
             cwd,
             env: Vec::new(),
+            spawn_override: None,
         }
     }
 
@@ -208,6 +151,7 @@ impl TerminalSpec {
             args,
             cwd,
             env: Vec::new(),
+            spawn_override: None,
         }
     }
 
@@ -223,6 +167,7 @@ impl TerminalSpec {
             args,
             cwd,
             env,
+            spawn_override: None,
         }
     }
 }
@@ -640,18 +585,100 @@ pub enum TerminalPaneEvent {
     ProcessExited { clean: bool },
 }
 
+/// The exact shape of `jerry_host::SessionHandle` (decisions.md §23's data-plane adapter) that
+/// [`TerminalPane`] needs, abstracted so a test can feed a scripted [`PtyOutput`] stream without
+/// spawning a real process. `TerminalPane` never calls `jerry_pty::`/`jerry_host::` beyond this
+/// trait and `crate::work_surface::agents::Agents::spawn_inner`'s own orchestration, which
+/// dispatches `SessionSpawn` through the host and attaches via `SessionManager::handle_for`.
+pub(crate) trait SessionAdapter: Send + Sync {
+    fn id(&self) -> &jerry_core::SessionId;
+    fn write_input(&self, data: &[u8]) -> Result<(), PtyError>;
+    /// The relayed output stream, exactly once - see `jerry_host::SessionHandle::take_output`'s
+    /// own docs for why a second call must answer `None`.
+    fn take_output(&self) -> Option<futures::channel::mpsc::Receiver<PtyOutput>>;
+    fn process_id(&self) -> Option<u32>;
+    fn pause(&self) -> Result<(), PtyError>;
+    fn resume(&self) -> Result<(), PtyError>;
+    /// Blocks until the process is confirmed dead - unlike `SessionKill`'s non-blocking control-
+    /// plane contract, kept in-process like `write_input` for the one caller (the worktree-discard
+    /// flow, GitHub issue #470) that must be certain before it proceeds. See
+    /// `docs/architecture/decisions.md` §23 for why this doesn't also travel through `Call`/`Report`.
+    fn shutdown(&self) -> Result<(), PtyError>;
+}
+
+impl SessionAdapter for SessionHandle {
+    fn id(&self) -> &jerry_core::SessionId {
+        SessionHandle::id(self)
+    }
+
+    fn write_input(&self, data: &[u8]) -> Result<(), PtyError> {
+        SessionHandle::write_input(self, data)
+    }
+
+    fn take_output(&self) -> Option<futures::channel::mpsc::Receiver<PtyOutput>> {
+        SessionHandle::take_output(self)
+    }
+
+    fn process_id(&self) -> Option<u32> {
+        SessionHandle::process_id(self)
+    }
+
+    fn pause(&self) -> Result<(), PtyError> {
+        SessionHandle::pause(self)
+    }
+
+    fn resume(&self) -> Result<(), PtyError> {
+        SessionHandle::resume(self)
+    }
+
+    fn shutdown(&self) -> Result<(), PtyError> {
+        SessionHandle::shutdown(self)
+    }
+}
+
 pub struct TerminalPane {
     spec: TerminalSpec,
     grid: TerminalGrid,
-    session: Option<PtySession>,
+    session: Option<Arc<dyn SessionAdapter>>,
+    /// The host's own dispatch client, for the one thing this pane still asks the control plane
+    /// for directly: `SessionResize` (decisions.md §23 - resize never travels on the data plane).
+    /// `None` for a session with no real host behind it (a scripted test session) or before one
+    /// has ever attached.
+    host_client: Option<LocalClient>,
+    /// Test-only: the throwaway `jerry_host::Host` a real-pty test fixture
+    /// (`pty_pane_fixtures::attach_real_session_for_test`) spawned this pane's session through,
+    /// kept alive here rather than dropped at the end of that function. `Host::shutdown` (via
+    /// `Drop`) now kills every session it still owns a real process for
+    /// (`SessionManager::shutdown_all`, GitHub issue #530) - a throwaway host that dropped
+    /// immediately after spawning would kill the session before this pane, or the test driving
+    /// it, ever got to observe its own natural exit. Tying its lifetime to this pane's own -
+    /// exactly like `Self::session` reflects `SessionManager`'s per-pane ownership in
+    /// production - keeps it alive for as long as the pane needs it and no longer.
+    #[cfg(test)]
+    _test_host: Option<jerry_host::Host>,
     spawn_error: Option<String>,
-    /// The process's exit status, once it has exited - captured via a non-blocking
-    /// `PtySession::try_wait` the moment the poll loop notices the process ended: on unix, when
-    /// the output channel disconnects (real pty EOF); on Windows, from an independent
-    /// `try_wait` poll every tick, since pty EOF can't be relied on there (see the module docs'
-    /// "Windows: process-exit detection can't rely on pty EOF" section). `None` while running,
-    /// before ever spawned, or if a spawn attempt itself failed (see [`Self::spawn_error`] for
-    /// that case - a process that never started has no `ExitStatus` to report).
+    /// Set by [`Self::take_session_for_teardown`] - this pane's process must not outlive the
+    /// worktree teardown that claimed it, even if its own `SessionSpawn` dispatch was still in
+    /// flight at that moment (GitHub issue #470: `docs/architecture/decisions.md` §23's
+    /// control-plane spawn genuinely crosses the host, unlike the direct `jerry_pty::spawn` this
+    /// used to be able to treat as already settled by teardown time). [`Self::attach_session`]
+    /// checks this and shuts a late-arriving session straight back down instead of running it.
+    doomed: bool,
+    /// Set by [`Self::take_session_for_teardown`] the moment it actually hands a session off -
+    /// distinct from `self.session.is_none()` alone, which is equally true of a pane whose
+    /// `SessionSpawn` genuinely never attached yet. Without this, [`Self::teardown_still_pending`]
+    /// could not tell "still waiting to attach" from "already torn down", and a second caller
+    /// dooming the same already-torn-down pane (`Agents::close` on a tab a worktree discard's own
+    /// orphaned-agent cleanup already tore down, since both now go through the same doom-poll-
+    /// shutdown sequence) would poll forever for a session that will never arrive.
+    torn_down: bool,
+    /// The process's exit status, once it has exited - captured the moment a
+    /// [`jerry_pty::PtyOutput::Exited`] item arrives on [`Self::session`]'s output stream, real
+    /// on every platform (`run_wait_loop`'s dedicated thread in `jerry-pty` blocks on the
+    /// child's own `Child::wait`, independent of pty EOF timing - see
+    /// `docs/architecture/decisions.md` §8's amendment). `None` while running, before ever
+    /// spawned, or if a spawn attempt itself failed (see [`Self::spawn_error`] for that case - a
+    /// process that never started has no `ExitStatus` to report).
     exit_status: Option<ExitStatus>,
     /// The last time this pane's process is known to have produced output, or - if it hasn't
     /// produced any yet - the moment it started. `None` only before any process has ever
@@ -663,14 +690,6 @@ pub struct TerminalPane {
     /// human has not yet answered, or `None` if it never has or the human has since answered
     /// (GitHub issue #239).
     attention_ping_at: Option<Instant>,
-    /// `true` from the moment pty EOF is observed until the child's exit status is either
-    /// confirmed or given up on - see [`eof_poll_decision`]'s docs for the bug this state
-    /// exists to fix. While `true`, [`Self::session`] is deliberately not yet cleared: the
-    /// process may genuinely still be alive.
-    eof_pending: bool,
-    /// How many poll ticks [`Self::eof_pending`] has been `true` for - fed into
-    /// [`eof_poll_decision`] each tick; reset whenever a fresh EOF is observed.
-    eof_poll_ticks: u32,
     focus_handle: FocusHandle,
     /// This pane's rendered content-area bounds - captured every frame via a measuring
     /// `canvas()` child in `render` (see that method's docs for why this exists instead of
@@ -691,15 +710,10 @@ pub struct TerminalPane {
     /// Tracks which `(rows, cols)` the grid and the child pty are each actually in sync with -
     /// see [`ResizeLatch`]'s docs for the bug this decomposition exists to prevent.
     resize_latch: ResizeLatch,
-    /// Owns the in-flight "spawn the process, then poll its output" task. Dropping/replacing
-    /// this cancels whatever the previous task was doing, stopping an old session's poll loop
+    /// Owns the in-flight "spawn the process, then await its output" task. Dropping/replacing
+    /// this cancels whatever the previous task was doing, stopping an old session's output loop
     /// from racing a new one over the same struct fields.
     _task: Option<Task<()>>,
-    /// Whether this pane's agent is the *globally active* tab
-    /// (`crate::work_surface::agents::Agents::active`). Drives [`tick_cadence`]: only the active
-    /// agent's pane gets the frame-accurate [`POLL_INTERVAL`]/[`MAX_BYTES_PER_TICK`]
-    /// cadence; every other pane polls at the coarser background cadence.
-    is_foreground: bool,
     /// `true` between a real left mouse-down inside the grid and the matching mouse-up - i.e.
     /// while a text-selection drag is genuinely in progress (GitHub issue #158). Gates
     /// [`Self::handle_mouse_move`] so an ordinary hover never extends a selection; the
@@ -750,6 +764,20 @@ pub struct TerminalPane {
     settled_real_size: bool,
 }
 
+impl Drop for TerminalPane {
+    /// Cancels [`Self::_task`] - dropping its captured output receiver - before the automatic
+    /// field drops below reach [`Self::session`]. Ordering matters: `PtySession::drop` only
+    /// *signals* the child and returns, so its reader/wait threads (`jerry-pty`) can keep running
+    /// briefly afterward; if the receiver were still alive when one of them next sends, that send
+    /// wakes this pane's task on whatever executor scheduled it. In a `#[gpui::test]` that can
+    /// mean waking a scheduler the test harness already tore down, which panics
+    /// (`assert_correct_thread`, "Your test is not deterministic"). Dropping the receiver first
+    /// makes any such send observe a closed channel and return before it ever touches a waker.
+    fn drop(&mut self) {
+        self._task = None;
+    }
+}
+
 impl TerminalPane {
     /// `font_size_px` is the caller-supplied starting font size - every production caller
     /// (`crate::work_surface::agents::Agents::spawn`) passes the live
@@ -758,24 +786,43 @@ impl TerminalPane {
     /// Clamped via [`sanitized_font_size_px`] the same way [`Self::set_font_size`] clamps a
     /// later edit, so an already out-of-range persisted value (a hand-edited settings file)
     /// can never reach font-metrics measurement.
+    ///
+    /// Spawns nothing by itself: the host owns every session now
+    /// (`docs/architecture/decisions.md` §23), so a pane starts with none attached.
+    /// `crate::work_surface::agents::Agents::spawn_inner` dispatches `SessionSpawn` and calls
+    /// [`Self::attach_session`] once it resolves; a caller with no host in scope at all (a bare
+    /// pane test) attaches its own real or scripted session the same way.
     pub fn new(spec: TerminalSpec, font_size_px: f32, cx: &mut Context<Self>) -> Self {
-        let mut this = Self {
+        // `jerry-pty`'s reader/wait threads wake this pane's output task through a real
+        // `futures::channel::mpsc` waker (`docs/architecture/decisions.md` §8's amendment).
+        // GPUI's test scheduler treats any wake from a thread other than the test's own as
+        // non-deterministic unless this has been called once; every real-pty test constructs a
+        // pane through here (directly or via `AdeApp`), so this is the one place that needs it.
+        // `cfg(test)`, not a feature: `gpui`'s own `allow_parking` only exists at all under its
+        // dev-only `test-support` feature, which cargo unifies in automatically for this crate's
+        // own `#[cfg(test)]` builds.
+        #[cfg(test)]
+        cx.background_executor().allow_parking();
+
+        Self {
             spec,
             grid: TerminalGrid::new(TERMINAL_ROWS, TERMINAL_COLS),
             session: None,
+            host_client: None,
+            #[cfg(test)]
+            _test_host: None,
             spawn_error: None,
+            doomed: false,
+            torn_down: false,
             exit_status: None,
             activity_at: None,
             attention_ping_at: None,
-            eof_pending: false,
-            eof_poll_ticks: 0,
             focus_handle: cx.focus_handle(),
             content_bounds: None,
             font_size_px: sanitized_font_size_px(font_size_px),
             cell_width_px: None,
             resize_latch: ResizeLatch::default(),
             _task: None,
-            is_foreground: true,
             selecting: false,
             last_reported_cell: None,
             reported_presses: [false; 3],
@@ -785,9 +832,137 @@ impl TerminalPane {
             pending_scroll_px: 0.0,
             new_output_while_scrolled: false,
             settled_real_size: false,
+        }
+    }
+
+    /// Attaches this pane to a live (or scripted) session and starts the "wait for the next
+    /// item, update the grid, or record exit" loop against its output stream - what
+    /// `Self::new` used to do itself, against a `jerry_pty::PtySession` it spawned directly,
+    /// before the host owned every session (decisions.md §23). `client` is the host's dispatch
+    /// handle for `Self::resize_to`'s own `SessionResize` calls; `None` for a session with no
+    /// real host behind it.
+    ///
+    /// A `None` from `session.take_output()` is a real error, not a silent no-op: a session's
+    /// stream is claimed exactly once, so seeing it already gone here means something upstream
+    /// took it first.
+    pub(crate) fn attach_session(
+        &mut self,
+        session: Arc<dyn SessionAdapter>,
+        client: Option<LocalClient>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut output) = session.take_output() else {
+            self.spawn_error = Some(
+                "internal error: this session's output stream was already claimed".to_string(),
+            );
+            cx.notify();
+            return;
         };
-        this.spawn_process(cx);
-        this
+        self.session = Some(session);
+        self.host_client = client;
+        if self.doomed {
+            // This pane's own worktree-discard flow (`crate::worktree_history::flow`) is
+            // already polling `Self::take_session_for_teardown` for exactly this case - a
+            // `SessionSpawn` dispatch that was still in flight when the discard claimed this
+            // pane. That flow must own the shutdown itself, so it can sequence it *before* the
+            // real `git worktree remove` (GitHub issue #470) - so this attaches the session and
+            // stops here, deliberately never starting the usual output-processing task, which
+            // would otherwise start running a process about to be killed.
+            return;
+        }
+        // A freshly attached process hasn't produced output yet, but it just demonstrably did
+        // something (started) - counting that as activity keeps a still-spawning agent from
+        // being immediately misread as long-idle by `crate::rail::status::derive_status`.
+        self.activity_at = Some(Instant::now());
+        // A previous process's unanswered attention ping is not this one's - see
+        // `attention_ping_at`'s field docs.
+        self.clear_attention_ping();
+        // The pane may already have rendered (and computed a target grid size) before this
+        // attached - there was no live session yet for that call to reach, so retry it now that
+        // one exists, rather than waiting for the next resize to reach the pty.
+        if let Some(target) = self.resize_latch.grid {
+            self.resize_to(target.0, target.1, cx);
+        }
+        cx.notify();
+
+        // Wakes exactly when the host's relay thread (or, on Windows, `jerry-pty`'s own
+        // independent exit-wait thread - see `docs/architecture/decisions.md` §8) has something
+        // ready, rather than draining a channel on a fixed interval. `Exited` ends this loop: it
+        // is the stream's terminal item (guaranteed last on unix; see `PtyOutput`'s docs for
+        // Windows' narrower guarantee, preserved by the host's relay - see decisions.md §23).
+        let task = cx.spawn(async move |this, cx| {
+            while let Some(item) = output.next().await {
+                let mut exited = false;
+                let updated = this.update(cx, |this, cx| match item {
+                    PtyOutput::Bytes(chunk) => {
+                        this.grid.append_bytes(&chunk);
+                        // GitHub issue #331: real output arrived while the human was looking
+                        // at scrollback - latch the "new output" indicator for the
+                        // jump-to-bottom affordance. `Self::grid` already stays pinned to the
+                        // same historical lines on its own (see
+                        // `TerminalGrid::scroll_display`'s docs), so this is purely the UI
+                        // signal, never a scroll-position decision.
+                        if this.grid.is_scrolled_back() {
+                            this.new_output_while_scrolled = true;
+                        }
+                        this.activity_at = Some(Instant::now());
+                        // Consume the grid's one-shot OSC 9 / 777 notification flag right
+                        // where the bytes that could have set it were parsed, and latch it -
+                        // see `attention_ping_at`'s field docs for why this must not be
+                        // consumed from the render path.
+                        if this.grid.take_attention_ping() {
+                            this.attention_ping_at = Some(Instant::now());
+                        }
+
+                        // Any bytes the VT parser itself generated while processing this
+                        // chunk - e.g. a cursor position report for `ESC[6n` - must be
+                        // written back to the pty's own stdin, not just left in `this.grid`.
+                        // This is never a no-op-safe skip: real Windows ConPTY sends exactly
+                        // this query as part of its own startup handshake and blocks its
+                        // entire output stream on a real answer (confirmed live - see
+                        // `TermEventSink`'s own docs), so a dropped reply here doesn't just
+                        // misrender a query response, it silently hangs the whole pane
+                        // forever.
+                        let pending_writes = this.grid.take_pending_pty_writes();
+                        if !pending_writes.is_empty() {
+                            if let Some(session) = this.session.as_ref() {
+                                if let Err(err) = session.write_input(&pending_writes) {
+                                    log::warn!(
+                                        "failed to answer a terminal query (e.g. cursor \
+                                         position report) back to the pty: {err}"
+                                    );
+                                }
+                            }
+                        }
+
+                        cx.notify();
+                    }
+                    PtyOutput::Exited(status) => {
+                        let clean = status.success();
+                        this.exit_status = Some(status);
+                        this.session = None;
+                        this.grid.mark_ended();
+                        cx.emit(TerminalPaneEvent::ProcessExited { clean });
+                        cx.notify();
+                        exited = true;
+                    }
+                });
+
+                if updated.is_err() || exited {
+                    break; // the pane entity was dropped, or the process it watched exited
+                }
+            }
+        });
+
+        self._task = Some(task);
+    }
+
+    /// Records that this pane's process could not be started - a real, honest failure (denied by
+    /// the host, no host reachable, dispatch itself failed) rather than a silent no-op. The one
+    /// caller is `Agents::spawn_inner`'s own `SessionSpawn` orchestration task.
+    pub(crate) fn mark_spawn_failed(&mut self, message: String, cx: &mut Context<Self>) {
+        self.spawn_error = Some(message);
+        cx.notify();
     }
 
     /// Applies a Settings › Appearance "Terminal font size" edit
@@ -812,7 +987,7 @@ impl TerminalPane {
     }
 
     /// Deterministically tears down the current child process, if any, via
-    /// `PtySession::shutdown` (blocks until the process tree is confirmed dead and reaped) -
+    /// `SessionAdapter::shutdown` (blocks until the process tree is confirmed dead and reaped) -
     /// run on the background executor so this doesn't block the GPUI foreground thread.
     /// Intended for closing a tab: called before the owning `Entity<TerminalPane>` is dropped,
     /// so process teardown is a completed, verified fact rather than left to `Drop`'s
@@ -820,7 +995,7 @@ impl TerminalPane {
     /// per `jerry-pty`'s docs, just not deterministic about *when* the process is reaped).
     pub fn shutdown(&mut self, cx: &mut Context<Self>) {
         self._task = None;
-        if let Some(mut session) = self.session.take() {
+        if let Some(session) = self.session.take() {
             cx.background_executor()
                 .spawn(async move {
                     if let Err(err) = session.shutdown() {
@@ -836,13 +1011,37 @@ impl TerminalPane {
     /// flow (GitHub issue #470), which must have every process in the worktree confirmed dead
     /// **before** deleting the directory - on Windows a live child's cwd holds an open handle
     /// that makes the removal half-fail. The pane renders as exited from this point on.
-    pub fn take_session_for_teardown(
+    ///
+    /// Also marks this pane [`Self::doomed`] - idempotently safe to call again once
+    /// [`Self::teardown_still_pending`] reports a still-in-flight `SessionSpawn` has resolved,
+    /// which is exactly what the worktree discard flow does for a pane whose spawn had not yet
+    /// attached the first time it called this.
+    pub(crate) fn take_session_for_teardown(
         &mut self,
         cx: &mut Context<Self>,
-    ) -> Option<jerry_pty::PtySession> {
+    ) -> Option<Arc<dyn SessionAdapter>> {
         self._task = None;
+        self.doomed = true;
         cx.notify();
-        self.session.take()
+        let session = self.session.take();
+        if session.is_some() {
+            self.torn_down = true;
+        }
+        session
+    }
+
+    /// Whether [`Self::take_session_for_teardown`] has claimed this pane but its `SessionSpawn`
+    /// dispatch had not yet resolved (to either a real attach or a spawn failure) at the time -
+    /// a caller doing the doom-poll-shutdown sequence (`crate::work_surface::agents::
+    /// collect_doomed_sessions`, GitHub issue #470/#530)'s signal to keep polling rather than
+    /// give up, so a process that attaches after the fact is still shut down. `false` once
+    /// [`Self::take_session_for_teardown`] has already handed a session off - not just once
+    /// `self.session` happens to be `None` again, which a second, later doomer (a tab close
+    /// after a worktree discard's own orphaned-agent cleanup already tore it down) would
+    /// otherwise misread as "still waiting to attach" and poll forever for a session that will
+    /// never arrive.
+    pub(crate) fn teardown_still_pending(&self) -> bool {
+        self.doomed && self.session.is_none() && self.spawn_error.is_none() && !self.torn_down
     }
 
     /// `true` while a child process is alive (spawned and not yet observed to have exited).
@@ -896,25 +1095,6 @@ impl TerminalPane {
     /// takes the pane over. See [`Self::attention_ping_at`]'s field docs.
     fn clear_attention_ping(&mut self) {
         self.attention_ping_at = None;
-    }
-
-    /// Tells this pane whether its agent is the globally active tab - see
-    /// [`Self::is_foreground`]'s field docs. Called (only) by
-    /// `crate::work_surface::agents::Agents::sync_pane_cadence` on every active-agent change; the poll
-    /// loop reads the flag afresh each tick, so a change takes effect within one tick of
-    /// whichever cadence the pane was on. Deliberately no `cx.notify()`: the flag changes
-    /// polling cadence, never anything rendered.
-    pub fn set_foreground(&mut self, foreground: bool) {
-        self.is_foreground = foreground;
-    }
-
-    /// Whether this pane currently polls at the foreground cadence - see
-    /// [`Self::is_foreground`]'s field docs. Test-only observation point (this crate's
-    /// cadence tests); no production reader exists - the poll loop reads the field directly -
-    /// so this is `#[cfg(test)]` rather than shipping dead code.
-    #[cfg(test)]
-    pub(crate) fn is_foreground(&self) -> bool {
-        self.is_foreground
     }
 
     /// The error from the most recent failed spawn attempt, if any. A process that never
@@ -1064,13 +1244,11 @@ impl TerminalPane {
             return false;
         }
         // A prompt is only worth claiming as delivered if there is really something running to
-        // read it. `session.is_some()` alone is not that: the poll loop only clears `session`
-        // once it has *observed* EOF, which lags the child's real exit by at least a tick plus
-        // `MAX_EOF_POLL_TICKS`' grace, and in that window a write into a dead agent would return
-        // `true`. GitHub issue #288 flips every note on the file to `sent` on that `true`, with
-        // no way back, so this checks the two facts the pane already knows about the child's
-        // liveness before it writes anything.
-        if self.exit_status.is_some() || self.eof_pending {
+        // read it. `exit_status` and `session` flip together, atomically, the moment the output
+        // task processes a `PtyOutput::Exited` item (see [`Self::spawn_process`]) - GitHub issue
+        // #288 flips every note on the file to `sent` on a write that returns `true` with no way
+        // back, so this checks the pane's own liveness fact before it writes anything.
+        if self.exit_status.is_some() {
             self.spawn_error = Some("refused to send: this agent's process has ended".to_string());
             cx.notify();
             return false;
@@ -1453,12 +1631,26 @@ impl TerminalPane {
     }
 
     /// Test-only seam: feeds bytes straight into this pane's grid, exactly as
-    /// [`Self::spawn_process`]'s poll loop does for pty output - lets a test put known,
+    /// [`Self::spawn_process`]'s output task does for pty output - lets a test put known,
     /// deterministic text on screen without synchronizing against a real child process's
     /// timing.
     #[cfg(test)]
     pub(crate) fn inject_bytes_for_test(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         self.grid.append_bytes(bytes);
+        cx.notify();
+    }
+
+    /// Test-only seam: blanks this pane's grid, independent of any real pty state - for a test
+    /// that needs its own [`Self::inject_bytes_for_test`] content to land at a known row
+    /// regardless of what a concurrently running real child (e.g. the app's own real startup
+    /// shell) may have already written. That risk is real, not theoretical: the output task now
+    /// wakes on genuine activity rather than a polling interval (see
+    /// `docs/architecture/decisions.md` §8's amendment), so it can run before a `run_until_parked`
+    /// a test calls for an unrelated reason. Call this immediately before injecting, in the same
+    /// `update`, so nothing can interleave between the two.
+    #[cfg(test)]
+    pub(crate) fn reset_grid_for_test(&mut self, cx: &mut Context<Self>) {
+        self.grid.clear();
         cx.notify();
     }
 
@@ -1517,6 +1709,15 @@ impl TerminalPane {
         self.font_size_px
     }
 
+    /// Test-only seam: this pane's own host dispatch client, for a test that wants to prove the
+    /// host `Self::resize_to`'s own `SessionResize` dispatch went through is still genuinely
+    /// reachable, not merely that `Self::resize_latch` was latched optimistically - see
+    /// `scrollback_pane_tests::a_settled_pane_can_still_reach_its_host_through_the_same_client_a_resize_used`.
+    #[cfg(test)]
+    pub(crate) fn host_client_for_test(&self) -> Option<LocalClient> {
+        self.host_client.clone()
+    }
+
     /// Test-only seam: the real [`TerminalSpec`] this pane was constructed with - lets a test
     /// outside this module (GitHub issue #227's resume flow) assert on the actual program/args/env
     /// a real [`crate::work_surface::agents::Agents::spawn`]/`spawn_resume` call produced, rather
@@ -1571,235 +1772,6 @@ impl TerminalPane {
     /// the last `max_lines` - see [`crate::terminal::grid::TerminalGrid::retained_text_lines`].
     pub fn retained_text_lines(&self, max_lines: usize) -> Vec<String> {
         self.grid.retained_text_lines(max_lines)
-    }
-
-    fn spawn_process(&mut self, cx: &mut Context<Self>) {
-        let spec = self.spec.clone();
-        let program_for_error = spec.program.clone();
-        let task = cx.spawn(async move |this, cx| {
-            let spawn_result: Result<PtySession, PtyError> = cx
-                .background_executor()
-                .spawn(async move {
-                    let mut options = SpawnOptions::new(spec.program)
-                        .args(spec.args)
-                        .cwd(spec.cwd)
-                        .size(TERMINAL_ROWS, TERMINAL_COLS);
-                    for (key, value) in spec.env {
-                        options = options.env(key, value);
-                    }
-                    jerry_pty::spawn(options)
-                })
-                .await;
-
-            let session = match spawn_result {
-                Ok(session) => session,
-                Err(err) => {
-                    let message = format!("failed to start {}: {err}", program_for_error.display());
-                    let _ = this.update(cx, |this, cx| {
-                        this.spawn_error = Some(message);
-                        cx.notify();
-                    });
-                    return;
-                }
-            };
-
-            if this
-                .update(cx, |this, cx| {
-                    this.session = Some(session);
-                    // A freshly started process hasn't produced output yet, but it just
-                    // demonstrably did something (started) - counting that as activity keeps
-                    // a still-spawning agent from being immediately misread as long-idle by
-                    // `crate::rail::status::derive_status`.
-                    this.activity_at = Some(std::time::Instant::now());
-                    // A previous process's unanswered attention ping is not this one's - see
-                    // `attention_ping_at`'s field docs.
-                    this.clear_attention_ping();
-                    // The pane may already have rendered (and computed a target grid size)
-                    // before this task's background spawn finished - there was no live
-                    // session yet for that call to reach, so retry it now that one exists,
-                    // rather than waiting for the next resize to reach the pty.
-                    if let Some(target) = this.resize_latch.grid {
-                        this.resize_to(target.0, target.1);
-                    }
-                    cx.notify();
-                })
-                .is_err()
-            {
-                return; // the pane was dropped before the process finished starting
-            }
-
-            // The pane starts foreground (see `Self::is_foreground`'s field docs), so the first
-            // tick uses the foreground interval; every later tick re-reads the live flag via
-            // the `tick_cadence` the previous tick returned.
-            let mut next_interval = POLL_INTERVAL;
-            loop {
-                cx.background_executor().timer(next_interval).await;
-
-                let poll_result = this.update(cx, |this, cx| {
-                    // Budget from the cadence at the tick's *start*; the interval returned at
-                    // the bottom is recomputed after any EOF transition this tick made, so a
-                    // background pane that just saw EOF starts its exit-confirmation grace
-                    // countdown at the foreground interval `MAX_EOF_POLL_TICKS` is derived
-                    // from immediately, not one background tick later.
-                    let (_, drain_budget) = tick_cadence(this.is_foreground, this.eof_pending);
-                    let mut appended = false;
-                    let mut process_ended = false;
-                    // Captured inside the `this.session.as_mut()` borrow below (so it can
-                    // call `&mut self` `PtySession::try_wait`) and only written back to
-                    // `this.exit_status` once that borrow has ended.
-                    let mut newly_exited: Option<ExitStatus> = None;
-
-                    if this.eof_pending {
-                        // EOF was already observed on a previous tick but the exit status
-                        // wasn't confirmed yet - see `eof_poll_decision`'s docs for the race
-                        // this branch handles. `Self::session` is deliberately still `Some`
-                        // here: the process may genuinely still be alive.
-                        match this.session.as_mut() {
-                            Some(session) => {
-                                let wait_result = session.try_wait().map_err(|_| ());
-                                match eof_poll_decision(wait_result, this.eof_poll_ticks) {
-                                    Some(status) => {
-                                        newly_exited = Some(status);
-                                        process_ended = true;
-                                    }
-                                    None => this.eof_poll_ticks += 1,
-                                }
-                            }
-                            None => process_ended = true, // defensive; shouldn't happen
-                        }
-                    } else if let Some(session) = this.session.as_mut() {
-                        // Capped at this tick's cadence budget (`MAX_BYTES_PER_TICK` or its
-                        // background counterpart - see those constants' docs), not drained to
-                        // empty. Anything left in the channel is picked up next tick.
-                        let mut drained_bytes = 0usize;
-                        while drained_bytes < drain_budget {
-                            match session.output().try_recv() {
-                                Ok(chunk) => {
-                                    // `.max(1)` so the loop is bounded by its own iteration
-                                    // count too, not only by bytes: a zero-length chunk would
-                                    // otherwise never advance `drained_bytes`. `jerry-pty`
-                                    // never sends one (its reader treats `read` returning 0 as
-                                    // EOF and breaks), but a drain bound that silently becomes
-                                    // unbounded if that ever changes is not a bound.
-                                    drained_bytes += chunk.len().max(1);
-                                    this.grid.append_bytes(&chunk);
-                                    // GitHub issue #331: real output arrived while the human was
-                                    // looking at scrollback - latch the "new output" indicator
-                                    // for the jump-to-bottom affordance. `Self::grid` already
-                                    // stays pinned to the same historical lines on its own (see
-                                    // `TerminalGrid::scroll_display`'s docs), so this is purely
-                                    // the UI signal, never a scroll-position decision.
-                                    if this.grid.is_scrolled_back() {
-                                        this.new_output_while_scrolled = true;
-                                    }
-                                    this.activity_at = Some(Instant::now());
-                                    // Consume the grid's one-shot OSC 9 / 777 notification flag
-                                    // right where the bytes that could have set it were parsed,
-                                    // and latch it - see `attention_ping_at`'s field docs for
-                                    // why this must not be consumed from the render path.
-                                    if this.grid.take_attention_ping() {
-                                        this.attention_ping_at = Some(Instant::now());
-                                    }
-                                    appended = true;
-                                }
-                                Err(TryRecvError::Empty) => break,
-                                Err(TryRecvError::Disconnected) => {
-                                    this.eof_pending = true;
-                                    let wait_result = session.try_wait().map_err(|_| ());
-                                    match eof_poll_decision(wait_result, 0) {
-                                        Some(status) => {
-                                            newly_exited = Some(status);
-                                            process_ended = true;
-                                        }
-                                        None => this.eof_poll_ticks = 1,
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-
-                        // Any bytes the VT parser itself generated while processing the chunks
-                        // just appended above - e.g. a cursor position report for `ESC[6n` -
-                        // must be written back to the pty's own stdin, not just left in
-                        // `this.grid`. This is never a no-op-safe skip: real Windows ConPTY
-                        // sends exactly this query as part of its own startup handshake and
-                        // blocks its entire output stream on a real answer (confirmed live -
-                        // see `TermEventSink`'s own docs), so a dropped reply here doesn't just
-                        // misrender a query response, it silently hangs the whole pane forever.
-                        if appended {
-                            let pending_writes = this.grid.take_pending_pty_writes();
-                            if !pending_writes.is_empty() {
-                                if let Err(err) = session.write_input(&pending_writes) {
-                                    log::warn!(
-                                        "failed to answer a terminal query (e.g. cursor \
-                                         position report) back to the pty: {err}"
-                                    );
-                                }
-                            }
-                        }
-
-                        // Windows has no channel-disconnect signal to react to, ever - see
-                        // `jerry_pty`'s crate-level "Platform scope" docs. On unix, a dead
-                        // child's reader thread hits real pty EOF quickly, which closes
-                        // `output_tx` and trips the `TryRecvError::Disconnected` arm above.
-                        // On Windows, `run_reader_loop`'s reader thread only observes EOF once
-                        // `PtySession::master` itself is dropped - which killing/reaping the
-                        // child does NOT do on its own (see that function's docs for the full
-                        // ConPTY/`ClosePseudoConsole` ownership chain) - so a killed Windows
-                        // process would otherwise leave `session` `Some` forever and this poll
-                        // loop would spin indefinitely believing it was still running:
-                        // `is_running()` stuck `true`, `exit_status()` stuck `None`,
-                        // `grid.mark_ended()` never called. So Windows independently polls
-                        // `PtySession::try_wait` directly, every tick, regardless of channel
-                        // state - a real, cheap, non-blocking `GetExitCodeProcess` check (see
-                        // `jerry_pty`'s docs) that works whether or not the pty's own I/O ever
-                        // signals anything. Reuses the exact same `newly_exited`/
-                        // `process_ended` transition the unix EOF path above uses, rather than
-                        // a second, parallel one.
-                        #[cfg(windows)]
-                        if !process_ended {
-                            if let Ok(Some(status)) = session.try_wait() {
-                                newly_exited = Some(status);
-                                process_ended = true;
-                            }
-                        }
-                    }
-
-                    if let Some(status) = newly_exited {
-                        let clean = status.success();
-                        this.exit_status = Some(status);
-                        cx.emit(TerminalPaneEvent::ProcessExited { clean });
-                    }
-
-                    if process_ended {
-                        this.session = None;
-                        this.eof_pending = false;
-                        this.eof_poll_ticks = 0;
-                        this.grid.mark_ended();
-                        appended = true;
-                    }
-
-                    if appended {
-                        cx.notify();
-                    }
-
-                    // Keep polling while there's a live session, or while still waiting on a
-                    // final exit status after EOF (`this.session` can be `Some` while
-                    // `eof_pending` is `true`, so the two conditions aren't redundant).
-                    let keep_polling = this.session.is_some() || this.eof_pending;
-                    let (interval, _) = tick_cadence(this.is_foreground, this.eof_pending);
-                    (keep_polling, interval)
-                });
-
-                match poll_result {
-                    Ok((true, interval)) => next_interval = interval,
-                    Ok((false, _)) => break, // the child process exited; nothing left to poll
-                    Err(_) => break,         // the pane entity was dropped
-                }
-            }
-        });
-
-        self._task = Some(task);
     }
 
     /// Forwards a typed key to the child process via `PtySession::write_input`. See the
@@ -1915,7 +1887,7 @@ impl TerminalPane {
     /// whenever the pane's own size changes - not just the window's, since Phase A's
     /// three-zone shell means those are no longer the same thing (see [`size_to_grid`]'s docs
     /// for the bug this distinction fixes).
-    fn maybe_resize_pty(&mut self, window: &Window) {
+    fn maybe_resize_pty(&mut self, window: &Window, cx: &mut Context<Self>) {
         let raw_size = self
             .content_bounds
             .map(|bounds| bounds.size)
@@ -1924,7 +1896,7 @@ impl TerminalPane {
         let cell_size = self.cell_size(window);
         let (rows, cols) = size_to_grid(size, cell_size);
         let measured_real_size = self.content_bounds.is_some();
-        self.resize_to(rows, cols);
+        self.resize_to(rows, cols, cx);
         let reached_the_pty = self.resize_latch.session == Some((rows, cols));
         if !self.settled_real_size && measured_real_size && reached_the_pty {
             self.settled_real_size = true;
@@ -1932,12 +1904,20 @@ impl TerminalPane {
         }
     }
 
-    /// Applies a target `(rows, cols)` to the grid and, if a live session exists, the child
-    /// pty - delegating the "what actually needs to happen" decision to [`ResizeLatch::apply`]
-    /// (see its docs for the bug this split prevents), and only calling
-    /// [`ResizeLatch::session_resize_succeeded`] once `PtySession::resize` has returned `Ok`,
-    /// so a failed resize is retried next time instead of being treated as done.
-    fn resize_to(&mut self, rows: u16, cols: u16) {
+    /// Applies a target `(rows, cols)` to the grid synchronously and, if a live session exists,
+    /// dispatches `SessionResize` to the child pty - delegating the "what actually needs to
+    /// happen" decision to [`ResizeLatch::apply`] (see its docs for the bug this split
+    /// prevents). Resize is a control-plane Command, never the data-plane adapter
+    /// (`docs/architecture/decisions.md` §23), so unlike the grid resize this cannot complete
+    /// synchronously - [`ResizeLatch::session_resize_succeeded`] is applied optimistically,
+    /// immediately, rather than waiting for the dispatch's own `Report`, since every synchronous
+    /// caller (chiefly [`Self::maybe_resize_pty`]'s own "has this pane settled to its real size
+    /// yet" check) already expects a resize it asked for to be reflected right away. A failure is
+    /// logged, same as before this moved to the control plane, though - unlike before - it does
+    /// not roll the latch back to force an automatic retry on the next call: a session that
+    /// cannot be resized right now is a rare, non-critical condition the next real resize event
+    /// (a window resize, a font-size change) will simply retry anyway.
+    fn resize_to(&mut self, rows: u16, cols: u16, cx: &mut Context<Self>) {
         let actions = self
             .resize_latch
             .apply((rows, cols), self.session.is_some());
@@ -1947,13 +1927,22 @@ impl TerminalPane {
         }
 
         if actions.resize_session {
-            let Some(session) = &self.session else {
+            let (Some(session), Some(client)) = (&self.session, self.host_client.clone()) else {
                 return;
             };
-            match session.resize(rows, cols) {
-                Ok(()) => self.resize_latch.session_resize_succeeded((rows, cols)),
-                Err(err) => log::warn!("failed to resize pty session: {err}"),
-            }
+            let id = session.id().clone();
+            let cwd = self.spec.cwd.clone();
+            self.resize_latch.session_resize_succeeded((rows, cols));
+            cx.background_spawn(async move {
+                let request =
+                    Request::Command(AppCommand::SessionResize(SessionResize { id, rows, cols }));
+                match client.request(Call::human(cwd, request)).await {
+                    Ok(Report::Ok { .. }) => {}
+                    Ok(other) => log::warn!("failed to resize pty session: {other:?}"),
+                    Err(err) => log::warn!("failed to resize pty session: {}", err.message),
+                }
+            })
+            .detach();
         }
     }
 }
@@ -2566,7 +2555,7 @@ fn render_plain_line_with_links(
 
 impl Render for TerminalPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.maybe_resize_pty(window);
+        self.maybe_resize_pty(window, cx);
 
         // GitHub issue #331: apply a scrollbar click/drag from the previous frame before this
         // frame reads `self.grid`'s scroll state - see `Self::apply_pending_scrollbar_target`'s
@@ -2771,17 +2760,18 @@ impl Render for TerminalPane {
 }
 
 /// Shared fixtures for the test modules below that drive a **real** child process on a **real**
-/// pty. Everything here exists because those two clocks are genuinely different: the poll loop's
-/// ticks are driven by GPUI's simulated executor clock, while the pty reader is an ordinary OS
-/// thread that only makes progress in real wall-clock time. A loop that advanced only the virtual
-/// clock would race ahead of the reader; a fixed `thread::sleep` would be simultaneously too
-/// short under load and dead time when idle. `test_support::wait_until`/`stays_false` are the
-/// workspace's one sanctioned wall-clock wait (`docs/testing.md`), so both clocks advance
-/// together, one poll at a time.
+/// pty. Everything here exists because the pane's own task and the pty reader are genuinely on
+/// different clocks: the task wakes the moment GPUI's executor sees a channel item ready, but
+/// that item only exists once an ordinary OS thread has made real wall-clock progress. A loop
+/// that only called `run_until_parked` in a tight spin would race ahead of the reader; a fixed
+/// `thread::sleep` would be simultaneously too short under load and dead time when idle.
+/// `test_support::wait_until`/`stays_false` are the workspace's one sanctioned wall-clock wait
+/// (`docs/testing.md`) - their own real sleep between checks is what gives the reader thread
+/// room to run, with `run_until_parked` on each check picking up whatever it produced meanwhile.
 #[cfg(test)]
 mod pty_pane_fixtures {
-    use super::{TerminalPane, TerminalSpec, POLL_INTERVAL, ROW_FONT_SIZE_PX};
-    use gpui::{AppContext, Entity, TestAppContext};
+    use super::{TerminalPane, TerminalSpec, ROW_FONT_SIZE_PX, TERMINAL_COLS, TERMINAL_ROWS};
+    use gpui::{AppContext, Context, Entity, TestAppContext};
     use std::time::Duration;
 
     /// How long a real pty round trip is given before a test calls it a failure. Generous: it has
@@ -2795,37 +2785,80 @@ mod pty_pane_fixtures {
         program: &str,
         args: &[&str],
     ) -> Entity<TerminalPane> {
-        let pane = cx.new(|cx| {
-            TerminalPane::new(
-                TerminalSpec::command(
-                    program,
-                    args.iter().map(|arg| arg.to_string()).collect(),
-                    std::env::temp_dir(),
-                ),
-                ROW_FONT_SIZE_PX,
-                cx,
-            )
-        });
+        let spec = TerminalSpec::command(
+            program,
+            args.iter().map(|arg| arg.to_string()).collect(),
+            std::env::temp_dir(),
+        );
+        let pane = new_pane_with_real_session(cx, spec);
         cx.run_until_parked();
         pane
     }
 
-    /// Drives real poll ticks until `done` holds, or until [`PTY_ROUND_TRIP`] elapses.
+    /// Constructs a real pane and immediately attaches a really-spawned session to it - what
+    /// `TerminalPane::new` used to do by itself before the host owned every session
+    /// (decisions.md §23). A `jerry_host::Host` of this test's own, not the "one true" table an
+    /// `AdeApp` owns: every test in this file that needs a real child process is exercising the
+    /// pane's own grid/output handling, not session-table bookkeeping, so a throwaway host - the
+    /// same real spawn/relay/adapter code decisions.md §23 put there - is honest and sufficient.
+    pub(super) fn new_pane_with_real_session(
+        cx: &mut TestAppContext,
+        spec: TerminalSpec,
+    ) -> Entity<TerminalPane> {
+        cx.new(|cx| {
+            let mut pane = TerminalPane::new(spec.clone(), ROW_FONT_SIZE_PX, cx);
+            attach_real_session_for_test(&mut pane, &spec, cx);
+            pane
+        })
+    }
+
+    /// The spawn-a-real-session half of [`new_pane_with_real_session`], factored out so a test
+    /// that builds its `TerminalPane` through some other GPUI constructor (`add_window_view`,
+    /// most often, for a windowed pane) can still get a real session attached the identical way.
+    pub(super) fn attach_real_session_for_test(
+        pane: &mut TerminalPane,
+        spec: &TerminalSpec,
+        cx: &mut Context<TerminalPane>,
+    ) {
+        let (host, dispatch) = jerry_host::Host::start_detached();
+        cx.background_executor().spawn(dispatch).detach();
+        let mut options = jerry_pty::SpawnOptions::new(spec.program.clone())
+            .args(spec.args.clone())
+            .cwd(spec.cwd.clone())
+            .size(TERMINAL_ROWS, TERMINAL_COLS);
+        for (key, value) in spec.env.clone() {
+            options = options.env(key, value);
+        }
+        match host.sessions().spawn(spec.cwd.clone(), None, options) {
+            Ok((_id, handle)) => pane.attach_session(handle, Some(host.client()), cx),
+            Err(err) => pane.mark_spawn_failed(
+                format!("failed to start {}: {err}", spec.program.display()),
+                cx,
+            ),
+        }
+        // Kept alive on the pane, not dropped here: `Host::shutdown` (via `Drop`) now kills
+        // every session it still owns a real process for (GitHub issue #530), so dropping this
+        // throwaway host right after spawning would kill the session before the pane - or the
+        // test driving it - ever got to observe its own natural exit. See `TerminalPane::
+        // _test_host`'s own docs.
+        pane._test_host = Some(host);
+    }
+
+    /// Drives the executor until `done` holds, or until [`PTY_ROUND_TRIP`] elapses.
     pub(super) fn pump_until(
         cx: &mut TestAppContext,
         mut done: impl FnMut(&mut TestAppContext) -> bool,
     ) -> bool {
         cx.run_until_parked();
         test_support::wait_until(PTY_ROUND_TRIP, || {
-            cx.background_executor.advance_clock(POLL_INTERVAL);
             cx.run_until_parked();
             done(cx)
         })
     }
 
-    /// The inverse: drives real poll ticks for `window` and reports whether `unwanted` stayed
-    /// false throughout - for proving something genuinely never reaches the child, rather than
-    /// merely being slow to arrive.
+    /// The inverse: drives the executor for `window` and reports whether `unwanted` stayed false
+    /// throughout - for proving something genuinely never reaches the child, rather than merely
+    /// being slow to arrive.
     pub(super) fn stays_absent(
         cx: &mut TestAppContext,
         window: Duration,
@@ -2833,7 +2866,6 @@ mod pty_pane_fixtures {
     ) -> bool {
         cx.run_until_parked();
         test_support::stays_false(window, || {
-            cx.background_executor.advance_clock(POLL_INTERVAL);
             cx.run_until_parked();
             unwanted(cx)
         })
@@ -2883,101 +2915,81 @@ mod pty_pane_fixtures {
                 .any(|line| line.contains(needle))
         })
     }
-}
 
-#[cfg(test)]
-mod cadence_tests {
-    use super::pty_pane_fixtures::{grid_shows, pump_until, release, spawn_pane};
-    use super::*;
-    use gpui::TestAppContext;
+    /// An in-process [`super::SessionAdapter`] fed by a test-controlled [`jerry_pty::PtyOutput`]
+    /// stream, for pane coverage that wants no real child process at all - see the trait's own
+    /// docs for why this substitution is possible.
+    pub(super) struct FakeSessionAdapter {
+        id: jerry_core::SessionId,
+        output: std::sync::Mutex<Option<futures::channel::mpsc::Receiver<jerry_pty::PtyOutput>>>,
+    }
 
-    #[gpui::test]
-    fn a_background_pane_drains_on_the_background_interval_read_fresh_each_tick(
+    impl FakeSessionAdapter {
+        /// A fake session and the sender a test drives its scripted `PtyOutput` stream through.
+        fn new() -> (
+            std::sync::Arc<Self>,
+            futures::channel::mpsc::Sender<jerry_pty::PtyOutput>,
+        ) {
+            let (tx, rx) = futures::channel::mpsc::channel(16);
+            (
+                std::sync::Arc::new(Self {
+                    id: jerry_core::SessionId::from("fake-session"),
+                    output: std::sync::Mutex::new(Some(rx)),
+                }),
+                tx,
+            )
+        }
+    }
+
+    impl super::SessionAdapter for FakeSessionAdapter {
+        fn id(&self) -> &jerry_core::SessionId {
+            &self.id
+        }
+
+        fn write_input(&self, _data: &[u8]) -> Result<(), jerry_pty::PtyError> {
+            Ok(())
+        }
+
+        fn take_output(&self) -> Option<futures::channel::mpsc::Receiver<jerry_pty::PtyOutput>> {
+            self.output
+                .lock()
+                .expect("fake session output lock poisoned")
+                .take()
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+
+        fn pause(&self) -> Result<(), jerry_pty::PtyError> {
+            Ok(())
+        }
+
+        fn resume(&self) -> Result<(), jerry_pty::PtyError> {
+            Ok(())
+        }
+
+        fn shutdown(&self) -> Result<(), jerry_pty::PtyError> {
+            Ok(())
+        }
+    }
+
+    /// A pane backed by [`FakeSessionAdapter`] - no real process, a test-scripted byte/exit
+    /// stream driven through the returned sender.
+    pub(super) fn new_pane_with_fake_session(
         cx: &mut TestAppContext,
+        spec: TerminalSpec,
+    ) -> (
+        Entity<TerminalPane>,
+        futures::channel::mpsc::Sender<jerry_pty::PtyOutput>,
     ) {
-        let pane = spawn_pane(cx, "cat", &[]);
-
-        // Fire the loop's first (foreground-armed) tick, demote the pane, then fire one more
-        // tick so the demotion is picked up and a BACKGROUND_POLL_INTERVAL sleep is armed.
-        cx.background_executor.advance_clock(POLL_INTERVAL);
-        cx.run_until_parked();
-        pane.update(cx, |pane, _| pane.set_foreground(false));
-        cx.background_executor.advance_clock(POLL_INTERVAL);
-        cx.run_until_parked();
-
-        // Ctrl-L; the pty's ECHOCTL echo is "^L" (see
-        // `clear_with_a_live_session_sends_a_real_ctrl_l_the_pty_echoes_back`).
-        pane.update(cx, |pane, cx| pane.clear(cx));
-
-        // Advance one *foreground*-sized step at a time, counting how much simulated time it
-        // took for the echo to appear. A loop that hoisted `is_foreground` out and kept the
-        // spawn-time `true` would drain it on the very next 8ms tick; one that re-reads the flag
-        // cannot drain before its 33ms background timer next fires, whenever the echo arrives.
-        let mut virtual_elapsed = Duration::ZERO;
-        assert!(
-            test_support::wait_until(super::pty_pane_fixtures::PTY_ROUND_TRIP, || {
-                cx.background_executor.advance_clock(POLL_INTERVAL);
-                cx.run_until_parked();
-                virtual_elapsed += POLL_INTERVAL;
-                grid_shows(cx, &pane, "^L")
-            }),
-            "the background cadence must still drain output - coarser, not never"
-        );
-        assert!(
-            virtual_elapsed >= BACKGROUND_POLL_INTERVAL,
-            "a background pane drained pty output after only {virtual_elapsed:?} of simulated \
-             time, less than one BACKGROUND_POLL_INTERVAL ({BACKGROUND_POLL_INTERVAL:?}) - the \
-             poll loop is not reading the live foreground flag each tick"
-        );
-
-        // And a promoted pane resumes draining (which tick is not under test here - only that
-        // promotion doesn't strand it).
-        pane.update(cx, |pane, cx| {
-            pane.set_foreground(true);
-            pane.clear(cx); // wipes the grid, sends a fresh Ctrl-L
+        let (adapter, tx) = FakeSessionAdapter::new();
+        let pane = cx.new(|cx| {
+            let mut pane = TerminalPane::new(spec, ROW_FONT_SIZE_PX, cx);
+            pane.attach_session(adapter, None, cx);
+            pane
         });
-        assert!(
-            pump_until(cx, |cx| grid_shows(cx, &pane, "^L")),
-            "a pane promoted back to foreground must keep draining output"
-        );
-        release(cx, pane);
-    }
-
-    #[test]
-    fn a_foreground_pane_gets_the_full_frame_accurate_cadence() {
-        assert_eq!(
-            tick_cadence(true, false),
-            (POLL_INTERVAL, MAX_BYTES_PER_TICK),
-            "the visible pane must keep the measured single-agent throughput fix"
-        );
-    }
-
-    #[test]
-    fn a_background_pane_gets_a_strictly_coarser_interval_and_smaller_budget() {
-        let (interval, budget) = tick_cadence(false, false);
-        assert_eq!(interval, BACKGROUND_POLL_INTERVAL);
-        assert_eq!(budget, BACKGROUND_MAX_BYTES_PER_TICK);
-        // The relationships, not just the current literals: the whole point of the split is
-        // that a background pane generates strictly less foreground-thread work per second
-        // than the visible one (see BACKGROUND_POLL_INTERVAL's docs for the measured 25-pane
-        // regression this bounds).
-        assert!(interval > POLL_INTERVAL);
-        assert!(budget < MAX_BYTES_PER_TICK);
-    }
-
-    #[test]
-    fn eof_pending_forces_the_foreground_cadence_so_the_exit_grace_stays_ten_seconds() {
-        // MAX_EOF_POLL_TICKS is derived from POLL_INTERVAL; if a background pane ticked its
-        // EOF grace countdown at BACKGROUND_POLL_INTERVAL instead, the real ~10s
-        // exit-confirmation window would silently stretch ~4x (see tick_cadence's docs).
-        assert_eq!(
-            tick_cadence(false, true),
-            (POLL_INTERVAL, MAX_BYTES_PER_TICK)
-        );
-        assert_eq!(
-            tick_cadence(true, true),
-            (POLL_INTERVAL, MAX_BYTES_PER_TICK)
-        );
+        (pane, tx)
     }
 }
 
@@ -3112,44 +3124,6 @@ mod resize_tests {
         let actions = latch.apply((50, 170), true);
         assert!(actions.resize_grid);
         assert!(actions.resize_session);
-    }
-}
-
-#[cfg(test)]
-mod eof_poll_tests {
-    use super::*;
-
-    #[test]
-    fn resolves_immediately_when_try_wait_already_has_a_status() {
-        let status = ExitStatus::with_exit_code(7);
-        match eof_poll_decision(Ok(Some(status)), 0) {
-            Some(resolved) => assert_eq!(resolved.exit_code(), 7),
-            None => panic!("expected an immediate resolution from a ready try_wait result"),
-        }
-    }
-
-    #[test]
-    fn keeps_waiting_while_try_wait_has_no_answer_and_the_tick_cap_is_not_reached() {
-        assert!(eof_poll_decision(Ok(None), 0).is_none());
-        assert!(eof_poll_decision(Ok(None), MAX_EOF_POLL_TICKS - 1).is_none());
-        assert!(
-            eof_poll_decision(Err(()), MAX_EOF_POLL_TICKS - 1).is_none(),
-            "a transient try_wait error must also be retried, not treated as final"
-        );
-    }
-
-    #[test]
-    fn gives_up_at_the_tick_cap_with_a_synthetic_failed_status_not_silence() {
-        // The exact bug this whole decomposition exists to prevent: giving up must never
-        // look like "no exit status at all" (which `crate::rail::status::derive_status` would
-        // read as `Status::Idle`) - it must resolve to a real, if synthetic, failed status.
-        match eof_poll_decision(Ok(None), MAX_EOF_POLL_TICKS) {
-            Some(status) => assert!(
-                !status.success(),
-                "giving up must never be reported as a successful exit"
-            ),
-            None => panic!("expected the tick cap to force a resolution"),
-        }
     }
 }
 
@@ -3513,6 +3487,77 @@ mod process_exit_event_tests {
     }
 }
 
+/// [`process_exit_event_tests`]'s real-pty coverage, plus the in-process byte adapter DoD
+/// (`docs/architecture/decisions.md` §23): a scripted [`jerry_pty::PtyOutput`] stream through
+/// [`pty_pane_fixtures::FakeSessionAdapter`] reaches `TerminalPane`'s grid and event surface
+/// exactly like a real session's does, with no child process spawned at all.
+#[cfg(test)]
+mod fake_adapter_tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use gpui::TestAppContext;
+    use jerry_pty::{ExitStatus, PtyOutput};
+
+    use super::pty_pane_fixtures::{new_pane_with_fake_session, release};
+    use super::{TerminalPaneEvent, TerminalSpec};
+
+    fn fake_spec() -> TerminalSpec {
+        TerminalSpec::command("fake", Vec::new(), std::env::temp_dir())
+    }
+
+    #[gpui::test]
+    fn a_scripted_byte_chunk_lands_in_the_grid_the_same_way_a_real_ptys_does(
+        cx: &mut TestAppContext,
+    ) {
+        let (pane, mut tx) = new_pane_with_fake_session(cx, fake_spec());
+
+        tx.try_send(PtyOutput::Bytes(b"hello from the fake session".to_vec()))
+            .expect("the fake channel has room for one scripted chunk");
+        cx.run_until_parked();
+
+        assert!(
+            pane.read_with(cx, |pane, _| pane
+                .visible_text_lines()
+                .iter()
+                .any(|line| line.contains("hello from the fake session"))),
+            "a scripted PtyOutput::Bytes item must reach the grid exactly like a real pty's does \
+             - TerminalPane never sees the difference (SessionAdapter's own docs)"
+        );
+
+        release(cx, pane);
+    }
+
+    #[gpui::test]
+    fn a_scripted_exit_reports_the_same_event_a_real_processs_would(cx: &mut TestAppContext) {
+        let (pane, mut tx) = new_pane_with_fake_session(cx, fake_spec());
+        let seen: Rc<RefCell<Vec<TerminalPaneEvent>>> = Rc::default();
+        let recorder = Rc::clone(&seen);
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&pane, move |_pane, event: &TerminalPaneEvent, _cx| {
+                recorder.borrow_mut().push(event.clone());
+            })
+        });
+
+        tx.try_send(PtyOutput::Exited(ExitStatus::with_exit_code(0)))
+            .expect("the fake channel has room for one scripted exit");
+        cx.run_until_parked();
+
+        assert_eq!(
+            seen.borrow().as_slice(),
+            [TerminalPaneEvent::ProcessExited { clean: true }],
+            "a scripted PtyOutput::Exited item must end the pane's output loop and announce the \
+             same event a real process' exit does"
+        );
+        assert!(
+            pane.read_with(cx, |pane, _| !pane.is_running()),
+            "the pane must also record the exit on itself, not just emit the event"
+        );
+
+        release(cx, pane);
+    }
+}
+
 #[cfg(test)]
 mod clear_pty_signal_tests {
     use super::pty_pane_fixtures::{grid_shows, pump_until, release, spawn_pane};
@@ -3540,7 +3585,7 @@ mod clear_pty_signal_tests {
 /// escape bytes are produced by a real `printf`, exactly as a real agent CLI produces them.
 #[cfg(test)]
 mod terminal_signal_tests {
-    use super::pty_pane_fixtures::{pump_until, release, spawn_pane};
+    use super::pty_pane_fixtures::{pump_until, release, spawn_pane, stays_absent};
     use super::*;
     use crate::rail::title_signal::{classify_title, TitleSignal};
     use crate::terminal::osc::{Progress, ProgressState};
@@ -3648,10 +3693,16 @@ mod terminal_signal_tests {
         // The honest default, and the one every non-agent process hits: a `cat` sitting on a
         // real pty has no title, no ping and no progress - not an invented one.
         let pane = spawn_pane(cx, "cat", &[]);
-        for _ in 0..5 {
-            cx.background_executor.advance_clock(POLL_INTERVAL);
-            cx.run_until_parked();
-        }
+        assert!(
+            stays_absent(cx, Duration::from_millis(200), |cx| {
+                pane.read_with(cx, |pane, _| {
+                    pane.title().is_some()
+                        || pane.has_pending_attention_ping()
+                        || pane.progress().is_some()
+                })
+            }),
+            "a silent process must never report a title, ping, or progress signal"
+        );
         pane.read_with(cx, |pane, _| {
             assert_eq!(pane.title(), None);
             assert!(!pane.has_pending_attention_ping());
@@ -4016,11 +4067,10 @@ mod mouse_selection_tests {
         Size<Pixels>,
     ) {
         let (pane, cx) = cx.add_window_view(|_window, cx| {
-            TerminalPane::new(
-                TerminalSpec::command("cat", Vec::new(), std::env::temp_dir()),
-                ROW_FONT_SIZE_PX,
-                cx,
-            )
+            let spec = TerminalSpec::command("cat", Vec::new(), std::env::temp_dir());
+            let mut pane = TerminalPane::new(spec.clone(), ROW_FONT_SIZE_PX, cx);
+            super::pty_pane_fixtures::attach_real_session_for_test(&mut pane, &spec, cx);
+            pane
         });
         cx.run_until_parked();
 
@@ -4163,7 +4213,7 @@ mod mouse_selection_tests {
 /// it.
 #[cfg(test)]
 mod utf8_input_tests {
-    use super::pty_pane_fixtures::release;
+    use super::pty_pane_fixtures::{release, PTY_ROUND_TRIP};
     use super::*;
     use gpui::{Modifiers, TestAppContext};
 
@@ -4213,11 +4263,10 @@ mod utf8_input_tests {
         cx: &mut TestAppContext,
     ) {
         let (pane, cx) = cx.add_window_view(|_window, cx| {
-            TerminalPane::new(
-                TerminalSpec::command("cat", Vec::new(), std::env::temp_dir()),
-                ROW_FONT_SIZE_PX,
-                cx,
-            )
+            let spec = TerminalSpec::command("cat", Vec::new(), std::env::temp_dir());
+            let mut pane = TerminalPane::new(spec.clone(), ROW_FONT_SIZE_PX, cx);
+            super::pty_pane_fixtures::attach_real_session_for_test(&mut pane, &spec, cx);
+            pane
         });
         cx.run_until_parked();
 
@@ -4236,8 +4285,7 @@ mod utf8_input_tests {
         });
 
         let mut echoed = None;
-        for _ in 0..100 {
-            cx.background_executor.advance_clock(POLL_INTERVAL);
+        test_support::wait_until(PTY_ROUND_TRIP, || {
             cx.run_until_parked();
             let row = pane.read_with(cx, |pane, _| pane.painted_rows_for_test().remove(0));
             let text: String = row
@@ -4247,9 +4295,11 @@ mod utf8_input_tests {
                 .collect();
             if text.trim_end() == "日本🎉" {
                 echoed = Some(row);
-                break;
+                true
+            } else {
+                false
             }
-        }
+        });
 
         let row = echoed.expect("expected the real pty's echo of the typed UTF-8 in the grid");
         assert_eq!(
@@ -4439,11 +4489,10 @@ mod wide_char_render_tests {
     #[gpui::test]
     fn the_plain_text_view_of_the_grid_drops_the_padding_spaces(cx: &mut gpui::TestAppContext) {
         let (pane, cx) = cx.add_window_view(|_window, cx| {
-            TerminalPane::new(
-                TerminalSpec::command("cat", Vec::new(), std::env::temp_dir()),
-                ROW_FONT_SIZE_PX,
-                cx,
-            )
+            let spec = TerminalSpec::command("cat", Vec::new(), std::env::temp_dir());
+            let mut pane = TerminalPane::new(spec.clone(), ROW_FONT_SIZE_PX, cx);
+            super::pty_pane_fixtures::attach_real_session_for_test(&mut pane, &spec, cx);
+            pane
         });
         cx.run_until_parked();
         pane.update(cx, |pane, cx| {
@@ -4507,11 +4556,10 @@ mod terminal_theme_tests {
         bytes: &[u8],
     ) -> (Entity<TerminalPane>, &'a mut VisualTestContext) {
         let (pane, cx) = cx.add_window_view(|_window, cx| {
-            TerminalPane::new(
-                TerminalSpec::command("cat", Vec::new(), std::env::temp_dir()),
-                ROW_FONT_SIZE_PX,
-                cx,
-            )
+            let spec = TerminalSpec::command("cat", Vec::new(), std::env::temp_dir());
+            let mut pane = TerminalPane::new(spec.clone(), ROW_FONT_SIZE_PX, cx);
+            super::pty_pane_fixtures::attach_real_session_for_test(&mut pane, &spec, cx);
+            pane
         });
         cx.run_until_parked();
         pane.update(cx, |pane, cx| pane.inject_bytes_for_test(bytes, cx));
@@ -4614,7 +4662,7 @@ mod terminal_theme_tests {
 /// loop while scrolled back neither moving the viewport nor going unnoticed.
 #[cfg(test)]
 mod scrollback_pane_tests {
-    use super::pty_pane_fixtures::release;
+    use super::pty_pane_fixtures::{release, PTY_ROUND_TRIP};
     use super::*;
     use gpui::{Modifiers, TestAppContext};
 
@@ -4622,11 +4670,10 @@ mod scrollback_pane_tests {
         cx: &mut TestAppContext,
     ) -> (gpui::Entity<TerminalPane>, &mut gpui::VisualTestContext) {
         let (pane, cx) = cx.add_window_view(|_window, cx| {
-            TerminalPane::new(
-                TerminalSpec::command("cat", Vec::new(), std::env::temp_dir()),
-                ROW_FONT_SIZE_PX,
-                cx,
-            )
+            let spec = TerminalSpec::command("cat", Vec::new(), std::env::temp_dir());
+            let mut pane = TerminalPane::new(spec.clone(), ROW_FONT_SIZE_PX, cx);
+            super::pty_pane_fixtures::attach_real_session_for_test(&mut pane, &spec, cx);
+            pane
         });
         // Two passes, not one: the pane's real content-bounds measurement now schedules its own
         // follow-up render via `Window::defer` (see the measuring `canvas()`'s own docs) rather
@@ -4685,8 +4732,7 @@ mod scrollback_pane_tests {
             pane.read_with(cx, |pane, _| pane.visible_text_lines())
                 .join("")
         };
-        test_support::wait_until(super::pty_pane_fixtures::PTY_ROUND_TRIP, || {
-            cx.background_executor.advance_clock(POLL_INTERVAL);
+        test_support::wait_until(PTY_ROUND_TRIP, || {
             cx.run_until_parked();
             predicate(&joined(cx))
         });
@@ -4702,11 +4748,10 @@ mod scrollback_pane_tests {
         cx: &mut TestAppContext,
     ) -> (gpui::Entity<TerminalPane>, &mut gpui::VisualTestContext) {
         let (pane, cx) = cx.add_window_view(|_window, cx| {
-            TerminalPane::new(
-                TerminalSpec::command("cat", vec!["-v".to_string()], std::env::temp_dir()),
-                ROW_FONT_SIZE_PX,
-                cx,
-            )
+            let spec = TerminalSpec::command("cat", vec!["-v".to_string()], std::env::temp_dir());
+            let mut pane = TerminalPane::new(spec.clone(), ROW_FONT_SIZE_PX, cx);
+            super::pty_pane_fixtures::attach_real_session_for_test(&mut pane, &spec, cx);
+            pane
         });
         cx.run_until_parked();
         pane.update(cx, |pane, cx| {
@@ -4760,24 +4805,16 @@ mod scrollback_pane_tests {
 
         // `cat` echoes back verbatim anything it receives on stdin - if PageUp had wrongly also
         // been forwarded as pty input (rather than claimed before `keystroke_to_bytes` runs at
-        // all), a real echoed reply would show up in the grid, and/or the poll loop draining it
-        // could perturb `display_offset`, within a handful of real poll ticks.
-        for _ in 0..20 {
-            cx.background_executor.advance_clock(POLL_INTERVAL);
-            cx.run_until_parked();
-        }
-
-        assert_eq!(
-            pane.read_with(cx, |pane, _| pane.grid.scroll_offset()),
-            offset_right_after,
-            "display_offset must not drift after PageUp once the poll loop has had many real \
-             ticks to run - it would if a stray echoed reply had reached the pty"
-        );
-        assert_eq!(
-            pane.read_with(cx, |pane, _| pane.visible_text_lines()),
-            lines_right_after,
-            "no new content may appear after PageUp with no further input - a real echoed PageUp \
-             byte sequence would show up here"
+        // all), a real echoed reply would show up in the grid, and/or the pane's output task
+        // draining it could perturb `display_offset`, within this real wall-clock window.
+        assert!(
+            test_support::stays_false(Duration::from_millis(200), || {
+                cx.run_until_parked();
+                pane.read_with(cx, |pane, _| pane.grid.scroll_offset()) != offset_right_after
+                    || pane.read_with(cx, |pane, _| pane.visible_text_lines()) != lines_right_after
+            }),
+            "display_offset must not drift and no new content may appear after PageUp with no \
+             further input - either would mean a stray echoed PageUp byte sequence reached the pty"
         );
         release(cx, pane);
     }
@@ -5055,9 +5092,9 @@ mod scrollback_pane_tests {
             origin: gpui::point(px(0.0), px(0.0)),
             size: gpui::size(px(800.0), px(20.0 * ROW_LINE_HEIGHT_PX)),
         };
-        pane.update_in(cx, |pane, window, _cx| {
+        pane.update_in(cx, |pane, window, cx| {
             pane.content_bounds = Some(bounds);
-            pane.maybe_resize_pty(window);
+            pane.maybe_resize_pty(window, cx);
         });
         assert!(
             !pane.read_with(cx, |pane, _| pane.settled_real_size),
@@ -5067,11 +5104,72 @@ mod scrollback_pane_tests {
         );
 
         pane.update(cx, |pane, _cx| pane.session = session);
-        pane.update_in(cx, |pane, window, _cx| pane.maybe_resize_pty(window));
+        pane.update_in(cx, |pane, window, cx| pane.maybe_resize_pty(window, cx));
         assert!(
             pane.read_with(cx, |pane, _| pane.settled_real_size),
             "once the resize really reached the live pty, the pane is settled and the one-time \
              discard has run"
+        );
+        release(cx, pane);
+    }
+
+    /// `TerminalPane::resize_to`'s own `SessionResize` dispatch is a detached background task
+    /// (`docs/architecture/decisions.md` §23's control plane) - a failed request there only ever
+    /// logs a warning, so `Self::settled_real_size`'s own optimistic latch (set the moment the
+    /// dispatch is sent, not once it succeeds - see `ResizeLatch::session_resize_succeeded`'s own
+    /// docs) proves the resize was *asked for*, never that it actually reached a live host. This
+    /// proves the host side directly: settling below already sent at least one real
+    /// `SessionResize` through the pane's `host_client`, so dispatching a second, independent
+    /// real request through that same client and getting a real `Report::Ok` back is what the
+    /// throwaway host dropping immediately after spawn (before `TerminalPane::_test_host` kept it
+    /// alive - GitHub issue #530) would have made fail with `SHUTTING_DOWN` instead.
+    #[gpui::test]
+    fn a_settled_pane_can_still_reach_its_host_through_the_same_client_a_resize_used(
+        cx: &mut TestAppContext,
+    ) {
+        // A real, reliably-present blocking command, not `new_pane`'s own `"cat"` - unavailable
+        // in this real spawn's own `CreateProcessW` environment on at least one real Windows
+        // machine this was verified against, the same reason `crate::test_support`'s own `ui`-
+        // tier stub (GitHub issue #530) uses this exact pair instead.
+        #[cfg(windows)]
+        let pane = super::pty_pane_fixtures::spawn_pane(cx, "cmd", &["/d", "/c", "more"]);
+        #[cfg(not(windows))]
+        let pane = super::pty_pane_fixtures::spawn_pane(cx, "sh", &["-c", "cat >/dev/null"]);
+        let client = pane
+            .read_with(cx, |pane, _| pane.host_client_for_test())
+            .expect("a settled real-session pane has a real host client");
+
+        let result: std::rc::Rc<std::cell::RefCell<Option<Result<Report, jerry_core::RpcError>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let recorder = std::rc::Rc::clone(&result);
+        pane.update(cx, |_pane, cx| {
+            cx.spawn(async move |_this, _cx| {
+                let report = client
+                    .request(Call::human(
+                        std::env::temp_dir(),
+                        Request::Query(jerry_core::AppQuery::Status(Default::default())),
+                    ))
+                    .await;
+                *recorder.borrow_mut() = Some(report);
+            })
+            .detach();
+        });
+        cx.run_until_parked();
+
+        let report = result
+            .borrow_mut()
+            .take()
+            .expect("the dispatch must have completed by the time the executor parked");
+        // `Ok(_)` alone, not `Ok(Report::Ok { .. })`: a *reached* host answering this particular
+        // query with `Report::Error` (this test's `cwd` is a plain temp dir, not a real repo, so
+        // `StatusQuery` genuinely cannot resolve one) is still proof the round trip itself
+        // succeeded. A pre-`TerminalPane::_test_host` dropped-out-from-under-it host answers
+        // every request with `Err(RpcError { code: "shutting-down", .. })` instead - the one
+        // outcome this actually rules out.
+        assert!(
+            report.is_ok(),
+            "the pane's own host client must still reach a live host after settling - got \
+             {report:?}"
         );
         release(cx, pane);
     }
@@ -5150,9 +5248,9 @@ mod scrollback_pane_tests {
             origin: gpui::point(px(0.0), px(0.0)),
             size: gpui::size(px(800.0), px(real_rows as f32 * ROW_LINE_HEIGHT_PX)),
         };
-        pane.update_in(cx, |pane, window, _cx| {
+        pane.update_in(cx, |pane, window, cx| {
             pane.content_bounds = Some(small_bounds);
-            pane.maybe_resize_pty(window);
+            pane.maybe_resize_pty(window, cx);
         });
 
         assert!(
@@ -5192,9 +5290,9 @@ mod scrollback_pane_tests {
         };
         let history_before_second_resize =
             pane.read_with(cx, |pane, _| pane.grid.scroll_history_len());
-        pane.update_in(cx, |pane, window, _cx| {
+        pane.update_in(cx, |pane, window, cx| {
             pane.content_bounds = Some(smaller_bounds);
-            pane.maybe_resize_pty(window);
+            pane.maybe_resize_pty(window, cx);
         });
         assert!(
             pane.read_with(cx, |pane, _| pane.grid.scroll_history_len())
@@ -5268,19 +5366,14 @@ mod scrollback_pane_tests {
             cx.notify();
         });
         let last_line = format!("line {}", line_count - 1);
-        let mut echoed = false;
-        for _ in 0..300 {
-            cx.background_executor.advance_clock(POLL_INTERVAL);
+        let echoed = test_support::wait_until(PTY_ROUND_TRIP, || {
             cx.run_until_parked();
-            if pane.read_with(cx, |pane, _| {
+            pane.read_with(cx, |pane, _| {
                 pane.visible_text_lines()
                     .iter()
                     .any(|line| line.contains(&last_line))
-            }) {
-                echoed = true;
-                break;
-            }
-        }
+            })
+        });
         assert!(echoed, "the real pty must echo the first batch back");
 
         pane.update_in(cx, |pane, window, cx| {
@@ -5309,18 +5402,13 @@ mod scrollback_pane_tests {
                 .expect("writing to a real live pty must succeed");
             cx.notify();
         });
-        let mut saw_new_output_flag = false;
-        for _ in 0..300 {
-            cx.background_executor.advance_clock(POLL_INTERVAL);
+        let saw_new_output_flag = test_support::wait_until(PTY_ROUND_TRIP, || {
             cx.run_until_parked();
-            if pane.read_with(cx, |pane, _| pane.new_output_while_scrolled) {
-                saw_new_output_flag = true;
-                break;
-            }
-        }
+            pane.read_with(cx, |pane, _| pane.new_output_while_scrolled)
+        });
         assert!(
             saw_new_output_flag,
-            "real output arriving through the real poll loop while scrolled back must latch \
+            "real output arriving through the pane's output task while scrolled back must latch \
              the jump-to-bottom affordance's indicator"
         );
         assert_eq!(
@@ -5382,9 +5470,9 @@ mod scrollback_pane_tests {
 /// tracking must actually receive the clicks, hovers, and wheel notches the human aims at it.
 #[cfg(test)]
 mod mouse_reporting_tests {
+    use super::pty_pane_fixtures::PTY_ROUND_TRIP;
     use super::{
-        TerminalPane, TerminalSpec, PANE_PADDING_PX, POLL_INTERVAL, ROW_FONT_SIZE_PX,
-        WHEEL_LINES_PER_NOTCH,
+        TerminalPane, TerminalSpec, PANE_PADDING_PX, ROW_FONT_SIZE_PX, WHEEL_LINES_PER_NOTCH,
     };
     use crate::terminal::grid::ScrollAmount;
     use gpui::{
@@ -5406,11 +5494,10 @@ mod mouse_reporting_tests {
         Size<Pixels>,
     ) {
         let (pane, cx) = cx.add_window_view(|_window, cx| {
-            TerminalPane::new(
-                TerminalSpec::command("cat", vec!["-v".to_string()], std::env::temp_dir()),
-                ROW_FONT_SIZE_PX,
-                cx,
-            )
+            let spec = TerminalSpec::command("cat", vec!["-v".to_string()], std::env::temp_dir());
+            let mut pane = TerminalPane::new(spec.clone(), ROW_FONT_SIZE_PX, cx);
+            super::pty_pane_fixtures::attach_real_session_for_test(&mut pane, &spec, cx);
+            pane
         });
         cx.run_until_parked();
         cx.run_until_parked();
@@ -5489,23 +5576,20 @@ mod mouse_reporting_tests {
         }
     }
 
-    /// Pumps real poll ticks until `predicate` sees the round-trip land, or a generous cap is hit.
+    /// Pumps the executor until `predicate` sees the round-trip land, or [`PTY_ROUND_TRIP`] elapses.
     fn drain_until(
         pane: &gpui::Entity<TerminalPane>,
         cx: &mut VisualTestContext,
         predicate: impl Fn(&str) -> bool,
     ) -> String {
         let mut joined = String::new();
-        for _ in 0..400 {
-            cx.background_executor.advance_clock(POLL_INTERVAL);
+        test_support::wait_until(PTY_ROUND_TRIP, || {
             cx.run_until_parked();
             joined = pane
                 .read_with(cx, |pane, _| pane.visible_text_lines())
                 .join("");
-            if predicate(&joined) {
-                break;
-            }
-        }
+            predicate(&joined)
+        });
         joined
     }
 

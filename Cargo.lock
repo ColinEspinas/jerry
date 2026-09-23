@@ -4500,11 +4500,14 @@ version = "0.2.0"
 dependencies = [
  "futures",
  "jerry-core",
+ "jerry-pty",
+ "libc",
  "log",
  "serde_json",
  "tempfile",
  "test-support",
  "thiserror 1.0.69",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4531,6 +4534,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "filedescriptor",
+ "futures",
  "libc",
  "log",
  "nix",

@@ -6,19 +6,24 @@
 
 use crate::root::AdeApp;
 use crate::work_surface::agents::{AgentKind, ProcessKind};
+use futures::channel::mpsc;
 use futures::StreamExt;
 use gpui::{AppContext as _, Context, Task};
-use jerry_host::LocalClient;
+use jerry_core::Message;
 use serde_json::Value;
 use std::path::PathBuf;
 
-/// Subscribes to `client`'s notifications for as long as the returned `Task` is held - a
-/// channel-woken loop, never a timer (§16). `this.update_in` reaches this launch's one real
+/// Drains `events` for as long as the returned `Task` is held - a channel-woken loop, never a
+/// timer (§16). The subscription itself already happened, synchronously, when `events` was
+/// created (`crate::host::HostRuntime::subscribe_events`), so this task can start arbitrarily
+/// later than that with nothing lost in between. `this.update_in` reaches this launch's one real
 /// window through GPUI's own entity-to-window lookup, exactly as
 /// `AdeApp::spawn_with_minted_chat_id` already does from an identical async-continuation shape.
-pub(crate) fn spawn_consumer(client: LocalClient, cx: &mut Context<AdeApp>) -> Task<()> {
+pub(crate) fn spawn_consumer(
+    mut events: mpsc::UnboundedReceiver<Message>,
+    cx: &mut Context<AdeApp>,
+) -> Task<()> {
     cx.spawn(async move |this, cx| {
-        let mut events = client.subscribe();
         while let Some(message) = events.next().await {
             let jerry_core::Message::Notification { method, params } = message else {
                 continue;

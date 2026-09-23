@@ -11,6 +11,10 @@ workspace = true
 
 [dependencies]
 jerry-core = { path = "../jerry-core" }
+# `SessionManager` owns the real `jerry_pty::PtySession` for every session it spawns
+# (decisions.md §23) - the one place in this workspace besides `jerry-app` that links PTY
+# machinery.
+jerry-pty = { path = "../jerry-pty" }
 futures = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -19,3 +23,18 @@ log = "0.4"
 [dev-dependencies]
 tempfile = "3"
 test-support = { path = "../test-support" }
+
+# Test-only "does this pid still exist" checks for `SessionManager::shutdown_all`'s own coverage
+# (GitHub issue #530's regression, decisions.md §23's Part B/C) - the exact same pair
+# `crate::hooks::settings_file::process_is_alive` in `jerry-app` already uses, copied rather than
+# shared across a crate boundary for one test module. Already in the lock file transitively
+# (`libc` via `jerry-pty`, `windows-sys` via `gpui_platform`), so this adds no new build surface.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }

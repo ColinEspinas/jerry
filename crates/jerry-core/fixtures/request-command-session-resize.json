@@ -1,0 +1,11 @@
+{
+  "method": "command/session-resize",
+  "params": {
+    "cwd": "/repo",
+    "params": {
+      "id": "session-1",
+      "rows": 40,
+      "cols": 120
+    }
+  }
+}

@@ -2,18 +2,25 @@
 //! worktree it's running in, and tracks which agents are open and which one is active for
 //! the tabbed center pane. `TerminalPane` itself has no notion of tabs or of "which
 //! worktree" - see its module docs - this is that one layer up.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use gpui::{App, AppContext as _, Context, Entity, Focusable as _, Subscription, Window};
+use gpui::{
+    App, AppContext as _, AsyncApp, Context, Entity, Focusable as _, Subscription, WeakEntity,
+    Window,
+};
 
 use crate::root::AdeApp;
-use crate::terminal::pane::{TerminalPane, TerminalPaneEvent, TerminalSpec};
+use crate::terminal::pane::{
+    SessionAdapter, TerminalPane, TerminalPaneEvent, TerminalSpec, TERMINAL_COLS, TERMINAL_ROWS,
+};
+use jerry_core::{AppCommand, Report, Request, SessionSpawn};
 
 /// Which agent CLI a real agent runs. Never a bare shell - see [`ProcessKind`] for the type that
 /// also covers a plain interactive terminal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AgentKind {
     /// The `claude` CLI (Claude Code), spawned with no arguments in the chosen worktree.
     /// Resolved via `PATH`; if not installed, spawning fails and the pane shows
@@ -278,6 +285,11 @@ pub struct Agent {
     /// `None` for any Cursor pane whose id could not be minted at spawn time - an agent with no
     /// id is simply not resumable, which is what the run-history footer already says.
     pub session_id: Option<String>,
+    /// The host's own PTY session id for this agent's process, once `Agents::spawn_inner`'s
+    /// `SessionSpawn` dispatch resolves - distinct from [`Self::session_id`] (a CLI conversation
+    /// id). `None` until attach, and briefly `None` again for a spawn that failed. What
+    /// `crate::work_surface::session_exited` looks an incoming `event/session-exited` up by.
+    pub host_session_id: Option<jerry_core::SessionId>,
     /// Keeps [`Agents::spawn`]'s subscription to this agent's pane (see [`TerminalPaneEvent`])
     /// alive for this agent's lifetime - never read, only held.
     _pane_subscription: Subscription,
@@ -298,6 +310,28 @@ pub struct Agents {
     /// every close forgets, so `jerry` calls from an agent classify as that agent and stay
     /// confined to its worktree. Plain shells carry no `JERRY_AGENT_ID` and are never entered.
     host_agents: Option<jerry_host::AgentTable>,
+    /// Test-only per-kind spawn override - see [`Self::override_binary`]. Always empty in
+    /// production, since nothing outside `#[cfg(test)]` code ever inserts into it.
+    binary_overrides: HashMap<AgentKind, (PathBuf, Vec<String>)>,
+    /// [`Self::spawn_inner`]'s own `SessionSpawn`-dispatch-then-attach task, one per spawn - held
+    /// here (rather than detached) so it is cancelled, not orphaned, if this collection (and so
+    /// the `AdeApp` that owns it) drops before a spawn resolves.
+    _spawn_tasks: crate::root::task_pool::TaskPool,
+    /// [`Self::close`]'s own doom-poll-shutdown task, one per close - the same lifecycle
+    /// reasoning as [`Self::_spawn_tasks`], kept in a separate pool since it is a different
+    /// concern (`crate::root::task_pool::TaskPool`'s own docs list several such pools on
+    /// `AdeApp` for exactly this reason).
+    _close_tasks: crate::root::task_pool::TaskPool,
+    /// Host session ids an `event/session-exited` notification named before
+    /// [`Self::set_host_session_id`] ever recorded which agent that id belongs to - real on
+    /// Linux, where `sh -c exit` can finish inside the very dispatch round trip that spawned it,
+    /// so its exit event reaches this instance's subscriber before the spawn's own response has
+    /// even resolved (`crate::work_surface::session_exited`'s own docs). Consulted, and cleared
+    /// of any match, by [`Self::set_host_session_id`] the moment the id it was waiting for
+    /// finally arrives. An id belonging to a session this instance never spawns at all (another
+    /// client's session on the same host) is never claimed and stays here - accepted, since the
+    /// fanout only ever names a session id once per exit and each entry is a small string.
+    pending_exits: HashSet<jerry_core::SessionId>,
 }
 
 impl Agents {
@@ -308,6 +342,10 @@ impl Agents {
             active_by_cwd: HashMap::new(),
             next_id: 0,
             host_agents: None,
+            binary_overrides: HashMap::new(),
+            _spawn_tasks: crate::root::task_pool::TaskPool::default(),
+            _close_tasks: crate::root::task_pool::TaskPool::default(),
+            pending_exits: HashSet::new(),
         }
     }
 
@@ -495,6 +533,40 @@ impl Agents {
         }
     }
 
+    /// Records the host's own PTY session id a pane attached to - see [`Agent::host_session_id`].
+    /// A no-op on [`Agent::host_session_id`] itself for an id that isn't open (the pane could
+    /// have been closed in the interval between `SessionSpawn` dispatch and this resolving), but
+    /// `Self::pending_exits` is still consulted regardless: if this exact session id already
+    /// exited before this call ever ran (real on Linux - see [`Self::pending_exits`]'s own docs),
+    /// that exit is applied right now, the same [`Self::forget_host_agent`] path a normally
+    /// ordered `event/session-exited` takes.
+    pub fn set_host_session_id(&mut self, id: AgentId, session_id: jerry_core::SessionId) {
+        if let Some(agent) = self.agents.iter_mut().find(|agent| agent.id == id) {
+            agent.host_session_id = Some(session_id.clone());
+        }
+        if self.pending_exits.remove(&session_id) {
+            self.forget_host_agent(id);
+        }
+    }
+
+    /// The open agent whose process the host knows as `session_id`, if any - the reverse of
+    /// [`Self::set_host_session_id`]. What `crate::work_surface::session_exited` resolves an
+    /// incoming `event/session-exited` notification's `id` against.
+    pub fn agent_for_host_session(&self, session_id: &jerry_core::SessionId) -> Option<AgentId> {
+        self.agents
+            .iter()
+            .find(|agent| agent.host_session_id.as_ref() == Some(session_id))
+            .map(|agent| agent.id)
+    }
+
+    /// [`Self::pending_exits`]'s own write side: `crate::work_surface::session_exited` calls
+    /// this when an `event/session-exited` notification's id matches no agent yet, so
+    /// [`Self::set_host_session_id`] can apply it once that agent's id is finally known instead
+    /// of losing it - see that field's own docs for the real race this closes.
+    pub(crate) fn note_unmatched_session_exit(&mut self, session_id: jerry_core::SessionId) {
+        self.pending_exits.insert(session_id);
+    }
+
     /// The conversation id this pane is attached to, if it was known at spawn time - `None` for
     /// every kind whose id arrives through hooks instead (see [`Agent::session_id`]).
     pub fn session_id_for(&self, id: AgentId) -> Option<&str> {
@@ -524,6 +596,62 @@ impl Agents {
     ) -> AgentId {
         let id = self.next_id;
         self.next_id += 1;
+        let hook_extras = hook_extras_for(kind, hooks, id);
+        let extras = if leading_args.is_empty() {
+            hook_extras
+        } else {
+            let (mut hook_args, env) = hook_extras.unwrap_or_default();
+            leading_args.append(&mut hook_args);
+            Some((leading_args, env))
+        };
+        let mut spec = kind.spec(cwd.clone(), shell_override, extras);
+        if let ProcessKind::Agent(agent) = kind {
+            if let Some(override_command) = self.binary_overrides.get(&agent) {
+                spec.spawn_override = Some(override_command.clone());
+            }
+        }
+        self.spawn_resolved(id, kind, cwd, terminal_font_size_px, spec, window, cx)
+    }
+
+    /// Test-only: [`Self::spawn_inner`], but with an explicit [`TerminalSpec`] rather than one
+    /// resolved from a [`ProcessKind`] - lets a test exercise agent-table-scoped behaviour
+    /// (`crate::work_surface::session_exited`'s own coverage) against a real, genuinely-exiting
+    /// process, without requiring a real `claude`/`codex`/`cursor-agent` binary this workspace's
+    /// own nextest mitigation deliberately keeps off `PATH`. `kind` is still recorded and still
+    /// registered in the host's agent table exactly as [`Self::spawn_inner`] would for a real
+    /// [`ProcessKind::Agent`] - the same "downstream code cannot tell the difference" honesty
+    /// [`Self::set_kind_for_test`]'s own docs describe.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_with_explicit_command_for_test(
+        &mut self,
+        kind: ProcessKind,
+        cwd: PathBuf,
+        terminal_font_size_px: f32,
+        spec: TerminalSpec,
+        window: &mut Window,
+        cx: &mut Context<AdeApp>,
+    ) -> AgentId {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.spawn_resolved(id, kind, cwd, terminal_font_size_px, spec, window, cx)
+    }
+
+    /// The shared tail of [`Self::spawn_inner`] and (in tests)
+    /// [`Self::spawn_with_explicit_command_for_test`]: everything that only needs an already-
+    /// allocated `id` and an already-resolved `spec`, regardless of where either came from -
+    /// table registration, the pane and its tab, and the `SessionSpawn` dispatch/attach task.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_resolved(
+        &mut self,
+        id: AgentId,
+        kind: ProcessKind,
+        cwd: PathBuf,
+        terminal_font_size_px: f32,
+        spec: TerminalSpec,
+        window: &mut Window,
+        cx: &mut Context<AdeApp>,
+    ) -> AgentId {
         if let Some(table) = &self.host_agents {
             if let ProcessKind::Agent(agent_kind) = kind {
                 table.register(
@@ -534,16 +662,7 @@ impl Agents {
             }
         }
 
-        let hook_extras = hook_extras_for(kind, hooks, id);
-        let extras = if leading_args.is_empty() {
-            hook_extras
-        } else {
-            let (mut hook_args, env) = hook_extras.unwrap_or_default();
-            leading_args.append(&mut hook_args);
-            Some((leading_args, env))
-        };
-        let spec = kind.spec(cwd.clone(), shell_override, extras);
-        let pane = cx.new(|cx| TerminalPane::new(spec, terminal_font_size_px, cx));
+        let pane = cx.new(|cx| TerminalPane::new(spec.clone(), terminal_font_size_px, cx));
         let pane_subscription = cx.subscribe_in(
             &pane,
             window,
@@ -562,6 +681,8 @@ impl Agents {
             },
         );
 
+        let spawn_pane = pane.downgrade();
+        let spawn_cwd = cwd.clone();
         self.agents.push(Agent {
             id,
             kind,
@@ -570,11 +691,120 @@ impl Agents {
             spawned_at: Instant::now(),
             spawned_at_unix: unix_now(),
             session_id: None,
+            host_session_id: None,
             _pane_subscription: pane_subscription,
         });
         self.active = Some(id);
         self.active_by_cwd.insert(cwd, id);
-        self.sync_pane_cadence(cx);
+
+        // Dispatches `SessionSpawn` through the host and attaches this pane to the real
+        // `SessionHandle` once it resolves (`docs/architecture/decisions.md` §23) - the tab
+        // itself appears immediately, above; the real process attaches asynchronously, exactly
+        // as it always has, just through the host rather than a direct `jerry_pty::spawn` call.
+        // A `ui`-tier test's stub takes over here, never in `spec.program`/`args` themselves -
+        // see `TerminalSpec::spawn_override`.
+        let (program, args) = spec
+            .spawn_override
+            .clone()
+            .unwrap_or_else(|| (spec.program.clone(), spec.args.clone()));
+        let spawn_task = cx.spawn(async move |this, cx| {
+            let dispatch = this.update(cx, |this, cx| {
+                this.dispatch(
+                    spawn_cwd,
+                    Request::Command(AppCommand::SessionSpawn(SessionSpawn {
+                        program: program.clone(),
+                        args: args.clone(),
+                        env: spec.env.clone(),
+                        rows: TERMINAL_ROWS,
+                        cols: TERMINAL_COLS,
+                    })),
+                    cx,
+                )
+            });
+            let Ok(dispatch) = dispatch else {
+                return; // the app itself was dropped before this could even be asked
+            };
+            let outcome = match dispatch.await {
+                Ok(Report::Ok { outcome }) => outcome,
+                Ok(other) => {
+                    let _ = spawn_pane.update(cx, |pane, cx| {
+                        pane.mark_spawn_failed(
+                            format!("failed to start {}: {other:?}", spec.program.display()),
+                            cx,
+                        )
+                    });
+                    return;
+                }
+                Err(error) => {
+                    let _ = spawn_pane.update(cx, |pane, cx| {
+                        pane.mark_spawn_failed(
+                            format!(
+                                "failed to start {}: {}",
+                                spec.program.display(),
+                                error.message
+                            ),
+                            cx,
+                        )
+                    });
+                    return;
+                }
+            };
+            let Some(session_id) = outcome
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(jerry_core::SessionId::from)
+            else {
+                let _ = spawn_pane.update(cx, |pane, cx| {
+                    pane.mark_spawn_failed(
+                        "internal error: the host's session-spawn outcome had no id".to_string(),
+                        cx,
+                    )
+                });
+                return;
+            };
+            let attached = this.update(cx, |this, _cx| {
+                let handle = this
+                    .sessions()
+                    .and_then(|sessions| sessions.handle_for(&session_id));
+                this.agents.set_host_session_id(id, session_id.clone());
+                (handle, this.host_client())
+            });
+            let Ok((Some(handle), client)) = attached else {
+                let _ = spawn_pane.update(cx, |pane, cx| {
+                    pane.mark_spawn_failed(
+                        "internal error: the session host could not hand back this session's \
+                         adapter"
+                            .to_string(),
+                        cx,
+                    )
+                });
+                return;
+            };
+            let attach_outcome = spawn_pane.update(cx, |pane, cx| {
+                pane.attach_session(handle.clone(), client, cx)
+            });
+            if attach_outcome.is_err() {
+                // The pane entity itself is already gone - not just doomed, which `TerminalPane::
+                // attach_session` already handles on its own by leaving the session for whichever
+                // caller is already polling `TerminalPane::take_session_for_teardown` to pick up
+                // and shut down. Nothing will ever reach this session through a pane again, so
+                // this task must kill it itself rather than silently drop the handle: unlike the
+                // old direct `jerry_pty::spawn`, `SessionManager` keeps a session's real process
+                // alive independent of any pane, so dropping the handle alone leaks it (GitHub
+                // issue #530's own regression).
+                cx.background_executor()
+                    .spawn(async move {
+                        if let Err(err) = handle.shutdown() {
+                            log::warn!(
+                                "failed to shut down a session whose pane was already gone by \
+                                 attach time: {err}"
+                            );
+                        }
+                    })
+                    .detach();
+            }
+        });
+        self._spawn_tasks.push(spawn_task);
         id
     }
 
@@ -599,6 +829,29 @@ impl Agents {
         if let Some(agent) = self.agents.iter_mut().find(|agent| agent.id == id) {
             agent.spawned_at_unix = spawned_at_unix;
         }
+    }
+
+    /// Test-only (GitHub issue #530): makes every future spawn of `kind` really exec `program`
+    /// with `args` in place of `AgentKind::binary_name()` and whatever arguments the real spawn
+    /// path would have computed (hook injection, `--resume`, ...). The recorded
+    /// [`TerminalSpec::program`]/[`TerminalSpec::args`] ([`ProcessKind::spec`]'s own output)
+    /// are untouched - only [`TerminalSpec::spawn_override`] carries this, so a test asserting
+    /// on the spec via `TerminalPane::spec_for_test` still sees the kind's real binary name and
+    /// real arguments. A `ui`-tier test must never launch a real agent CLI; the real args are
+    /// meaningless to a stub and, on Windows, actively break one (`more.com` treats an
+    /// unrecognized flag as a filename to open and exits immediately rather than blocking -
+    /// verified against a real `more.com`), which is why the whole invocation is replaced
+    /// rather than just the program name.
+    #[cfg(test)]
+    pub(crate) fn override_binary(&mut self, kind: AgentKind, program: PathBuf, args: Vec<String>) {
+        self.binary_overrides.insert(kind, (program, args));
+    }
+
+    /// Test-only: undoes [`Self::override_binary`] for `kind`, for the rare test that genuinely
+    /// needs a real agent CLI on the spawn path (the `external`-tier hook integration test).
+    #[cfg(test)]
+    pub(crate) fn clear_binary_override(&mut self, kind: AgentKind) {
+        self.binary_overrides.remove(&kind);
     }
 
     /// Real `SIGSTOP`, via `TerminalPane::pause`, against every real agent session (never a bare
@@ -640,25 +893,6 @@ impl Agents {
         }
     }
 
-    /// Re-derives every open pane's poll cadence from [`Self::active`]: exactly the active
-    /// agent's pane is foreground (`TerminalPane::set_foreground`), every other pane is
-    /// background. Called at the end of **every** mutator that can change which agent is
-    /// active ([`Self::spawn`], [`Self::set_active`], [`Self::activate_for_worktree`],
-    /// [`Self::close`]) - a full re-derivation over all panes rather than a delta update at
-    /// each site, so no future mutator can leave a pane's cadence stale by forgetting the
-    /// "demote the old one" half (this codebase's recurring stale-state bug class; a pane
-    /// wrongly left background would lag visibly, one wrongly left foreground would quietly
-    /// re-grow the multi-pane drain cost this flag exists to bound). Cheap enough for that:
-    /// one flag write per open agent.
-    fn sync_pane_cadence(&self, cx: &mut Context<AdeApp>) {
-        for agent in &self.agents {
-            let foreground = Some(agent.id) == self.active;
-            agent
-                .pane
-                .update(cx, |pane, _| pane.set_foreground(foreground));
-        }
-    }
-
     /// Applies a Settings › Appearance "Terminal font size" edit to every currently open
     /// agent's pane, not just newly spawned ones. `TerminalPane::set_font_size` is a no-op
     /// for a pane already at that size, so calling this on every edit is cheap.
@@ -671,14 +905,11 @@ impl Agents {
     }
 
     /// Makes `id` the globally active agent, and remembers it as its own worktree's active
-    /// tab too - a no-op if `id` doesn't name a currently open agent. Takes `cx` (unlike a
-    /// plain setter) because the active agent is what drives every pane's poll cadence -
-    /// see [`Self::sync_pane_cadence`].
-    pub fn set_active(&mut self, id: AgentId, cx: &mut Context<AdeApp>) {
+    /// tab too - a no-op if `id` doesn't name a currently open agent.
+    pub fn set_active(&mut self, id: AgentId) {
         if let Some(agent) = self.agents.iter().find(|agent| agent.id == id) {
             self.active = Some(id);
             self.active_by_cwd.insert(agent.cwd.clone(), id);
-            self.sync_pane_cadence(cx);
         }
     }
 
@@ -686,13 +917,12 @@ impl Agents {
     /// agent - or, if `cwd` has never had one recorded (a worktree just visited for the
     /// first time this window), its first open agent in creation order. `None` if `cwd`
     /// currently has no open agents at all.
-    pub fn activate_for_worktree(&mut self, cwd: &Path, cx: &mut Context<AdeApp>) {
+    pub fn activate_for_worktree(&mut self, cwd: &Path) {
         let id = self.primary_for_cwd(cwd).map(|agent| agent.id);
         self.active = id;
         if let Some(id) = id {
             self.active_by_cwd.insert(cwd.to_path_buf(), id);
         }
-        self.sync_pane_cadence(cx);
     }
 
     /// The other half of [`Self::activate_for_worktree`]'s own worktree-scoping fix: clears
@@ -708,9 +938,43 @@ impl Agents {
     /// inconsistency than the one this exists to fix. `active_by_cwd`'s own remembered-tab
     /// entries are untouched, so a later real worktree-row click still lands on the same agent
     /// [`Self::activate_for_worktree`] would have picked before this call ever ran.
-    pub fn clear_active(&mut self, cx: &mut Context<AdeApp>) {
+    pub fn clear_active(&mut self) {
         self.active = None;
-        self.sync_pane_cadence(cx);
+    }
+
+    /// Test-only: the host agent table's own ids right now, straight from
+    /// `jerry_host::AgentTable::list` - the same underlying state `AgentsQuery` answers from
+    /// (`crate::work_surface::session_exited`'s own coverage), without a full dispatch round
+    /// trip. Empty with no host table yet.
+    #[cfg(test)]
+    pub(crate) fn host_agent_ids_for_test(&self) -> Vec<jerry_core::AgentId> {
+        self.host_agents
+            .as_ref()
+            .map(|table| table.list().into_iter().map(|(id, _)| id).collect())
+            .unwrap_or_default()
+    }
+
+    /// Forgets `id`'s entry in the host's agent table (`Self::host_agents`) without touching its
+    /// tab or process - for `crate::work_surface::session_exited`'s reaction to an
+    /// `event/session-exited` notification, which must stop `AgentsQuery` listing an agent whose
+    /// process has genuinely ended even while [`Self::close`]'s "an unclean exit keeps its tab
+    /// open" policy leaves the tab itself in place. A no-op with no host table yet.
+    pub fn forget_host_agent(&self, id: AgentId) {
+        if let Some(table) = &self.host_agents {
+            table.forget(&host_agent_id(id));
+        }
+    }
+
+    /// Removes `session_id`'s entry from the host's session table entirely
+    /// (`jerry_host::AgentTable::forget_session`) - the real id `SessionSpawn` minted, distinct
+    /// from [`Self::forget_host_agent`]'s synthetic `agent:<id>` key. Without a caller ever doing
+    /// this, every session this host ever spawned stayed in the table (dead `PtySession` record
+    /// and all) until the host itself exited, and `jerry sessions` listed every one of them
+    /// forever (GitHub issue #530's own follow-up). A no-op with no host table yet.
+    pub fn forget_session(&self, session_id: &jerry_core::SessionId) {
+        if let Some(table) = &self.host_agents {
+            table.forget_session(session_id);
+        }
     }
 
     /// Moves keyboard focus onto the currently active agent's terminal pane, if there is
@@ -722,9 +986,14 @@ impl Agents {
         }
     }
 
-    /// Closes a tab: tears down its `PtySession` via `TerminalPane::shutdown` before dropping
-    /// the `Entity<TerminalPane>`, so closing a tab never just hides it while its process
-    /// leaks.
+    /// Closes a tab: dooms its pane's session (the same doom-poll-shutdown sequence
+    /// [`crate::worktree_history::flow::AdeApp::execute_discard_worktree_path`] uses, via
+    /// [`collect_doomed_sessions`]) before dropping the `Entity<TerminalPane>`, so closing a tab
+    /// never just hides it while its process leaks - including one whose `SessionSpawn` dispatch
+    /// was still in flight at the moment of the close (GitHub issue #530's own follow-up: without
+    /// this, that session would attach after the fact and run unsupervised forever, and its dead
+    /// entry would never leave the host's session table either - see [`Self::forget_host_agent`]
+    /// and `jerry_host::AgentTable::forget_session`).
     pub fn close(
         &mut self,
         id: AgentId,
@@ -736,13 +1005,33 @@ impl Agents {
             return;
         };
         let cwd = self.agents[index].cwd.clone();
+        let pane = self.agents[index].pane.clone();
         if let Some(table) = &self.host_agents {
             table.forget(&host_agent_id(id));
         }
-
-        self.agents[index]
-            .pane
-            .update(cx, |pane, cx| pane.shutdown(cx));
+        let host_agents = self.host_agents.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let sessions = collect_doomed_sessions(vec![pane], &this, cx).await;
+            let session_ids: Vec<jerry_core::SessionId> = sessions
+                .iter()
+                .map(|session| session.id().clone())
+                .collect();
+            cx.background_executor()
+                .spawn(async move {
+                    for session in sessions {
+                        if let Err(err) = session.shutdown() {
+                            log::warn!("failed to shut down a closed tab's session: {err}");
+                        }
+                    }
+                })
+                .await;
+            if let Some(table) = host_agents {
+                for session_id in session_ids {
+                    table.forget_session(&session_id);
+                }
+            }
+        });
+        self._close_tasks.push(task);
         self.agents.remove(index);
 
         let sibling_indices: Vec<usize> = self
@@ -775,8 +1064,71 @@ impl Agents {
                 self.focus_active(window, cx);
             }
         }
-        self.sync_pane_cadence(cx);
     }
+}
+
+/// Marks every pane in `panes` doomed and collects its session for teardown - the real,
+/// already-attached ones immediately (`TerminalPane::take_session_for_teardown`), and any still
+/// in flight `SessionSpawn` dispatch by polling `TerminalPane::teardown_still_pending` until it
+/// settles, so a spawn that resolves after the caller stopped waiting for it is never left
+/// running unsupervised (GitHub issue #470/#530's own regressions). Shared by [`Agents::close`]
+/// and `crate::worktree_history::flow::AdeApp::execute_discard_worktree_path`, whose own callers
+/// shut each returned session down (and forget it, where that applies) themselves, off the UI
+/// thread - this only collects them.
+///
+/// A real, scheduled no-op is what each poll attempt yields on, never
+/// `cx.background_executor().timer()`: GPUI's test scheduler only ever advances its simulated
+/// clock against an explicit `advance_clock`, so a `timer()` would never resolve under it; a real
+/// background task is what `run_until_parked` already blocks on.
+pub(crate) async fn collect_doomed_sessions(
+    panes: Vec<Entity<TerminalPane>>,
+    this: &WeakEntity<AdeApp>,
+    cx: &mut AsyncApp,
+) -> Vec<Arc<dyn SessionAdapter>> {
+    let mut doomed_sessions = Vec::with_capacity(panes.len());
+    let mut pending_panes = Vec::new();
+    for pane in panes {
+        let outcome = this.update(cx, |_this, cx| {
+            pane.update(cx, |pane, cx| pane.take_session_for_teardown(cx))
+        });
+        match outcome {
+            Ok(Some(session)) => doomed_sessions.push(session),
+            Ok(None) => pending_panes.push(pane),
+            Err(_) => break, // the app itself was dropped
+        }
+    }
+
+    const POLL_ATTEMPTS: u32 = 10_000;
+    for pane in pending_panes {
+        for attempt in 0..POLL_ATTEMPTS {
+            let resolved = this.update(cx, |_this, cx| {
+                pane.update(cx, |pane, cx| {
+                    (
+                        pane.take_session_for_teardown(cx),
+                        pane.teardown_still_pending(),
+                    )
+                })
+            });
+            let Ok((session, still_pending)) = resolved else {
+                break; // the app itself was dropped
+            };
+            if let Some(session) = session {
+                doomed_sessions.push(session);
+                break;
+            }
+            if !still_pending {
+                break; // resolved to a spawn failure - nothing left to shut down
+            }
+            if attempt + 1 == POLL_ATTEMPTS {
+                log::warn!(
+                    "a doomed pane's SessionSpawn never settled before its owner stopped \
+                     waiting for it - it may still be starting after the fact"
+                );
+            }
+            cx.background_executor().spawn(async {}).await;
+        }
+    }
+    doomed_sessions
 }
 
 /// Real wall-clock seconds since the Unix epoch, for [`Agent::spawned_at_unix`]. Mirrors
@@ -1230,4 +1582,84 @@ mod chat_id_tests {
 /// The identity the host knows an agent by: the same text `JERRY_AGENT_ID` carries.
 fn host_agent_id(id: AgentId) -> jerry_core::AgentId {
     jerry_core::AgentId(id.to_string())
+}
+
+/// `Agents::pending_exits`'s own coverage: a real, in-process `jerry_host::Host` (no `gpui`, no
+/// real spawned process needed) proves the exit is applied the moment the id it was waiting for
+/// arrives, deterministically - the real-process ordering
+/// `session_exited::tests::a_real_agents_exit_is_forgotten_from_the_agent_table_once_its_event_
+/// arrives` covers is inherently racy to reproduce on demand (that is the whole bug), so this
+/// drives the same two calls directly instead of hoping a real `sh -c exit` finishes fast enough.
+#[cfg(test)]
+mod pending_exit_tests {
+    use super::{host_agent_id, Agents};
+    use std::path::PathBuf;
+
+    #[test]
+    fn a_session_exit_recorded_before_the_id_is_known_is_applied_the_moment_it_is() {
+        let host = jerry_host::Host::start().expect("host");
+        let mut agents = Agents::new();
+        agents.attach_host(host.agents());
+
+        let agent_id = 1;
+        host.agents().register(
+            host_agent_id(agent_id),
+            PathBuf::from("/repo"),
+            "Claude".into(),
+        );
+        let session_id = jerry_core::SessionId::from("session-1");
+
+        // The exit arrives first - before anything has told `Agents` this session id belongs to
+        // `agent_id` at all, exactly the Linux race this closes.
+        agents.note_unmatched_session_exit(session_id.clone());
+        assert!(
+            host.agents()
+                .list()
+                .iter()
+                .any(|(id, _)| *id == host_agent_id(agent_id)),
+            "sanity check: still registered - nothing has applied the exit yet"
+        );
+
+        // The spawn response resolves after the fact.
+        agents.set_host_session_id(agent_id, session_id);
+
+        assert!(
+            !host
+                .agents()
+                .list()
+                .iter()
+                .any(|(id, _)| *id == host_agent_id(agent_id)),
+            "a session exit recorded before its agent id was known must be applied the moment \
+             set_host_session_id learns it"
+        );
+        host.shutdown_and_join();
+    }
+
+    /// The ordinary case must keep working unchanged: an id `set_host_session_id` already knows
+    /// about, with no pending exit recorded for it, is left alone.
+    #[test]
+    fn a_session_with_no_pending_exit_is_left_registered() {
+        let host = jerry_host::Host::start().expect("host");
+        let mut agents = Agents::new();
+        agents.attach_host(host.agents());
+
+        let agent_id = 1;
+        host.agents().register(
+            host_agent_id(agent_id),
+            PathBuf::from("/repo"),
+            "Claude".into(),
+        );
+        let session_id = jerry_core::SessionId::from("session-1");
+
+        agents.set_host_session_id(agent_id, session_id);
+
+        assert!(
+            host.agents()
+                .list()
+                .iter()
+                .any(|(id, _)| *id == host_agent_id(agent_id)),
+            "no exit was ever recorded - the agent must stay registered"
+        );
+        host.shutdown_and_join();
+    }
 }

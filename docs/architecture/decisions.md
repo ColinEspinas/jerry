@@ -266,9 +266,97 @@ real hardware — see issues #465–#468). `kill()`/`shutdown()` terminate the w
 descendants, with the direct kill as backstop (an orphaned tree was how npm `.cmd`-shim agents'
 real `node.exe` survived, #468). There is no self-pipe either: `WSAPoll` accepts only sockets
 and a ConPTY master is a named pipe, so the reader blocks until `master` itself drops, *not* when
-the child is reaped. Callers must therefore poll `try_wait` rather than wait for the output channel
-to disconnect. These paths are `#[cfg(windows)]`, never `#[cfg(not(unix))]`, so an unsupported
-non-unix target fails to compile instead of silently inheriting Windows semantics.
+the child is reaped - the reader's own EOF must never be read as "the child exited" on this
+platform. `portable-pty` exposes no way to interrupt that blocked read from another thread either
+(no overlapped I/O, no `CancelIoEx`/`CancelSynchronousIo` equivalent - verified against
+`portable-pty-0.9.0/src/win/{conpty,psuedocon}.rs`, which read/close synchronously with nothing
+else), nor a raw handle a caller could use to inspect the pipe from outside it: `MasterPty::
+try_clone_reader` erases to `Box<dyn Read + Send>`, and downcasting the master to the concrete
+`ConPtyMasterPty` (via the `Downcast` bound `impl_downcast!(MasterPty)` gives every implementor)
+does not help either, since its only field is private with no additional inherent methods. These
+paths are `#[cfg(windows)]`, never `#[cfg(not(unix))]`, so an unsupported non-unix target fails to
+compile instead of silently inheriting Windows semantics. How this platform still gets a real exit
+ordering contract despite the above: see the amendment below.
+
+**Amended 2026-09-22 (#504):** The output channel is now `futures::channel::mpsc` rather than
+`std::sync::mpsc::sync_channel`, so a GPUI task can `.await` it instead of `crates/jerry-app`
+polling it on a timer — the reader thread drives its `Sender` with
+`futures::executor::block_on(tx.send(chunk))`, which blocks exactly like the old `sync_channel`
+did once the bounded channel fills, preserving this entry's backpressure contract unchanged.
+Process exit is now an item on that same channel (`PtyOutput::Bytes(Vec<u8>) | Exited(ExitStatus)`),
+produced by a dedicated thread (`run_wait_loop`) that owns the `portable_pty::Child` handle for the
+rest of the session and makes the one blocking `Child::wait()` call — a real, platform-uniform exit
+signal (on Windows, `portable-pty`'s own `WaitForSingleObject` on the process handle) that replaced
+the Windows-only independent `try_wait` poll this entry originally called for and, on unix, the
+`eof_poll_decision` retry dance that used to bound the race between observing pty EOF and the child
+actually being reaped. `PtySession::try_wait` stays (now a non-blocking peek at whether that thread
+has finished, via `JoinHandle::is_finished`), but nothing in `crates/jerry-app` calls it anymore.
+`PtySession::pid`/`killer` are cached/cloned at spawn time, before `child` moves to that thread, so
+`process_id()`/`kill()` don't need it back.
+
+**Exit ordering:** an initial version had `run_wait_loop` send `Exited` on the output channel
+directly on every platform, racing the reader thread's own trailing `Bytes` sends - both threads
+held a `Sender` with no ordering between them, so a chunk read just before real exit could arrive
+after `Exited`. Observed for real on Linux and macOS CI: a 200,000-line counting test lost the
+last few hundred lines, and a grid built by draining "until `Exited`" (the natural way to read a
+terminal stream) missed content that had, in fact, already been written. The contract now held on
+every target - `Exited` is always safe to treat as the stream's terminal item - is a hard guarantee
+on unix and a strong, real-world-verified heuristic on Windows, achieved differently because the
+platforms offer genuinely different tools, not because one target got less engineering effort.
+
+*Unix* (a hard guarantee): the reader thread has sole ownership of `output_tx` - `run_wait_loop` no
+longer sends on it at all. Instead it hands its `ExitStatus` to the reader over a one-shot
+`std::sync::mpsc` channel and wakes it via a second self-pipe (`exit_read`/`exit_write`, alongside
+the existing shutdown one). On that wake the reader (`drain_final_output`) does a final bounded
+drain - `filedescriptor::poll` with a zero timeout, a genuine non-blocking readiness check, not a
+real-EOF wait - so an orphaned descendant still holding the pty slave open cannot make this hang:
+the drain stops the moment nothing is immediately available, then sends `Exited`. `crates/jerry-app`'s
+`TerminalPane` and this crate's own test drains treat `Exited` as terminal (stopping at the first
+one) rather than draining past it.
+
+A quiet child (nothing left holding the slave open) routinely reaches real pty EOF/hangup on its
+own *before* `run_wait_loop`'s `Child::wait()` returns and wakes `exit_read` - a fast `wait()` for
+the parent still has to wait out process-table bookkeeping the kernel already did at child exit,
+including closing the child's fds. Linux reports that as an `EIO` read error; macOS - whose
+`filedescriptor::poll` is `select`-backed rather than real `poll(2)`, and so reports the fd as
+plain read-ready instead of `POLLHUP` - as an `Ok(0)` read. Earlier code treated either as the
+stream ending and returned from the reader thread immediately, which is exactly backwards: nothing
+had signalled `exit_read` yet, so `Exited` was simply never sent and the guarantee above did not
+hold on either platform. The reader now treats `EIO`/`Ok(0)` as "master done, not thread done": it
+stops polling/reading the master fd (avoiding a busy spin against Linux's still-set `POLLHUP`) and
+blocks on `[shutdown_read, exit_read]` alone until one fires, then proceeds exactly as above.
+
+*Windows* (a strong heuristic, not a hard guarantee, and documented as such): `PeekNamedPipe`
+against a real handle to the ConPTY output pipe was considered and is not reachable at all (see the
+Windows paragraph above for what was actually checked) - but even a real handle would only have
+bought a heuristic here, not a hard guarantee, because ConPTY translates the child's console output
+to VT on its own internal thread and writes to the pipe asynchronously; a race against that
+translation pipeline exists inside ConPTY itself, outside anything jerry-pty could observe from
+outside it. The reader-idle quiet window is therefore the strongest observable signal actually
+available. The reader thread flips a shared `AtomicBool` (`delivering`) to `true` from the moment
+`read` returns a chunk until it has reached `output_tx`, and back to `false` before every blocking
+`read` call. Once `Child::wait` returns, `run_wait_loop` sends `Exited` only after `delivering` has
+read `false` continuously for `WINDOWS_EXIT_QUIET_WINDOW` (any `true` reading restarts the window,
+since a chunk was in flight), backstopped by `WINDOWS_EXIT_GRACE_DEADLINE` so a descendant that
+never goes quiet cannot stall exit reporting forever. Both constants are the Windows *post-exit*
+grace only, never consulted in the steady state. Widened once already, from an initial 25ms/500ms
+to 150ms/2000ms, after real runs on real Windows hardware under heavy concurrent load (many pty
+tests, and other processes on the same machine, competing for the same cores) showed the tighter
+values flaking - per this project's own testing philosophy, flakes get fixed by widening the real
+margin, not by weakening what the test asserts. `exited_is_always_the_last_item_after_every_byte_
+the_child_wrote` (50 iterations, a real `cmd /c echo` child on Windows, real `sh`/`printf` on unix)
+pins this for both platforms with the same assertions.
+
+One more consequence, GPUI-specific: `crates/jerry-app`'s tests that spawn a real `TerminalPane`
+must call `cx.background_executor().allow_parking()` first (done once, centrally, in
+`TerminalPane::new` and gated `#[cfg(test)]`) — `jerry-pty`'s reader/wait threads now wake the
+pane's output task through a real cross-thread waker, and GPUI's test scheduler treats any wake
+from a thread other than the test's own as non-deterministic and fails the test at teardown
+unless this has been called. A real shell process (`cmd.exe` on Windows in particular, which sets
+its own OSC 0 window title as part of its ConPTY startup handshake) can also now report state to
+the grid before a test's own `run_until_parked` returns, where the old polling design accidentally
+never drained it at all; tests asserting on a pane's "hasn't reported anything yet" state need to
+clear it explicitly (`TerminalPane::reset_grid_for_test`) rather than assume it.
 
 ## 9. `crates/test-support` is a real crate, not a feature-gated one
 
@@ -876,3 +964,179 @@ describe, since `jerry mcp` is a `jerry-cli` subcommand talking to a real socket
 own in-process `LocalClient`. `crates/jerry-cli/skill/SKILL.md` gained an "MCP" section so an
 agent reading the skill knows the tools mirror the CLI one-for-one rather than discovering it by
 trial and error.
+
+## 23. `jerry-host` owns the session table and every PTY it spawns; the data plane is a separate
+byte stream, never `Call`/`Report`
+
+**Status:** Accepted (2026-09-23, issue #505; decisions Q2, Q12, Q13 of the UI-optional plan).
+Part A (below) landed first; Part B (further down) closed most of "What did not move" in the same
+issue. One piece - the hook store - is still open; see "What still has not moved".
+
+**Context:** `AgentTable` (§21) already gave the host a table of *identities* - which worktree an
+agent may act in - but the real `jerry_pty::PtySession` for every terminal tab, agent or plain
+shell, still lived entirely inside `crates/jerry-app`'s `TerminalPane`, spawned with a direct
+`jerry_pty::spawn` call. Two different things were both called "the session": the host's identity
+record and the app's own process handle, with no single table naming a PTY the same way twice.
+This issue was scoped to unify them - one `SessionId` per PTY, host-owned - while keeping the
+byte stream itself off the JSON-RPC wire, since bytes are not a control-plane concern.
+
+**Decision:**
+
+- **One session table, in `jerry-host`** (`crate::session::SessionManager`): `SessionId` (a
+  host-minted, wire-serializable newtype), `SessionKind::Pty` (the only kind today - an ACP kind
+  is planned, out of scope here), `worktree`, `agent: Option<SessionAgentInfo { kind, agent_id }>`,
+  `started_at`, `exit: Option<ExitStatusWire>`. `AgentTable` (§21) is now a thin view over this
+  table (`SessionManager::agent_table`) rather than its own independent map: `register`/`forget`/
+  `worktree_of`/`len`/`is_empty`/`list` keep their exact pre-existing signatures and behaviour
+  (`jerry-app`'s own callers, and `dispatch.rs`'s `classify`/`confine`, are unchanged), but every
+  entry they create or remove lives in the same `HashMap<SessionId, Entry>` a real spawn does -
+  one source of truth, not two tables that can drift. An `AgentTable`-only registration (no
+  process behind it, exactly `register`'s pre-existing contract) is a real, listed `SessionRecord`
+  with `exit: None` forever; `SessionResize`/`SessionKill` against its id answer a real
+  `session-not-owned` error rather than pretending to act on a process that was never spawned.
+- **`SessionManager::spawn` owns the real `PtySession`.** It calls `jerry_pty::spawn` directly (the
+  one new PTY-owning caller besides `jerry-app`), takes the session's own output stream once, and
+  hands the caller back `(SessionId, Arc<SessionHandle>)`. `SessionHandle` is the data-plane
+  adapter: `write_input` (delegates straight to `PtySession::write_input`) and `take_output`
+  (hands out the relayed `futures::channel::mpsc::Receiver<PtyOutput>` exactly once - `None` on a
+  second call). Neither travels through `Call`/`Report`; an in-process caller reaches a spawned
+  session's handle directly via `Host::sessions().handle_for(id)` ("attach"), a plain Rust call,
+  since a JSON envelope cannot carry a byte-stream receiver at all, in-process or otherwise. A
+  **relay thread**, one per spawned session, is what makes this possible without the host needing
+  to understand ANSI/grid state: it drains `PtySession::take_output`'s own stream on its own
+  thread and forwards every item, in order, to the channel `SessionHandle` hands out - the same
+  `Bytes*, Exited` shape and Exited-last ordering guarantee `jerry_pty::PtyOutput` itself documents
+  (§8's amendment) is preserved by construction, since the relay only ever forwards, never
+  reorders or drops. The moment it observes `Exited`, it records the exit on the table and
+  publishes `event/session-exited { id, status }` on the same `Fanout` the rest of the host uses -
+  before forwarding that same item downstream - so the control-plane notification and the
+  data-plane byte stream's own terminal item are never out of step with each other. **Stated
+  explicitly, per this issue's own scope note:** this is single-consumer - one relay, one
+  `SessionHandle`, `take_output` gives out its receiver exactly once. A second attacher (two panes
+  on one session) is not supported; it would need a real per-session fan-out in
+  `SessionHandle::take_output` instead of a plain `Option::take`, which nothing here needed yet.
+- **Control plane: `SessionSpawn`, `SessionResize`, `SessionKill`, `SessionsQuery`.** All
+  `Locality::Session`; `SessionSpawn`/`SessionResize`/`SessionKill` are `Invocability::Denied` to
+  agents (an agent already has a real pty of its own from whatever spawned it, and resizes/kills
+  that one, not one Jerry is holding on someone else's behalf). Like `AgentsQuery` before them,
+  none of the four ever actually reaches `Command::execute`/`Query::run`: `jerry-host`'s
+  dispatcher special-cases all four, exactly as it already did for `AgentsQuery` and `Hook`,
+  answering directly from `inner.sessions()`. `AgentsQuery` is unchanged on the wire and is now
+  genuinely "implemented on top of" the same table `SessionsQuery` reads, for free, since
+  `AgentTable` is that table's own view. `SessionSpawn`'s worktree is the caller's own `cwd` from
+  the call envelope, never a field on the command - a caller cannot ask to spawn somewhere its own
+  confinement would not otherwise reach.
+- **A real shell, not a fake one, is what a Windows PTY consumer must answer.** Every jerry-host
+  session test spawns `cmd /c`/`sh -c` for real. Doing so surfaced a real, pre-existing contract
+  `crates/jerry-app/src/terminal/pane.rs` already had to honor and `jerry-pty`'s own tests already
+  work around: on Windows, ConPTY withholds *all* child output until something answers its startup
+  Device Status Report query (`ESC[6n`) with a cursor position report - a real consumer answers
+  this from its VT parser (`jerry-app`'s pane, from `alacritty_terminal`'s grid); a bare test
+  harness with no grid has to answer it by hand, exactly as `jerry-pty`'s own
+  `answer_cursor_position_query` test helper does, or the session hangs forever, not just slowly.
+  `jerry-host`'s own session tests needed the identical helper, since `SessionManager`'s test
+  seam is likewise VT-blind by design.
+
+**What moved (Part A):** the session table and the real `PtySession` for every session
+`SessionManager` itself spawns; `AgentTable`'s storage (not its public shape).
+
+**What Part A did not move, and why:**
+
+- **`crates/jerry-app`'s `TerminalPane` still called `jerry_pty::spawn` directly** for every
+  production tab (agent or shell) and still owned its own `PtySession`. Flipping every spawn call
+  site to dispatch `SessionSpawn` through the host was not done, because `AdeApp::new` spawned the
+  opened repository's first shell during `Self::new_with_settings`, and only called `Self::
+  start_host` (which brings the host up asynchronously, on a background task) afterward - a
+  `TerminalPane` could not reliably dispatch a Command through a host that provably did not exist
+  yet at the moment it needed to spawn.
+- **The hook store (`hooks/store.rs`) and the rest of `Agents` bookkeeping stayed in `jerry-app`.**
+- Because of both of the above, `jerry-app` needed zero code changes for Part A: `AgentTable`'s
+  public surface was identical, so every existing call site and test compiled and passed
+  unmodified. The DoD's "pane tests against the in-process byte adapter" and "`AdeApp` reflects a
+  session exit received as an event" were not met for the same reason - there was no real
+  production consumer of `SessionHandle` yet to test honestly.
+
+**Part B (same issue, later commits on the same branch): `TerminalPane` spawns through the host.**
+
+- **The host's cheap, in-memory half starts synchronously, before any pane can spawn.**
+  `HostRuntime::in_process()` (unpublished: no socket, no registry entry, reachable only from this
+  process - what a test app already ran on) is now created inside `AdeApp::new_with_settings`
+  itself, immediately after the struct literal, before `Self::load_worktrees`/`Self::
+  spawn_initial_shell_for_opened_repo` can spawn the first shell. Only the slow half - registry
+  publish and the real socket bind, both real filesystem/network I/O - stays deferred to
+  `AdeApp::start_host`'s existing background task, which now calls the new `AdeApp::publish_host`
+  (`HostRuntime::allocate_instance`/`HostRuntime::publish`, split the same way `HostRuntime::start`
+  already bundled them) once that work finishes. A `TerminalPane` can now always dispatch
+  `SessionSpawn` through a real, live host - the ordering problem above is closed by construction,
+  not worked around.
+- **`Agents::spawn_inner` dispatches `SessionSpawn` and attaches asynchronously; the tab appears
+  synchronously.** The `Agent` (and its `TerminalPane`, unattached) is still pushed and made active
+  in the same call that returns its `AgentId` - every caller's existing "spawn returns an id for a
+  real, focusable tab" contract holds unchanged. A background `cx.spawn` task then dispatches
+  `SessionSpawn`, resolves the returned `SessionId` to a real `SessionHandle` via `Host::
+  sessions().handle_for`, and calls the new `TerminalPane::attach_session` - or `TerminalPane::
+  mark_spawn_failed` on any real, honest failure (host unreachable, the dispatch itself erroring,
+  a malformed outcome). `TerminalPane` no longer calls `jerry_pty::spawn`, or anything under
+  `jerry_pty::`/`jerry_host::`, anywhere but through the new `pub(crate) trait SessionAdapter`
+  (`id`, `write_input`, `take_output`, `process_id`, `pause`, `resume`, `shutdown`) - implemented
+  for `jerry_host::SessionHandle` in production, and for an in-process, test-only
+  `FakeSessionAdapter` (`terminal::pane::pty_pane_fixtures`, a real `futures::channel::mpsc`
+  stream a test drives by hand) that finally lets pane tests exercise `PtyOutput::Bytes`/`Exited`
+  handling without spawning a real process at all - the DoD's "pane tests against the in-process
+  byte adapter" this closes.
+- **Resize is the one thing left asking the control plane directly.** `TerminalPane::resize_to`
+  still calls `write_input`/`take_output` in-process (data plane, unchanged), but dispatches
+  `SessionResize` for the pty's own real size, applying `ResizeLatch::session_resize_succeeded`
+  optimistically - immediately, not waiting for the `Report` - since every synchronous caller
+  (`maybe_resize_pty`'s own "has this pane settled to its real size yet" check) already expected a
+  resize it asked for to be reflected right away, and the old, direct `PtySession::resize` call was
+  equally synchronous from that caller's point of view. A failure is logged, not retried
+  automatically; the next real resize event (a window resize, a font-size change) retries it.
+- **`event/session-exited` gets a real subscriber: `crate::work_surface::session_exited`.** The
+  same `worktree_created.rs` pattern (`spawn_consumer`, started alongside it at all three of its
+  own call sites in `host.rs`, cancelled with the `HostRuntime` that owns it) - the control-plane
+  signal every subscribed client sees, not just the one pane attached to a session's own
+  data-plane stream. Its one real reaction: forgets the exited session from the host's agent table
+  (`Agents::forget_host_agent`, via a new `Agent::host_session_id` reverse index set once
+  `SessionSpawn` resolves), so `AgentsQuery` stops listing an agent whose process has genuinely
+  ended even while `Agents::close`'s own "an unclean exit keeps its tab open" policy leaves the tab
+  itself in place - this instance's own confirmation that the notification actually reached it,
+  rather than assuming the data-plane exit path (which the pane already had) covered everything a
+  second, independent client-facing signal is for. The DoD's "`AdeApp` reflects a session exit
+  received as an event" test spawns a real, genuinely-exiting process tagged as an agent
+  (`Agents::spawn_with_explicit_command_for_test`, since a real `claude`/`codex`/`cursor-agent`
+  binary never exits on its own within a test's budget, and this workspace's own nextest
+  mitigation deliberately keeps `claude` off `PATH` besides) and asserts the host's own agent table
+  goes empty once the real exit's event arrives - not merely that the tab's own data-plane path
+  fired, which a bug in the event subscriber specifically would not have caught.
+- **A worktree discard now waits out a pane whose spawn was still in flight, not just one already
+  attached (GitHub issue #470).** The control-plane `SessionSpawn` round trip genuinely crosses the
+  host, unlike the old direct `jerry_pty::spawn` a discard could treat as already settled by the
+  time it ran. `TerminalPane::take_session_for_teardown` now also marks the pane `doomed`;
+  `TerminalPane::attach_session` checks that flag and, if set, attaches the session but never
+  starts its usual output-processing task, leaving it for the discard flow's own poll (via the new
+  `TerminalPane::teardown_still_pending`) to claim and shut down *before* `git worktree remove`
+  runs, rather than the process attaching after the fact and outliving the worktree it was spawned
+  into. The poll yields with a real scheduled no-op task, never `cx.background_executor().timer` -
+  GPUI's test scheduler only ever advances its simulated clock against an explicit `advance_clock`,
+  which a caller relying on a plain `cx.run_until_parked()` never provides, while a real
+  background-thread completion (the host round trip itself) is exactly what `run_until_parked`
+  already blocks on with `TerminalPane::new`'s own `#[cfg(test)] allow_parking()` in force.
+- **`AdeApp` now genuinely owns no session state.** `Agents` holds `Vec<Agent>` (view state: id,
+  kind, cwd, the `Entity<TerminalPane>`, spawn/activity timestamps, the CLI conversation id, and
+  now the host session id) plus its `AgentTable` view (`host_agents`); the real `PtySession` for
+  every session lives only in `jerry-host`'s own `SessionManager` table. This was already the
+  shape once Part A moved the session table and Part B routed every spawn through it - nothing
+  further needed removing.
+
+**What still has not moved: the hook store (`hooks/store.rs`) and the rest of `hooks/`'s ~6,300
+lines** (`event.rs`, `flow.rs`, `inbox.rs`, `cursor_event.rs`/`cursor_hooks_file.rs`,
+`settings_file.rs`, plus their own ~2,200 lines of tests). Assessed, not attempted, in the same
+work that did Part B above: moving the store behind a Query plus the existing `event/hook`
+notification - so a hook posted to one `jerry-app`/`jerry-cli`/`jerry-mcp` instance is visible to
+every other one watching the same host, the same reason `SessionsQuery`/`AgentsQuery` exist - would
+mean designing a host-ownable data model for what is currently a `jerry-app`-only, gpui-adjacent
+struct, rewriting every read/write site across all six `hooks/` modules to dispatch a Command/Query
+instead of touching the struct directly, and updating their ~2,200 lines of existing tests to
+match. That is larger than every other change Part B made combined, and belongs in its own issue,
+not folded into this one as a partial pass. Tracked as issue #532's own scope, not attempted here.

@@ -12,7 +12,7 @@ use crate::hooks::event::HookFact;
 use crate::hooks::settings_file::{AGENT_ENV, SOCKET_ENV};
 use crate::rail::status::{derive_status, HookSignal, ProcessSignal, Status, TerminalSignal};
 use crate::test_support::open_test_app;
-use crate::work_surface::agents::ProcessKind;
+use crate::work_surface::agents::{AgentKind, ProcessKind};
 
 /// A registry directory this test's own host publishes into - short enough for every platform's
 /// socket path limit, removed on drop even when the test fails. Mirrors
@@ -634,6 +634,12 @@ async fn a_claude_agent_spawned_through_the_real_app_path_really_reports_its_hoo
         crate::host::HostRuntime::start(registry.path.clone()).expect("host must start");
     std::thread::spawn(move || futures::executor::block_on(dispatch));
     app.update(cx, |app, cx| app.adopt_host(runtime, cx));
+    // Every `ui`-tier fixture stubs every agent kind's binary (GitHub issue #530) - undo it here,
+    // since this is the one test that must really exec `claude` for its own real path to mean
+    // anything.
+    app.update(cx, |app, _cx| {
+        app.agents.clear_binary_override(AgentKind::Claude)
+    });
 
     let (id, pane) = app.update_in(cx, |app, window, cx| {
         app.new_agent(ProcessKind::claude(), window, cx);
