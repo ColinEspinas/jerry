@@ -726,8 +726,9 @@ real, executable path (§7's `jerry` binary) to hand `jerry-git`, so `GIT_SEQUEN
 and `AmendHeadMessage { message }` are Git-locality Commands, all `Invocability::Denied` to
 agents (git already gives an agent a rebase); `RebaseStatus` is a Query mirroring
 `jerry_git::rebase::rebase_status`. `RebaseStart::validate` splits a real `rebase_preflight` out
-of `start_interactive_rebase` (refusing `rebase-already-in-progress` without touching git, mirroring
-`merge_preflight`'s split from `attempt_merge`), and `RebaseContinue`/`RebaseSkip`/`RebaseAbort`/
+of `start_interactive_rebase` (refusing `rebase-already-in-progress` and `rebase-worktree-dirty`
+without touching git, mirroring `merge_preflight`'s split from `attempt_merge`), and
+`RebaseContinue`/`RebaseSkip`/`RebaseAbort`/
 `AmendHeadMessage` all validate against `rebase_status`'s real on-disk state
 (`rebase-not-in-progress`/`rebase-not-stopped`) rather than in-memory assumptions. Every outcome
 and plan row is mirrored onto the wire (`RebaseOutcomeReport`, `RebasePlanEntryWire`,
@@ -736,9 +737,9 @@ directly — the same reasoning §18 already gives for `ConflictKind` — with `
 ways so the app can keep building its in-memory plan and reading `RebasePhase` in terms of
 `jerry_git::rebase`'s own plain-data types, converting only at the dispatch boundary.
 `RebaseStart::execute` locates the `jerry` binary itself (`jerry_core::jerry_binary::locate`, a
-sibling of `std::env::current_exe`, then `bin/jerry` next to it — no `PATH` fallback, unlike
-`crate::host::find_jerry_binary` in `jerry-app`, so this crate adds no `jerry-pty` dependency),
-refusing `jerry-binary-not-found` rather than guessing when neither exists.
+sibling of `std::env::current_exe`, then `bin/jerry` next to it, then `jerry` one directory up —
+no `PATH` fallback, unlike `crate::host::find_jerry_binary` in `jerry-app`, so this crate adds no
+`jerry-pty` dependency), refusing `jerry-binary-not-found` rather than guessing when none exist.
 
 `graph_view/rebase.rs` dispatches every mutation through `AdeApp::dispatch`, the same idiom
 `merge/flow.rs` established: `start_rebase`/`skip_rebase` share `run_rebase_op` (dispatch, apply
@@ -754,13 +755,25 @@ spawnable `jerry` for a test — turned out reliable only for a `[[bin]]` of the
 referenced from an integration test (`tests/*.rs`), not from a `--lib` unit test referencing it,
 and not across a dev-dependency cycle back through `jerry-core`/`jerry-cli` either (both were
 tried and both failed to see the environment variable at compile time, verified against this
-issue's own build). `jerry-git` and `jerry-core` each grew a minimal, same-package `[[bin]]`
-purely for this (`jerry_git_test_editor`, `jerry_core_test_jerry`) and moved every test that needs
-a real spawn into `tests/rebase_editor.rs`/`tests/rebase_commands.rs`; what stayed in each crate's
-`--lib` module is what never spawns anything (pure classification, and sidecar-file tests that
-call `run_editor`/`run_sequence_editor` directly). This mechanism runs on every platform `jerry`
-does — verified directly against this Windows checkout, both the quoted-path editor-hook spawn
-(§7) and every one of `jerry-git`'s 15 real-rebase integration tests, previously Unix-only.
+issue's own build). `jerry-git` grew a minimal, same-package `[[bin]]` purely for this
+(`jerry_git_test_editor`) and moved every test that needs a real spawn into
+`tests/rebase_editor.rs`; what stayed in `--lib` is what never spawns anything (pure
+classification, and sidecar-file tests that call `run_editor`/`run_sequence_editor` directly).
+`jerry-core` tried the identical shape (`jerry_core_test_jerry`) first and hit a real, worse bug:
+on Windows, cargo places a `[[bin]]`'s own unhashed `target/debug/deps/` copy under the *same
+name* the top-level uplifted binary gets, so a helper copied to
+`current_exe().parent().join("jerry.exe")` from inside an integration test (whose own executable
+already lives in that same `deps/` directory) silently overwrote `jerry-cli`'s real
+`deps/jerry.exe` — and the next build then uplifted that corruption to `target/debug/jerry.exe`,
+breaking the real CLI for every other consumer, not just this test. `jerry-core`'s own `[[bin]]`
+and its copy mechanism were deleted outright; `jerry_binary::locate` instead gained a third tier
+(one directory up from `current_exe`, the layout an integration test's own executable — nested
+one level under wherever a `[[bin]]` gets uplifted to — actually has), so `jerry-core`'s tests
+find the real `jerry` `cargo build -p jerry-cli` produces directly, asserting that up front
+(`assert_real_jerry_binary_available`, the same shape `jerry-app`'s own helper of that name
+uses) rather than copying anything. This mechanism runs on every platform `jerry` does —
+verified directly against this Windows checkout, both the quoted-path editor-hook spawn (§7) and
+every one of `jerry-git`'s 15 real-rebase integration tests, previously Unix-only.
 `jerry-cli`'s hidden `git-sequence-editor`/`git-editor` subcommands are the only part of this
 issue's CLI surface; `jerry rebase` itself is out of scope; `jerry-git` promotes from a
 `jerry-cli` dev-dependency to a normal one so those two subcommands can call
@@ -956,7 +969,8 @@ trial and error.
 byte stream, never `Call`/`Report`
 
 **Status:** Accepted (2026-09-23, issue #505; decisions Q2, Q12, Q13 of the UI-optional plan).
-Partial: see "What did not move" below.
+Part A (below) landed first; Part B (further down) closed most of "What did not move" in the same
+issue. One piece - the hook store - is still open; see "What still has not moved".
 
 **Context:** `AgentTable` (§21) already gave the host a table of *identities* - which worktree an
 agent may act in - but the real `jerry_pty::PtySession` for every terminal tab, agent or plain
@@ -1023,29 +1037,106 @@ byte stream itself off the JSON-RPC wire, since bytes are not a control-plane co
   `jerry-host`'s own session tests needed the identical helper, since `SessionManager`'s test
   seam is likewise VT-blind by design.
 
-**What moved:** the session table and the real `PtySession` for every session `SessionManager`
-itself spawns; `AgentTable`'s storage (not its public shape).
+**What moved (Part A):** the session table and the real `PtySession` for every session
+`SessionManager` itself spawns; `AgentTable`'s storage (not its public shape).
 
-**What did not move, and why - the honest remainder of this issue's scope:**
+**What Part A did not move, and why:**
 
-- **`crates/jerry-app`'s `TerminalPane` still calls `jerry_pty::spawn` directly** for every
-  production tab (agent or shell) and still owns its own `PtySession`. Flipping every spawn call
-  site to dispatch `SessionSpawn` through the host was not done, because `AdeApp::new` spawns the
-  opened repository's first shell during `Self::new_with_settings`, and only calls `Self::
-  start_host` (which brings the host up asynchronously, on a background task) afterward - the
-  identical ordering the test fixture (`crate::test_support::open_test_app_with_settings`) makes
-  explicit by calling `new_with_settings` and only then `adopt_host`. A `TerminalPane` cannot
-  reliably dispatch a Command through a host that provably does not exist yet at the moment it
-  needs to spawn. Making it reliable is a real, separate restructuring - the host's cheap,
-  in-memory `Host::start_detached()` half would need to run eagerly, before any pane exists, with
-  only the slower registry-publish/socket-bind half staying deferred - not a session-ownership
-  change, and out of this issue's diff.
-- **The hook store (`hooks/store.rs`) and the rest of `Agents` bookkeeping stay in `jerry-app`.**
-  Unchanged in this issue; still tracked as decision 4 of this issue's own scope, alongside the
-  pane-spawn migration above, as follow-up work.
-- Because of both of the above, `jerry-app` needed **zero code changes** for this issue:
-  `AgentTable`'s public surface is identical, so every existing call site and test still compiles
-  and passes unmodified. The DoD's "pane tests against the in-process byte adapter" and "`AdeApp`
-  reflects a session exit received as an event" are not met here for the same reason - there is no
-  real production consumer of `SessionHandle` yet to test honestly; building one before the spawn
-  path is wired through would be exactly the fake-functionality this project's standards forbid.
+- **`crates/jerry-app`'s `TerminalPane` still called `jerry_pty::spawn` directly** for every
+  production tab (agent or shell) and still owned its own `PtySession`. Flipping every spawn call
+  site to dispatch `SessionSpawn` through the host was not done, because `AdeApp::new` spawned the
+  opened repository's first shell during `Self::new_with_settings`, and only called `Self::
+  start_host` (which brings the host up asynchronously, on a background task) afterward - a
+  `TerminalPane` could not reliably dispatch a Command through a host that provably did not exist
+  yet at the moment it needed to spawn.
+- **The hook store (`hooks/store.rs`) and the rest of `Agents` bookkeeping stayed in `jerry-app`.**
+- Because of both of the above, `jerry-app` needed zero code changes for Part A: `AgentTable`'s
+  public surface was identical, so every existing call site and test compiled and passed
+  unmodified. The DoD's "pane tests against the in-process byte adapter" and "`AdeApp` reflects a
+  session exit received as an event" were not met for the same reason - there was no real
+  production consumer of `SessionHandle` yet to test honestly.
+
+**Part B (same issue, later commits on the same branch): `TerminalPane` spawns through the host.**
+
+- **The host's cheap, in-memory half starts synchronously, before any pane can spawn.**
+  `HostRuntime::in_process()` (unpublished: no socket, no registry entry, reachable only from this
+  process - what a test app already ran on) is now created inside `AdeApp::new_with_settings`
+  itself, immediately after the struct literal, before `Self::load_worktrees`/`Self::
+  spawn_initial_shell_for_opened_repo` can spawn the first shell. Only the slow half - registry
+  publish and the real socket bind, both real filesystem/network I/O - stays deferred to
+  `AdeApp::start_host`'s existing background task, which now calls the new `AdeApp::publish_host`
+  (`HostRuntime::allocate_instance`/`HostRuntime::publish`, split the same way `HostRuntime::start`
+  already bundled them) once that work finishes. A `TerminalPane` can now always dispatch
+  `SessionSpawn` through a real, live host - the ordering problem above is closed by construction,
+  not worked around.
+- **`Agents::spawn_inner` dispatches `SessionSpawn` and attaches asynchronously; the tab appears
+  synchronously.** The `Agent` (and its `TerminalPane`, unattached) is still pushed and made active
+  in the same call that returns its `AgentId` - every caller's existing "spawn returns an id for a
+  real, focusable tab" contract holds unchanged. A background `cx.spawn` task then dispatches
+  `SessionSpawn`, resolves the returned `SessionId` to a real `SessionHandle` via `Host::
+  sessions().handle_for`, and calls the new `TerminalPane::attach_session` - or `TerminalPane::
+  mark_spawn_failed` on any real, honest failure (host unreachable, the dispatch itself erroring,
+  a malformed outcome). `TerminalPane` no longer calls `jerry_pty::spawn`, or anything under
+  `jerry_pty::`/`jerry_host::`, anywhere but through the new `pub(crate) trait SessionAdapter`
+  (`id`, `write_input`, `take_output`, `process_id`, `pause`, `resume`, `shutdown`) - implemented
+  for `jerry_host::SessionHandle` in production, and for an in-process, test-only
+  `FakeSessionAdapter` (`terminal::pane::pty_pane_fixtures`, a real `futures::channel::mpsc`
+  stream a test drives by hand) that finally lets pane tests exercise `PtyOutput::Bytes`/`Exited`
+  handling without spawning a real process at all - the DoD's "pane tests against the in-process
+  byte adapter" this closes.
+- **Resize is the one thing left asking the control plane directly.** `TerminalPane::resize_to`
+  still calls `write_input`/`take_output` in-process (data plane, unchanged), but dispatches
+  `SessionResize` for the pty's own real size, applying `ResizeLatch::session_resize_succeeded`
+  optimistically - immediately, not waiting for the `Report` - since every synchronous caller
+  (`maybe_resize_pty`'s own "has this pane settled to its real size yet" check) already expected a
+  resize it asked for to be reflected right away, and the old, direct `PtySession::resize` call was
+  equally synchronous from that caller's point of view. A failure is logged, not retried
+  automatically; the next real resize event (a window resize, a font-size change) retries it.
+- **`event/session-exited` gets a real subscriber: `crate::work_surface::session_exited`.** The
+  same `worktree_created.rs` pattern (`spawn_consumer`, started alongside it at all three of its
+  own call sites in `host.rs`, cancelled with the `HostRuntime` that owns it) - the control-plane
+  signal every subscribed client sees, not just the one pane attached to a session's own
+  data-plane stream. Its one real reaction: forgets the exited session from the host's agent table
+  (`Agents::forget_host_agent`, via a new `Agent::host_session_id` reverse index set once
+  `SessionSpawn` resolves), so `AgentsQuery` stops listing an agent whose process has genuinely
+  ended even while `Agents::close`'s own "an unclean exit keeps its tab open" policy leaves the tab
+  itself in place - this instance's own confirmation that the notification actually reached it,
+  rather than assuming the data-plane exit path (which the pane already had) covered everything a
+  second, independent client-facing signal is for. The DoD's "`AdeApp` reflects a session exit
+  received as an event" test spawns a real, genuinely-exiting process tagged as an agent
+  (`Agents::spawn_with_explicit_command_for_test`, since a real `claude`/`codex`/`cursor-agent`
+  binary never exits on its own within a test's budget, and this workspace's own nextest
+  mitigation deliberately keeps `claude` off `PATH` besides) and asserts the host's own agent table
+  goes empty once the real exit's event arrives - not merely that the tab's own data-plane path
+  fired, which a bug in the event subscriber specifically would not have caught.
+- **A worktree discard now waits out a pane whose spawn was still in flight, not just one already
+  attached (GitHub issue #470).** The control-plane `SessionSpawn` round trip genuinely crosses the
+  host, unlike the old direct `jerry_pty::spawn` a discard could treat as already settled by the
+  time it ran. `TerminalPane::take_session_for_teardown` now also marks the pane `doomed`;
+  `TerminalPane::attach_session` checks that flag and, if set, attaches the session but never
+  starts its usual output-processing task, leaving it for the discard flow's own poll (via the new
+  `TerminalPane::teardown_still_pending`) to claim and shut down *before* `git worktree remove`
+  runs, rather than the process attaching after the fact and outliving the worktree it was spawned
+  into. The poll yields with a real scheduled no-op task, never `cx.background_executor().timer` -
+  GPUI's test scheduler only ever advances its simulated clock against an explicit `advance_clock`,
+  which a caller relying on a plain `cx.run_until_parked()` never provides, while a real
+  background-thread completion (the host round trip itself) is exactly what `run_until_parked`
+  already blocks on with `TerminalPane::new`'s own `#[cfg(test)] allow_parking()` in force.
+- **`AdeApp` now genuinely owns no session state.** `Agents` holds `Vec<Agent>` (view state: id,
+  kind, cwd, the `Entity<TerminalPane>`, spawn/activity timestamps, the CLI conversation id, and
+  now the host session id) plus its `AgentTable` view (`host_agents`); the real `PtySession` for
+  every session lives only in `jerry-host`'s own `SessionManager` table. This was already the
+  shape once Part A moved the session table and Part B routed every spawn through it - nothing
+  further needed removing.
+
+**What still has not moved: the hook store (`hooks/store.rs`) and the rest of `hooks/`'s ~6,300
+lines** (`event.rs`, `flow.rs`, `inbox.rs`, `cursor_event.rs`/`cursor_hooks_file.rs`,
+`settings_file.rs`, plus their own ~2,200 lines of tests). Assessed, not attempted, in the same
+work that did Part B above: moving the store behind a Query plus the existing `event/hook`
+notification - so a hook posted to one `jerry-app`/`jerry-cli`/`jerry-mcp` instance is visible to
+every other one watching the same host, the same reason `SessionsQuery`/`AgentsQuery` exist - would
+mean designing a host-ownable data model for what is currently a `jerry-app`-only, gpui-adjacent
+struct, rewriting every read/write site across all six `hooks/` modules to dispatch a Command/Query
+instead of touching the struct directly, and updating their ~2,200 lines of existing tests to
+match. That is larger than every other change Part B made combined, and belongs in its own issue,
+not folded into this one as a partial pass. Tracked as issue #532's own scope, not attempted here.

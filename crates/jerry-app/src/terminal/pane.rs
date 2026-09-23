@@ -10,6 +10,7 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
@@ -18,7 +19,9 @@ use gpui::{
     FocusHandle, Focusable, FontWeight, KeyDownEvent, Keystroke, Modifiers, Pixels,
     ScrollWheelEvent, Size, Task, Window,
 };
-use jerry_pty::{ExitStatus, PtyError, PtyOutput, PtySession, SpawnOptions};
+use jerry_core::{AppCommand, Call, Report, Request, SessionResize};
+use jerry_host::{LocalClient, SessionHandle};
+use jerry_pty::{ExitStatus, PtyError, PtyOutput};
 
 use crate::root::scrollbar::{self, ScrollableHandle};
 use crate::root::widgets::text_tooltip;
@@ -34,8 +37,8 @@ use crate::theme;
 
 /// Initial pty size used for the spawned shell, before the first real resize (see
 /// `maybe_resize_pty`) has a chance to run during the first render.
-const TERMINAL_ROWS: u16 = 48;
-const TERMINAL_COLS: u16 = 160;
+pub(crate) const TERMINAL_ROWS: u16 = 48;
+pub(crate) const TERMINAL_COLS: u16 = 160;
 
 /// The terminal body's default/fallback font size and line height - the designed 12px/19 mono.
 /// Set
@@ -582,11 +585,74 @@ pub enum TerminalPaneEvent {
     ProcessExited { clean: bool },
 }
 
+/// The exact shape of `jerry_host::SessionHandle` (decisions.md §23's data-plane adapter) that
+/// [`TerminalPane`] needs, abstracted so a test can feed a scripted [`PtyOutput`] stream without
+/// spawning a real process. `TerminalPane` never calls `jerry_pty::`/`jerry_host::` beyond this
+/// trait and `crate::work_surface::agents::Agents::spawn_inner`'s own orchestration, which
+/// dispatches `SessionSpawn` through the host and attaches via `SessionManager::handle_for`.
+pub(crate) trait SessionAdapter: Send + Sync {
+    fn id(&self) -> &jerry_core::SessionId;
+    fn write_input(&self, data: &[u8]) -> Result<(), PtyError>;
+    /// The relayed output stream, exactly once - see `jerry_host::SessionHandle::take_output`'s
+    /// own docs for why a second call must answer `None`.
+    fn take_output(&self) -> Option<futures::channel::mpsc::Receiver<PtyOutput>>;
+    fn process_id(&self) -> Option<u32>;
+    fn pause(&self) -> Result<(), PtyError>;
+    fn resume(&self) -> Result<(), PtyError>;
+    /// Blocks until the process is confirmed dead - unlike `SessionKill`'s non-blocking control-
+    /// plane contract, kept in-process like `write_input` for the one caller (the worktree-discard
+    /// flow, GitHub issue #470) that must be certain before it proceeds. See
+    /// `docs/architecture/decisions.md` §23 for why this doesn't also travel through `Call`/`Report`.
+    fn shutdown(&self) -> Result<(), PtyError>;
+}
+
+impl SessionAdapter for SessionHandle {
+    fn id(&self) -> &jerry_core::SessionId {
+        SessionHandle::id(self)
+    }
+
+    fn write_input(&self, data: &[u8]) -> Result<(), PtyError> {
+        SessionHandle::write_input(self, data)
+    }
+
+    fn take_output(&self) -> Option<futures::channel::mpsc::Receiver<PtyOutput>> {
+        SessionHandle::take_output(self)
+    }
+
+    fn process_id(&self) -> Option<u32> {
+        SessionHandle::process_id(self)
+    }
+
+    fn pause(&self) -> Result<(), PtyError> {
+        SessionHandle::pause(self)
+    }
+
+    fn resume(&self) -> Result<(), PtyError> {
+        SessionHandle::resume(self)
+    }
+
+    fn shutdown(&self) -> Result<(), PtyError> {
+        SessionHandle::shutdown(self)
+    }
+}
+
 pub struct TerminalPane {
     spec: TerminalSpec,
     grid: TerminalGrid,
-    session: Option<PtySession>,
+    session: Option<Arc<dyn SessionAdapter>>,
+    /// The host's own dispatch client, for the one thing this pane still asks the control plane
+    /// for directly: `SessionResize` (decisions.md §23 - resize never travels on the data plane).
+    /// `None` for a session with no real host behind it (a scripted test session) or before one
+    /// has ever attached.
+    host_client: Option<LocalClient>,
     spawn_error: Option<String>,
+    /// Set by [`Self::take_session_for_teardown`] - this pane's process must not outlive the
+    /// worktree teardown that claimed it, even if its own `SessionSpawn` dispatch was still in
+    /// flight at that moment (GitHub issue #470: `docs/architecture/decisions.md` §23's
+    /// control-plane spawn genuinely crosses the host, unlike the direct `jerry_pty::spawn` this
+    /// used to be able to treat as already settled by teardown time). [`Self::attach_session`]
+    /// checks this and shuts a late-arriving session straight back down instead of running it.
+    doomed: bool,
     /// The process's exit status, once it has exited - captured the moment a
     /// [`jerry_pty::PtyOutput::Exited`] item arrives on [`Self::session`]'s output stream, real
     /// on every platform (`run_wait_loop`'s dedicated thread in `jerry-pty` blocks on the
@@ -701,6 +767,12 @@ impl TerminalPane {
     /// Clamped via [`sanitized_font_size_px`] the same way [`Self::set_font_size`] clamps a
     /// later edit, so an already out-of-range persisted value (a hand-edited settings file)
     /// can never reach font-metrics measurement.
+    ///
+    /// Spawns nothing by itself: the host owns every session now
+    /// (`docs/architecture/decisions.md` §23), so a pane starts with none attached.
+    /// `crate::work_surface::agents::Agents::spawn_inner` dispatches `SessionSpawn` and calls
+    /// [`Self::attach_session`] once it resolves; a caller with no host in scope at all (a bare
+    /// pane test) attaches its own real or scripted session the same way.
     pub fn new(spec: TerminalSpec, font_size_px: f32, cx: &mut Context<Self>) -> Self {
         // `jerry-pty`'s reader/wait threads wake this pane's output task through a real
         // `futures::channel::mpsc` waker (`docs/architecture/decisions.md` §8's amendment).
@@ -713,11 +785,13 @@ impl TerminalPane {
         #[cfg(test)]
         cx.background_executor().allow_parking();
 
-        let mut this = Self {
+        Self {
             spec,
             grid: TerminalGrid::new(TERMINAL_ROWS, TERMINAL_COLS),
             session: None,
+            host_client: None,
             spawn_error: None,
+            doomed: false,
             exit_status: None,
             activity_at: None,
             attention_ping_at: None,
@@ -736,9 +810,137 @@ impl TerminalPane {
             pending_scroll_px: 0.0,
             new_output_while_scrolled: false,
             settled_real_size: false,
+        }
+    }
+
+    /// Attaches this pane to a live (or scripted) session and starts the "wait for the next
+    /// item, update the grid, or record exit" loop against its output stream - what
+    /// `Self::new` used to do itself, against a `jerry_pty::PtySession` it spawned directly,
+    /// before the host owned every session (decisions.md §23). `client` is the host's dispatch
+    /// handle for `Self::resize_to`'s own `SessionResize` calls; `None` for a session with no
+    /// real host behind it.
+    ///
+    /// A `None` from `session.take_output()` is a real error, not a silent no-op: a session's
+    /// stream is claimed exactly once, so seeing it already gone here means something upstream
+    /// took it first.
+    pub(crate) fn attach_session(
+        &mut self,
+        session: Arc<dyn SessionAdapter>,
+        client: Option<LocalClient>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut output) = session.take_output() else {
+            self.spawn_error = Some(
+                "internal error: this session's output stream was already claimed".to_string(),
+            );
+            cx.notify();
+            return;
         };
-        this.spawn_process(cx);
-        this
+        self.session = Some(session);
+        self.host_client = client;
+        if self.doomed {
+            // This pane's own worktree-discard flow (`crate::worktree_history::flow`) is
+            // already polling `Self::take_session_for_teardown` for exactly this case - a
+            // `SessionSpawn` dispatch that was still in flight when the discard claimed this
+            // pane. That flow must own the shutdown itself, so it can sequence it *before* the
+            // real `git worktree remove` (GitHub issue #470) - so this attaches the session and
+            // stops here, deliberately never starting the usual output-processing task, which
+            // would otherwise start running a process about to be killed.
+            return;
+        }
+        // A freshly attached process hasn't produced output yet, but it just demonstrably did
+        // something (started) - counting that as activity keeps a still-spawning agent from
+        // being immediately misread as long-idle by `crate::rail::status::derive_status`.
+        self.activity_at = Some(Instant::now());
+        // A previous process's unanswered attention ping is not this one's - see
+        // `attention_ping_at`'s field docs.
+        self.clear_attention_ping();
+        // The pane may already have rendered (and computed a target grid size) before this
+        // attached - there was no live session yet for that call to reach, so retry it now that
+        // one exists, rather than waiting for the next resize to reach the pty.
+        if let Some(target) = self.resize_latch.grid {
+            self.resize_to(target.0, target.1, cx);
+        }
+        cx.notify();
+
+        // Wakes exactly when the host's relay thread (or, on Windows, `jerry-pty`'s own
+        // independent exit-wait thread - see `docs/architecture/decisions.md` §8) has something
+        // ready, rather than draining a channel on a fixed interval. `Exited` ends this loop: it
+        // is the stream's terminal item (guaranteed last on unix; see `PtyOutput`'s docs for
+        // Windows' narrower guarantee, preserved by the host's relay - see decisions.md §23).
+        let task = cx.spawn(async move |this, cx| {
+            while let Some(item) = output.next().await {
+                let mut exited = false;
+                let updated = this.update(cx, |this, cx| match item {
+                    PtyOutput::Bytes(chunk) => {
+                        this.grid.append_bytes(&chunk);
+                        // GitHub issue #331: real output arrived while the human was looking
+                        // at scrollback - latch the "new output" indicator for the
+                        // jump-to-bottom affordance. `Self::grid` already stays pinned to the
+                        // same historical lines on its own (see
+                        // `TerminalGrid::scroll_display`'s docs), so this is purely the UI
+                        // signal, never a scroll-position decision.
+                        if this.grid.is_scrolled_back() {
+                            this.new_output_while_scrolled = true;
+                        }
+                        this.activity_at = Some(Instant::now());
+                        // Consume the grid's one-shot OSC 9 / 777 notification flag right
+                        // where the bytes that could have set it were parsed, and latch it -
+                        // see `attention_ping_at`'s field docs for why this must not be
+                        // consumed from the render path.
+                        if this.grid.take_attention_ping() {
+                            this.attention_ping_at = Some(Instant::now());
+                        }
+
+                        // Any bytes the VT parser itself generated while processing this
+                        // chunk - e.g. a cursor position report for `ESC[6n` - must be
+                        // written back to the pty's own stdin, not just left in `this.grid`.
+                        // This is never a no-op-safe skip: real Windows ConPTY sends exactly
+                        // this query as part of its own startup handshake and blocks its
+                        // entire output stream on a real answer (confirmed live - see
+                        // `TermEventSink`'s own docs), so a dropped reply here doesn't just
+                        // misrender a query response, it silently hangs the whole pane
+                        // forever.
+                        let pending_writes = this.grid.take_pending_pty_writes();
+                        if !pending_writes.is_empty() {
+                            if let Some(session) = this.session.as_ref() {
+                                if let Err(err) = session.write_input(&pending_writes) {
+                                    log::warn!(
+                                        "failed to answer a terminal query (e.g. cursor \
+                                         position report) back to the pty: {err}"
+                                    );
+                                }
+                            }
+                        }
+
+                        cx.notify();
+                    }
+                    PtyOutput::Exited(status) => {
+                        let clean = status.success();
+                        this.exit_status = Some(status);
+                        this.session = None;
+                        this.grid.mark_ended();
+                        cx.emit(TerminalPaneEvent::ProcessExited { clean });
+                        cx.notify();
+                        exited = true;
+                    }
+                });
+
+                if updated.is_err() || exited {
+                    break; // the pane entity was dropped, or the process it watched exited
+                }
+            }
+        });
+
+        self._task = Some(task);
+    }
+
+    /// Records that this pane's process could not be started - a real, honest failure (denied by
+    /// the host, no host reachable, dispatch itself failed) rather than a silent no-op. The one
+    /// caller is `Agents::spawn_inner`'s own `SessionSpawn` orchestration task.
+    pub(crate) fn mark_spawn_failed(&mut self, message: String, cx: &mut Context<Self>) {
+        self.spawn_error = Some(message);
+        cx.notify();
     }
 
     /// Applies a Settings › Appearance "Terminal font size" edit
@@ -763,7 +965,7 @@ impl TerminalPane {
     }
 
     /// Deterministically tears down the current child process, if any, via
-    /// `PtySession::shutdown` (blocks until the process tree is confirmed dead and reaped) -
+    /// `SessionAdapter::shutdown` (blocks until the process tree is confirmed dead and reaped) -
     /// run on the background executor so this doesn't block the GPUI foreground thread.
     /// Intended for closing a tab: called before the owning `Entity<TerminalPane>` is dropped,
     /// so process teardown is a completed, verified fact rather than left to `Drop`'s
@@ -771,7 +973,7 @@ impl TerminalPane {
     /// per `jerry-pty`'s docs, just not deterministic about *when* the process is reaped).
     pub fn shutdown(&mut self, cx: &mut Context<Self>) {
         self._task = None;
-        if let Some(mut session) = self.session.take() {
+        if let Some(session) = self.session.take() {
             cx.background_executor()
                 .spawn(async move {
                     if let Err(err) = session.shutdown() {
@@ -787,13 +989,28 @@ impl TerminalPane {
     /// flow (GitHub issue #470), which must have every process in the worktree confirmed dead
     /// **before** deleting the directory - on Windows a live child's cwd holds an open handle
     /// that makes the removal half-fail. The pane renders as exited from this point on.
-    pub fn take_session_for_teardown(
+    ///
+    /// Also marks this pane [`Self::doomed`] - idempotently safe to call again once
+    /// [`Self::teardown_still_pending`] reports a still-in-flight `SessionSpawn` has resolved,
+    /// which is exactly what the worktree discard flow does for a pane whose spawn had not yet
+    /// attached the first time it called this.
+    pub(crate) fn take_session_for_teardown(
         &mut self,
         cx: &mut Context<Self>,
-    ) -> Option<jerry_pty::PtySession> {
+    ) -> Option<Arc<dyn SessionAdapter>> {
         self._task = None;
+        self.doomed = true;
         cx.notify();
         self.session.take()
+    }
+
+    /// Whether [`Self::take_session_for_teardown`] has claimed this pane but its `SessionSpawn`
+    /// dispatch had not yet resolved (to either a real attach or a spawn failure) at the time -
+    /// the worktree discard flow's signal to keep polling rather than proceed, so a process that
+    /// attaches after the fact is still shut down before the real `git worktree remove` runs
+    /// (GitHub issue #470).
+    pub(crate) fn teardown_still_pending(&self) -> bool {
+        self.doomed && self.session.is_none() && self.spawn_error.is_none()
     }
 
     /// `true` while a child process is alive (spawned and not yet observed to have exited).
@@ -1517,152 +1734,6 @@ impl TerminalPane {
         self.grid.retained_text_lines(max_lines)
     }
 
-    fn spawn_process(&mut self, cx: &mut Context<Self>) {
-        let spec = self.spec.clone();
-        let program_for_error = spec.program.clone();
-        let task = cx.spawn(async move |this, cx| {
-            let spawn_result: Result<PtySession, PtyError> = cx
-                .background_executor()
-                .spawn(async move {
-                    // A `ui`-tier test's stub takes over here, never in `spec.program`/`args`
-                    // themselves - see `TerminalSpec::spawn_override`'s docs for why the two
-                    // must stay independent.
-                    let (program, args) = spec.spawn_override.unwrap_or((spec.program, spec.args));
-                    let mut options = SpawnOptions::new(program)
-                        .args(args)
-                        .cwd(spec.cwd)
-                        .size(TERMINAL_ROWS, TERMINAL_COLS);
-                    for (key, value) in spec.env {
-                        options = options.env(key, value);
-                    }
-                    jerry_pty::spawn(options)
-                })
-                .await;
-
-            let mut session = match spawn_result {
-                Ok(session) => session,
-                Err(err) => {
-                    let message = format!("failed to start {}: {err}", program_for_error.display());
-                    let _ = this.update(cx, |this, cx| {
-                        this.spawn_error = Some(message);
-                        cx.notify();
-                    });
-                    return;
-                }
-            };
-
-            // Claimed once, immediately, and held in this task's own scope for the rest of the
-            // pane's life - see `PtySession::take_output`'s docs for why it must be owned here
-            // rather than borrowed back through `this.session` on every item (a GPUI entity only
-            // grants `&mut Self` inside an `update` closure, which cannot survive the `.await`
-            // below).
-            let Some(mut output) = session.take_output() else {
-                let _ = this.update(cx, |this, cx| {
-                    this.spawn_error = Some(
-                        "internal error: a freshly spawned session had no output stream"
-                            .to_string(),
-                    );
-                    cx.notify();
-                });
-                return;
-            };
-
-            if this
-                .update(cx, |this, cx| {
-                    this.session = Some(session);
-                    // A freshly started process hasn't produced output yet, but it just
-                    // demonstrably did something (started) - counting that as activity keeps
-                    // a still-spawning agent from being immediately misread as long-idle by
-                    // `crate::rail::status::derive_status`.
-                    this.activity_at = Some(std::time::Instant::now());
-                    // A previous process's unanswered attention ping is not this one's - see
-                    // `attention_ping_at`'s field docs.
-                    this.clear_attention_ping();
-                    // The pane may already have rendered (and computed a target grid size)
-                    // before this task's background spawn finished - there was no live
-                    // session yet for that call to reach, so retry it now that one exists,
-                    // rather than waiting for the next resize to reach the pty.
-                    if let Some(target) = this.resize_latch.grid {
-                        this.resize_to(target.0, target.1);
-                    }
-                    cx.notify();
-                })
-                .is_err()
-            {
-                return; // the pane was dropped before the process finished starting
-            }
-
-            // Wakes exactly when jerry-pty's reader thread (or, on Windows, its independent
-            // exit-wait thread - see `docs/architecture/decisions.md` §8) has something ready,
-            // rather than draining a channel on a fixed interval. `Exited` ends this loop: it is
-            // `jerry_pty`'s stream's terminal item (guaranteed last on unix; see `PtyOutput`'s
-            // docs for Windows' narrower guarantee).
-            while let Some(item) = output.next().await {
-                let mut exited = false;
-                let updated = this.update(cx, |this, cx| match item {
-                    PtyOutput::Bytes(chunk) => {
-                        this.grid.append_bytes(&chunk);
-                        // GitHub issue #331: real output arrived while the human was looking
-                        // at scrollback - latch the "new output" indicator for the
-                        // jump-to-bottom affordance. `Self::grid` already stays pinned to the
-                        // same historical lines on its own (see
-                        // `TerminalGrid::scroll_display`'s docs), so this is purely the UI
-                        // signal, never a scroll-position decision.
-                        if this.grid.is_scrolled_back() {
-                            this.new_output_while_scrolled = true;
-                        }
-                        this.activity_at = Some(Instant::now());
-                        // Consume the grid's one-shot OSC 9 / 777 notification flag right
-                        // where the bytes that could have set it were parsed, and latch it -
-                        // see `attention_ping_at`'s field docs for why this must not be
-                        // consumed from the render path.
-                        if this.grid.take_attention_ping() {
-                            this.attention_ping_at = Some(Instant::now());
-                        }
-
-                        // Any bytes the VT parser itself generated while processing this
-                        // chunk - e.g. a cursor position report for `ESC[6n` - must be
-                        // written back to the pty's own stdin, not just left in `this.grid`.
-                        // This is never a no-op-safe skip: real Windows ConPTY sends exactly
-                        // this query as part of its own startup handshake and blocks its
-                        // entire output stream on a real answer (confirmed live - see
-                        // `TermEventSink`'s own docs), so a dropped reply here doesn't just
-                        // misrender a query response, it silently hangs the whole pane
-                        // forever.
-                        let pending_writes = this.grid.take_pending_pty_writes();
-                        if !pending_writes.is_empty() {
-                            if let Some(session) = this.session.as_ref() {
-                                if let Err(err) = session.write_input(&pending_writes) {
-                                    log::warn!(
-                                        "failed to answer a terminal query (e.g. cursor \
-                                         position report) back to the pty: {err}"
-                                    );
-                                }
-                            }
-                        }
-
-                        cx.notify();
-                    }
-                    PtyOutput::Exited(status) => {
-                        let clean = status.success();
-                        this.exit_status = Some(status);
-                        this.session = None;
-                        this.grid.mark_ended();
-                        cx.emit(TerminalPaneEvent::ProcessExited { clean });
-                        cx.notify();
-                        exited = true;
-                    }
-                });
-
-                if updated.is_err() || exited {
-                    break; // the pane entity was dropped, or the process it watched exited
-                }
-            }
-        });
-
-        self._task = Some(task);
-    }
-
     /// Forwards a typed key to the child process via `PtySession::write_input`. See the
     /// module docs' "Input" section for the (deliberately small) subset of keys handled.
     fn handle_key_down(
@@ -1776,7 +1847,7 @@ impl TerminalPane {
     /// whenever the pane's own size changes - not just the window's, since Phase A's
     /// three-zone shell means those are no longer the same thing (see [`size_to_grid`]'s docs
     /// for the bug this distinction fixes).
-    fn maybe_resize_pty(&mut self, window: &Window) {
+    fn maybe_resize_pty(&mut self, window: &Window, cx: &mut Context<Self>) {
         let raw_size = self
             .content_bounds
             .map(|bounds| bounds.size)
@@ -1785,7 +1856,7 @@ impl TerminalPane {
         let cell_size = self.cell_size(window);
         let (rows, cols) = size_to_grid(size, cell_size);
         let measured_real_size = self.content_bounds.is_some();
-        self.resize_to(rows, cols);
+        self.resize_to(rows, cols, cx);
         let reached_the_pty = self.resize_latch.session == Some((rows, cols));
         if !self.settled_real_size && measured_real_size && reached_the_pty {
             self.settled_real_size = true;
@@ -1793,12 +1864,20 @@ impl TerminalPane {
         }
     }
 
-    /// Applies a target `(rows, cols)` to the grid and, if a live session exists, the child
-    /// pty - delegating the "what actually needs to happen" decision to [`ResizeLatch::apply`]
-    /// (see its docs for the bug this split prevents), and only calling
-    /// [`ResizeLatch::session_resize_succeeded`] once `PtySession::resize` has returned `Ok`,
-    /// so a failed resize is retried next time instead of being treated as done.
-    fn resize_to(&mut self, rows: u16, cols: u16) {
+    /// Applies a target `(rows, cols)` to the grid synchronously and, if a live session exists,
+    /// dispatches `SessionResize` to the child pty - delegating the "what actually needs to
+    /// happen" decision to [`ResizeLatch::apply`] (see its docs for the bug this split
+    /// prevents). Resize is a control-plane Command, never the data-plane adapter
+    /// (`docs/architecture/decisions.md` §23), so unlike the grid resize this cannot complete
+    /// synchronously - [`ResizeLatch::session_resize_succeeded`] is applied optimistically,
+    /// immediately, rather than waiting for the dispatch's own `Report`, since every synchronous
+    /// caller (chiefly [`Self::maybe_resize_pty`]'s own "has this pane settled to its real size
+    /// yet" check) already expects a resize it asked for to be reflected right away. A failure is
+    /// logged, same as before this moved to the control plane, though - unlike before - it does
+    /// not roll the latch back to force an automatic retry on the next call: a session that
+    /// cannot be resized right now is a rare, non-critical condition the next real resize event
+    /// (a window resize, a font-size change) will simply retry anyway.
+    fn resize_to(&mut self, rows: u16, cols: u16, cx: &mut Context<Self>) {
         let actions = self
             .resize_latch
             .apply((rows, cols), self.session.is_some());
@@ -1808,13 +1887,22 @@ impl TerminalPane {
         }
 
         if actions.resize_session {
-            let Some(session) = &self.session else {
+            let (Some(session), Some(client)) = (&self.session, self.host_client.clone()) else {
                 return;
             };
-            match session.resize(rows, cols) {
-                Ok(()) => self.resize_latch.session_resize_succeeded((rows, cols)),
-                Err(err) => log::warn!("failed to resize pty session: {err}"),
-            }
+            let id = session.id().clone();
+            let cwd = self.spec.cwd.clone();
+            self.resize_latch.session_resize_succeeded((rows, cols));
+            cx.background_spawn(async move {
+                let request =
+                    Request::Command(AppCommand::SessionResize(SessionResize { id, rows, cols }));
+                match client.request(Call::human(cwd, request)).await {
+                    Ok(Report::Ok { .. }) => {}
+                    Ok(other) => log::warn!("failed to resize pty session: {other:?}"),
+                    Err(err) => log::warn!("failed to resize pty session: {}", err.message),
+                }
+            })
+            .detach();
         }
     }
 }
@@ -2427,7 +2515,7 @@ fn render_plain_line_with_links(
 
 impl Render for TerminalPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.maybe_resize_pty(window);
+        self.maybe_resize_pty(window, cx);
 
         // GitHub issue #331: apply a scrollbar click/drag from the previous frame before this
         // frame reads `self.grid`'s scroll state - see `Self::apply_pending_scrollbar_target`'s
@@ -2642,8 +2730,8 @@ impl Render for TerminalPane {
 /// room to run, with `run_until_parked` on each check picking up whatever it produced meanwhile.
 #[cfg(test)]
 mod pty_pane_fixtures {
-    use super::{TerminalPane, TerminalSpec, ROW_FONT_SIZE_PX};
-    use gpui::{AppContext, Entity, TestAppContext};
+    use super::{TerminalPane, TerminalSpec, ROW_FONT_SIZE_PX, TERMINAL_COLS, TERMINAL_ROWS};
+    use gpui::{AppContext, Context, Entity, TestAppContext};
     use std::time::Duration;
 
     /// How long a real pty round trip is given before a test calls it a failure. Generous: it has
@@ -2657,19 +2745,57 @@ mod pty_pane_fixtures {
         program: &str,
         args: &[&str],
     ) -> Entity<TerminalPane> {
-        let pane = cx.new(|cx| {
-            TerminalPane::new(
-                TerminalSpec::command(
-                    program,
-                    args.iter().map(|arg| arg.to_string()).collect(),
-                    std::env::temp_dir(),
-                ),
-                ROW_FONT_SIZE_PX,
-                cx,
-            )
-        });
+        let spec = TerminalSpec::command(
+            program,
+            args.iter().map(|arg| arg.to_string()).collect(),
+            std::env::temp_dir(),
+        );
+        let pane = new_pane_with_real_session(cx, spec);
         cx.run_until_parked();
         pane
+    }
+
+    /// Constructs a real pane and immediately attaches a really-spawned session to it - what
+    /// `TerminalPane::new` used to do by itself before the host owned every session
+    /// (decisions.md §23). A `jerry_host::Host` of this test's own, not the "one true" table an
+    /// `AdeApp` owns: every test in this file that needs a real child process is exercising the
+    /// pane's own grid/output handling, not session-table bookkeeping, so a throwaway host - the
+    /// same real spawn/relay/adapter code decisions.md §23 put there - is honest and sufficient.
+    pub(super) fn new_pane_with_real_session(
+        cx: &mut TestAppContext,
+        spec: TerminalSpec,
+    ) -> Entity<TerminalPane> {
+        cx.new(|cx| {
+            let mut pane = TerminalPane::new(spec.clone(), ROW_FONT_SIZE_PX, cx);
+            attach_real_session_for_test(&mut pane, &spec, cx);
+            pane
+        })
+    }
+
+    /// The spawn-a-real-session half of [`new_pane_with_real_session`], factored out so a test
+    /// that builds its `TerminalPane` through some other GPUI constructor (`add_window_view`,
+    /// most often, for a windowed pane) can still get a real session attached the identical way.
+    pub(super) fn attach_real_session_for_test(
+        pane: &mut TerminalPane,
+        spec: &TerminalSpec,
+        cx: &mut Context<TerminalPane>,
+    ) {
+        let (host, dispatch) = jerry_host::Host::start_detached();
+        cx.background_executor().spawn(dispatch).detach();
+        let mut options = jerry_pty::SpawnOptions::new(spec.program.clone())
+            .args(spec.args.clone())
+            .cwd(spec.cwd.clone())
+            .size(TERMINAL_ROWS, TERMINAL_COLS);
+        for (key, value) in spec.env.clone() {
+            options = options.env(key, value);
+        }
+        match host.sessions().spawn(spec.cwd.clone(), None, options) {
+            Ok((_id, handle)) => pane.attach_session(handle, Some(host.client()), cx),
+            Err(err) => pane.mark_spawn_failed(
+                format!("failed to start {}: {err}", spec.program.display()),
+                cx,
+            ),
+        }
     }
 
     /// Drives the executor until `done` holds, or until [`PTY_ROUND_TRIP`] elapses.
@@ -2742,6 +2868,82 @@ mod pty_pane_fixtures {
                 .iter()
                 .any(|line| line.contains(needle))
         })
+    }
+
+    /// An in-process [`super::SessionAdapter`] fed by a test-controlled [`jerry_pty::PtyOutput`]
+    /// stream, for pane coverage that wants no real child process at all - see the trait's own
+    /// docs for why this substitution is possible.
+    pub(super) struct FakeSessionAdapter {
+        id: jerry_core::SessionId,
+        output: std::sync::Mutex<Option<futures::channel::mpsc::Receiver<jerry_pty::PtyOutput>>>,
+    }
+
+    impl FakeSessionAdapter {
+        /// A fake session and the sender a test drives its scripted `PtyOutput` stream through.
+        fn new() -> (
+            std::sync::Arc<Self>,
+            futures::channel::mpsc::Sender<jerry_pty::PtyOutput>,
+        ) {
+            let (tx, rx) = futures::channel::mpsc::channel(16);
+            (
+                std::sync::Arc::new(Self {
+                    id: jerry_core::SessionId::from("fake-session"),
+                    output: std::sync::Mutex::new(Some(rx)),
+                }),
+                tx,
+            )
+        }
+    }
+
+    impl super::SessionAdapter for FakeSessionAdapter {
+        fn id(&self) -> &jerry_core::SessionId {
+            &self.id
+        }
+
+        fn write_input(&self, _data: &[u8]) -> Result<(), jerry_pty::PtyError> {
+            Ok(())
+        }
+
+        fn take_output(&self) -> Option<futures::channel::mpsc::Receiver<jerry_pty::PtyOutput>> {
+            self.output
+                .lock()
+                .expect("fake session output lock poisoned")
+                .take()
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+
+        fn pause(&self) -> Result<(), jerry_pty::PtyError> {
+            Ok(())
+        }
+
+        fn resume(&self) -> Result<(), jerry_pty::PtyError> {
+            Ok(())
+        }
+
+        fn shutdown(&self) -> Result<(), jerry_pty::PtyError> {
+            Ok(())
+        }
+    }
+
+    /// A pane backed by [`FakeSessionAdapter`] - no real process, a test-scripted byte/exit
+    /// stream driven through the returned sender.
+    pub(super) fn new_pane_with_fake_session(
+        cx: &mut TestAppContext,
+        spec: TerminalSpec,
+    ) -> (
+        Entity<TerminalPane>,
+        futures::channel::mpsc::Sender<jerry_pty::PtyOutput>,
+    ) {
+        let (adapter, tx) = FakeSessionAdapter::new();
+        let pane = cx.new(|cx| {
+            let mut pane = TerminalPane::new(spec, ROW_FONT_SIZE_PX, cx);
+            pane.attach_session(adapter, None, cx);
+            pane
+        });
+        (pane, tx)
     }
 }
 
@@ -3233,6 +3435,77 @@ mod process_exit_event_tests {
             seen.borrow().as_slice(),
             [TerminalPaneEvent::ProcessExited { clean: false }],
             "a non-zero exit must not be reported as clean - the pane stays open on it"
+        );
+
+        release(cx, pane);
+    }
+}
+
+/// [`process_exit_event_tests`]'s real-pty coverage, plus the in-process byte adapter DoD
+/// (`docs/architecture/decisions.md` §23): a scripted [`jerry_pty::PtyOutput`] stream through
+/// [`pty_pane_fixtures::FakeSessionAdapter`] reaches `TerminalPane`'s grid and event surface
+/// exactly like a real session's does, with no child process spawned at all.
+#[cfg(test)]
+mod fake_adapter_tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use gpui::TestAppContext;
+    use jerry_pty::{ExitStatus, PtyOutput};
+
+    use super::pty_pane_fixtures::{new_pane_with_fake_session, release};
+    use super::{TerminalPaneEvent, TerminalSpec};
+
+    fn fake_spec() -> TerminalSpec {
+        TerminalSpec::command("fake", Vec::new(), std::env::temp_dir())
+    }
+
+    #[gpui::test]
+    fn a_scripted_byte_chunk_lands_in_the_grid_the_same_way_a_real_ptys_does(
+        cx: &mut TestAppContext,
+    ) {
+        let (pane, mut tx) = new_pane_with_fake_session(cx, fake_spec());
+
+        tx.try_send(PtyOutput::Bytes(b"hello from the fake session".to_vec()))
+            .expect("the fake channel has room for one scripted chunk");
+        cx.run_until_parked();
+
+        assert!(
+            pane.read_with(cx, |pane, _| pane
+                .visible_text_lines()
+                .iter()
+                .any(|line| line.contains("hello from the fake session"))),
+            "a scripted PtyOutput::Bytes item must reach the grid exactly like a real pty's does \
+             - TerminalPane never sees the difference (SessionAdapter's own docs)"
+        );
+
+        release(cx, pane);
+    }
+
+    #[gpui::test]
+    fn a_scripted_exit_reports_the_same_event_a_real_processs_would(cx: &mut TestAppContext) {
+        let (pane, mut tx) = new_pane_with_fake_session(cx, fake_spec());
+        let seen: Rc<RefCell<Vec<TerminalPaneEvent>>> = Rc::default();
+        let recorder = Rc::clone(&seen);
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&pane, move |_pane, event: &TerminalPaneEvent, _cx| {
+                recorder.borrow_mut().push(event.clone());
+            })
+        });
+
+        tx.try_send(PtyOutput::Exited(ExitStatus::with_exit_code(0)))
+            .expect("the fake channel has room for one scripted exit");
+        cx.run_until_parked();
+
+        assert_eq!(
+            seen.borrow().as_slice(),
+            [TerminalPaneEvent::ProcessExited { clean: true }],
+            "a scripted PtyOutput::Exited item must end the pane's output loop and announce the \
+             same event a real process' exit does"
+        );
+        assert!(
+            pane.read_with(cx, |pane, _| !pane.is_running()),
+            "the pane must also record the exit on itself, not just emit the event"
         );
 
         release(cx, pane);
@@ -3748,11 +4021,10 @@ mod mouse_selection_tests {
         Size<Pixels>,
     ) {
         let (pane, cx) = cx.add_window_view(|_window, cx| {
-            TerminalPane::new(
-                TerminalSpec::command("cat", Vec::new(), std::env::temp_dir()),
-                ROW_FONT_SIZE_PX,
-                cx,
-            )
+            let spec = TerminalSpec::command("cat", Vec::new(), std::env::temp_dir());
+            let mut pane = TerminalPane::new(spec.clone(), ROW_FONT_SIZE_PX, cx);
+            super::pty_pane_fixtures::attach_real_session_for_test(&mut pane, &spec, cx);
+            pane
         });
         cx.run_until_parked();
 
@@ -3945,11 +4217,10 @@ mod utf8_input_tests {
         cx: &mut TestAppContext,
     ) {
         let (pane, cx) = cx.add_window_view(|_window, cx| {
-            TerminalPane::new(
-                TerminalSpec::command("cat", Vec::new(), std::env::temp_dir()),
-                ROW_FONT_SIZE_PX,
-                cx,
-            )
+            let spec = TerminalSpec::command("cat", Vec::new(), std::env::temp_dir());
+            let mut pane = TerminalPane::new(spec.clone(), ROW_FONT_SIZE_PX, cx);
+            super::pty_pane_fixtures::attach_real_session_for_test(&mut pane, &spec, cx);
+            pane
         });
         cx.run_until_parked();
 
@@ -4172,11 +4443,10 @@ mod wide_char_render_tests {
     #[gpui::test]
     fn the_plain_text_view_of_the_grid_drops_the_padding_spaces(cx: &mut gpui::TestAppContext) {
         let (pane, cx) = cx.add_window_view(|_window, cx| {
-            TerminalPane::new(
-                TerminalSpec::command("cat", Vec::new(), std::env::temp_dir()),
-                ROW_FONT_SIZE_PX,
-                cx,
-            )
+            let spec = TerminalSpec::command("cat", Vec::new(), std::env::temp_dir());
+            let mut pane = TerminalPane::new(spec.clone(), ROW_FONT_SIZE_PX, cx);
+            super::pty_pane_fixtures::attach_real_session_for_test(&mut pane, &spec, cx);
+            pane
         });
         cx.run_until_parked();
         pane.update(cx, |pane, cx| {
@@ -4240,11 +4510,10 @@ mod terminal_theme_tests {
         bytes: &[u8],
     ) -> (Entity<TerminalPane>, &'a mut VisualTestContext) {
         let (pane, cx) = cx.add_window_view(|_window, cx| {
-            TerminalPane::new(
-                TerminalSpec::command("cat", Vec::new(), std::env::temp_dir()),
-                ROW_FONT_SIZE_PX,
-                cx,
-            )
+            let spec = TerminalSpec::command("cat", Vec::new(), std::env::temp_dir());
+            let mut pane = TerminalPane::new(spec.clone(), ROW_FONT_SIZE_PX, cx);
+            super::pty_pane_fixtures::attach_real_session_for_test(&mut pane, &spec, cx);
+            pane
         });
         cx.run_until_parked();
         pane.update(cx, |pane, cx| pane.inject_bytes_for_test(bytes, cx));
@@ -4355,11 +4624,10 @@ mod scrollback_pane_tests {
         cx: &mut TestAppContext,
     ) -> (gpui::Entity<TerminalPane>, &mut gpui::VisualTestContext) {
         let (pane, cx) = cx.add_window_view(|_window, cx| {
-            TerminalPane::new(
-                TerminalSpec::command("cat", Vec::new(), std::env::temp_dir()),
-                ROW_FONT_SIZE_PX,
-                cx,
-            )
+            let spec = TerminalSpec::command("cat", Vec::new(), std::env::temp_dir());
+            let mut pane = TerminalPane::new(spec.clone(), ROW_FONT_SIZE_PX, cx);
+            super::pty_pane_fixtures::attach_real_session_for_test(&mut pane, &spec, cx);
+            pane
         });
         // Two passes, not one: the pane's real content-bounds measurement now schedules its own
         // follow-up render via `Window::defer` (see the measuring `canvas()`'s own docs) rather
@@ -4434,11 +4702,10 @@ mod scrollback_pane_tests {
         cx: &mut TestAppContext,
     ) -> (gpui::Entity<TerminalPane>, &mut gpui::VisualTestContext) {
         let (pane, cx) = cx.add_window_view(|_window, cx| {
-            TerminalPane::new(
-                TerminalSpec::command("cat", vec!["-v".to_string()], std::env::temp_dir()),
-                ROW_FONT_SIZE_PX,
-                cx,
-            )
+            let spec = TerminalSpec::command("cat", vec!["-v".to_string()], std::env::temp_dir());
+            let mut pane = TerminalPane::new(spec.clone(), ROW_FONT_SIZE_PX, cx);
+            super::pty_pane_fixtures::attach_real_session_for_test(&mut pane, &spec, cx);
+            pane
         });
         cx.run_until_parked();
         pane.update(cx, |pane, cx| {
@@ -4779,9 +5046,9 @@ mod scrollback_pane_tests {
             origin: gpui::point(px(0.0), px(0.0)),
             size: gpui::size(px(800.0), px(20.0 * ROW_LINE_HEIGHT_PX)),
         };
-        pane.update_in(cx, |pane, window, _cx| {
+        pane.update_in(cx, |pane, window, cx| {
             pane.content_bounds = Some(bounds);
-            pane.maybe_resize_pty(window);
+            pane.maybe_resize_pty(window, cx);
         });
         assert!(
             !pane.read_with(cx, |pane, _| pane.settled_real_size),
@@ -4791,7 +5058,7 @@ mod scrollback_pane_tests {
         );
 
         pane.update(cx, |pane, _cx| pane.session = session);
-        pane.update_in(cx, |pane, window, _cx| pane.maybe_resize_pty(window));
+        pane.update_in(cx, |pane, window, cx| pane.maybe_resize_pty(window, cx));
         assert!(
             pane.read_with(cx, |pane, _| pane.settled_real_size),
             "once the resize really reached the live pty, the pane is settled and the one-time \
@@ -4874,9 +5141,9 @@ mod scrollback_pane_tests {
             origin: gpui::point(px(0.0), px(0.0)),
             size: gpui::size(px(800.0), px(real_rows as f32 * ROW_LINE_HEIGHT_PX)),
         };
-        pane.update_in(cx, |pane, window, _cx| {
+        pane.update_in(cx, |pane, window, cx| {
             pane.content_bounds = Some(small_bounds);
-            pane.maybe_resize_pty(window);
+            pane.maybe_resize_pty(window, cx);
         });
 
         assert!(
@@ -4916,9 +5183,9 @@ mod scrollback_pane_tests {
         };
         let history_before_second_resize =
             pane.read_with(cx, |pane, _| pane.grid.scroll_history_len());
-        pane.update_in(cx, |pane, window, _cx| {
+        pane.update_in(cx, |pane, window, cx| {
             pane.content_bounds = Some(smaller_bounds);
-            pane.maybe_resize_pty(window);
+            pane.maybe_resize_pty(window, cx);
         });
         assert!(
             pane.read_with(cx, |pane, _| pane.grid.scroll_history_len())
@@ -5120,11 +5387,10 @@ mod mouse_reporting_tests {
         Size<Pixels>,
     ) {
         let (pane, cx) = cx.add_window_view(|_window, cx| {
-            TerminalPane::new(
-                TerminalSpec::command("cat", vec!["-v".to_string()], std::env::temp_dir()),
-                ROW_FONT_SIZE_PX,
-                cx,
-            )
+            let spec = TerminalSpec::command("cat", vec!["-v".to_string()], std::env::temp_dir());
+            let mut pane = TerminalPane::new(spec.clone(), ROW_FONT_SIZE_PX, cx);
+            super::pty_pane_fixtures::attach_real_session_for_test(&mut pane, &spec, cx);
+            pane
         });
         cx.run_until_parked();
         cx.run_until_parked();

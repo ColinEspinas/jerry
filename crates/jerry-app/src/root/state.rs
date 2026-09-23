@@ -748,6 +748,17 @@ impl AdeApp {
             window_active: true,
             sound_player: crate::sound::player::SoundPlayer::new(),
         };
+        // The session host's cheap, synchronous half - the session table, fanout and dispatch
+        // loop, no filesystem or socket I/O - is up from this line on, in every caller
+        // (`Self::new` and every test through this same constructor): a pane spawned below
+        // (`Self::spawn_initial_shell_for_opened_repo`, deferred until the worktree fetch lands)
+        // always has a real, dispatchable host underneath it, never a race against `Self::
+        // start_host`'s slower registry/socket work (decisions.md §23). `Self::new` upgrades this
+        // very runtime to a discoverable one in place once that work completes
+        // (`Self::publish_host`); a test app stays exactly this unpublished, as it already did via
+        // `crate::test_support`'s own `adopt_host(HostRuntime::in_process(), ...)` call before it
+        // moved here.
+        this.adopt_host(crate::host::HostRuntime::in_process(), cx);
         // GitHub issue #45 ("Input blink only on focused input or file") / a live follow-up
         // report of missing carets: `graph_state.branches_filter_focus_handle` (added later, in
         // Revision R12's git graph tab), `new_file_focus_handle`, and (GitHub issue #241)

@@ -1,12 +1,8 @@
 //! Headless `git rebase --interactive`: the engine, with no UI.
 //!
-//! Real `git rebase` driven non-interactively through `GIT_SEQUENCE_EDITOR` and `GIT_EDITOR` - the
-//! same hooks a human's `$EDITOR` goes through, pointed at hidden `jerry git-sequence-editor`/
-//! `jerry git-editor` subcommands rather than a generated shell script, so this works on every
-//! platform the `jerry` binary runs on. See `docs/architecture/decisions.md` §7 for the mechanism
-//! and why each part of it is load-bearing; [`classify_editor_invocation`] is the three-case
-//! message classification that subcommand drives, and [`run_editor`]/[`run_sequence_editor`] are
-//! its whole implementation.
+//! Real `git rebase` driven non-interactively through `GIT_SEQUENCE_EDITOR`/`GIT_EDITOR`, pointed
+//! at hidden `jerry git-sequence-editor`/`jerry git-editor` subcommands - see
+//! `docs/architecture/decisions.md` §7 for the mechanism, §20 for the Commands built on it.
 //!
 //! Sidecar state lives under `<git-dir>/ade-rebase/` until the rebase completes or aborts, so
 //! [`rebase_status`] can reconstruct a stop after a process restart.
@@ -18,7 +14,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, GitExit};
-use crate::{absolutize, check_success, format_args, git_command, run_git};
+use crate::{absolutize, check_success, format_args, git_command, is_dirty, run_git};
 
 /// One of git's six interactive-rebase todo verbs, with a pre-supplied message added to `reword`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -403,11 +399,16 @@ pub fn commits_to_rebase(worktree_path: &Path, onto: &str) -> Result<Vec<String>
 /// (the `RebaseStart` Command's own `validate`) can ask "would this run" without running it -
 /// mirrors `jerry_git::merge::merge_preflight`'s own split from `attempt_merge`.
 ///
-/// Only real git state is checked here - a stale, uncleaned-up `<git-dir>/ade-rebase/` from a
-/// previous run is not a reason to refuse (see [`start_interactive_rebase`]'s own handling of it).
+/// A stale, uncleaned-up `<git-dir>/ade-rebase/` from a previous run is not a reason to refuse
+/// (see [`start_interactive_rebase`]'s own handling of it).
 pub fn rebase_preflight(worktree_path: &Path) -> Result<(), Error> {
     if rebase_status(worktree_path)?.is_some() {
         return Err(Error::RebaseAlreadyInProgress {
+            path: worktree_path.to_path_buf(),
+        });
+    }
+    if is_dirty(worktree_path)? {
+        return Err(Error::RebaseWorktreeDirty {
             path: worktree_path.to_path_buf(),
         });
     }

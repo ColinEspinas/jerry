@@ -160,6 +160,13 @@ pub(crate) enum RebasePhase {
     Stopped {
         outcome: RebaseOutcome,
     },
+    /// A dispatched mutation was refused or failed - the same real-error-state role
+    /// `merge::MergeFlowState::Error` plays for merge, so a `Report` failure is a visible banner
+    /// state, not silently dropped. The mode stays open (`Cancel` recovers it); the plan itself
+    /// is untouched, since nothing on disk actually changed.
+    Error {
+        message: String,
+    },
 }
 
 /// The interactive-rebase mode's whole real state - `Some` only while the graph pane is showing
@@ -914,8 +921,6 @@ impl AdeApp {
         let Some(root) = self.rebase_worktree_root() else {
             return;
         };
-        #[allow(clippy::expect_used)]
-        let rebase_state = self.graph_state.rebase.as_ref().expect("checked above");
         let plan = rebase_state
             .plan
             .iter()
@@ -946,8 +951,6 @@ impl AdeApp {
         let Some(root) = self.rebase_worktree_root() else {
             return;
         };
-        #[allow(clippy::expect_used)]
-        let rebase_state = self.graph_state.rebase.as_ref().expect("checked above");
         // Real, load-bearing gap `jerry_git::rebase`'s own module docs call out: the reword-message
         // queue `RebaseStart` fixes is set at that dispatch's own time - a message obtained only
         // *after* a message-less-reword stop can never be picked up by that queue retroactively.
@@ -1069,12 +1072,7 @@ impl AdeApp {
                         this.leave_rebase_mode(cx);
                         this.load_graph(cx);
                     }
-                    Err(reason) => {
-                        if let Some(rs) = this.graph_state.rebase.as_mut() {
-                            rs.op_in_flight = false;
-                        }
-                        this.graph_state.status_message = Some(format!("Abort failed: {reason}"));
-                    }
+                    Err(message) => this.rebase_op_failed(format!("Abort failed: {message}"), cx),
                 }
                 cx.notify();
             });
@@ -1113,8 +1111,9 @@ impl AdeApp {
     /// [`Self::continue_rebase`] - a real `Completed` leaves rebase mode entirely (via
     /// [`Self::leave_rebase_mode`], real agent resume included) and reloads the graph (the
     /// freshly rewritten history); a real stop transitions to [`RebasePhase::Stopped`]; a genuine
-    /// refusal or failure is surfaced as a status message with the mode left exactly as it was
-    /// (never silently discarded - the user can retry `Continue`/`Skip`/`Abort`).
+    /// refusal or failure transitions to [`RebasePhase::Error`] - the same visible-banner role
+    /// `merge::MergeFlowState::Error` plays, never silently discarded - the user can dismiss
+    /// (`Cancel`) or retry.
     fn apply_rebase_outcome(
         &mut self,
         result: Result<RebaseOutcome, String>,
@@ -1132,18 +1131,18 @@ impl AdeApp {
                 }
                 cx.notify();
             }
-            Err(reason) => self.rebase_op_failed(reason, cx),
+            Err(message) => self.rebase_op_failed(message, cx),
         }
     }
 
     /// The shared failure path for a dispatched rebase mutation - clears
-    /// [`RebaseModeState::op_in_flight`] and surfaces `reason`, leaving the mode exactly as it
-    /// was so the user can retry.
-    fn rebase_op_failed(&mut self, reason: String, cx: &mut Context<Self>) {
+    /// [`RebaseModeState::op_in_flight`] and transitions to [`RebasePhase::Error`], leaving the
+    /// plan itself untouched (nothing on disk changed) so the user can retry.
+    fn rebase_op_failed(&mut self, message: String, cx: &mut Context<Self>) {
         if let Some(rs) = self.graph_state.rebase.as_mut() {
             rs.op_in_flight = false;
+            rs.phase = RebasePhase::Error { message };
         }
-        self.graph_state.status_message = Some(format!("Interactive rebase failed: {reason}"));
         cx.notify();
     }
 

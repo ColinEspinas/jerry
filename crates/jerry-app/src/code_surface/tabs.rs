@@ -2043,10 +2043,39 @@ mod terminal_link_click_tests {
         VisualTestContext,
     };
 
+    /// How long a real pty round trip is given before a test calls it a failure - matches
+    /// `work_surface::render::terminal_action_tests::PTY_ROUND_TRIP`'s own reasoning (a full-suite
+    /// run has dozens of other tests' child processes competing for the same cores).
+    const PTY_ROUND_TRIP: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// [`work_surface::render::terminal_action_tests::pump_until`], duplicated here rather than
+    /// shared: both drive GPUI's simulated clock and the real wall clock together one poll at a
+    /// time, but each lives in its own private `#[cfg(test)]` module with no third place for a
+    /// shared helper that isn't itself GPUI-free (`crates/test-support`, which these two modules'
+    /// own `TestAppContext` usage cannot depend on).
+    fn pump_until(
+        cx: &mut VisualTestContext,
+        mut arrived: impl FnMut(&mut VisualTestContext) -> bool,
+    ) -> bool {
+        test_support::wait_until(PTY_ROUND_TRIP, || {
+            cx.background_executor
+                .advance_clock(std::time::Duration::from_millis(8));
+            cx.run_until_parked();
+            arrived(cx)
+        })
+    }
+
     /// Injects a row of terminal text containing a `path:line` link on the third visible row
-    /// (`"see src/main.rs:1 for it"`, 0-indexed row 2) into the active agent's pane, and
-    /// returns the painted geometry (`content_bounds`, cell size) needed to compute a click
-    /// position.
+    /// (`"see src/main.rs:1 for it"`, 0-indexed row 2) into the active agent's pane, and returns
+    /// the painted geometry (`content_bounds`, cell size) needed to compute a click position.
+    ///
+    /// Retries the whole reset+inject cycle until a real drain leaves it untouched: the real
+    /// startup shell this pane is also running attaches and produces its own banner
+    /// asynchronously (`docs/architecture/decisions.md` §23's control-plane `SessionSpawn`), and
+    /// that real output can land - overwriting these injected rows from the top of the screen,
+    /// the same way any fresh process's first real write does - *after* a single injection here
+    /// rather than before it, silently moving the very rows this test's click-position math
+    /// depends on.
     fn inject_link_row_and_measure(
         app: &Entity<AdeApp>,
         cx: &mut VisualTestContext,
@@ -2054,24 +2083,37 @@ mod terminal_link_click_tests {
         let pane = app
             .read_with(cx, |app, _| app.agents.active().map(|s| s.pane.clone()))
             .expect("a fresh test window has one real, active shell agent");
+        const LINK_ROW: &str = "see src/main.rs:1 for it";
 
-        pane.update(cx, |pane, cx| {
-            // Reset first, in the same `update`: the real startup shell this pane is also
-            // running now wakes and drains the moment it has real output, rather than on a
-            // polling interval (`docs/architecture/decisions.md` §8's amendment), so its own
-            // banner/prompt could otherwise land before the lines this test's click-position
-            // math depends on land at a known row.
-            pane.reset_grid_for_test(cx);
-            pane.inject_bytes_for_test(
-                b"first line\r\nsecond line\r\nsee src/main.rs:1 for it",
-                cx,
-            );
+        let reseed = |cx: &mut VisualTestContext| {
+            pane.update(cx, |pane, cx| {
+                pane.reset_grid_for_test(cx);
+                pane.inject_bytes_for_test(
+                    b"first line\r\nsecond line\r\nsee src/main.rs:1 for it",
+                    cx,
+                );
+            });
+        };
+        reseed(cx);
+        let mut consecutive_clean = 0;
+        let settled = pump_until(cx, |cx| {
+            let landed = pane.read_with(cx, |pane, _| {
+                pane.visible_text_lines()
+                    .get(2)
+                    .is_some_and(|line| line == LINK_ROW)
+            });
+            if landed {
+                consecutive_clean += 1;
+            } else {
+                consecutive_clean = 0;
+                reseed(cx);
+            }
+            consecutive_clean >= 3
         });
-        // Lets the injected `cx.notify()` drive a real paint (populating `content_bounds`). The
-        // agent's `$SHELL` spawn may also make background progress here, but only ever appends
-        // after the injected bytes, so it can't touch the link characters this test's
-        // click-position math depends on.
-        cx.run_until_parked();
+        assert!(
+            settled,
+            "the injected link row never survived a real drain within {PTY_ROUND_TRIP:?}"
+        );
 
         let (bounds, cell_size) = pane.update_in(cx, |pane, window, _cx| {
             (

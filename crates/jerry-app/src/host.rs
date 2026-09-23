@@ -7,7 +7,7 @@ use gpui::{AppContext, Context, Task};
 use jerry_core::registry::{Instance, Registry, RegistryError};
 use jerry_core::wire::rpc_code;
 use jerry_core::{Call, Report, Request, RpcError};
-use jerry_host::{AgentTable, DispatchFuture, Host, HostError, LocalClient};
+use jerry_host::{AgentTable, DispatchFuture, Host, HostError, LocalClient, SessionManager};
 use std::path::{Path, PathBuf};
 use std::thread;
 
@@ -33,6 +33,10 @@ pub struct HostRuntime {
     /// `AdeApp::adopt_host` - held here (rather than detached) so it is cancelled, not orphaned,
     /// when this runtime drops (§16, CLAUDE.md's entity-lifecycle rule). `None` until adoption.
     worktree_created_consumer: Option<Task<()>>,
+    /// `crate::work_surface::session_exited::spawn_consumer`'s task - the same lifecycle and
+    /// eager/lazy start as [`Self::worktree_created_consumer`], started alongside it at every one
+    /// of its own call sites.
+    session_exited_consumer: Option<Task<()>>,
 }
 
 impl HostRuntime {
@@ -51,6 +55,7 @@ impl HostRuntime {
             instance,
             repos: Vec::new(),
             worktree_created_consumer: None,
+            session_exited_consumer: None,
         };
         Ok((runtime, dispatch))
     }
@@ -75,11 +80,42 @@ impl HostRuntime {
             },
             repos: Vec::new(),
             worktree_created_consumer: None,
+            session_exited_consumer: None,
         }
     }
 
     fn is_published(&self) -> bool {
         !self.instance.name.is_empty()
+    }
+
+    /// The slow half of publishing an already-running (`Self::in_process`) runtime: opens the
+    /// registry directory (real filesystem I/O) and reserves a fresh instance name. Needs no live
+    /// host reference, so it runs entirely off the UI thread; `Self::publish` does the fast
+    /// remainder (the socket bind) synchronously against the runtime itself. Blocking - call from
+    /// a background task.
+    pub fn allocate_instance(registry_dir: PathBuf) -> Result<(PathBuf, Instance), HostStartError> {
+        let registry = Registry::open(registry_dir.clone())?;
+        let instance = registry.allocate()?;
+        Ok((registry_dir, instance))
+    }
+
+    /// Upgrades this already-running, unpublished runtime (`Self::in_process`) to a discoverable
+    /// one: binds its socket and records where it registered - the state `Self::start` builds all
+    /// at once instead, for a caller with no existing runtime to upgrade (a few tests still want
+    /// exactly that). A no-op, `Ok(())`, if already published - guards against a second startup
+    /// attempt racing the first (decisions.md §23).
+    pub fn publish(&mut self, registry_dir: PathBuf, instance: Instance) -> Result<(), HostError> {
+        if self.is_published() {
+            return Ok(());
+        }
+        let Some(host) = self.host.as_ref() else {
+            // Draining toward `Drop`; nothing left to publish.
+            return Ok(());
+        };
+        host.listen(&instance.socket)?;
+        self.registry_dir = registry_dir;
+        self.instance = instance;
+        Ok(())
     }
 
     /// Records `repo_common_dir` as served and returns what a background task needs to write
@@ -108,6 +144,12 @@ impl HostRuntime {
         self.host.as_ref().map(Host::agents)
     }
 
+    /// The session table (`docs/architecture/decisions.md` §23): what `TerminalPane` attaches to
+    /// via `SessionManager::handle_for` once its own `SessionSpawn` dispatch resolves.
+    pub fn sessions(&self) -> Option<SessionManager> {
+        self.host.as_ref().map(Host::sessions)
+    }
+
     pub fn socket(&self) -> &Path {
         &self.instance.socket
     }
@@ -122,6 +164,13 @@ impl HostRuntime {
     /// Whether the consumer above is already running - `Self::dispatch`'s own lazy-start check.
     pub(crate) fn worktree_created_consumer_is_running(&self) -> bool {
         self.worktree_created_consumer.is_some()
+    }
+
+    /// [`Self::set_worktree_created_consumer`], for `event/session-exited` - always started
+    /// alongside it, so `Self::worktree_created_consumer_is_running` is the one shared gate both
+    /// consumers' call sites check.
+    pub(crate) fn set_session_exited_consumer(&mut self, task: Task<()>) {
+        self.session_exited_consumer = Some(task);
     }
 }
 
@@ -166,18 +215,26 @@ fn publish(
 }
 
 impl AdeApp {
-    /// Brings the host up off the UI thread. Every repository open once it is up is published
-    /// then; a failure is logged and every dispatch answers `NEEDS_HOST`, so nothing pretends
-    /// a host exists.
+    /// Publishes the host `Self::new_with_settings` already installed (`HostRuntime::in_process`,
+    /// unpublished) so `jerry` can find this instance - the slow half of startup
+    /// (`HostRuntime::allocate_instance`'s registry I/O) runs off the UI thread; a failure is
+    /// logged and every dispatch keeps answering `NEEDS_HOST`, so nothing pretends a host exists.
     pub(crate) fn start_host(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
-            let started = cx
-                .background_spawn(async move { HostRuntime::start_default() })
+            let registry_dir = match jerry_core::registry::runtime_dir() {
+                Ok(dir) => dir,
+                Err(error) => {
+                    log::warn!("jerry-host could not resolve its registry directory: {error}");
+                    return;
+                }
+            };
+            let allocated = cx
+                .background_spawn(async move { HostRuntime::allocate_instance(registry_dir) })
                 .await;
-            match started {
-                Ok((runtime, dispatch)) => {
-                    cx.background_spawn(dispatch).detach();
-                    let _ = this.update(cx, |this, cx| this.adopt_host(runtime, cx));
+            match allocated {
+                Ok((registry_dir, instance)) => {
+                    let _ =
+                        this.update(cx, |this, cx| this.publish_host(registry_dir, instance, cx));
                 }
                 Err(error) => log::warn!(
                     "jerry-host could not start; `jerry` cannot reach this instance: {error}"
@@ -185,6 +242,37 @@ impl AdeApp {
             }
         })
         .detach();
+    }
+
+    /// Binds the already-running host's socket, starts the `event/worktree-created` consumer
+    /// (mirroring `Self::adopt_host`'s own eager-for-published reasoning - the socket is live now,
+    /// so a real agent could connect and dispatch at any moment), and publishes every repository
+    /// already open, including any added while the registry work above was in flight.
+    pub(crate) fn publish_host(
+        &mut self,
+        registry_dir: PathBuf,
+        instance: Instance,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(runtime) = self.host_runtime.as_mut() else {
+            return;
+        };
+        if let Err(error) = runtime.publish(registry_dir, instance) {
+            log::warn!(
+                "jerry-host could not bind its socket; `jerry` cannot reach this instance: {error}"
+            );
+            return;
+        }
+        if let Some(client) = runtime.client() {
+            let task = crate::work_surface::worktree_created::spawn_consumer(client.clone(), cx);
+            runtime.set_worktree_created_consumer(task);
+            let task = crate::work_surface::session_exited::spawn_consumer(client, cx);
+            runtime.set_session_exited_consumer(task);
+        }
+        let repo_paths: Vec<PathBuf> = self.repos.iter().map(|repo| repo.path.clone()).collect();
+        for path in repo_paths {
+            self.serve_repo_from_host(path, cx);
+        }
     }
 
     /// Installs a started runtime, hands the host every agent already open, and publishes
@@ -206,8 +294,11 @@ impl AdeApp {
         // broke).
         if runtime.is_published() {
             if let Some(client) = runtime.client() {
-                let task = crate::work_surface::worktree_created::spawn_consumer(client, cx);
+                let task =
+                    crate::work_surface::worktree_created::spawn_consumer(client.clone(), cx);
                 runtime.set_worktree_created_consumer(task);
+                let task = crate::work_surface::session_exited::spawn_consumer(client, cx);
+                runtime.set_session_exited_consumer(task);
             }
         }
         self.host_runtime = Some(runtime);
@@ -292,8 +383,27 @@ impl AdeApp {
             if let Some(runtime) = self.host_runtime.as_mut() {
                 runtime.set_worktree_created_consumer(task);
             }
+            let task = crate::work_surface::session_exited::spawn_consumer(client.clone(), cx);
+            if let Some(runtime) = self.host_runtime.as_mut() {
+                runtime.set_session_exited_consumer(task);
+            }
         }
         cx.spawn(async move |_this, _cx| client.request(Call::human(cwd, request)).await)
+    }
+
+    /// The session table's own in-process handle, for a caller that needs to attach to a
+    /// spawned session's data-plane adapter (`SessionManager::handle_for`) rather than dispatch a
+    /// Command - see `docs/architecture/decisions.md` §23. `None` only in the same narrow window
+    /// `Self::dispatch`'s own `NEEDS_HOST` case covers.
+    pub fn sessions(&self) -> Option<SessionManager> {
+        self.host_runtime.as_ref().and_then(HostRuntime::sessions)
+    }
+
+    /// The host's own dispatch handle, for a caller (`TerminalPane::attach_session`) that needs
+    /// to reach the control plane directly for something narrower than a full `Self::dispatch`
+    /// call - `SessionResize` (decisions.md §23).
+    pub fn host_client(&self) -> Option<LocalClient> {
+        self.host_runtime.as_ref().and_then(HostRuntime::client)
     }
 }
 

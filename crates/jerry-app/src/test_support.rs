@@ -101,11 +101,10 @@ pub(crate) fn open_test_app_with_settings(
     crate::job_object::adopt_this_process();
 
     cx.add_window_view(|window, cx| {
+        // `AdeApp::new_with_settings` itself installs a real in-process host, driven by the test
+        // executor; it has no socket, so `jerry` never finds a test instance.
         let mut app =
             AdeApp::new_with_settings(Some(repo_path), true, settings, settings_path, window, cx);
-        // Every test app dispatches through a real in-process host, driven by the test
-        // executor; it has no socket, so `jerry` never finds a test instance.
-        app.adopt_host(crate::host::HostRuntime::in_process(), cx);
         // No `ui`-tier test may launch a real agent CLI (GitHub issue #530) - every kind spawns
         // this stub instead, which stays alive until its stdin closes and then exits 0, so a
         // spawned "agent" behaves like a real, live process for as long as a test needs one.
@@ -115,6 +114,18 @@ pub(crate) fn open_test_app_with_settings(
         }
         app
     })
+}
+
+/// A real, dispatched `RebaseStart` needs `jerry_core::jerry_binary::locate` to find a real,
+/// executable `jerry` - called at the top of every fixture that goes on to start a real rebase,
+/// so a missing binary fails right here with an actionable cause instead of as a confusing
+/// downstream state assertion once the rebase never ran.
+pub(crate) fn assert_real_jerry_binary_available() {
+    assert!(
+        jerry_core::jerry_binary::locate().is_some(),
+        "no real `jerry` binary found next to this test binary - run `cargo build -p jerry-cli` \
+         first"
+    );
 }
 
 /// The stub every `ui`-tier test app spawns in place of a real `claude`/`codex`/`cursor-agent`

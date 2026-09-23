@@ -1,19 +1,16 @@
-﻿//! Where the running process's own `jerry` binary lives, for [`crate::commands::RebaseStart`] to
+//! Where the running process's own `jerry` binary lives, for [`crate::commands::RebaseStart`] to
 //! hand `jerry-git` a real path for `GIT_SEQUENCE_EDITOR`/`GIT_EDITOR`.
 //!
-//! A sibling of [`std::env::current_exe`], or `bin/jerry` next to it - the two layouts every real
-//! caller actually has: `jerry-cli`'s own binary (trivially a sibling of itself), and `jerry-app`
-//! dispatching in-process, where the two binaries ship side by side
-//! (`docs/architecture/decisions.md` Â§17). No `PATH` fallback: unlike hook/skill injection
-//! (`crate::host::find_jerry_binary` in `jerry-app`, which does search `PATH`), this never needs
-//! to reach across an installation that split the two binaries apart, and adding one here would
-//! mean a `jerry-pty` dependency this crate deliberately has none of (Â§15's "standalone jerry-cli
-//! can run [Git-locality commands] without linking any host or PTY machinery").
+//! A sibling of [`std::env::current_exe`], `bin/jerry` next to it, or `jerry` one directory up
+//! (a cargo test binary's own exe lives in `target/<profile>/deps/`, not `target/<profile>/`) -
+//! every real caller has one of these layouts. No `PATH` fallback: unlike `crate::host::
+//! find_jerry_binary` in `jerry-app`, this never needs to reach across a split installation, and
+//! a fallback would cost this crate the `jerry-pty` dependency it otherwise has none of.
 
 use std::path::{Path, PathBuf};
 
-/// The currently running process's own `jerry` binary, or `None` rather than a guess if neither
-/// tier exists.
+/// The currently running process's own `jerry` binary, or `None` rather than a guess if no tier
+/// finds one.
 pub fn locate() -> Option<PathBuf> {
     let current_exe = std::env::current_exe().ok()?;
     locate_from(&current_exe)
@@ -29,6 +26,14 @@ fn locate_from(current_exe: &Path) -> Option<PathBuf> {
     let nested = dir.join("bin").join(name);
     if nested.is_file() {
         return Some(nested);
+    }
+    // unix's `deps/` copy of a `[[bin]]` target is hash-suffixed (unlike Windows's, which the
+    // sibling tier above already matches), so the only stable name is one level up, where cargo
+    // places the real, unhashed artifact.
+    if let Some(one_up) = dir.parent().map(|parent| parent.join(name)) {
+        if one_up.is_file() {
+            return Some(one_up);
+        }
     }
     None
 }
@@ -81,6 +86,19 @@ mod tests {
         touch(&nested);
 
         assert_eq!(locate_from(&current_exe), Some(nested));
+    }
+
+    #[test]
+    fn one_directory_up_is_the_third_place_checked() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let deps_dir = temp.path().join("deps");
+        std::fs::create_dir_all(&deps_dir).expect("mkdir deps");
+        let current_exe = deps_dir.join("some-test-binary-deadbeef");
+        touch(&current_exe);
+        let one_up = temp.path().join(exe_name());
+        touch(&one_up);
+
+        assert_eq!(locate_from(&current_exe), Some(one_up));
     }
 
     #[test]
