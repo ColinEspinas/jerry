@@ -650,7 +650,13 @@ mod session_manager_tests {
     #[test]
     fn spawn_creates_its_own_sockets_directory_when_it_does_not_exist_yet() {
         let temp = tempfile::TempDir::new().expect("tempdir");
-        let sockets_dir = temp.path().join("never-created-until-now");
+        // Short on purpose: macOS's own `$TMPDIR` is already ~49 bytes
+        // (`/var/folders/<2>/<random>/T/`) before `tempfile::TempDir`'s own random suffix, and
+        // this directory name is test-only overhead a real caller never pays (production sockets
+        // live directly under `sockets_dir`, never a nested subdirectory this test invents) - see
+        // `every_platforms_runtime_dir_leaves_real_margin_for_a_data_plane_socket_too` for the
+        // real production-shape check.
+        let sockets_dir = temp.path().join("nc");
         assert!(!sockets_dir.exists(), "sanity check: truly not created yet");
         let manager = SessionManager::new(Fanout::default(), sockets_dir);
         let (_id, handle) = manager
