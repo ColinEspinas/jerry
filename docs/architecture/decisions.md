@@ -693,3 +693,82 @@ issue's CLI surface; `jerry rebase` itself is out of scope; `jerry-git` promotes
 mechanics git itself spawns, not part of the Command/Query wire model, so they run before any
 `Ctx`/transport is built and answer with git's own exit-code contract (0 accept, non-zero stop),
 never `jerry-cli`'s own.
+
+## 21. `WorktreeCreate` is `Invocability::Allowed`; the agent spawn is the host's reaction, not the
+Command's
+
+**Status:** Accepted (2026-09-22, issue #502; decision Q17 of the UI-optional plan).
+
+**Context:** Every Command so far (§18, §20) is `Denied` to agents because git already gives an
+agent an equivalent (a merge, a rebase). Worktree creation is the first genuine exception: git
+gives an agent `git worktree add`, but nothing that also tells Jerry to supervise the result or
+start a second agent in it - the thing an agent actually needs is the *supervision*, not the
+worktree. This issue is also the first time anything reaches for the `jerry` CLI's own existence
+from inside an agent's environment at all, which only matters once an agent can act on it.
+
+**Decision:** `WorktreeCreate { branch, from, agent: Option<AgentSpec>, prompt }` is a
+`Locality::Git`, `Invocability::Allowed` Command in `jerry-core`. `AgentSpec` (`Claude`/`Codex`/
+`Cursor`, kebab-case on the wire) is an independent mirror of `jerry_app::work_surface::
+agents::AgentKind`'s three kinds - jerry-core cannot depend on jerry-app (§1) - reunited by an
+exhaustive `From<AgentSpec> for AgentKind` at the one dispatch boundary that needs it
+(`work_surface::worktree_created`). `execute` places the new worktree as a sibling of the main
+checkout, under `<main-dir-name>-worktrees/<branch, sanitized>` (never nested inside the main
+worktree, which would show up there as an untracked directory in `git status`), through the
+existing `jerry_git::add_worktree`, and reports `{ path }` only - never the agent, never the
+prompt, which is `execute`'s whole point: the Command's own job ends at "the worktree now exists".
+Preflight (`validate`) is deliberately narrower than the rest of the codebase's "collisions
+surface as git's own error" convention (`jerry_git::checkout::create_branch_at`'s own docs): since
+the target path is *this crate's own* deterministic function of `branch`, a real, cheap,
+non-mutating existence check catches a same-branch retry before git ever runs, with a specific
+`worktree-path-exists` code rather than a generic one. A colliding *branch name* (someone else's
+worktree, not ours) still surfaces as git's own error, unchanged.
+
+The spawn is `jerry-host`'s reaction to the outcome, not the Command's: `dispatch.rs` publishes
+`event/worktree-created` (`{ path, agent, prompt, requested_by }`, `agent: null` for a plain
+creation too) on the existing fanout after any successful `command/worktree-create`, mirroring
+exactly how `event/hook` is already produced there. `jerry-app` subscribes once, in
+`AdeApp::adopt_host` (a `Task` owned by `HostRuntime`, cancelled on drop - the channel-woken shape
+§16 asks for, no timer): on the notification it refreshes the owning repository's worktree list
+and calls the same `select_worktree_by_path` a rail click calls, then - when `agent` was given -
+spawns it via `Agents::spawn`/the new `Agents::spawn_with_prompt` (a prompt becomes the CLI's own
+leading positional argument, `claude`'s/`codex`'s real "start with this message" convention).
+
+`jerry agents [--json]` is `AgentsQuery {}`, `Locality::Session`: local dispatch (`execute_locally`)
+answers `NeedsHost` for it exactly like every other Session-locality request always has, and
+`AgentsQuery::run` itself is an honest, never-actually-reached `Error` rather than a fake answer -
+the real host special-cases `Request::Query(AppQuery::Agents(_))` in `dispatch.rs`, answering
+directly from `AgentTable::list()` (extended from a bare `PathBuf` to `{ worktree, kind }`; `kind`
+is whatever label the registering caller passes - `jerry-app`'s own `AgentKind::label()`, e.g.
+`"Claude"` - never interpreted by `jerry-host`). `jerry wt new <branch> [--from <ref>] [--agent
+<kind>] [prompt]` dispatches `WorktreeCreate`, printing the created path either way; standalone
+with `--agent` still creates the worktree (Git-locality never needs a host) but warns on stderr
+and exits `NO_INSTANCE` (4), since nothing is listening to spawn the agent it asked for.
+
+Every agent this app spawns gets the directory holding its own `jerry` binary
+(`jerry_core::jerry_binary::locate()`, sibling-of-self or `bin/` next to it - never a `PATH`
+fallback, so this never reports a stranger's unrelated `jerry`) prepended to `PATH`
+(`work_surface::agents::with_jerry_on_path`, the one place `ProcessKind::spec` builds an agent's
+environment) - a `locate()` miss logs a warning and spawns anyway, never blocks. The `jerry` skill
+(`crates/jerry-cli/skill/SKILL.md`, `include_str!`'d by both `jerry-cli` itself, for `jerry skill`,
+and `jerry-app`'s `hooks/settings_file.rs` by file-system-relative path - never a crate dependency
+edge, `jerry-cli` stays a leaf) is written as a minimal Claude Code plugin
+(`.claude-plugin/plugin.json` + `SKILL.md` at its root - verified against a real `claude --help`
+and <https://code.claude.com/docs/en/plugins.md>) into the same per-launch directory
+`HookFiles::write_in` already owns, and passed as `claude --plugin-dir <dir>` alongside
+`--settings`. `codex`/`cursor-agent` get PATH injection (kind-independent) but no skill injection:
+neither binary's own `--help` on this machine documents a per-launch, no-user-setup equivalent to
+`--plugin-dir`, and this issue does not guess one.
+
+**Consequences:** `AgentTable::register`'s signature grew a third parameter (`kind: String`),
+updating every call site in `jerry-app`, `jerry-host`, and `jerry-cli`'s own tests. The worktree
+placement convention here (sibling, `<name>-worktrees/`) is this issue's own choice, not a
+pre-existing one - `rail::repo::Repo::path`'s doc comment mentions a `~/.jerry/wt/<name>` layout
+"per the revision doc", but no such document or convention exists yet anywhere in this codebase;
+reconciling the two is left to whichever future issue actually introduces that layout. The
+`#[gpui::test]` proving a real notification really causes a real second agent to spawn
+(`work_surface::worktree_created::tests`) uses the in-process host, and the `external`-tier test
+proving a real, autonomous `claude` really reaches for `jerry wt new --agent claude` on its own
+uses a real threaded socket host with a plain `claude -p` subprocess
+(`hooks::integration_tests::a_real_claude_session_uses_jerry_wt_new_and_the_real_host_hears_about_it`)
+- never combined in one test, the same real-socket-or-in-process-consumer split §19's own
+consequences section already documents for hooks.

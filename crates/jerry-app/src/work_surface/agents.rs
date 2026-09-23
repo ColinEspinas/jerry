@@ -140,6 +140,7 @@ impl ProcessKind {
             ProcessKind::Shell => TerminalSpec::shell(cwd, shell_override),
             ProcessKind::Agent(agent) => {
                 let (args, env) = extras.unwrap_or_default();
+                let env = with_jerry_on_path(env, jerry_core::jerry_binary::locate);
                 TerminalSpec::command_with_env(agent.binary_name(), args, cwd, env)
             }
         }
@@ -181,9 +182,73 @@ fn hook_extras_for(
     }
 }
 
+/// Prepends the directory holding the `jerry` binary to `env`'s `PATH`, so every spawned agent
+/// can find `jerry` with no injected flag - the one thing an agent needs to know the CLI exists
+/// at all (`docs/architecture/decisions.md` §21). `locate` is injected so a test can supply a
+/// fake sibling directory without a real binary on disk; production passes
+/// [`jerry_core::jerry_binary::locate`]. A `locate` miss logs a warning and leaves `env`
+/// untouched - PATH injection is a convenience, never something that may block a spawn.
+fn with_jerry_on_path(
+    mut env: Vec<(String, String)>,
+    locate: impl FnOnce() -> Option<PathBuf>,
+) -> Vec<(String, String)> {
+    let Some(jerry_binary) = locate() else {
+        log::warn!(
+            "jerry-app: could not locate the jerry binary; a spawned agent's PATH will not \
+             include it"
+        );
+        return env;
+    };
+    let Some(dir) = jerry_binary.parent() else {
+        return env;
+    };
+    match prepend_dir_to_path(dir, std::env::var_os("PATH").as_deref()) {
+        Ok(joined) => match joined.to_str() {
+            Some(joined) => env.push(("PATH".to_owned(), joined.to_owned())),
+            None => log::warn!(
+                "jerry-app: the PATH with {} prepended is not valid UTF-8; leaving this spawn's \
+                 PATH unset",
+                dir.display()
+            ),
+        },
+        Err(error) => {
+            log::warn!("jerry-app: could not build a PATH for a spawned agent: {error}")
+        }
+    }
+    env
+}
+
+/// `dir`, then every entry of `existing` (Windows joins with `;`, Unix with `:` -
+/// [`std::env::join_paths`] picks the right one for this platform).
+fn prepend_dir_to_path(
+    dir: &Path,
+    existing: Option<&std::ffi::OsStr>,
+) -> Result<std::ffi::OsString, std::env::JoinPathsError> {
+    let mut entries = vec![dir.to_path_buf()];
+    if let Some(existing) = existing {
+        entries.extend(std::env::split_paths(existing));
+    }
+    std::env::join_paths(entries)
+}
+
 impl From<AgentKind> for ProcessKind {
     fn from(agent: AgentKind) -> Self {
         ProcessKind::Agent(agent)
+    }
+}
+
+/// The dispatch-boundary conversion `docs/architecture/decisions.md` §21 calls for:
+/// `jerry_core::AgentSpec` is jerry-core's own independent mirror of these three kinds (jerry-core
+/// cannot depend on jerry-app), reunited here into a real [`AgentKind`] wherever the app acts on
+/// an `event/worktree-created` notification's `agent` field. Exhaustive, so a third kind added to
+/// either enum without the other is a compile error, not a silently wrong spawn.
+impl From<jerry_core::AgentSpec> for AgentKind {
+    fn from(spec: jerry_core::AgentSpec) -> Self {
+        match spec {
+            jerry_core::AgentSpec::Claude => AgentKind::Claude,
+            jerry_core::AgentSpec::Codex => AgentKind::Codex,
+            jerry_core::AgentSpec::Cursor => AgentKind::Cursor,
+        }
     }
 }
 
@@ -249,8 +314,12 @@ impl Agents {
     /// Hands the host every agent already open and every one spawned from now on.
     pub fn attach_host(&mut self, table: jerry_host::AgentTable) {
         for agent in &self.agents {
-            if agent.kind.is_agent_session() {
-                table.register(host_agent_id(agent.id), agent.cwd.clone());
+            if let ProcessKind::Agent(kind) = agent.kind {
+                table.register(
+                    host_agent_id(agent.id),
+                    agent.cwd.clone(),
+                    kind.label().to_owned(),
+                );
             }
         }
         self.host_agents = Some(table);
@@ -389,6 +458,35 @@ impl Agents {
         id
     }
 
+    /// [`Self::spawn`], but with `prompt` as the agent CLI's own leading positional argument -
+    /// `claude`/`codex`'s real "start with this initial message" convention, the same one a
+    /// human types at the end of the command line. For `event/worktree-created`'s own agent
+    /// spawn (`docs/architecture/decisions.md` §21), where the prompt travels on the wire rather
+    /// than being typed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_prompt(
+        &mut self,
+        agent_kind: AgentKind,
+        cwd: PathBuf,
+        terminal_font_size_px: f32,
+        shell_override: Option<&str>,
+        hooks: Option<&crate::hooks::HookInjection>,
+        prompt: String,
+        window: &mut Window,
+        cx: &mut Context<AdeApp>,
+    ) -> AgentId {
+        self.spawn_inner(
+            ProcessKind::Agent(agent_kind),
+            cwd,
+            terminal_font_size_px,
+            shell_override,
+            hooks,
+            vec![prompt],
+            window,
+            cx,
+        )
+    }
+
     /// Records the conversation id a pane is attached to, for a kind that cannot learn one from
     /// hooks - see [`Agent::session_id`]. A no-op for an id that isn't open.
     pub fn set_session_id(&mut self, id: AgentId, session_id: String) {
@@ -427,8 +525,12 @@ impl Agents {
         let id = self.next_id;
         self.next_id += 1;
         if let Some(table) = &self.host_agents {
-            if kind.is_agent_session() {
-                table.register(host_agent_id(id), cwd.clone());
+            if let ProcessKind::Agent(agent_kind) = kind {
+                table.register(
+                    host_agent_id(id),
+                    cwd.clone(),
+                    agent_kind.label().to_owned(),
+                );
             }
         }
 
@@ -850,9 +952,17 @@ mod tests {
         let spec = ProcessKind::claude().spec(PathBuf::from("/tmp"), None, extras);
         assert_eq!(spec.program, PathBuf::from("claude"));
         assert_eq!(spec.args, vec!["--settings", "/tmp/jerry.json"]);
+        assert!(spec
+            .env
+            .contains(&("JERRY_HOST_SOCKET".to_owned(), "/tmp/jerry.sock".to_owned())));
+        // Every real agent spawn also gets `jerry`'s own directory prepended to PATH (this test
+        // binary really does have one, via the `jerry` bin target's `CARGO_BIN_EXE_jerry` sibling
+        // - see `with_jerry_on_path`'s own tests for the injectable, deterministic form of this).
         assert_eq!(
-            spec.env,
-            vec![("JERRY_HOST_SOCKET".to_owned(), "/tmp/jerry.sock".to_owned())]
+            spec.env.iter().filter(|(key, _)| key == "PATH").count(),
+            1,
+            "{:?}",
+            spec.env
         );
     }
 
@@ -871,6 +981,10 @@ mod tests {
         assert!(
             claude_args.iter().any(|arg| arg == "--settings"),
             "claude keeps its --settings flag: {claude_args:?}"
+        );
+        assert!(
+            claude_args.iter().any(|arg| arg == "--plugin-dir"),
+            "claude also gets the jerry skill plugin: {claude_args:?}"
         );
         assert!(claude_env.iter().any(|(key, _)| key == "JERRY_HOST_SOCKET"));
         assert!(claude_env.iter().any(|(key, _)| key == "JERRY_AGENT_ID"));
@@ -894,6 +1008,57 @@ mod tests {
     }
 
     #[test]
+    fn a_located_jerry_binarys_directory_is_prepended_to_the_spawned_agents_path() {
+        let dir = if cfg!(windows) {
+            PathBuf::from(r"C:\jerry-bin")
+        } else {
+            PathBuf::from("/opt/jerry-bin")
+        };
+        let jerry_binary = dir.join(if cfg!(windows) { "jerry.exe" } else { "jerry" });
+        let env = with_jerry_on_path(Vec::new(), || Some(jerry_binary.clone()));
+        let path = env
+            .iter()
+            .find(|(key, _)| key == "PATH")
+            .map(|(_, value)| value.clone())
+            .expect("a PATH entry was added");
+        let first_entry = std::env::split_paths(&path)
+            .next()
+            .expect("at least one entry");
+        assert_eq!(first_entry, dir, "{path}");
+    }
+
+    #[test]
+    fn a_located_jerry_binary_is_prepended_ahead_of_the_rest_of_the_inherited_path() {
+        let dir = PathBuf::from("jerry-bin-dir");
+        let joined =
+            prepend_dir_to_path(&dir, Some(std::ffi::OsStr::new("existing-dir"))).expect("joins");
+        let entries: Vec<_> = std::env::split_paths(&joined).collect();
+        assert_eq!(entries, vec![dir, PathBuf::from("existing-dir")]);
+    }
+
+    #[test]
+    fn a_locate_miss_leaves_the_env_untouched_rather_than_blocking_the_spawn() {
+        let env = with_jerry_on_path(vec![("EXISTING".to_owned(), "1".to_owned())], || None);
+        assert_eq!(env, vec![("EXISTING".to_owned(), "1".to_owned())]);
+    }
+
+    #[test]
+    fn every_agent_spec_converts_to_its_matching_agent_kind() {
+        assert_eq!(
+            AgentKind::from(jerry_core::AgentSpec::Claude),
+            AgentKind::Claude
+        );
+        assert_eq!(
+            AgentKind::from(jerry_core::AgentSpec::Codex),
+            AgentKind::Codex
+        );
+        assert_eq!(
+            AgentKind::from(jerry_core::AgentSpec::Cursor),
+            AgentKind::Cursor
+        );
+    }
+
+    #[test]
     fn the_settings_path_search_and_the_real_spawn_read_the_same_binary_name() {
         for agent in [AgentKind::Claude, AgentKind::Codex, AgentKind::Cursor] {
             let spec = ProcessKind::Agent(agent).spec(PathBuf::from("/tmp"), None, None);
@@ -906,9 +1071,13 @@ mod tests {
                 spec.args.is_empty(),
                 "{agent:?} with no hook injection is spawned bare, exactly as before issue #239"
             );
+            // PATH injection (`with_jerry_on_path`) is independent of hook injection - it is
+            // the one thing every real agent spawn gets regardless - so `env` may legitimately
+            // carry a `PATH` entry here and nothing else.
             assert!(
-                spec.env.is_empty(),
-                "{agent:?} with no hook injection gets no extra environment either"
+                spec.env.iter().all(|(key, _)| key == "PATH"),
+                "{agent:?} with no hook injection gets no extra environment beyond PATH: {:?}",
+                spec.env
             );
         }
         // `shell_override` reaches only the shell arm - an agent CLI is spawned directly, never

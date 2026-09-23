@@ -29,6 +29,10 @@ pub struct HostRuntime {
     instance: Instance,
     /// Common git dirs published so far; republished as a whole when one is added.
     repos: Vec<PathBuf>,
+    /// `crate::work_surface::worktree_created::spawn_consumer`'s task, started once by
+    /// `AdeApp::adopt_host` - held here (rather than detached) so it is cancelled, not orphaned,
+    /// when this runtime drops (§16, CLAUDE.md's entity-lifecycle rule). `None` until adoption.
+    worktree_created_consumer: Option<Task<()>>,
 }
 
 impl HostRuntime {
@@ -46,6 +50,7 @@ impl HostRuntime {
             registry_dir,
             instance,
             repos: Vec::new(),
+            worktree_created_consumer: None,
         };
         Ok((runtime, dispatch))
     }
@@ -69,6 +74,7 @@ impl HostRuntime {
                 descriptor: PathBuf::new(),
             },
             repos: Vec::new(),
+            worktree_created_consumer: None,
         }
     }
 
@@ -104,6 +110,18 @@ impl HostRuntime {
 
     pub fn socket(&self) -> &Path {
         &self.instance.socket
+    }
+
+    /// Installs the `event/worktree-created` consumer task, replacing (and so cancelling) any
+    /// earlier one - the caller runs this at most once per runtime in practice, but it stays
+    /// correct even if that ever changes.
+    pub(crate) fn set_worktree_created_consumer(&mut self, task: Task<()>) {
+        self.worktree_created_consumer = Some(task);
+    }
+
+    /// Whether the consumer above is already running - `Self::dispatch`'s own lazy-start check.
+    pub(crate) fn worktree_created_consumer_is_running(&self) -> bool {
+        self.worktree_created_consumer.is_some()
     }
 }
 
@@ -171,9 +189,26 @@ impl AdeApp {
 
     /// Installs a started runtime, hands the host every agent already open, and publishes
     /// every repository open right now, including any added while the host was starting.
-    pub(crate) fn adopt_host(&mut self, runtime: HostRuntime, cx: &mut Context<Self>) {
+    pub(crate) fn adopt_host(&mut self, mut runtime: HostRuntime, cx: &mut Context<Self>) {
         if let Some(agents) = runtime.agents() {
             self.agents.attach_host(agents);
+        }
+        // A published host's socket is already listening by this point (`HostRuntime::start`),
+        // so a real agent could connect and dispatch `WorktreeCreate` at any moment - the
+        // consumer starts right here, eagerly, or a real notification could arrive before
+        // anything subscribes. An unpublished (test-only) host has no socket at all, so nothing
+        // outside `Self::dispatch` can ever reach it; starting the consumer there instead, lazily
+        // on first dispatch, mirrors `HostRuntime::pending_dispatch`'s own reasoning exactly - a
+        // test app that never dispatches carries no extra pending future, which the deterministic
+        // test scheduler's interleaving is sensitive to (see
+        // `sidebar::render::virtualization_tests::
+        // file_tree_row_and_header_actions_clear_the_real_scrollbar`, which a second such future
+        // broke).
+        if runtime.is_published() {
+            if let Some(client) = runtime.client() {
+                let task = crate::work_surface::worktree_created::spawn_consumer(client, cx);
+                runtime.set_worktree_created_consumer(task);
+            }
         }
         self.host_runtime = Some(runtime);
         let repo_paths: Vec<PathBuf> = self.repos.iter().map(|repo| repo.path.clone()).collect();
@@ -245,6 +280,19 @@ impl AdeApp {
                 "the session host is not running in this instance",
             )));
         };
+        // The lazy half of `Self::adopt_host`'s eager-for-published/lazy-for-test split: an
+        // unpublished host's consumer starts here, on this first real dispatch, rather than at
+        // adoption - see that method's own docs for why.
+        let already_running = self
+            .host_runtime
+            .as_ref()
+            .is_some_and(HostRuntime::worktree_created_consumer_is_running);
+        if !already_running {
+            let task = crate::work_surface::worktree_created::spawn_consumer(client.clone(), cx);
+            if let Some(runtime) = self.host_runtime.as_mut() {
+                runtime.set_worktree_created_consumer(task);
+            }
+        }
         cx.spawn(async move |_this, _cx| client.request(Call::human(cwd, request)).await)
     }
 }

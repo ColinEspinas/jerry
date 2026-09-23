@@ -136,6 +136,7 @@ fn jerry_hook_reaches_a_real_host_over_a_real_socket_and_the_notification_can_be
     host.agents().register(
         jerry_core::AgentId::from(agent_id.to_string()),
         repo.path().to_path_buf(),
+        "Claude".into(),
     );
     let mut events = host.client().subscribe();
 
@@ -210,6 +211,7 @@ async fn a_hook_dispatched_through_the_apps_own_host_reaches_its_hook_runtimes_c
             agents.register(
                 jerry_core::AgentId::from(agent_id.to_string()),
                 repo.path().to_path_buf(),
+                "Claude".into(),
             );
         }
         app.adopt_host(runtime, cx);
@@ -446,6 +448,7 @@ fn a_real_claude_session_reports_its_hooks_to_a_real_jerry_host() {
     host.agents().register(
         jerry_core::AgentId::from(agent_id.to_string()),
         project.clone(),
+        "Claude".into(),
     );
     let mut events = host.client().subscribe();
 
@@ -550,6 +553,7 @@ fn jerry_s_settings_file_does_not_disable_the_user_s_own_hooks() {
     host.agents().register(
         jerry_core::AgentId::from(agent_id.to_string()),
         project.clone(),
+        "Claude".into(),
     );
     let mut events = host.client().subscribe();
     let args = vec![
@@ -751,4 +755,157 @@ async fn a_claude_agent_spawned_through_the_real_app_path_really_reports_its_hoo
 
     app.update_in(cx, |app, window, cx| app.close_agent(id, window, cx));
     cx.run_until_parked();
+}
+
+/// Issue #502's definition of done: a real, autonomous `claude` session, told nothing but a
+/// prompt, uses `jerry wt new --agent claude` on its own and a real `event/worktree-created`
+/// notification (`agent: "claude"`) reaches the host over a real socket - the same real transport
+/// [`a_real_claude_session_reports_its_hooks_to_a_real_jerry_host`] proves for hooks. That a real
+/// `AdeApp` really spawns a second agent in reaction to this exact notification is proven
+/// separately, in `crate::work_surface::worktree_created::tests` (the in-process host, matching
+/// this file's own documented "real socket, or the app's consumer - never both in the same test"
+/// split, decisions.md §19); this test's own job is only the first half - that a real agent
+/// really reaches for `jerry wt new` and the real host really hears about it.
+#[ignore = "external: claude, jerry; see docs/testing.md"]
+#[test]
+fn a_real_claude_session_uses_jerry_wt_new_and_the_real_host_hears_about_it() {
+    let Some(claude) = real_claude() else {
+        skip_or_fail(
+            "no `claude` binary on PATH - the worktree-create transport itself is still covered \
+             by jerry-core's and jerry-host's own test suites",
+        );
+        return;
+    };
+    let Some(jerry) = real_jerry_binary() else {
+        skip_or_fail(
+            "no `jerry` binary reachable - cannot generate a real, runnable settings file",
+        );
+        return;
+    };
+
+    let repo = test_support::seed_repo();
+    let socket = socket_path("wt-new-agent");
+    let host = jerry_host::Host::start().expect("host");
+    host.listen(&socket.path).expect("listen");
+    let agent_id = 13u64;
+    host.agents().register(
+        jerry_core::AgentId::from(agent_id.to_string()),
+        repo.path().to_path_buf(),
+        "Claude".into(),
+    );
+    let mut events = host.client().subscribe();
+
+    let settings_temp = tempfile::tempdir().expect("temp dir");
+    let files = crate::hooks::settings_file::HookFiles::write_in(settings_temp.path(), &jerry)
+        .expect("files must write");
+    let jerry_dir = jerry.parent().expect("jerry has a parent directory");
+    let path_with_jerry = std::env::join_paths(
+        std::iter::once(jerry_dir.to_path_buf()).chain(
+            std::env::var_os("PATH")
+                .as_deref()
+                .map(std::env::split_paths)
+                .into_iter()
+                .flatten(),
+        ),
+    )
+    .expect("PATH joins");
+    // No `--dangerously-skip-permissions`, unlike a full permission-bypassed agent: `--allowedTools`
+    // alone is what every other real-`claude` test in this file relies on. Not verified here that
+    // headless `-p` mode honors it without also skipping permissions outright - if this test is
+    // ever actually run and stalls on a permission prompt instead of completing, that is the first
+    // thing to check.
+    let args = vec![
+        "--settings".to_owned(),
+        files.settings_path().to_string_lossy().into_owned(),
+        "--plugin-dir".to_owned(),
+        files.plugin_dir().to_string_lossy().into_owned(),
+        "--allowedTools".to_owned(),
+        "Bash(jerry:*)".to_owned(),
+    ];
+    let env = vec![
+        (AGENT_ENV.to_owned(), agent_id.to_string()),
+        (
+            SOCKET_ENV.to_owned(),
+            socket.path.to_string_lossy().into_owned(),
+        ),
+        (
+            "PATH".to_owned(),
+            path_with_jerry.to_string_lossy().into_owned(),
+        ),
+    ];
+
+    if !run_real_claude_with_prompt(
+        &claude,
+        repo.path(),
+        &args,
+        &env,
+        "Run this exact shell command and nothing else: jerry wt new wt-new-agent-e2e --agent claude",
+    ) {
+        return;
+    }
+
+    let mut last = None;
+    assert!(
+        test_support::wait_until(Duration::from_secs(15), || {
+            while let Ok(message) = events.try_recv() {
+                if let jerry_core::Message::Notification { method, .. } = &message {
+                    if method == "event/worktree-created" {
+                        last = Some(message);
+                    }
+                }
+            }
+            last.is_some()
+        }),
+        "a real claude session told to run `jerry wt new --agent claude` must produce a real \
+         event/worktree-created notification"
+    );
+    match last.expect("received") {
+        jerry_core::Message::Notification { params, .. } => {
+            assert_eq!(params["agent"], serde_json::json!("claude"));
+            let path = params["path"].as_str().expect("path");
+            assert!(Path::new(path).is_dir(), "{path}");
+            let _ = std::fs::remove_dir_all(Path::new(path).parent().expect("parent"));
+        }
+        other => panic!("expected a notification, got {other:?}"),
+    }
+    host.shutdown_and_join();
+}
+
+/// [`run_real_claude`], with an explicit `prompt` rather than the fixed "reply with the single
+/// word ok" - for a test that needs `claude` to actually take an action, not just answer.
+fn run_real_claude_with_prompt(
+    binary: &Path,
+    cwd: &Path,
+    args: &[String],
+    env: &[(String, String)],
+    prompt: &str,
+) -> bool {
+    let mut command = std::process::Command::new(binary);
+    command
+        .args(args)
+        .arg("-p")
+        .arg(prompt)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    match command.output() {
+        Ok(output) => {
+            if !output.status.success() {
+                skip_or_fail(&format!(
+                    "the installed `claude` could not complete a turn here ({:?}): {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+            output.status.success()
+        }
+        Err(err) => {
+            skip_or_fail(&format!("could not run `claude` ({err})"));
+            false
+        }
+    }
 }

@@ -46,15 +46,24 @@ pub enum HostError {
     AlreadyListening { path: PathBuf },
 }
 
-/// The agents this host spawned, by the identity it injected as `JERRY_AGENT_ID`, and the
-/// worktree each is confined to. Shared by the app, which registers and forgets, and the
-/// dispatcher, which classifies callers against it.
+/// One agent this host is tracking: the worktree it's confined to, and which CLI it runs -
+/// `kind` is a free-form label (`jerry-app`'s own `AgentKind::label()`, e.g. `"Claude"`), never
+/// interpreted here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRecord {
+    pub worktree: PathBuf,
+    pub kind: String,
+}
+
+/// The agents this host spawned, by the identity it injected as `JERRY_AGENT_ID`. Shared by the
+/// app, which registers and forgets, and the dispatcher, which classifies callers against it and
+/// answers `AgentsQuery` from it.
 #[derive(Clone, Default)]
-pub struct AgentTable(Arc<Mutex<HashMap<AgentId, PathBuf>>>);
+pub struct AgentTable(Arc<Mutex<HashMap<AgentId, AgentRecord>>>);
 
 impl AgentTable {
-    pub fn register(&self, id: AgentId, worktree: PathBuf) {
-        lock(&self.0).insert(id, worktree);
+    pub fn register(&self, id: AgentId, worktree: PathBuf, kind: String) {
+        lock(&self.0).insert(id, AgentRecord { worktree, kind });
     }
 
     pub fn forget(&self, id: &AgentId) {
@@ -62,7 +71,7 @@ impl AgentTable {
     }
 
     pub fn worktree_of(&self, id: &AgentId) -> Option<PathBuf> {
-        lock(&self.0).get(id).cloned()
+        lock(&self.0).get(id).map(|record| record.worktree.clone())
     }
 
     pub fn len(&self) -> usize {
@@ -71,6 +80,15 @@ impl AgentTable {
 
     pub fn is_empty(&self) -> bool {
         lock(&self.0).is_empty()
+    }
+
+    /// Every agent this host is tracking right now, for `AgentsQuery` - the dispatcher's own
+    /// answer for a request `execute_locally` can never resolve on its own (§15).
+    pub fn list(&self) -> Vec<(AgentId, AgentRecord)> {
+        lock(&self.0)
+            .iter()
+            .map(|(id, record)| (id.clone(), record.clone()))
+            .collect()
     }
 }
 
@@ -311,10 +329,12 @@ mod host_dispatch_tests {
     use futures::executor::block_on;
     use jerry_core::request::HookEvent;
     use jerry_core::wire::rpc_code;
-    use jerry_core::{AgentId, AppQuery, Call, Message, Report, Request};
+    use jerry_core::{
+        AgentId, AppCommand, AppQuery, Call, Message, Report, Request, WorktreeCreate,
+    };
     use std::path::Path;
     use std::time::Duration;
-    use test_support::{seed_empty_repo, wait_until};
+    use test_support::{seed_empty_repo, seed_repo, wait_until};
 
     fn status() -> Request {
         Request::Query(AppQuery::Status(Default::default()))
@@ -358,7 +378,7 @@ mod host_dispatch_tests {
         assert_eq!(unknown.code, rpc_code::FORBIDDEN);
 
         host.agents()
-            .register(id.clone(), repo.path().to_path_buf());
+            .register(id.clone(), repo.path().to_path_buf(), "Claude".into());
         let report = block_on(client.request(Call::agent(repo.path(), id.clone(), status())))
             .expect("registered");
         assert!(report.is_ok(), "{report:?}");
@@ -382,7 +402,7 @@ mod host_dispatch_tests {
         let client = host.client();
         let id = AgentId::from("agent-2");
         host.agents()
-            .register(id.clone(), repo.path().to_path_buf());
+            .register(id.clone(), repo.path().to_path_buf(), "Claude".into());
         let mut events = client.subscribe();
 
         let hook = Request::Hook(HookEvent {
@@ -420,6 +440,120 @@ mod host_dispatch_tests {
         )))
         .expect_err("a hook without an agent identity is refused");
         assert_eq!(anonymous.code, rpc_code::FORBIDDEN);
+        host.shutdown_and_join();
+    }
+
+    #[test]
+    fn a_successful_worktree_create_publishes_one_worktree_created_notification() {
+        let repo = seed_repo();
+        let host = Host::start().expect("host");
+        let client = host.client();
+        let mut events = client.subscribe();
+
+        let create = Request::Command(AppCommand::WorktreeCreate(WorktreeCreate {
+            branch: "feature-notify".into(),
+            from: None,
+            agent: Some(jerry_core::AgentSpec::Claude),
+            prompt: Some("do the thing".into()),
+        }));
+        let report =
+            block_on(client.request(Call::human(repo.path(), create))).expect("dispatched");
+        assert!(report.is_ok(), "{report:?}");
+        let path = outcome_path(&report, "path");
+
+        let mut received = None;
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                received = events.try_recv().ok();
+                received.is_some()
+            }),
+            "one notification arrives"
+        );
+        match received.expect("received") {
+            Message::Notification { method, params } => {
+                assert_eq!(method, "event/worktree-created");
+                assert_eq!(params["path"], serde_json::json!(path));
+                assert_eq!(params["agent"], serde_json::json!("claude"));
+                assert_eq!(params["prompt"], serde_json::json!("do the thing"));
+                assert_eq!(
+                    params["requested_by"],
+                    serde_json::json!({ "kind": "human" })
+                );
+            }
+            other => panic!("expected a notification, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(Path::new(&path).parent().expect("parent"));
+        host.shutdown_and_join();
+    }
+
+    #[test]
+    fn a_refused_worktree_create_publishes_no_notification() {
+        let repo = seed_repo();
+        let host = Host::start().expect("host");
+        let client = host.client();
+        let mut events = client.subscribe();
+
+        // Same branch twice: the second call is denied (`worktree-path-exists`) before it ever
+        // touches git, and must publish nothing.
+        let create = || {
+            Request::Command(AppCommand::WorktreeCreate(WorktreeCreate {
+                branch: "feature-dupe".into(),
+                from: None,
+                agent: None,
+                prompt: None,
+            }))
+        };
+        let first = block_on(client.request(Call::human(repo.path(), create()))).expect("first");
+        let path = outcome_path(&first, "path");
+        assert!(wait_until(Duration::from_secs(5), || events
+            .try_recv()
+            .is_ok()));
+
+        let second =
+            block_on(client.request(Call::human(repo.path(), create()))).expect("dispatched");
+        assert!(
+            matches!(second, Report::Denied { ref code, .. } if code == "worktree-path-exists")
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "a denied command must publish nothing"
+        );
+
+        let _ = std::fs::remove_dir_all(Path::new(&path).parent().expect("parent"));
+        host.shutdown_and_join();
+    }
+
+    #[test]
+    fn agents_query_answers_from_this_hosts_own_table() {
+        let repo = seed_empty_repo();
+        let host = Host::start().expect("host");
+        let client = host.client();
+
+        let empty = block_on(client.request(Call::human(
+            repo.path(),
+            Request::Query(AppQuery::Agents(Default::default())),
+        )))
+        .expect("empty table answers");
+        assert_eq!(
+            empty,
+            Report::Ok {
+                outcome: serde_json::json!([])
+            }
+        );
+
+        let id = AgentId::from("agent-3");
+        host.agents()
+            .register(id.clone(), repo.path().to_path_buf(), "Claude".into());
+        let populated = block_on(client.request(Call::human(
+            repo.path(),
+            Request::Query(AppQuery::Agents(Default::default())),
+        )))
+        .expect("populated table answers");
+        let Report::Ok { outcome } = populated else {
+            panic!("expected ok, got {populated:?}")
+        };
+        assert_eq!(outcome[0]["id"], serde_json::json!("agent-3"));
+        assert_eq!(outcome[0]["kind"], serde_json::json!("Claude"));
         host.shutdown_and_join();
     }
 

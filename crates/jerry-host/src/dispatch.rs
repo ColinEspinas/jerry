@@ -10,8 +10,8 @@
 use crate::Inner;
 use jerry_core::wire::rpc_code;
 use jerry_core::{
-    execute_locally, permits, Call, Caller, Ctx, LocalDispatchError, Message, Report, Request,
-    RpcError,
+    execute_locally, permits, AppCommand, AppQuery, Call, Caller, Ctx, LocalDispatchError, Message,
+    Report, Request, RpcError,
 };
 use serde_json::Value;
 use std::fs;
@@ -49,13 +49,21 @@ pub(crate) fn handle(inner: &Inner, call: Call) -> Result<Value, RpcError> {
                 outcome: Value::Null,
             })
         }
+        // `Locality::Session`: `execute_locally` can never answer this on its own (§15), so the
+        // one process with a real session table answers directly from it, exactly like `Hook`
+        // above.
+        Request::Query(AppQuery::Agents(_)) => to_value(Report::ok(&agents_entries(inner))),
         _ => {
+            let requested_by = caller.clone();
             let ctx = match Ctx::from_cwd(&call.cwd, caller) {
                 Ok(ctx) => ctx,
                 Err(error) => return to_value(Report::Error { error }),
             };
             match execute_locally(&call.request, &ctx) {
-                Ok(report) => to_value(report),
+                Ok(report) => {
+                    publish_worktree_created(inner, &call.request, &report, &requested_by);
+                    to_value(report)
+                }
                 Err(LocalDispatchError::Forbidden(method)) => Err(RpcError::new(
                     rpc_code::FORBIDDEN,
                     format!("{method} is not invocable by this caller"),
@@ -67,6 +75,52 @@ pub(crate) fn handle(inner: &Inner, call: Call) -> Result<Value, RpcError> {
             }
         }
     }
+}
+
+/// Every agent this host is tracking, as `AgentsQuery`'s own wire shape.
+fn agents_entries(inner: &Inner) -> Vec<jerry_core::AgentsEntry> {
+    inner
+        .agents()
+        .list()
+        .into_iter()
+        .map(|(id, record)| jerry_core::AgentsEntry {
+            id: id.to_string(),
+            kind: record.kind,
+            worktree: record.worktree,
+        })
+        .collect()
+}
+
+/// After a successful `command/worktree-create`, the agent spawn is the host's own reaction to
+/// the outcome, never the Command's (`docs/architecture/decisions.md` §21): publishes
+/// `event/worktree-created` for `jerry-app`'s subscriber to open the worktree and, when `agent`
+/// was given, spawn it there. Published with `agent: null` for a plain creation too, so the app
+/// opens every worktree it created this way, agent or none. A no-op for anything else, and for a
+/// `Validate` (nothing ran) or a refused/failed `Command`.
+fn publish_worktree_created(
+    inner: &Inner,
+    request: &Request,
+    report: &Report,
+    requested_by: &Caller,
+) {
+    let Request::Command(AppCommand::WorktreeCreate(command)) = request else {
+        return;
+    };
+    let Report::Ok { outcome } = report else {
+        return;
+    };
+    let Some(path) = outcome.get("path").cloned() else {
+        return;
+    };
+    inner.fanout().broadcast(Message::Notification {
+        method: "event/worktree-created".into(),
+        params: serde_json::json!({
+            "path": path,
+            "agent": command.agent,
+            "prompt": command.prompt,
+            "requested_by": requested_by,
+        }),
+    });
 }
 
 /// Env-injected identity makes an `Agent`, and only an identity this host handed out counts.

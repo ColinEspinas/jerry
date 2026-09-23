@@ -315,6 +315,16 @@ pub fn add_worktree(
     check_success(&args, &output)
 }
 
+/// Whether `name` is usable as `git worktree add -b <name>`'s branch (`git check-ref-format
+/// --branch <name>`, the real arbiter for git's own ref-name rules - control characters, `~ ^ :
+/// ? * [ \`, `..`, a leading `-`, empty, `.`/`.lock` - rather than reimplementing them). `false`
+/// for anything git itself would refuse; `Err` only if `git` could not be run at all.
+pub fn is_valid_branch_name(dir: &Path, name: &str) -> Result<bool, Error> {
+    let args: Vec<OsString> = vec!["check-ref-format".into(), "--branch".into(), name.into()];
+    let output = run_git(dir, &args)?;
+    Ok(output.status.success())
+}
+
 /// Removes the worktree at `worktree_path`, refusing a dirty one with [`Error::DirtyWorktree`]
 /// unless `force`.
 ///
@@ -598,6 +608,34 @@ mod tests {
             other => panic!("expected Error::GitCommand, got {other:?}"),
         }
         assert!(!linked_path.exists());
+    }
+
+    #[test]
+    fn is_valid_branch_name_defers_to_gits_own_real_ref_format_rules() {
+        let repo = seed_repo();
+        for name in ["feature/login", "fix-123", "a"] {
+            assert!(
+                is_valid_branch_name(repo.path(), name).expect("git runs"),
+                "{name} must be accepted"
+            );
+        }
+        for name in [
+            r"\Temp\x",
+            r"a\b",
+            "..",
+            ".",
+            "",
+            "-evil",
+            "--evil",
+            "a..b",
+            "a/../../b",
+            "C:evil",
+        ] {
+            assert!(
+                !is_valid_branch_name(repo.path(), name).expect("git runs"),
+                "{name:?} must be refused"
+            );
+        }
     }
 
     #[test]

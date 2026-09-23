@@ -6,12 +6,13 @@ use crate::command::{
     permits, run_command, run_query, validate_command, Command, Invocability, Locality, Query,
 };
 use crate::commands::{
-    AmendHeadMessage, MergeAbort, MergeAttempt, MergeBranchIntoCurrent, MergeComplete, RebaseAbort,
-    RebaseActionWire, RebaseContinue, RebasePlanEntryWire, RebaseSkip, RebaseStart, StageResolved,
+    AgentSpec, AmendHeadMessage, MergeAbort, MergeAttempt, MergeBranchIntoCurrent, MergeComplete,
+    RebaseAbort, RebaseActionWire, RebaseContinue, RebasePlanEntryWire, RebaseSkip, RebaseStart,
+    StageResolved, WorktreeCreate,
 };
 use crate::ctx::Ctx;
 use crate::method::Method;
-use crate::queries::{MergeStatusQuery, RebaseStatusQuery, StatusQuery};
+use crate::queries::{AgentsQuery, MergeStatusQuery, RebaseStatusQuery, StatusQuery};
 use crate::report::Report;
 use crate::wire::{rpc_code, RpcError};
 use serde::{Deserialize, Serialize};
@@ -41,6 +42,7 @@ pub enum AppCommand {
     RebaseSkip(RebaseSkip),
     RebaseAbort(RebaseAbort),
     AmendHeadMessage(AmendHeadMessage),
+    WorktreeCreate(WorktreeCreate),
 }
 
 /// Every Query a client can send.
@@ -50,6 +52,7 @@ pub enum AppQuery {
     Status(StatusQuery),
     MergeStatus(MergeStatusQuery),
     RebaseStatus(RebaseStatusQuery),
+    Agents(AgentsQuery),
 }
 
 /// The kebab-case names of every `AppCommand` variant, for method lookup and tool listing.
@@ -64,10 +67,11 @@ pub const COMMAND_NAMES: &[&str] = &[
     "rebase-skip",
     "rebase-start",
     "stage-resolved",
+    "worktree-create",
 ];
 
 /// The kebab-case names of every `AppQuery` variant.
-pub const QUERY_NAMES: &[&str] = &["merge-status", "rebase-status", "status"];
+pub const QUERY_NAMES: &[&str] = &["agents", "merge-status", "rebase-status", "status"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Request {
@@ -102,6 +106,7 @@ macro_rules! each_command {
             AppCommand::RebaseSkip($c) => $body,
             AppCommand::RebaseAbort($c) => $body,
             AppCommand::AmendHeadMessage($c) => $body,
+            AppCommand::WorktreeCreate($c) => $body,
         }
     };
 }
@@ -119,6 +124,7 @@ impl AppCommand {
             AppCommand::RebaseSkip(_) => RebaseSkip::NAME,
             AppCommand::RebaseAbort(_) => RebaseAbort::NAME,
             AppCommand::AmendHeadMessage(_) => AmendHeadMessage::NAME,
+            AppCommand::WorktreeCreate(_) => WorktreeCreate::NAME,
         }
     }
 
@@ -146,6 +152,7 @@ macro_rules! each_query {
             AppQuery::Status($q) => $body,
             AppQuery::MergeStatus($q) => $body,
             AppQuery::RebaseStatus($q) => $body,
+            AppQuery::Agents($q) => $body,
         }
     };
 }
@@ -156,6 +163,7 @@ impl AppQuery {
             AppQuery::Status(_) => StatusQuery::NAME,
             AppQuery::MergeStatus(_) => MergeStatusQuery::NAME,
             AppQuery::RebaseStatus(_) => RebaseStatusQuery::NAME,
+            AppQuery::Agents(_) => AgentsQuery::NAME,
         }
     }
 
@@ -321,6 +329,19 @@ impl Request {
                 Request::Command(AppCommand::AmendHeadMessage(AmendHeadMessage {
                     message: "a real new message".into(),
                 })),
+            ),
+            (
+                "request-command-worktree-create",
+                Request::Command(AppCommand::WorktreeCreate(WorktreeCreate {
+                    branch: "feature/login".into(),
+                    from: None,
+                    agent: Some(AgentSpec::Claude),
+                    prompt: Some("fix the login bug".into()),
+                })),
+            ),
+            (
+                "request-query-agents",
+                Request::Query(AppQuery::Agents(AgentsQuery::default())),
             ),
         ]
     }

@@ -31,6 +31,12 @@ pub enum Command {
     /// Merge this worktree's branch into the repository's base branch, through Jerry's own
     /// merge flow: conflicts stay on disk for you to resolve, then `--continue` finishes.
     Merge(MergeArgs),
+    /// Create or act on worktrees.
+    Wt(WtArgs),
+    /// List the agents Jerry is currently supervising.
+    Agents,
+    /// Print the `jerry` skill: what these commands do, and when to use them.
+    Skill,
     /// Forwards one agent hook event, read from stdin, to the Jerry that spawned this agent.
     /// Jerry's own generated hook entry, not a stable part of the CLI surface - hidden from
     /// `--help` accordingly.
@@ -64,6 +70,35 @@ pub struct GitEditorArgs {
 pub struct HookArgs {
     /// The agent CLI's own event name, e.g. `PreToolUse`.
     pub event: String,
+}
+
+#[derive(Debug, Args)]
+pub struct WtArgs {
+    #[command(subcommand)]
+    pub action: WtAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WtAction {
+    /// Create a new worktree on a fresh branch, optionally starting an agent in it.
+    New(WtNewArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct WtNewArgs {
+    /// The new branch's name.
+    pub branch: String,
+
+    /// The start point for `branch`; defaults to `HEAD`.
+    #[arg(long, value_name = "REF")]
+    pub from: Option<String>,
+
+    /// Also start this agent CLI in the new worktree: `claude`, `codex`, or `cursor`.
+    #[arg(long, value_name = "KIND")]
+    pub agent: Option<String>,
+
+    /// An initial message for the spawned agent. Only meaningful with `--agent`.
+    pub prompt: Option<String>,
 }
 
 #[derive(Debug, Args)]
