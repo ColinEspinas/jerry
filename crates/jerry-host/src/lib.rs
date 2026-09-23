@@ -279,6 +279,14 @@ impl Host {
     pub fn shutdown(&self) -> ShutdownHandles {
         self.inner.shutting_down.store(true, Ordering::SeqCst);
         lock(&self.inner.jobs).take();
+        // Before the fanout/listener teardown below, and before `lock(&self.dispatcher).take()`
+        // orphans the dispatch loop that would otherwise still be able to answer a `SessionKill`:
+        // a `TerminalPane` dropping no longer kills its own session's real process (§23's Part
+        // B moved that process into this table instead), so nothing else does either unless this
+        // does it here. Real, bounded per-session kills - each session's own relay thread is
+        // still alive to observe and broadcast its `event/session-exited`, which a live fanout
+        // is what lets any local subscriber still see.
+        self.inner.sessions().shutdown_all();
         let accept = lock(&self.listening)
             .as_mut()
             .and_then(listener::Listening::stop);
@@ -592,5 +600,98 @@ mod host_dispatch_tests {
         let err = block_on(client.call(Call::human(repo.path(), status()))).expect_err("down");
         assert_eq!(err.code, rpc_code::SHUTTING_DOWN);
         host.shutdown_and_join();
+    }
+}
+
+/// GitHub issue #530's regression, discovered once every spawn started going through the host
+/// (decisions.md §23's Part B): before that, dropping a `TerminalPane` dropped its `PtySession`,
+/// whose `Drop` killed the child. Now `SessionManager` owns it, so nothing did on host shutdown -
+/// `Host::shutdown`'s own new `sessions().shutdown_all()` call is what closes this.
+#[cfg(test)]
+mod host_shutdown_tests {
+    use super::Host;
+    use std::path::PathBuf;
+    use std::time::Duration;
+    use test_support::wait_until;
+
+    /// A real process that blocks until its stdin closes - genuinely still running by the time
+    /// shutdown reaches it, the same idiom `crate::session::session_manager_tests`'s own
+    /// `shell_options` helper uses for a real, short-lived command.
+    fn blocking_shell_options() -> jerry_pty::SpawnOptions {
+        if cfg!(windows) {
+            jerry_pty::SpawnOptions::new("cmd").args(["/d", "/c", "more"])
+        } else {
+            jerry_pty::SpawnOptions::new("sh").args(["-c", "cat >/dev/null"])
+        }
+    }
+
+    /// `crate::hooks::settings_file::process_is_alive` in `jerry-app`'s exact pair - "does this
+    /// pid still exist", real per platform - copied rather than shared across a crate boundary
+    /// for this one test module. See that function's own docs for why each branch's FFI is sound.
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    fn process_is_alive(pid: u32) -> bool {
+        // SAFETY: `kill` with signal 0 performs only an existence/permission check. It has no
+        // effect on the target process, and takes no pointers, so there is nothing to invalidate.
+        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        if result == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().kind() == std::io::ErrorKind::PermissionDenied
+    }
+
+    /// The Windows twin of the `kill(pid, 0)` check above - see that twin's docs.
+    #[cfg(windows)]
+    #[allow(unsafe_code)]
+    fn process_is_alive(pid: u32) -> bool {
+        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0};
+        use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        // SAFETY: `OpenProcess` takes only scalars and returns a handle (null on failure). It
+        // borrows no memory from this process, so there is nothing for it to invalidate.
+        let handle =
+            unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
+        if handle.is_null() {
+            // `ERROR_INVALID_PARAMETER` is Win32's real "there is no process with that id". Every
+            // other failure is reported as alive, because a wrong "dead" is the only answer here
+            // that would let this test pass without the process really being gone.
+            return std::io::Error::last_os_error().raw_os_error()
+                != Some(ERROR_INVALID_PARAMETER as i32);
+        }
+        // SAFETY: `handle` was just returned by a successful `OpenProcess` and has not been
+        // closed, so it is a valid handle this thread owns. A zero timeout makes this a poll.
+        let state = unsafe { WaitForSingleObject(handle, 0) };
+        // SAFETY: same handle, still owned here, closed exactly once and never used after.
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        state != WAIT_OBJECT_0
+    }
+
+    #[test]
+    fn shutting_down_the_host_kills_and_confirms_dead_every_live_session() {
+        let host = Host::start().expect("host");
+        let (_id, handle) = host
+            .sessions()
+            .spawn(PathBuf::from("/repo"), None, blocking_shell_options())
+            .expect("spawn");
+        let pid = handle
+            .process_id()
+            .expect("a real spawned session has a real pid");
+        assert!(
+            process_is_alive(pid),
+            "sanity check: the freshly spawned process must be alive before shutdown"
+        );
+
+        host.shutdown_and_join();
+
+        assert!(
+            wait_until(Duration::from_secs(5), || !process_is_alive(pid)),
+            "shutting down the host must kill and confirm dead every session it still owns a \
+             real process for, not just tear down the socket/fanout around it"
+        );
     }
 }

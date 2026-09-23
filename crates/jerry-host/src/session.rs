@@ -237,6 +237,32 @@ impl SessionManager {
             .ok_or_else(|| SessionError::NotOwned(id.clone()))
     }
 
+    /// Kills and confirms dead every session this host still owns a real process for - the
+    /// host's own shutdown path. Before this method existed, dropping the last `TerminalPane`
+    /// attached to a session dropped its `PtySession` too, whose `Drop` killed the child; now
+    /// this table (and each session's own relay thread, which holds a clone of the same
+    /// `SessionHandle`) is what actually keeps a `PtySession` alive, so nothing killed a live
+    /// child just because the process that owned its pane quit - GitHub issue #530's own
+    /// regression test caught exactly this once every spawn started going through the host.
+    /// Sequential, one real, bounded `SessionHandle::shutdown` per session (`jerry-pty`'s own
+    /// grace period, never a fresh timeout stacked on top) - a handful of open agents/shells is
+    /// the real, expected case, not hundreds, so parallelizing this would add real complexity for
+    /// no real win.
+    pub fn shutdown_all(&self) {
+        let handles: Vec<Arc<SessionHandle>> = lock(&self.entries)
+            .values()
+            .filter_map(|entry| entry.handle.clone())
+            .collect();
+        for handle in handles {
+            if let Err(err) = handle.shutdown() {
+                log::warn!(
+                    "jerry-host: failed to shut down session {} during host shutdown: {err}",
+                    handle.id()
+                );
+            }
+        }
+    }
+
     /// Every session this host is tracking right now, for `SessionsQuery` - dispatch.rs's own
     /// answer for a request `execute_locally` can never resolve on its own (§15).
     pub fn list(&self) -> Vec<SessionRecord> {

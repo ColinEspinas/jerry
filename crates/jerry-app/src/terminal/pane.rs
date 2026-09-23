@@ -645,6 +645,17 @@ pub struct TerminalPane {
     /// `None` for a session with no real host behind it (a scripted test session) or before one
     /// has ever attached.
     host_client: Option<LocalClient>,
+    /// Test-only: the throwaway `jerry_host::Host` a real-pty test fixture
+    /// (`pty_pane_fixtures::attach_real_session_for_test`) spawned this pane's session through,
+    /// kept alive here rather than dropped at the end of that function. `Host::shutdown` (via
+    /// `Drop`) now kills every session it still owns a real process for
+    /// (`SessionManager::shutdown_all`, GitHub issue #530) - a throwaway host that dropped
+    /// immediately after spawning would kill the session before this pane, or the test driving
+    /// it, ever got to observe its own natural exit. Tying its lifetime to this pane's own -
+    /// exactly like `Self::session` reflects `SessionManager`'s per-pane ownership in
+    /// production - keeps it alive for as long as the pane needs it and no longer.
+    #[cfg(test)]
+    _test_host: Option<jerry_host::Host>,
     spawn_error: Option<String>,
     /// Set by [`Self::take_session_for_teardown`] - this pane's process must not outlive the
     /// worktree teardown that claimed it, even if its own `SessionSpawn` dispatch was still in
@@ -790,6 +801,8 @@ impl TerminalPane {
             grid: TerminalGrid::new(TERMINAL_ROWS, TERMINAL_COLS),
             session: None,
             host_client: None,
+            #[cfg(test)]
+            _test_host: None,
             spawn_error: None,
             doomed: false,
             exit_status: None,
@@ -2796,6 +2809,12 @@ mod pty_pane_fixtures {
                 cx,
             ),
         }
+        // Kept alive on the pane, not dropped here: `Host::shutdown` (via `Drop`) now kills
+        // every session it still owns a real process for (GitHub issue #530), so dropping this
+        // throwaway host right after spawning would kill the session before the pane - or the
+        // test driving it - ever got to observe its own natural exit. See `TerminalPane::
+        // _test_host`'s own docs.
+        pane._test_host = Some(host);
     }
 
     /// Drives the executor until `done` holds, or until [`PTY_ROUND_TRIP`] elapses.
