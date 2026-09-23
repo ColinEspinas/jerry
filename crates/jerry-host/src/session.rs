@@ -638,6 +638,38 @@ mod session_manager_tests {
         );
     }
 
+    /// The real CI regression behind PR #538: every other test in this module reaches
+    /// `sockets_dir` via `crate::default_sockets_dir()`, a directory some *other*, unrelated test
+    /// in the same process may have already created as a side effect of its own
+    /// `Registry::open` call - true by luck on Windows (many test helpers key off the same real
+    /// `runtime_dir()`), never true on unix (every other helper here uses its own isolated
+    /// `tempfile::TempDir` instead), so unix never got the accidental head start and every real
+    /// spawn failed outright (`DataPlane::bind`'s `Listener::bind` cannot create a missing parent
+    /// directory). A definitely-fresh, never-created directory makes the bug deterministic on
+    /// every platform instead of dependent on unrelated test ordering.
+    #[test]
+    fn spawn_creates_its_own_sockets_directory_when_it_does_not_exist_yet() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let sockets_dir = temp.path().join("never-created-until-now");
+        assert!(!sockets_dir.exists(), "sanity check: truly not created yet");
+        let manager = SessionManager::new(Fanout::default(), sockets_dir);
+        let (_id, handle) = manager
+            .spawn(PathBuf::from("/repo"), None, shell_options("echo hello"))
+            .expect("spawn must succeed even when its own sockets directory does not exist yet");
+        assert!(
+            handle.process_id().is_some(),
+            "a real spawn always has a pid"
+        );
+        let mut output = handle.take_output().expect("output stream");
+        let (bytes, status) = drain_until_exit(&handle, &mut output, Duration::from_secs(10));
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("hello"),
+            "{:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert!(status.success(), "{status:?}");
+    }
+
     #[test]
     fn a_second_spawn_in_the_same_worktree_gets_a_distinct_id() {
         let manager = SessionManager::new(Fanout::default(), crate::default_sockets_dir());

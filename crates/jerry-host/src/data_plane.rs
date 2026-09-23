@@ -34,6 +34,11 @@ const LIVE_SINK_BACKLOG: usize = 256;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DataPlaneBindError {
+    /// `sockets_dir` itself does not exist and could not be created - unlike the host's own
+    /// control-plane socket, an unpublished (test, or not-yet-published) host's sessions have no
+    /// `Registry::open` call of their own to have created it first.
+    #[error(transparent)]
+    Directory(#[from] jerry_core::registry::RegistryError),
     #[error("could not listen on {}: {source}", path.display())]
     Bind {
         path: PathBuf,
@@ -77,6 +82,10 @@ impl DataPlane {
         sockets_dir: &Path,
         process: Arc<Mutex<PtySession>>,
     ) -> Result<Arc<DataPlane>, DataPlaneBindError> {
+        // An unpublished (test) host, or a published one whose registry directory happens to
+        // differ from `sockets_dir`, has no other code path that guarantees this directory
+        // exists yet - unlike `Registry::open`'s own directory, nothing else creates it first.
+        jerry_core::registry::ensure_private_dir(sockets_dir)?;
         let socket = sockets_dir.join(format!(
             "d-{:x}-{:08x}.sock",
             std::process::id(),
