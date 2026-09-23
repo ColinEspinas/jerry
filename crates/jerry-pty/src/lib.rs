@@ -47,6 +47,9 @@ pub use login_shell::resolve_login_shell_path;
 mod command;
 pub use command::new_std_command;
 
+mod detached;
+pub use detached::new_detached_command;
+
 pub use portable_pty::ExitStatus;
 
 /// How many chunks the output channel buffers before the reader thread blocks, bounding buffered

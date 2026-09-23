@@ -18,6 +18,7 @@ Set-Location $RepoRoot
 $AppName = "Jerry"
 $BinName = "jerry-app.exe"
 $CliName = "jerry.exe"
+$HostName = "jerry-host.exe"
 $ExecutableName = "Jerry.exe"
 $DistDir = Join-Path $RepoRoot "dist"
 $ArchivePath = Join-Path $DistDir "Jerry-windows.zip"
@@ -36,15 +37,16 @@ Write-Host "==> Bundling $AppName $Version for Windows"
 
 $ReleaseBin = Join-Path $RepoRoot "target\release\$BinName"
 $ReleaseCli = Join-Path $RepoRoot "target\release\$CliName"
+$ReleaseHost = Join-Path $RepoRoot "target\release\$HostName"
 if ((Test-Path $ReleaseBin) -and $env:SKIP_BUILD) {
     Write-Host "==> SKIP_BUILD set and $ReleaseBin exists - reusing it"
 } elseif (Test-Path $ReleaseBin) {
     Write-Host "==> $ReleaseBin already exists - reusing it (set SKIP_BUILD=1 to make this explicit, or remove it to force a rebuild)"
 } else {
     Write-Host "==> Building $ReleaseBin"
-    cargo build --release -p jerry-app -p jerry-cli
+    cargo build --release -p jerry-app -p jerry-cli -p jerry-host
     if ($LASTEXITCODE -ne 0) {
-        Write-Error "cargo build --release -p jerry-app -p jerry-cli failed with exit code $LASTEXITCODE"
+        Write-Error "cargo build --release -p jerry-app -p jerry-cli -p jerry-host failed with exit code $LASTEXITCODE"
         exit $LASTEXITCODE
     }
 }
@@ -57,10 +59,15 @@ if (-not (Test-Path $ReleaseCli)) {
     Write-Error "$ReleaseCli not found after build step"
     exit 1
 }
+if (-not (Test-Path $ReleaseHost)) {
+    Write-Error "$ReleaseHost not found after build step"
+    exit 1
+}
 
 # A case-insensitive filesystem cannot hold Jerry.exe and jerry.exe side by side, so the
-# `jerry` command lives under bin (decisions section 17), where jerry-app looks for it.
-Write-Host "==> Staging $ExecutableName and bin\$CliName"
+# `jerry`/`jerry-host` commands live under bin (decisions section 17/24), where `jerry-app`'s own
+# `find_jerry_binary`/spawn-or-connect look for them.
+Write-Host "==> Staging $ExecutableName, bin\$CliName and bin\$HostName"
 $StageDir = Join-Path $DistDir "Jerry-windows"
 if (Test-Path $StageDir) {
     Remove-Item $StageDir -Recurse -Force
@@ -68,6 +75,7 @@ if (Test-Path $StageDir) {
 New-Item -ItemType Directory -Force -Path (Join-Path $StageDir "bin") | Out-Null
 Copy-Item -Path $ReleaseBin -Destination (Join-Path $StageDir $ExecutableName) -Force
 Copy-Item -Path $ReleaseCli -Destination (Join-Path $StageDir "bin\$CliName") -Force
+Copy-Item -Path $ReleaseHost -Destination (Join-Path $StageDir "bin\$HostName") -Force
 
 Write-Host "==> Creating $ArchivePath"
 if (Test-Path $ArchivePath) {

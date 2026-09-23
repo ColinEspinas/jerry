@@ -3,8 +3,8 @@
 //! variants, and so a CLI or an MCP tool list can be generated from the same source.
 
 use crate::command::{
-    permits, run_command, run_query, schema_of, validate_command, Command, Invocability, Locality,
-    Query,
+    permits, run_command, run_query, schema_of, validate_command, Command, Denied, Invocability,
+    Locality, Query,
 };
 use crate::commands::{
     AgentSpec, AmendHeadMessage, MergeAbort, MergeAttempt, MergeBranchIntoCurrent, MergeComplete,
@@ -12,6 +12,7 @@ use crate::commands::{
     StageResolved, WorktreeCreate,
 };
 use crate::ctx::Ctx;
+use crate::error::Error;
 use crate::method::Method;
 use crate::queries::{
     AgentsQuery, MergeStatusQuery, RebaseStatusQuery, SessionsQuery, StatusQuery,
@@ -32,6 +33,44 @@ pub struct HookEvent {
     pub payload: Value,
 }
 
+/// Asks the host to shut itself down: every live session is killed, the socket closes, and the
+/// process exits (`docs/architecture/decisions.md` §24). `Locality::Session`, `Invocability::
+/// Denied` to agents - only a human or `jerry host stop` may ask a host to stop. Never actually
+/// executed through [`Command::execute`] - `jerry-host`'s dispatcher special-cases it and signals
+/// its own lifecycle loop directly, exactly as every other Session-locality command does (see
+/// [`crate::session::SessionSpawn`]'s own docs). The trait impl exists only so this type
+/// satisfies `Command` for cataloguing (`AppCommand`, the MCP tool list, the wire fixtures).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default,
+)]
+pub struct Shutdown {}
+
+impl Command for Shutdown {
+    type Outcome = ();
+    const NAME: &'static str = "shutdown";
+
+    fn invocability(&self) -> Invocability {
+        Invocability::Denied
+    }
+
+    fn locality(&self) -> Locality {
+        Locality::Session
+    }
+
+    /// Never reached - see the type's own docs.
+    fn validate(&self, _ctx: &Ctx) -> Result<(), Denied> {
+        Ok(())
+    }
+
+    /// Never reached - see the type's own docs.
+    fn execute(self, _ctx: &Ctx) -> Result<(), Error> {
+        Err(Error::new(
+            "needs-host",
+            "the session host lives in its own process, not in this one",
+        ))
+    }
+}
+
 /// Every Command a client can send.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "name", content = "params", rename_all = "kebab-case")]
@@ -50,6 +89,7 @@ pub enum AppCommand {
     SessionSpawn(SessionSpawn),
     SessionResize(SessionResize),
     SessionKill(SessionKill),
+    Shutdown(Shutdown),
 }
 
 /// Every Query a client can send.
@@ -77,6 +117,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "session-kill",
     "session-resize",
     "session-spawn",
+    "shutdown",
     "stage-resolved",
     "worktree-create",
 ];
@@ -96,6 +137,11 @@ pub enum Request {
     Command(AppCommand),
     Validate(AppCommand),
     Query(AppQuery),
+    /// `event/subscribe`: registers the connection as a fanout sink from the response onward
+    /// (`docs/architecture/decisions.md` §24). Handled directly by `jerry-host`'s listener,
+    /// before a `Call` is ever built from it - modeled as a `Request` variant only so it gets a
+    /// wire fixture and round-trips like everything else here.
+    Subscribe,
 }
 
 /// Why a request could not run in this process.
@@ -127,6 +173,7 @@ macro_rules! each_command {
             AppCommand::SessionSpawn($c) => $body,
             AppCommand::SessionResize($c) => $body,
             AppCommand::SessionKill($c) => $body,
+            AppCommand::Shutdown($c) => $body,
         }
     };
 }
@@ -148,6 +195,7 @@ impl AppCommand {
             AppCommand::SessionSpawn(_) => SessionSpawn::NAME,
             AppCommand::SessionResize(_) => SessionResize::NAME,
             AppCommand::SessionKill(_) => SessionKill::NAME,
+            AppCommand::Shutdown(_) => Shutdown::NAME,
         }
     }
 
@@ -201,6 +249,9 @@ impl AppCommand {
             AppCommand::SessionSpawn(_) => "Spawn a new PTY session, owned by this host.",
             AppCommand::SessionResize(_) => "Resize a live session's pty.",
             AppCommand::SessionKill(_) => "Kill a live session's process tree.",
+            AppCommand::Shutdown(_) => {
+                "Shut the connected Jerry host down, killing every session it still owns."
+            }
         }
     }
 
@@ -222,6 +273,7 @@ impl AppCommand {
             AppCommand::SessionSpawn(_) => schema_of::<SessionSpawn>(),
             AppCommand::SessionResize(_) => schema_of::<SessionResize>(),
             AppCommand::SessionKill(_) => schema_of::<SessionKill>(),
+            AppCommand::Shutdown(_) => schema_of::<Shutdown>(),
         }
     }
 
@@ -311,6 +363,7 @@ impl Request {
             Request::Command(command) => Method::Command(command.name().to_owned()),
             Request::Validate(command) => Method::Validate(command.name().to_owned()),
             Request::Query(query) => Method::Query(query.name().to_owned()),
+            Request::Subscribe => Method::Subscribe,
         }
     }
 
@@ -322,6 +375,7 @@ impl Request {
                 named_params(serde_json::to_value(command)?)
             }
             Request::Query(query) => named_params(serde_json::to_value(query)?),
+            Request::Subscribe => Ok(Value::Null),
         }
     }
 
@@ -352,6 +406,7 @@ impl Request {
                 QUERY_NAMES,
             )?)),
             Method::Event(_) => Err(method_not_found(method)),
+            Method::Subscribe => Ok(Request::Subscribe),
         }
     }
 
@@ -360,6 +415,9 @@ impl Request {
             Request::Hook(_) => Locality::Session,
             Request::Command(command) | Request::Validate(command) => command.locality(),
             Request::Query(query) => query.locality(),
+            // Meaningless without a host, like every other Session-locality request; there is no
+            // third `Locality` variant to give it instead.
+            Request::Subscribe => Locality::Session,
         }
     }
 
@@ -368,6 +426,9 @@ impl Request {
             Request::Hook(_) => Invocability::Allowed,
             Request::Command(command) | Request::Validate(command) => command.invocability(),
             Request::Query(query) => query.invocability(),
+            // Only adds a fanout sink; no new authority over anything an agent could already
+            // reach, so there is no reason to deny it.
+            Request::Subscribe => Invocability::Allowed,
         }
     }
 
@@ -495,6 +556,11 @@ impl Request {
                 "request-query-sessions",
                 Request::Query(AppQuery::Sessions(SessionsQuery::default())),
             ),
+            (
+                "request-command-shutdown",
+                Request::Command(AppCommand::Shutdown(Shutdown::default())),
+            ),
+            ("request-subscribe", Request::Subscribe),
         ]
     }
 }
@@ -509,7 +575,9 @@ pub fn execute_locally(request: &Request, ctx: &Ctx) -> Result<Report, LocalDisp
         return Err(LocalDispatchError::NeedsHost(request.method()));
     }
     match request {
-        Request::Hook(_) => Err(LocalDispatchError::NeedsHost(request.method())),
+        Request::Hook(_) | Request::Subscribe => {
+            Err(LocalDispatchError::NeedsHost(request.method()))
+        }
         Request::Command(command) => Ok(command.clone().run(ctx)),
         Request::Validate(command) => Ok(command.validate(ctx)),
         Request::Query(query) => Ok(query.run(ctx)),
@@ -571,7 +639,7 @@ mod request_catalogue_tests {
             match request.method() {
                 Method::Query(name) => queries.push(name),
                 Method::Command(name) | Method::Validate(name) => commands.push(name),
-                Method::Hook | Method::Event(_) => {}
+                Method::Hook | Method::Event(_) | Method::Subscribe => {}
             }
         }
         queries.sort_unstable();
@@ -614,5 +682,25 @@ mod request_catalogue_tests {
         let request = Request::Query(AppQuery::Status(Default::default()));
         let report = execute_locally(&request, &ctx).expect("git locality");
         assert!(report.is_ok(), "{report:?}");
+    }
+
+    /// `event/subscribe` and `shutdown` both need a live host, exactly like a hook - neither
+    /// ever runs through `execute_locally`'s own Git-locality path.
+    #[test]
+    fn subscribe_and_shutdown_both_need_a_running_host() {
+        let ctx = Ctx {
+            repo_path: PathBuf::from("/r/.git"),
+            worktree_path: PathBuf::from("/r"),
+            caller: Caller::Human,
+        };
+        assert_eq!(
+            execute_locally(&Request::Subscribe, &ctx),
+            Err(LocalDispatchError::NeedsHost(Method::Subscribe))
+        );
+        let shutdown = Request::Command(super::AppCommand::Shutdown(super::Shutdown::default()));
+        assert_eq!(
+            execute_locally(&shutdown, &ctx),
+            Err(LocalDispatchError::NeedsHost(shutdown.method()))
+        );
     }
 }

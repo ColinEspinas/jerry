@@ -15,17 +15,20 @@ pub(crate) mod mcp;
 pub mod transport;
 
 use crate::cli::{
-    Cli, Command, GitEditorArgs, GitSequenceEditorArgs, HookArgs, MergeArgs, WtAction, WtNewArgs,
+    Cli, Command, GitEditorArgs, GitSequenceEditorArgs, HookArgs, HostAction, MergeArgs, WtAction,
+    WtNewArgs,
 };
 use crate::transport::{ChooseError, Transport};
 use clap::Parser;
 use jerry_core::client::{Client, ClientError};
+use jerry_core::host_spawn::{self, SpawnOrConnectError};
 use jerry_core::registry::{runtime_dir_for, Os, Registry};
 use jerry_core::wire::rpc_code;
 use jerry_core::{
     execute_locally, AgentId, AgentSpec, AppCommand, AppQuery, Call, Caller, ConflictKind, Ctx,
     HookEvent, LocalDispatchError, MergeAbort, MergeAttempt, MergeAttemptOutcome, MergeComplete,
-    MergeStatusOutcome, MergeStatusQuery, Report, Request, RpcError, StageResolved, WorktreeCreate,
+    MergeStatusOutcome, MergeStatusQuery, Report, Request, RpcError, Shutdown, StageResolved,
+    WorktreeCreate,
 };
 use std::ffi::OsString;
 use std::io::{Read, Write};
@@ -43,6 +46,11 @@ pub const SOCKET_ENV: &str = "JERRY_HOST_SOCKET";
 
 /// How long a connected call may take end to end. A merge can legitimately run for seconds.
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// `jerry host start`'s own bound on waiting for a freshly spawned `jerry-host` to publish its
+/// descriptor - generous enough for a cold process start on a loaded machine, still a hard
+/// failure rather than a hang if it never shows up.
+const HOST_START_DEADLINE: Duration = Duration::from_secs(10);
 
 /// `jerry hook`'s own budget: it runs inline with an agent's tool call, so it must never hold
 /// that call open for anywhere near as long as an interactive command may.
@@ -150,6 +158,10 @@ pub fn run(
         },
         Command::Agents => agents(&mut session, cli.json, out, err),
         Command::Sessions => sessions(&mut session, cli.json, out, err),
+        Command::Host(args) => match args.action {
+            HostAction::Start => host_start(env, &session, out, err),
+            HostAction::Stop => host_stop(&mut session, out, err),
+        },
         Command::Hook(args) => hook(&mut session, args, stdin, err),
         Command::Mcp => mcp::run(&mut session, &caller, stdin, out, err),
         // Already handled and returned above, before any `Ctx`/transport existed to build a
@@ -773,6 +785,82 @@ fn sessions(session: &mut Session, json: bool, out: &mut dyn Write, err: &mut dy
     exit::for_report(&report)
 }
 
+/// `jerry host start`: spawns a Jerry host for this repository if none already serves it, or
+/// reports the one that does, printing its socket path - decision 2's spawn-or-connect, run from
+/// a headless CLI rather than `jerry-app`'s own `HostRuntime`
+/// (`docs/architecture/decisions.md` §24). Bypasses `Session::call` entirely: spawning is not a
+/// `Command`/`Query` a `Session`'s already-resolved `Transport` can express.
+fn host_start(
+    env: &dyn Fn(&str) -> Option<OsString>,
+    session: &Session,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> u8 {
+    let registry_dir = match runtime_dir_for(Os::host(), env) {
+        Ok(dir) => dir,
+        Err(error) => {
+            let _ = writeln!(err, "jerry: no host registry ({error})");
+            return exit::FAILED;
+        }
+    };
+    match host_spawn::spawn_or_connect(
+        registry_dir,
+        &session.ctx.repo_path,
+        session.timeout,
+        HOST_START_DEADLINE,
+    ) {
+        Ok(host_spawn::Outcome::Connected { descriptor, .. }) => {
+            let _ = writeln!(out, "{}", descriptor.socket.display());
+            exit::DONE
+        }
+        Ok(host_spawn::Outcome::VersionMismatch { descriptor }) => {
+            let _ = writeln!(
+                err,
+                "jerry: a Jerry host already serves this repository but speaks protocol {}, \
+                 this binary speaks {} - `jerry host stop` then `jerry host start` to restart \
+                 it",
+                descriptor.protocol_version,
+                jerry_core::wire::PROTOCOL_VERSION
+            );
+            exit::NO_INSTANCE
+        }
+        Err(SpawnOrConnectError::BreakawayForbidden) => {
+            let _ = writeln!(
+                err,
+                "jerry: this window's job does not allow a session host to outlive it"
+            );
+            exit::FAILED
+        }
+        Err(error) => {
+            let _ = writeln!(err, "jerry: could not start a Jerry host: {error}");
+            exit::FAILED
+        }
+    }
+}
+
+/// `jerry host stop`: sends `shutdown` to the Jerry host serving this repository. Standalone (no
+/// host at all) is reported, not an error - there was nothing to stop.
+fn host_stop(session: &mut Session, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
+    if matches!(session.transport, Transport::Standalone) {
+        let _ = writeln!(out, "jerry: no Jerry host serves this repository");
+        return exit::DONE;
+    }
+    let report = match session.call(
+        Request::Command(AppCommand::Shutdown(Shutdown::default())),
+        err,
+    ) {
+        Ok(report) => report,
+        Err(code) => return code,
+    };
+    match &report {
+        Report::Ok { .. } => {
+            let _ = writeln!(out, "jerry: asked the Jerry host to stop");
+        }
+        other => explain(other, err),
+    }
+    exit::for_report(&report)
+}
+
 fn emit_json(report: &Report, out: &mut dyn Write) -> u8 {
     if serde_json::to_writer(&mut *out, report).is_err() {
         return exit::FAILED;
@@ -870,7 +958,9 @@ mod run_tests {
     use std::io::Read;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
-    use test_support::{add_worktree, commit, git_output, seed_empty_repo, seed_repo, TempDir};
+    use test_support::{
+        add_worktree, commit, git_output, seed_empty_repo, seed_repo, wait_until, TempDir,
+    };
 
     use super::MAX_HOOK_PAYLOAD_BYTES;
 
@@ -976,6 +1066,89 @@ mod run_tests {
         assert_eq!(code, 0, "stderr: {err}");
         assert!(out.contains("connected"), "{out}");
         assert!(out.contains("caller      human"), "{out}");
+
+        host.shutdown_and_join();
+        registry.remove(&instance).expect("remove");
+    }
+
+    /// `jerry host start` against an already-running Jerry: reports its socket, and spawns
+    /// nothing - the `[[bin]]`-free half of decision 2's coverage (`docs/architecture/
+    /// decisions.md` §24); the real-spawn half lives in `crates/jerry-host/tests/`, where
+    /// `CARGO_BIN_EXE_jerry-host` is actually available.
+    #[test]
+    fn host_start_reports_the_already_running_jerry_without_spawning_another() {
+        let repo = seed_empty_repo();
+        let runtime = tempfile::TempDir::new().expect("runtime");
+        let env = env(&[(runtime_env_key(), runtime.path())]);
+        let registry_dir =
+            jerry_core::registry::runtime_dir_for(Os::host(), &env).expect("runtime dir");
+        let registry = Registry::open(registry_dir.clone()).expect("registry");
+        let instance = registry.allocate().expect("instance");
+        let host = jerry_host::Host::start().expect("host");
+        host.listen(&instance.socket).expect("listen");
+        let common = jerry_core::Ctx::from_cwd(repo.path(), jerry_core::Caller::Human)
+            .expect("a repo")
+            .repo_path;
+        registry.publish(&instance, &[common]).expect("publish");
+
+        let (code, out, err) = invoke(&["host", "start"], &env, repo.path());
+        assert_eq!(code, 0, "stderr: {err}");
+        assert_eq!(
+            out.trim(),
+            instance.socket.display().to_string(),
+            "must report the already-running host's own socket, not spawn a second one"
+        );
+        let entries = fs::read_dir(&registry_dir).expect("registry dir").count();
+        assert_eq!(
+            entries, 2,
+            "exactly the one instance's descriptor and socket file - nothing new spawned"
+        );
+
+        host.shutdown_and_join();
+        registry.remove(&instance).expect("remove");
+    }
+
+    /// `jerry host stop` end to end: the wire `shutdown` request reaches `Inner::
+    /// request_shutdown`, which wakes a real `Host::run_lifecycle` loop - the same mechanism
+    /// `jerry-host`'s own `lifecycle_tests` cover in isolation, exercised here through the CLI.
+    #[test]
+    fn host_stop_wakes_a_real_lifecycle_loop_and_reports_success() {
+        let repo = seed_empty_repo();
+        let runtime = tempfile::TempDir::new().expect("runtime");
+        let env = env(&[(runtime_env_key(), runtime.path())]);
+        let registry_dir =
+            jerry_core::registry::runtime_dir_for(Os::host(), &env).expect("runtime dir");
+        let registry = Registry::open(registry_dir).expect("registry");
+        let instance = registry.allocate().expect("instance");
+        let host = jerry_host::Host::start().expect("host");
+        host.listen(&instance.socket).expect("listen");
+        let common = jerry_core::Ctx::from_cwd(repo.path(), jerry_core::Caller::Human)
+            .expect("a repo")
+            .repo_path;
+        registry.publish(&instance, &[common]).expect("publish");
+
+        let exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let host_ref = &host;
+        std::thread::scope(|scope| {
+            let exited_writer = std::sync::Arc::clone(&exited);
+            scope.spawn(move || {
+                host_ref.run_lifecycle(jerry_host::LifecycleConfig {
+                    poll_interval: Duration::from_millis(10),
+                    linger: Duration::from_secs(60),
+                });
+                exited_writer.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+
+            let (code, out, err) = invoke(&["host", "stop"], &env, repo.path());
+            assert_eq!(code, 0, "stderr: {err}");
+            assert!(out.contains("stop"), "{out}");
+
+            assert!(
+                wait_until(Duration::from_secs(5), || exited
+                    .load(std::sync::atomic::Ordering::SeqCst)),
+                "the shutdown request must wake the lifecycle loop, long linger notwithstanding"
+            );
+        });
 
         host.shutdown_and_join();
         registry.remove(&instance).expect("remove");

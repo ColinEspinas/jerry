@@ -10,6 +10,11 @@ pub enum Method {
     Query(String),
     Event(String),
     Hook,
+    /// The one client-to-host request in the `event/` namespace, spelled `event/subscribe` -
+    /// every other `Event(_)` name is host-to-client only (`Request::from_wire` refuses them as
+    /// incoming). Registers the connection as a fanout sink (`docs/architecture/decisions.md`
+    /// §24); never carries a payload.
+    Subscribe,
 }
 
 impl Method {
@@ -17,6 +22,9 @@ impl Method {
     pub fn parse(method: &str) -> Option<Method> {
         if method == "hook" {
             return Some(Method::Hook);
+        }
+        if method == "event/subscribe" {
+            return Some(Method::Subscribe);
         }
         let (kind, name) = method.split_once('/')?;
         if !is_kebab(name) {
@@ -50,6 +58,7 @@ impl fmt::Display for Method {
             Method::Query(name) => write!(f, "query/{name}"),
             Method::Event(name) => write!(f, "event/{name}"),
             Method::Hook => f.write_str("hook"),
+            Method::Subscribe => f.write_str("event/subscribe"),
         }
     }
 }
@@ -66,10 +75,22 @@ mod method_name_tests {
             "query/status",
             "event/session-exited",
             "hook",
+            "event/subscribe",
         ] {
             let method = Method::parse(text).unwrap_or_else(|| panic!("{text} must parse"));
             assert_eq!(method.to_string(), text);
         }
+    }
+
+    /// `event/subscribe` is the one name in the `event/` namespace a client may send as a
+    /// request - every other `event/*` name is `Method::Event`, host-to-client only.
+    #[test]
+    fn only_the_literal_subscribe_name_gets_its_own_variant() {
+        assert_eq!(Method::parse("event/subscribe"), Some(Method::Subscribe));
+        assert_eq!(
+            Method::parse("event/session-exited"),
+            Some(Method::Event("session-exited".into()))
+        );
     }
 
     #[test]

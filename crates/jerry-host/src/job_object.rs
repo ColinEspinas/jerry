@@ -1,9 +1,12 @@
-//! The Windows kill-on-close job object that stops spawned children outliving Jerry
-//! (GitHub issue #482). `PtySession`'s tree kills only run while this process is alive to run
-//! them; a force-killed or crashed Jerry runs no destructors, and a Windows child is otherwise
-//! unaffected by its parent dying. Owns exactly one process-wide job; per-session kills stay
-//! in `jerry-pty`.
+//! Windows only: gives this host its own kill-on-close job for every session it spawns
+//! (`docs/architecture/decisions.md` §14 point 3, §24) - so a force-killed or crashed
+//! `jerry-host` does not leak the PTY processes it owns, independent of whatever job (if any)
+//! contains the host itself (it may have arrived here via `CREATE_BREAKAWAY_FROM_JOB`). Copied
+//! rather than shared across a crate boundary from `jerry-app`'s own private `job_object.rs` -
+//! the same precedent `crate::session::session_manager_tests`' own `process_is_alive` pair
+//! already set for one small platform primitive.
 
+#![cfg(windows)]
 // This module exists entirely to call Win32 FFI (`CreateJobObjectW`, `SetInformationJobObject`,
 // `AssignProcessToJobObject`) - every call site below carries its own `SAFETY` comment; see
 // CLAUDE.md's Rust standards for the project-wide "unsafe only for justified FFI" rule.
@@ -11,43 +14,37 @@
 
 use std::io;
 
-use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JobObjectExtendedLimitInformation,
-    QueryInformationJobObject, SetInformationJobObject, JOBOBJECT_BASIC_LIMIT_INFORMATION,
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, JOBOBJECT_BASIC_LIMIT_INFORMATION,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
-/// Puts this process in a fresh kill-on-close job so every child it ever spawns dies with it,
-/// however it dies. Call once, before anything can spawn - idempotent (a `ui`-tier test app can
-/// call this once per test in the same process, GitHub issue #530), so a later call is a no-op
-/// rather than nesting a second job or re-logging.
-///
-/// Failure is logged and non-fatal: without the job, cleanup degrades to the `Drop`-time tree
-/// kills that already exist, which is exactly the pre-#482 behavior.
-pub fn adopt_this_process() {
+/// Puts this process in a fresh kill-on-close job so every session it spawns dies with it,
+/// however it dies. Call once, before anything spawns - idempotent. Failure is logged and
+/// non-fatal: without the job, cleanup degrades to whatever tree-kill each session already does
+/// on its own exit.
+pub(crate) fn adopt_this_process() {
     static ADOPTED: std::sync::Once = std::sync::Once::new();
     ADOPTED.call_once(|| match adopt_this_process_returning_job() {
         Ok(_job) => {
             // The handle is deliberately never closed. This process is a member of a
-            // kill-on-close job, so closing the last handle would terminate Jerry itself; the
-            // kernel closes it when this process dies, which is the trigger doing its job.
-            log::info!("child processes are adopted by a kill-on-close job object");
+            // kill-on-close job, so closing the last handle would terminate it; the kernel
+            // closes it when this process dies, which is the trigger doing its job.
+            log::info!("jerry-host: sessions are adopted by a kill-on-close job object");
         }
         Err(err) => {
             log::warn!(
-                "could not set up the kill-on-close job object ({err}) - children of a \
-                 force-killed Jerry will outlive it"
+                "jerry-host: could not set up the kill-on-close job object ({err}) - sessions \
+                 of a force-killed host will outlive it"
             );
         }
     });
 }
 
-/// [`adopt_this_process`]'s fallible core, returning the job handle so a test can query
-/// membership against it. The caller must keep the handle open for the life of the process.
 fn adopt_this_process_returning_job() -> io::Result<HANDLE> {
     let job = create_kill_on_close_job()?;
     // SAFETY: `GetCurrentProcess` takes nothing and returns the process's own pseudo-handle,
@@ -65,12 +62,13 @@ fn adopt_this_process_returning_job() -> io::Result<HANDLE> {
 
 /// A fresh, unnamed job object whose members are terminated when its last handle closes
 /// (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`), with breakaway permitted
-/// (`JOB_OBJECT_LIMIT_BREAKAWAY_OK`) so the updater's relaunch can escape it deliberately.
+/// (`JOB_OBJECT_LIMIT_BREAKAWAY_OK`) for symmetry with `jerry-app`'s own job - nothing here
+/// spawns a breakaway child today, but a job that forbids it for no reason is a trap for later.
 fn create_kill_on_close_job() -> io::Result<HANDLE> {
     // SAFETY: both parameters are null by contract - default security, which also makes the
     // handle non-inheritable (load-bearing: an inherited copy in a child would keep the job
-    // alive past this process's death), and no name. Reads nothing from this process; returns
-    // a handle, null on failure.
+    // alive past this process's death), and no name. Reads nothing from this process; returns a
+    // handle, null on failure.
     let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
     if job.is_null() {
         return Err(io::Error::last_os_error());
@@ -85,9 +83,9 @@ fn create_kill_on_close_job() -> io::Result<HANDLE> {
     };
     // SAFETY: `job` is the live handle just created above. The information pointer addresses a
     // live, uniquely borrowed stack `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` whose length is the
-    // struct's real size taken from the type itself, the pair this call's contract requires
-    // for `JobObjectExtendedLimitInformation`; the callee only reads it and does not retain
-    // the pointer.
+    // struct's real size taken from the type itself, the pair this call's contract requires for
+    // `JobObjectExtendedLimitInformation`; the callee only reads it and does not retain the
+    // pointer.
     let ok = unsafe {
         SetInformationJobObject(
             job,
@@ -117,47 +115,6 @@ fn assign_process(job: HANDLE, process: HANDLE) -> io::Result<()> {
     Ok(())
 }
 
-/// Whether the job this process currently belongs to (if any) forbids `CREATE_BREAKAWAY_FROM_JOB`,
-/// read directly from the OS rather than guessed from a failed spawn's error code, exactly as
-/// `docs/architecture/decisions.md` §14's spike proved. `Ok(false)` also covers "not in a job at
-/// all", since nothing then forbids anything. This is the decision a caller of `jerry_core::
-/// host_spawn::spawn_or_connect_with` injects, since that crate stays free of this workspace's
-/// sanctioned Win32 FFI (`docs/architecture/decisions.md` §24): here, or `jerry-host`'s own
-/// `job_object.rs`, are the two places allowed to call it.
-pub fn breakaway_is_forbidden_for_current_process() -> io::Result<bool> {
-    let mut in_any_job: BOOL = 0;
-    // SAFETY: `GetCurrentProcess` returns this process's own valid pseudo-handle; a null job
-    // handle asks "in any job at all"; `in_any_job` addresses a live, uniquely borrowed stack
-    // `BOOL` the callee writes exactly once.
-    let ok = unsafe { IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &mut in_any_job) };
-    if ok == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if in_any_job == 0 {
-        return Ok(false);
-    }
-
-    let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-    // SAFETY: a null job handle queries the calling process's own job (confirmed above to be a
-    // member of exactly one); the buffer pointer addresses a live, uniquely borrowed stack value
-    // sized exactly to `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`, which the callee writes into and
-    // does not retain past the call. The return-length pointer is null: the exact size asked for
-    // is already known.
-    let ok = unsafe {
-        QueryInformationJobObject(
-            std::ptr::null_mut(),
-            JobObjectExtendedLimitInformation,
-            std::ptr::from_mut(&mut info).cast(),
-            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            std::ptr::null_mut(),
-        )
-    };
-    if ok == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(info.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_BREAKAWAY_OK == 0)
-}
-
 #[cfg(test)]
 mod kill_on_close_job_tests {
     use super::{adopt_this_process_returning_job, assign_process, create_kill_on_close_job};
@@ -181,8 +138,6 @@ mod kill_on_close_job_tests {
         ChildGuard::spawn(&mut command).expect("cmd.exe must spawn")
     }
 
-    /// The kernel property the whole fix rests on: no destructor, no `taskkill`, just the last
-    /// handle closing - which is what the OS does to every handle of a dead process.
     #[test]
     fn closing_the_last_job_handle_kills_a_process_assigned_to_it() {
         let job = create_kill_on_close_job().expect("job creation must succeed on real Windows");
@@ -202,8 +157,6 @@ mod kill_on_close_job_tests {
         );
     }
 
-    /// Children join the job at spawn because *this process* is a member - proving no
-    /// per-spawn-site plumbing is needed for coverage.
     #[test]
     fn a_child_spawned_after_adoption_is_born_inside_the_job() {
         let job = adopt_this_process_returning_job()
@@ -224,19 +177,5 @@ mod kill_on_close_job_tests {
             "a child spawned after adoption must be inside the job automatically"
         );
         child.kill_and_wait().expect("test child teardown");
-    }
-}
-
-#[cfg(test)]
-mod breakaway_detection_tests {
-    use super::breakaway_is_forbidden_for_current_process;
-
-    /// nextest gives every test its own process, so this test's own job membership (if any) is
-    /// whatever the test harness itself set up - never a job this test created, so the exact
-    /// answer is unknown, but the OS query must at least succeed rather than error.
-    #[test]
-    fn querying_this_process_own_job_information_succeeds_on_real_windows() {
-        breakaway_is_forbidden_for_current_process()
-            .expect("IsProcessInJob/QueryInformationJobObject must succeed for this process");
     }
 }
