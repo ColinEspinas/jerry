@@ -84,6 +84,14 @@ pub struct TerminalSpec {
     /// environment rather than replacing it, which is what makes this safe to use for a couple
     /// of variables without having to reconstruct a whole environment).
     pub env: Vec<(String, String)>,
+    /// Test-only escape hatch (GitHub issue #530): when set, the real OS spawn execs this
+    /// `(program, args)` pair instead of [`Self::program`]/[`Self::args`], which keep naming
+    /// whatever the real kind logic decided (`claude`, a leading `--resume <id>`, a generated
+    /// `--settings <path>`) so `spec_for_test()`-based assertions on that construction stay
+    /// meaningful even though nothing real ever runs. Set only by
+    /// `crate::work_surface::agents::Agents`'s per-kind test override; always `None` in
+    /// production.
+    pub(crate) spawn_override: Option<(PathBuf, Vec<String>)>,
 }
 
 impl TerminalSpec {
@@ -97,6 +105,7 @@ impl TerminalSpec {
             program,
             cwd,
             env: Vec::new(),
+            spawn_override: None,
         }
     }
 
@@ -139,6 +148,7 @@ impl TerminalSpec {
             args,
             cwd,
             env: Vec::new(),
+            spawn_override: None,
         }
     }
 
@@ -154,6 +164,7 @@ impl TerminalSpec {
             args,
             cwd,
             env,
+            spawn_override: None,
         }
     }
 }
@@ -1513,8 +1524,12 @@ impl TerminalPane {
             let spawn_result: Result<PtySession, PtyError> = cx
                 .background_executor()
                 .spawn(async move {
-                    let mut options = SpawnOptions::new(spec.program)
-                        .args(spec.args)
+                    // A `ui`-tier test's stub takes over here, never in `spec.program`/`args`
+                    // themselves - see `TerminalSpec::spawn_override`'s docs for why the two
+                    // must stay independent.
+                    let (program, args) = spec.spawn_override.unwrap_or((spec.program, spec.args));
+                    let mut options = SpawnOptions::new(program)
+                        .args(args)
                         .cwd(spec.cwd)
                         .size(TERMINAL_ROWS, TERMINAL_COLS);
                     for (key, value) in spec.env {

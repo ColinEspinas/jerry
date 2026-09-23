@@ -13,7 +13,7 @@ use crate::terminal::pane::{TerminalPane, TerminalPaneEvent, TerminalSpec};
 
 /// Which agent CLI a real agent runs. Never a bare shell - see [`ProcessKind`] for the type that
 /// also covers a plain interactive terminal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AgentKind {
     /// The `claude` CLI (Claude Code), spawned with no arguments in the chosen worktree.
     /// Resolved via `PATH`; if not installed, spawning fails and the pane shows
@@ -298,6 +298,9 @@ pub struct Agents {
     /// every close forgets, so `jerry` calls from an agent classify as that agent and stay
     /// confined to its worktree. Plain shells carry no `JERRY_AGENT_ID` and are never entered.
     host_agents: Option<jerry_host::AgentTable>,
+    /// Test-only per-kind spawn override - see [`Self::override_binary`]. Always empty in
+    /// production, since nothing outside `#[cfg(test)]` code ever inserts into it.
+    binary_overrides: HashMap<AgentKind, (PathBuf, Vec<String>)>,
 }
 
 impl Agents {
@@ -308,6 +311,7 @@ impl Agents {
             active_by_cwd: HashMap::new(),
             next_id: 0,
             host_agents: None,
+            binary_overrides: HashMap::new(),
         }
     }
 
@@ -542,7 +546,12 @@ impl Agents {
             leading_args.append(&mut hook_args);
             Some((leading_args, env))
         };
-        let spec = kind.spec(cwd.clone(), shell_override, extras);
+        let mut spec = kind.spec(cwd.clone(), shell_override, extras);
+        if let ProcessKind::Agent(agent) = kind {
+            if let Some(override_command) = self.binary_overrides.get(&agent) {
+                spec.spawn_override = Some(override_command.clone());
+            }
+        }
         let pane = cx.new(|cx| TerminalPane::new(spec, terminal_font_size_px, cx));
         let pane_subscription = cx.subscribe_in(
             &pane,
@@ -598,6 +607,29 @@ impl Agents {
         if let Some(agent) = self.agents.iter_mut().find(|agent| agent.id == id) {
             agent.spawned_at_unix = spawned_at_unix;
         }
+    }
+
+    /// Test-only (GitHub issue #530): makes every future spawn of `kind` really exec `program`
+    /// with `args` in place of `AgentKind::binary_name()` and whatever arguments the real spawn
+    /// path would have computed (hook injection, `--resume`, ...). The recorded
+    /// [`TerminalSpec::program`]/[`TerminalSpec::args`] ([`ProcessKind::spec`]'s own output)
+    /// are untouched - only [`TerminalSpec::spawn_override`] carries this, so a test asserting
+    /// on the spec via `TerminalPane::spec_for_test` still sees the kind's real binary name and
+    /// real arguments. A `ui`-tier test must never launch a real agent CLI; the real args are
+    /// meaningless to a stub and, on Windows, actively break one (`more.com` treats an
+    /// unrecognized flag as a filename to open and exits immediately rather than blocking -
+    /// verified against a real `more.com`), which is why the whole invocation is replaced
+    /// rather than just the program name.
+    #[cfg(test)]
+    pub(crate) fn override_binary(&mut self, kind: AgentKind, program: PathBuf, args: Vec<String>) {
+        self.binary_overrides.insert(kind, (program, args));
+    }
+
+    /// Test-only: undoes [`Self::override_binary`] for `kind`, for the rare test that genuinely
+    /// needs a real agent CLI on the spawn path (the `external`-tier hook integration test).
+    #[cfg(test)]
+    pub(crate) fn clear_binary_override(&mut self, kind: AgentKind) {
+        self.binary_overrides.remove(&kind);
     }
 
     /// Real `SIGSTOP`, via `TerminalPane::pause`, against every real agent session (never a bare
