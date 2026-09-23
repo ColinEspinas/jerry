@@ -37,8 +37,12 @@ pub(crate) fn spawn_consumer(
 
 impl AdeApp {
     /// `event/session-exited`'s own handler: resolves which open agent (if any) the host's
-    /// session id belongs to and forgets it from the host's agent table. A no-op for a session
-    /// this instance never attached to a pane (another client's session, or one already closed).
+    /// session id belongs to and forgets it from the host's agent table. When no agent matches
+    /// yet, the id is recorded (`Agents::note_unmatched_session_exit`) rather than dropped: a
+    /// process short-lived enough (`sh -c exit`) can exit before `Agents::set_host_session_id`
+    /// itself has run, particularly on Linux, and that method applies the exit the moment it
+    /// does. Still a genuine no-op for a session this instance never spawns at all (another
+    /// client's session on the same host).
     fn handle_session_exited(&mut self, params: Value, _cx: &mut Context<Self>) {
         let Some(session_id) = params
             .get("id")
@@ -47,8 +51,9 @@ impl AdeApp {
         else {
             return;
         };
-        if let Some(id) = self.agents.agent_for_host_session(&session_id) {
-            self.agents.forget_host_agent(id);
+        match self.agents.agent_for_host_session(&session_id) {
+            Some(id) => self.agents.forget_host_agent(id),
+            None => self.agents.note_unmatched_session_exit(session_id),
         }
     }
 }
