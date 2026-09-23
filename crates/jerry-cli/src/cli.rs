@@ -35,6 +35,9 @@ pub enum Command {
     Wt(WtArgs),
     /// List the agents Jerry is currently supervising.
     Agents,
+    /// Run an MCP server on stdio, exposing every Command/Query as a tool - see
+    /// `crates/jerry-cli/skill/SKILL.md`'s "MCP" section.
+    Mcp,
     /// Print the `jerry` skill: what these commands do, and when to use them.
     Skill,
     /// Forwards one agent hook event, read from stdin, to the Jerry that spawned this agent.

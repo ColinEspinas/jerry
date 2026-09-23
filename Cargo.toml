@@ -59,6 +59,9 @@ serde_json = "1"
 futures = "0.3"
 # The `jerry` command line; the same 4.4 line Zed pins.
 clap = { version = "4.4", features = ["derive", "wrap_help"] }
+# JSON Schema derivation for `jerry mcp`'s generated tool list (decisions.md §22). Pinned to the
+# same "1.0" line `vendor/zed/Cargo.toml` itself pins.
+schemars = "1.0"
 
 # Debug info is the bulk of a debug `target/` on MSVC, and almost none of it is ever read: a
 # backtrace or a debugger session wants this workspace's own frames, not `aws-lc-sys`' or a

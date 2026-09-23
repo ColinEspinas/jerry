@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 /// Where am I: the worktree, the repository and the caller a request acts as, as the host
 /// resolved them from the call envelope.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct StatusQuery {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,7 +41,7 @@ impl Query for StatusQuery {
 /// answer lives in `jerry-host`'s own agent table (§15), not anything this crate can read. Local
 /// dispatch always answers `NeedsHost` for it, exactly like every other Session-locality request;
 /// the host itself special-cases it in its dispatcher rather than calling [`Query::run`] below.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentsQuery {}
 
 /// One agent as the wire sees it: its host-assigned id, which CLI it runs, and its worktree.
@@ -74,7 +74,7 @@ impl Query for AgentsQuery {
 
 /// Is a merge in progress for this repository, and what is still unmerged in it. What
 /// `jerry merge --continue` and `--abort` read before acting.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MergeStatusQuery {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,9 +106,10 @@ impl Query for MergeStatusQuery {
     }
 }
 
-/// Is a rebase stopped at the caller's worktree, and where - the on-disk state a CLI or agent
-/// reads directly, without dispatching a mutation first.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Is a rebase stopped at the caller's worktree, and where. What the graph pane's rebase mode
+/// reconstructs its `Stopped`/`Planning` phase from after dispatching a mutation - and equally
+/// the on-disk state a CLI or agent reads directly, without dispatching a mutation first.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RebaseStatusQuery {}
 
 /// `jerry_git::rebase::RebaseStatus`, mirrored: paths and names only.

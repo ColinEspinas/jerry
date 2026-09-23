@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 
 /// Bumped only for a framing or envelope change. The registry descriptor carries it and
 /// `Client::connect_to` refuses a host whose version differs.
@@ -248,6 +248,48 @@ pub fn read_frame<R: Read>(reader: &mut R) -> Result<Message, FrameError> {
     Ok(serde_json::from_slice(&body)?)
 }
 
+/// Newline-delimited framing: one JSON-RPC message per line, no length prefix - MCP's stdio
+/// transport (`docs/architecture/decisions.md` §22), next to this module's length-prefixed frame
+/// the host socket uses. `Message` already models JSON-RPC 2.0 generically, so `jerry mcp` reuses
+/// it rather than a second codec.
+pub fn write_line_frame<W: Write + ?Sized>(
+    writer: &mut W,
+    message: &Message,
+) -> Result<(), FrameError> {
+    let mut body = serde_json::to_vec(message)?;
+    body.push(b'\n');
+    writer.write_all(&body)?;
+    writer.flush()?;
+    Ok(())
+}
+
+/// Reads one line and parses it as a `Message`. `Closed` on a clean EOF before any byte of a new
+/// line, matching [`read_frame`]'s own EOF contract; a line present but unparseable is
+/// `FrameError::Json`, letting the caller answer a JSON-RPC parse error and keep reading rather
+/// than tearing down the connection.
+pub fn read_line_frame<R: BufRead + ?Sized>(reader: &mut R) -> Result<Message, FrameError> {
+    read_line_frame_capped(reader, MAX_FRAME_BYTES)
+}
+
+/// [`read_line_frame`] with an explicit cap, so a test can hit it without allocating a
+/// `MAX_FRAME_BYTES`-sized line. There is no length prefix to check first here (unlike
+/// [`read_frame`]), so an oversized line is only detected by hitting the cap.
+fn read_line_frame_capped<R: BufRead + ?Sized>(
+    reader: &mut R,
+    cap: u32,
+) -> Result<Message, FrameError> {
+    let limit = u64::from(cap) + 1;
+    let mut line = String::new();
+    let read = (&mut *reader).take(limit).read_line(&mut line)?;
+    if read == 0 {
+        return Err(FrameError::Closed);
+    }
+    if !line.ends_with('\n') && line.len() as u64 >= limit {
+        return Err(FrameError::TooLarge(cap + 1));
+    }
+    Ok(serde_json::from_str(line.trim_end_matches(['\n', '\r']))?)
+}
+
 #[cfg(test)]
 mod frame_codec_tests {
     use super::{read_frame, write_frame, FrameError, Message, RequestId, RpcError};
@@ -366,5 +408,97 @@ mod frame_codec_tests {
         bytes.extend_from_slice(b"{}");
         let err = read_frame(&mut Cursor::new(bytes)).expect_err("truncated");
         assert!(matches!(err, FrameError::Io(_)), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod line_frame_codec_tests {
+    use super::{read_line_frame, write_line_frame, FrameError, Message, RequestId};
+    use std::io::{BufReader, Cursor};
+
+    #[test]
+    fn every_message_shape_survives_a_line_frame_round_trip() {
+        let messages = [
+            Message::Request {
+                id: RequestId::Number(1),
+                method: "initialize".into(),
+                params: serde_json::json!({ "protocolVersion": "2025-11-25" }),
+            },
+            Message::Notification {
+                method: "notifications/initialized".into(),
+                params: serde_json::Value::Null,
+            },
+            Message::Response {
+                id: RequestId::Number(1),
+                result: Ok(serde_json::json!({ "tools": [] })),
+            },
+        ];
+        let mut buffer = Vec::new();
+        for message in &messages {
+            write_line_frame(&mut buffer, message).expect("encodes");
+        }
+        // One line per message, newline-delimited rather than length-prefixed.
+        assert_eq!(
+            String::from_utf8(buffer.clone())
+                .expect("utf8")
+                .lines()
+                .count(),
+            messages.len()
+        );
+        let mut reader = BufReader::new(Cursor::new(buffer));
+        for expected in messages {
+            assert_eq!(read_line_frame(&mut reader).expect("decodes"), expected);
+        }
+        assert!(matches!(
+            read_line_frame(&mut reader),
+            Err(FrameError::Closed)
+        ));
+    }
+
+    #[test]
+    fn a_malformed_line_is_a_json_error_not_closed() {
+        let mut reader = BufReader::new(Cursor::new(b"not json at all\n".to_vec()));
+        let err = read_line_frame(&mut reader).expect_err("malformed");
+        assert!(matches!(err, FrameError::Json(_)), "{err}");
+    }
+
+    #[test]
+    fn a_trailing_carriage_return_is_stripped() {
+        let mut reader = BufReader::new(Cursor::new(
+            b"{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}\r\n".to_vec(),
+        ));
+        let message = read_line_frame(&mut reader).expect("decodes despite CRLF");
+        assert_eq!(
+            message,
+            Message::Notification {
+                method: "ping".into(),
+                params: serde_json::Value::Null,
+            }
+        );
+    }
+
+    #[test]
+    fn a_line_past_the_cap_is_refused_without_reading_the_rest_of_the_stream() {
+        let cap = 16;
+        // No newline within `cap` bytes - the pathological input the cap exists for.
+        let oversized = vec![b'a'; (cap as usize) * 4];
+        let mut reader = BufReader::new(Cursor::new(oversized));
+        let err = super::read_line_frame_capped(&mut reader, cap).expect_err("too large");
+        assert!(matches!(err, FrameError::TooLarge(_)), "{err}");
+    }
+
+    #[test]
+    fn a_line_within_the_cap_still_decodes() {
+        let mut reader =
+            BufReader::new(Cursor::new(b"{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}\n"));
+        let message =
+            super::read_line_frame_capped(&mut reader, 1024).expect("well within the cap");
+        assert_eq!(
+            message,
+            Message::Notification {
+                method: "ping".into(),
+                params: serde_json::Value::Null,
+            }
+        );
     }
 }
