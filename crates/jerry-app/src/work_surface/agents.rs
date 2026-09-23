@@ -2,7 +2,7 @@
 //! worktree it's running in, and tracks which agents are open and which one is active for
 //! the tabbed center pane. `TerminalPane` itself has no notion of tabs or of "which
 //! worktree" - see its module docs - this is that one layer up.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -322,6 +322,16 @@ pub struct Agents {
     /// concern (`crate::root::task_pool::TaskPool`'s own docs list several such pools on
     /// `AdeApp` for exactly this reason).
     _close_tasks: crate::root::task_pool::TaskPool,
+    /// Host session ids an `event/session-exited` notification named before
+    /// [`Self::set_host_session_id`] ever recorded which agent that id belongs to - real on
+    /// Linux, where `sh -c exit` can finish inside the very dispatch round trip that spawned it,
+    /// so its exit event reaches this instance's subscriber before the spawn's own response has
+    /// even resolved (`crate::work_surface::session_exited`'s own docs). Consulted, and cleared
+    /// of any match, by [`Self::set_host_session_id`] the moment the id it was waiting for
+    /// finally arrives. An id belonging to a session this instance never spawns at all (another
+    /// client's session on the same host) is never claimed and stays here - accepted, since the
+    /// fanout only ever names a session id once per exit and each entry is a small string.
+    pending_exits: HashSet<jerry_core::SessionId>,
 }
 
 impl Agents {
@@ -335,6 +345,7 @@ impl Agents {
             binary_overrides: HashMap::new(),
             _spawn_tasks: crate::root::task_pool::TaskPool::default(),
             _close_tasks: crate::root::task_pool::TaskPool::default(),
+            pending_exits: HashSet::new(),
         }
     }
 
@@ -523,11 +534,18 @@ impl Agents {
     }
 
     /// Records the host's own PTY session id a pane attached to - see [`Agent::host_session_id`].
-    /// A no-op for an id that isn't open (the pane could have been closed in the interval between
-    /// `SessionSpawn` dispatch and this resolving).
+    /// A no-op on [`Agent::host_session_id`] itself for an id that isn't open (the pane could
+    /// have been closed in the interval between `SessionSpawn` dispatch and this resolving), but
+    /// `Self::pending_exits` is still consulted regardless: if this exact session id already
+    /// exited before this call ever ran (real on Linux - see [`Self::pending_exits`]'s own docs),
+    /// that exit is applied right now, the same [`Self::forget_host_agent`] path a normally
+    /// ordered `event/session-exited` takes.
     pub fn set_host_session_id(&mut self, id: AgentId, session_id: jerry_core::SessionId) {
         if let Some(agent) = self.agents.iter_mut().find(|agent| agent.id == id) {
-            agent.host_session_id = Some(session_id);
+            agent.host_session_id = Some(session_id.clone());
+        }
+        if self.pending_exits.remove(&session_id) {
+            self.forget_host_agent(id);
         }
     }
 
@@ -539,6 +557,14 @@ impl Agents {
             .iter()
             .find(|agent| agent.host_session_id.as_ref() == Some(session_id))
             .map(|agent| agent.id)
+    }
+
+    /// [`Self::pending_exits`]'s own write side: `crate::work_surface::session_exited` calls
+    /// this when an `event/session-exited` notification's id matches no agent yet, so
+    /// [`Self::set_host_session_id`] can apply it once that agent's id is finally known instead
+    /// of losing it - see that field's own docs for the real race this closes.
+    pub(crate) fn note_unmatched_session_exit(&mut self, session_id: jerry_core::SessionId) {
+        self.pending_exits.insert(session_id);
     }
 
     /// The conversation id this pane is attached to, if it was known at spawn time - `None` for
@@ -1556,4 +1582,84 @@ mod chat_id_tests {
 /// The identity the host knows an agent by: the same text `JERRY_AGENT_ID` carries.
 fn host_agent_id(id: AgentId) -> jerry_core::AgentId {
     jerry_core::AgentId(id.to_string())
+}
+
+/// `Agents::pending_exits`'s own coverage: a real, in-process `jerry_host::Host` (no `gpui`, no
+/// real spawned process needed) proves the exit is applied the moment the id it was waiting for
+/// arrives, deterministically - the real-process ordering
+/// `session_exited::tests::a_real_agents_exit_is_forgotten_from_the_agent_table_once_its_event_
+/// arrives` covers is inherently racy to reproduce on demand (that is the whole bug), so this
+/// drives the same two calls directly instead of hoping a real `sh -c exit` finishes fast enough.
+#[cfg(test)]
+mod pending_exit_tests {
+    use super::{host_agent_id, Agents};
+    use std::path::PathBuf;
+
+    #[test]
+    fn a_session_exit_recorded_before_the_id_is_known_is_applied_the_moment_it_is() {
+        let host = jerry_host::Host::start().expect("host");
+        let mut agents = Agents::new();
+        agents.attach_host(host.agents());
+
+        let agent_id = 1;
+        host.agents().register(
+            host_agent_id(agent_id),
+            PathBuf::from("/repo"),
+            "Claude".into(),
+        );
+        let session_id = jerry_core::SessionId::from("session-1");
+
+        // The exit arrives first - before anything has told `Agents` this session id belongs to
+        // `agent_id` at all, exactly the Linux race this closes.
+        agents.note_unmatched_session_exit(session_id.clone());
+        assert!(
+            host.agents()
+                .list()
+                .iter()
+                .any(|(id, _)| *id == host_agent_id(agent_id)),
+            "sanity check: still registered - nothing has applied the exit yet"
+        );
+
+        // The spawn response resolves after the fact.
+        agents.set_host_session_id(agent_id, session_id);
+
+        assert!(
+            !host
+                .agents()
+                .list()
+                .iter()
+                .any(|(id, _)| *id == host_agent_id(agent_id)),
+            "a session exit recorded before its agent id was known must be applied the moment \
+             set_host_session_id learns it"
+        );
+        host.shutdown_and_join();
+    }
+
+    /// The ordinary case must keep working unchanged: an id `set_host_session_id` already knows
+    /// about, with no pending exit recorded for it, is left alone.
+    #[test]
+    fn a_session_with_no_pending_exit_is_left_registered() {
+        let host = jerry_host::Host::start().expect("host");
+        let mut agents = Agents::new();
+        agents.attach_host(host.agents());
+
+        let agent_id = 1;
+        host.agents().register(
+            host_agent_id(agent_id),
+            PathBuf::from("/repo"),
+            "Claude".into(),
+        );
+        let session_id = jerry_core::SessionId::from("session-1");
+
+        agents.set_host_session_id(agent_id, session_id);
+
+        assert!(
+            host.agents()
+                .list()
+                .iter()
+                .any(|(id, _)| *id == host_agent_id(agent_id)),
+            "no exit was ever recorded - the agent must stay registered"
+        );
+        host.shutdown_and_join();
+    }
 }
