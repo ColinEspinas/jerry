@@ -6819,6 +6819,7 @@ mod graph_remote_action_tests {
 
     #[gpui::test]
     async fn rebase_onto_really_replays_the_branch_and_reports_success(cx: &mut TestAppContext) {
+        crate::test_support::assert_real_jerry_binary_available();
         let (local, app, cx) = open_seeded_local_repo(cx);
         git(local.path(), &["checkout", "-b", "target-branch"]);
         commit(local.path(), "b.txt", "target content", "target advances");
@@ -6858,6 +6859,7 @@ mod graph_remote_action_tests {
     async fn rebase_onto_a_real_conflict_stops_in_the_recoverable_rebase_mode_not_a_dead_end(
         cx: &mut TestAppContext,
     ) {
+        crate::test_support::assert_real_jerry_binary_available();
         let (local, app, cx) = open_seeded_local_repo(cx);
         git(local.path(), &["checkout", "-b", "target-branch"]);
         commit(local.path(), "a.txt", "target change", "target advances");
@@ -6932,6 +6934,7 @@ mod graph_remote_action_tests {
     async fn resolving_a_rebase_conflict_in_the_diff_view_writes_through_and_refuses_to_clobber_an_external_change(
         cx: &mut TestAppContext,
     ) {
+        crate::test_support::assert_real_jerry_binary_available();
         let (local, app, cx) = open_seeded_local_repo(cx);
         git(local.path(), &["checkout", "-b", "target-branch"]);
         commit(local.path(), "a.txt", "target change", "target advances");
@@ -7019,6 +7022,7 @@ mod graph_remote_action_tests {
 
     #[gpui::test]
     async fn rebase_onto_refuses_while_a_rebase_mode_is_already_live(cx: &mut TestAppContext) {
+        crate::test_support::assert_real_jerry_binary_available();
         let (local, app, cx) = open_seeded_local_repo(cx);
         git(local.path(), &["checkout", "-b", "target-branch"]);
         commit(local.path(), "a.txt", "target change", "target advances");
@@ -8963,6 +8967,7 @@ mod graph_branch_action_tests {
     async fn rebase_on_branch_resolves_its_real_tip_and_enters_the_shared_rebase_mode(
         cx: &mut TestAppContext,
     ) {
+        crate::test_support::assert_real_jerry_binary_available();
         let (local, app, cx) = open_seeded_with_feature_branch(cx);
         commit(local.path(), "c.txt", "own", "own work");
         let feature_tip = git_output(local.path(), &["rev-parse", "feature"]);

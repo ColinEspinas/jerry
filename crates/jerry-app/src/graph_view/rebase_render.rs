@@ -212,6 +212,8 @@ impl AdeApp {
 
         if let Some(strip) = self.render_rebase_stopped_strip(cx) {
             container = container.child(strip);
+        } else if let Some(strip) = self.render_rebase_error_strip() {
+            container = container.child(strip);
         }
 
         container
@@ -406,6 +408,21 @@ impl AdeApp {
                     )
                     .into_any_element()
             }
+            RebasePhase::Error { .. } => div()
+                .flex()
+                .items_center()
+                .gap(px(10.0))
+                .child(
+                    render_rebase_button("Cancel", RebaseButtonStyle::Ghost, enabled, &[]).when(
+                        enabled,
+                        |el| {
+                            el.on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                                this.cancel_rebase_mode(cx);
+                            }))
+                        },
+                    ),
+                )
+                .into_any_element(),
             RebasePhase::Stopped { .. } => div()
                 .flex()
                 .items_center()
@@ -532,6 +549,53 @@ impl AdeApp {
         )
     }
 
+    /// [`RebasePhase::Error`]'s own strip - a dispatched mutation's real `Report` failure, in
+    /// `theme::status::FAIL`'s reserved failure hue (never the stopped strip's "needs input"
+    /// amber - this is a real failure, not a wait). Mirrors [`Self::render_rebase_stopped_strip`]'s
+    /// shape so the two read as the same kind of banner, not two different UI languages.
+    fn render_rebase_error_strip(&self) -> Option<gpui::AnyElement> {
+        let rebase_state = self.graph_state.rebase.as_ref()?;
+        let RebasePhase::Error { message } = &rebase_state.phase else {
+            return None;
+        };
+        Some(
+            div()
+                .id("rebase-error-strip")
+                .debug_selector(|| "rebase-error-strip".to_string())
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .px(px(12.0))
+                .py(px(6.0))
+                .bg(theme::status::FAIL_BG)
+                .border_b_1()
+                .border_color(theme::status::FAIL)
+                .child(
+                    div()
+                        .debug_selector(|| "rebase-error-strip-mark".to_string())
+                        .flex_none()
+                        .w(theme::graph::REBASE_MARK)
+                        .h(theme::graph::REBASE_MARK)
+                        .rounded(theme::radius::MARK_SM)
+                        .bg(theme::status::FAIL),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "rebase-error-strip-text".to_string())
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .font(font(theme::font::SANS))
+                        .font_weight(gpui::FontWeight(450.0))
+                        .text_size(px(11.0))
+                        .text_color(theme::status::FAIL)
+                        .child(message.clone()),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// Design spec §1.4: the scrollable plan row list, oldest first, top to bottom.
     fn render_rebase_plan_rows(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let Some(rebase_state) = self.graph_state.rebase.as_ref() else {
@@ -593,7 +657,7 @@ impl AdeApp {
             RebasePhase::Stopped { outcome } => {
                 outcome_stopped_commit(outcome) == Some(commit.as_str())
             }
-            RebasePhase::Planning => false,
+            RebasePhase::Planning | RebasePhase::Error { .. } => false,
         };
         let files_label = row
             .files_changed
@@ -1713,6 +1777,7 @@ mod rebase_flow_tests {
     fn starting_a_plan_that_drops_a_commit_completes_and_leaves_rebase_mode(
         cx: &mut TestAppContext,
     ) {
+        crate::test_support::assert_real_jerry_binary_available();
         // Independent files, unlike `open_seeded_graph`'s single shared file - dropping `second`
         // must not conflict with `third`, which touches a different file entirely.
         let repo = tempfile::tempdir().expect("tempdir");
@@ -1760,6 +1825,7 @@ mod rebase_flow_tests {
     fn the_derived_result_blocks_match_the_real_history_a_real_rebase_produces(
         cx: &mut TestAppContext,
     ) {
+        crate::test_support::assert_real_jerry_binary_available();
         // Independent files throughout: this test is comparing a derivation against real git
         // output, so a conflict getting in the way would only obscure what it is measuring.
         let repo = tempfile::tempdir().expect("tempdir");
@@ -1921,6 +1987,7 @@ mod rebase_flow_tests {
     fn a_reword_message_supplied_before_start_runs_straight_through_with_no_stop(
         cx: &mut TestAppContext,
     ) {
+        crate::test_support::assert_real_jerry_binary_available();
         let (repo, app, cx) = open_seeded_graph(cx);
         app.update_in(cx, |app, _window, cx| {
             app.enter_rebase_mode(2, cx);
@@ -2003,6 +2070,7 @@ mod rebase_flow_tests {
 
     #[gpui::test]
     fn starting_a_plan_that_stops_for_edit_shows_the_right_pause_marker(cx: &mut TestAppContext) {
+        crate::test_support::assert_real_jerry_binary_available();
         let (_repo, app, cx) = open_seeded_graph(cx);
         app.update_in(cx, |app, _window, cx| {
             app.enter_rebase_mode(2, cx);
@@ -2033,7 +2101,7 @@ mod rebase_flow_tests {
             assert!(
                 super::rebase::outcome_stopped_commit(match &rebase_state.phase {
                     RebasePhase::Stopped { outcome } => outcome,
-                    RebasePhase::Planning => unreachable!(),
+                    _ => unreachable!(),
                 }) == Some(rebase_state.plan[0].commit.as_str()),
                 "the row-level filled pause marker must match the real stopped commit"
             );
@@ -2046,6 +2114,7 @@ mod rebase_flow_tests {
     fn a_message_less_reword_stop_completes_once_continue_runs_after_a_real_message_is_supplied(
         cx: &mut TestAppContext,
     ) {
+        crate::test_support::assert_real_jerry_binary_available();
         let (repo, app, cx) = open_seeded_graph(cx);
         app.update_in(cx, |app, _window, cx| {
             app.enter_rebase_mode(2, cx);
@@ -2107,6 +2176,7 @@ mod rebase_flow_tests {
     fn a_real_conflict_stop_shows_the_banner_and_resolve_opens_the_real_file(
         cx: &mut TestAppContext,
     ) {
+        crate::test_support::assert_real_jerry_binary_available();
         let repo = tempfile::tempdir().expect("tempdir");
         seed_empty_repo_at(repo.path());
         commit(repo.path(), "file.txt", "base", "base");
@@ -2348,6 +2418,7 @@ mod rebase_flow_tests {
     fn a_second_op_click_while_the_first_is_still_in_flight_is_refused_not_raced(
         cx: &mut TestAppContext,
     ) {
+        crate::test_support::assert_real_jerry_binary_available();
         let (repo, app, cx) = open_seeded_graph(cx);
         app.update_in(cx, |app, _window, cx| {
             app.enter_rebase_mode(2, cx);
@@ -2397,6 +2468,7 @@ mod rebase_flow_tests {
     fn cancel_is_refused_while_start_rebase_is_in_flight_and_the_real_outcome_still_lands(
         cx: &mut TestAppContext,
     ) {
+        crate::test_support::assert_real_jerry_binary_available();
         let (repo, app, cx) = open_seeded_graph(cx);
         app.update_in(cx, |app, _window, cx| {
             app.enter_rebase_mode(2, cx);
@@ -3011,6 +3083,7 @@ mod rebase_flow_tests {
 
     #[gpui::test]
     fn the_stopped_strip_paints_the_amber_square_the_spec_asks_for(cx: &mut TestAppContext) {
+        crate::test_support::assert_real_jerry_binary_available();
         let repo = tempfile::tempdir().expect("tempdir");
         seed_empty_repo_at(repo.path());
         commit(repo.path(), "file.txt", "base", "base");
@@ -3060,6 +3133,56 @@ mod rebase_flow_tests {
             mark.origin.x < text.origin.x,
             "the square leads the strip, exactly like a warning row's own"
         );
+    }
+
+    // --- A dispatched mutation's real refusal is a visible banner, not dropped ------------------
+
+    #[gpui::test]
+    fn a_dispatched_rebase_start_failure_lands_in_a_real_visible_error_banner(
+        cx: &mut TestAppContext,
+    ) {
+        crate::test_support::assert_real_jerry_binary_available();
+        let (repo, app, cx) = open_seeded_graph(cx);
+        app.update_in(cx, |app, _window, cx| {
+            app.enter_rebase_mode(2, cx);
+        });
+        cx.run_until_parked();
+
+        // A real uncommitted file - `RebaseStart::validate`'s own dirty-worktree check
+        // (`rebase-worktree-dirty`) refuses this deterministically, without needing a real
+        // conflict or any other flaky trigger.
+        std::fs::write(repo.path().join("dirty.txt"), "uncommitted").expect("write dirty file");
+
+        app.update_in(cx, |app, _window, cx| {
+            app.start_rebase(cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            let rebase_state = app
+                .graph_state
+                .rebase
+                .as_ref()
+                .expect("a real refusal must leave the mode open, not leave it silently");
+            match &rebase_state.phase {
+                RebasePhase::Error { message } => {
+                    assert!(
+                        message.contains("uncommitted"),
+                        "the real refusal reason must reach the banner, got: {message:?}"
+                    );
+                }
+                other => panic!("expected a real Error phase, got {other:?}"),
+            }
+            assert!(!rebase_state.op_in_flight);
+        });
+
+        let strip = cx
+            .debug_bounds("rebase-error-strip")
+            .expect("the real error strip must paint for a dispatched failure");
+        let text = cx
+            .debug_bounds("rebase-error-strip-text")
+            .expect("the real error message must be painted inside the strip");
+        assert!(strip.contains(&text.origin));
     }
 
     #[cfg(not(target_os = "linux"))]
