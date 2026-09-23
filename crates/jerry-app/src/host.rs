@@ -57,7 +57,7 @@ impl HostRuntime {
     pub fn start(registry_dir: PathBuf) -> Result<(HostRuntime, DispatchFuture), HostStartError> {
         let registry = Registry::open(registry_dir.clone())?;
         let instance = registry.allocate()?;
-        let (host, dispatch) = Host::start_detached();
+        let (host, dispatch) = Host::start_detached(registry_dir.clone());
         host.listen(&instance.socket)?;
         let runtime = HostRuntime {
             host: Some(host),
@@ -79,9 +79,12 @@ impl HostRuntime {
 
     /// A host with no socket and no registry entry: the same dispatch path, reachable only from
     /// this process. What a test app runs on, so `jerry` never finds a test instance. Its
-    /// dispatch loop starts with the first dispatch.
+    /// dispatch loop starts with the first dispatch. Every session's own data-plane socket still
+    /// binds for real (`jerry_host::default_sockets_dir`) - `command/session-attach` hands back a
+    /// real, connectable path even for this unpublished host, exactly as a real out-of-process one
+    /// would (`docs/architecture/decisions.md` §24).
     pub fn in_process() -> HostRuntime {
-        let (host, dispatch) = Host::start_detached();
+        let (host, dispatch) = Host::start_detached(jerry_host::default_sockets_dir());
         HostRuntime {
             host: Some(host),
             pending_dispatch: Some(dispatch),

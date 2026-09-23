@@ -2820,7 +2820,7 @@ mod pty_pane_fixtures {
         spec: &TerminalSpec,
         cx: &mut Context<TerminalPane>,
     ) {
-        let (host, dispatch) = jerry_host::Host::start_detached();
+        let (host, dispatch) = jerry_host::Host::start_detached(jerry_host::default_sockets_dir());
         cx.background_executor().spawn(dispatch).detach();
         let mut options = jerry_pty::SpawnOptions::new(spec.program.clone())
             .args(spec.args.clone())

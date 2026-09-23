@@ -76,6 +76,12 @@ pub struct SessionRecord {
     /// `None` while running, or for an agent-identity registration with no `PtySession` the
     /// host actually owns (decisions.md §23's `AgentTable`-compatibility entries).
     pub exit: Option<ExitStatusWire>,
+    /// The real spawned process's own pid, `None` for an `AgentTable`-compatibility registration
+    /// with no process at all. `crate::terminal::socket_adapter::SocketSessionAdapter`'s own
+    /// `process_id()` (`docs/architecture/decisions.md` §24) resolves this from a `SessionsQuery`
+    /// rather than a control-plane round trip of its own, since a session's pid never changes
+    /// once spawned - set once, at spawn time, and left as-is once the session exits.
+    pub process_id: Option<u32>,
 }
 
 /// Spawns a new PTY session in the caller's worktree, owned by the host from then on
@@ -186,6 +192,51 @@ impl Command for SessionKill {
     }
 
     fn execute(self, _ctx: &Ctx) -> Result<(), Error> {
+        Err(Error::new(
+            "needs-host",
+            "the session table lives on the session host, not in this process",
+        ))
+    }
+}
+
+/// Attaches to a live session's data plane (`docs/architecture/decisions.md` §24's cutover):
+/// answers with the path to a per-session socket that, from the moment a client connects, carries
+/// raw bytes both ways - the host's own `PtyOutput::Bytes` payloads verbatim in order out, input
+/// bytes in. Never `PtyOutput`-framed on the wire: bytes are not a control-plane concern (§23).
+/// `Locality::Session`, `Invocability::Denied` to agents (an agent already owns its own real pty).
+/// Never actually executed through [`Command::execute`] - see [`SessionSpawn`]'s docs. Exactly one
+/// attach at a time per session: a second call while one is live answers `Report::Denied` with
+/// code `session-already-attached`, handled directly by `jerry-host`'s dispatcher rather than
+/// through this trait impl, exactly like `SessionSpawn`/`SessionResize`/`SessionKill`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SessionAttach {
+    pub id: SessionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionAttachOutcome {
+    pub socket: PathBuf,
+}
+
+impl Command for SessionAttach {
+    type Outcome = SessionAttachOutcome;
+    const NAME: &'static str = "session-attach";
+
+    fn invocability(&self) -> Invocability {
+        Invocability::Denied
+    }
+
+    fn locality(&self) -> Locality {
+        Locality::Session
+    }
+
+    /// Never reached - see the type's own docs.
+    fn validate(&self, _ctx: &Ctx) -> Result<(), Denied> {
+        Ok(())
+    }
+
+    /// Never reached - see the type's own docs.
+    fn execute(self, _ctx: &Ctx) -> Result<SessionAttachOutcome, Error> {
         Err(Error::new(
             "needs-host",
             "the session table lives on the session host, not in this process",

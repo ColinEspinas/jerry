@@ -136,7 +136,7 @@ impl Registry {
     /// Creates the directory if needed, private to the user on Unix (`0700`). An existing path
     /// that is not a plain directory (a symlink, a file) is refused rather than adopted.
     pub fn open(dir: PathBuf) -> Result<Registry, RegistryError> {
-        create_private_dir(&dir)?;
+        ensure_private_dir(&dir)?;
         Ok(Registry { dir })
     }
 
@@ -383,8 +383,11 @@ fn remove_if_present(path: &Path) -> Result<(), RegistryError> {
 }
 
 /// Distinct on every call within a process: a per-process counter mixed with the clock and the
-/// pid through the standard library's randomly keyed hasher.
-fn fresh_u32() -> u32 {
+/// pid through the standard library's randomly keyed hasher. `pub`: also how `jerry-host` names
+/// its own per-session data-plane sockets (`docs/architecture/decisions.md` §24), which need the
+/// exact same "distinct even across concurrent `SessionManager`s in one test process" guarantee
+/// this registry already relies on for instance names.
+pub fn fresh_u32() -> u32 {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -397,8 +400,13 @@ fn fresh_u32() -> u32 {
     hasher.finish() as u32
 }
 
+/// Creates `dir` if missing, private to the user (Unix: `0700`; Windows: relies on
+/// `%LOCALAPPDATA%`'s own per-user ACL). [`Registry::open`]'s own guarantee, exposed so
+/// `jerry-host`'s per-session data-plane sockets - a directory with no `Registry` of their own,
+/// `docs/architecture/decisions.md` §24 - get the same "this directory really exists" guarantee
+/// rather than assuming a registry directory elsewhere happened to create it first.
 #[cfg(unix)]
-fn create_private_dir(dir: &Path) -> Result<(), RegistryError> {
+pub fn ensure_private_dir(dir: &Path) -> Result<(), RegistryError> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     let io = |source| RegistryError::Io {
         path: dir.to_path_buf(),
@@ -424,7 +432,7 @@ fn create_private_dir(dir: &Path) -> Result<(), RegistryError> {
 }
 
 #[cfg(windows)]
-fn create_private_dir(dir: &Path) -> Result<(), RegistryError> {
+pub fn ensure_private_dir(dir: &Path) -> Result<(), RegistryError> {
     // `%LOCALAPPDATA%` is already private to the user; its default ACL is the defence here.
     match fs::symlink_metadata(dir) {
         Ok(meta) if meta.file_type().is_dir() => Ok(()),

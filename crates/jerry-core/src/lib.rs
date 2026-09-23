@@ -49,7 +49,7 @@ pub use request::{
     execute_locally, AppCommand, AppQuery, HookEvent, LocalDispatchError, Request, Shutdown,
 };
 pub use session::{
-    ExitStatusWire, SessionAgentInfo, SessionId, SessionKill, SessionKind, SessionRecord,
-    SessionResize, SessionSpawn, SessionSpawnOutcome,
+    ExitStatusWire, SessionAgentInfo, SessionAttach, SessionAttachOutcome, SessionId, SessionKill,
+    SessionKind, SessionRecord, SessionResize, SessionSpawn, SessionSpawnOutcome,
 };
 pub use wire::{Message, RequestId, RpcError, PROTOCOL_VERSION};

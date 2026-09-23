@@ -18,7 +18,7 @@ use crate::queries::{
     AgentsQuery, MergeStatusQuery, RebaseStatusQuery, SessionsQuery, StatusQuery,
 };
 use crate::report::Report;
-use crate::session::{SessionId, SessionKill, SessionResize, SessionSpawn};
+use crate::session::{SessionAttach, SessionId, SessionKill, SessionResize, SessionSpawn};
 use crate::wire::{rpc_code, RpcError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -87,6 +87,7 @@ pub enum AppCommand {
     AmendHeadMessage(AmendHeadMessage),
     WorktreeCreate(WorktreeCreate),
     SessionSpawn(SessionSpawn),
+    SessionAttach(SessionAttach),
     SessionResize(SessionResize),
     SessionKill(SessionKill),
     Shutdown(Shutdown),
@@ -114,6 +115,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "rebase-continue",
     "rebase-skip",
     "rebase-start",
+    "session-attach",
     "session-kill",
     "session-resize",
     "session-spawn",
@@ -171,6 +173,7 @@ macro_rules! each_command {
             AppCommand::AmendHeadMessage($c) => $body,
             AppCommand::WorktreeCreate($c) => $body,
             AppCommand::SessionSpawn($c) => $body,
+            AppCommand::SessionAttach($c) => $body,
             AppCommand::SessionResize($c) => $body,
             AppCommand::SessionKill($c) => $body,
             AppCommand::Shutdown($c) => $body,
@@ -193,6 +196,7 @@ impl AppCommand {
             AppCommand::AmendHeadMessage(_) => AmendHeadMessage::NAME,
             AppCommand::WorktreeCreate(_) => WorktreeCreate::NAME,
             AppCommand::SessionSpawn(_) => SessionSpawn::NAME,
+            AppCommand::SessionAttach(_) => SessionAttach::NAME,
             AppCommand::SessionResize(_) => SessionResize::NAME,
             AppCommand::SessionKill(_) => SessionKill::NAME,
             AppCommand::Shutdown(_) => Shutdown::NAME,
@@ -247,6 +251,9 @@ impl AppCommand {
                  it."
             }
             AppCommand::SessionSpawn(_) => "Spawn a new PTY session, owned by this host.",
+            AppCommand::SessionAttach(_) => {
+                "Attach to a live session's data plane; answers with a per-session socket path."
+            }
             AppCommand::SessionResize(_) => "Resize a live session's pty.",
             AppCommand::SessionKill(_) => "Kill a live session's process tree.",
             AppCommand::Shutdown(_) => {
@@ -271,6 +278,7 @@ impl AppCommand {
             AppCommand::AmendHeadMessage(_) => schema_of::<AmendHeadMessage>(),
             AppCommand::WorktreeCreate(_) => schema_of::<WorktreeCreate>(),
             AppCommand::SessionSpawn(_) => schema_of::<SessionSpawn>(),
+            AppCommand::SessionAttach(_) => schema_of::<SessionAttach>(),
             AppCommand::SessionResize(_) => schema_of::<SessionResize>(),
             AppCommand::SessionKill(_) => schema_of::<SessionKill>(),
             AppCommand::Shutdown(_) => schema_of::<Shutdown>(),
@@ -536,6 +544,12 @@ impl Request {
                     env: Vec::new(),
                     rows: 24,
                     cols: 80,
+                })),
+            ),
+            (
+                "request-command-session-attach",
+                Request::Command(AppCommand::SessionAttach(SessionAttach {
+                    id: SessionId::from("session-1"),
                 })),
             ),
             (

@@ -7,12 +7,12 @@
 //! confinement keep an agent from acting outside its lane by accident; they are guardrails, not
 //! a sandbox against a process that chooses to lie about who it is.
 
-use crate::session::SessionError;
+use crate::session::{SessionAttachError, SessionError};
 use crate::Inner;
 use jerry_core::wire::rpc_code;
 use jerry_core::{
     execute_locally, permits, AppCommand, AppQuery, Call, Caller, Ctx, Error, LocalDispatchError,
-    Message, Report, Request, RpcError, SessionSpawnOutcome,
+    Message, Report, Request, RpcError, SessionAttachOutcome, SessionSpawnOutcome,
 };
 use serde_json::Value;
 use std::fs;
@@ -62,6 +62,18 @@ pub(crate) fn handle(inner: &Inner, call: Call) -> Result<Value, RpcError> {
             to_value(match spawn_session(inner, &call.cwd, command.clone()) {
                 Ok(outcome) => Report::ok(&outcome),
                 Err(error) => Report::Error { error },
+            })
+        }
+        Request::Command(AppCommand::SessionAttach(command)) => {
+            to_value(match inner.sessions().attach(&command.id) {
+                Ok(socket) => Report::ok(&SessionAttachOutcome { socket }),
+                Err(SessionAttachError::AlreadyAttached(id)) => Report::Denied {
+                    code: "session-already-attached".into(),
+                    reason: format!("session {id} already has an attached client"),
+                },
+                Err(SessionAttachError::NotFound(id)) => Report::Error {
+                    error: Error::new("session-not-found", format!("no session with id {id}")),
+                },
             })
         }
         Request::Command(AppCommand::SessionResize(command)) => to_value(

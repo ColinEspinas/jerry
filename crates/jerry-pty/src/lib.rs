@@ -142,6 +142,15 @@ pub enum PtyError {
     CaptureTimeout(String),
     #[error("`{0}` printed no usable line")]
     CaptureEmpty(String),
+    /// Never produced by this crate itself: `crate::terminal::pane::SessionAdapter`
+    /// (`crates/jerry-app`) has two implementers, a real [`PtySession`] and
+    /// `jerry-app`'s own socket-backed adapter for a session owned by an out-of-process
+    /// `jerry-host` (`docs/architecture/decisions.md` §24) - the latter has no `PtySession` to
+    /// report a *real* [`PtyError`] variant for, so a socket I/O failure or a failed
+    /// `command/session-kill` dispatch is reported through this one instead, to satisfy the
+    /// same trait's signature rather than invent a second, adapter-specific error type.
+    #[error("{0}")]
+    Remote(String),
 }
 
 /// One item from [`PtySession::take_output`]'s stream: either a chunk of raw bytes, or the
