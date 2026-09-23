@@ -59,9 +59,10 @@ fn tool_for(request: Request) -> Option<ToolSpec> {
             input_schema: query.input_schema(),
             invocability: query.invocability(),
         }),
-        // Not tools: `Validate` is a CLI-only dry-run variant of a Command, and `Hook` is not a
-        // caller-invocable action at all.
-        Request::Hook(_) | Request::Validate(_) => None,
+        // Not tools: `Validate` is a CLI-only dry-run variant of a Command, `Hook` is not a
+        // caller-invocable action at all, and `Subscribe` opens a stream rather than answering a
+        // typed call - not a shape an MCP tool call fits.
+        Request::Hook(_) | Request::Validate(_) | Request::Subscribe => None,
     }
 }
 

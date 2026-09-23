@@ -87,6 +87,15 @@ pub(crate) fn handle(inner: &Inner, call: Call) -> Result<Value, RpcError> {
                 },
             })
         }
+        // `jerry host stop` / a human's own "restart sessions" action: signals the lifecycle
+        // loop (`Host::run_lifecycle`) directly, bypassing the idle/linger check entirely -
+        // `Host::shutdown` already kills every live session the same way an idle timeout would.
+        Request::Command(AppCommand::Shutdown(_)) => {
+            inner.request_shutdown();
+            to_value(Report::Ok {
+                outcome: Value::Null,
+            })
+        }
         _ => {
             let requested_by = caller.clone();
             let ctx = match Ctx::from_cwd(&call.cwd, caller) {

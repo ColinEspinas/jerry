@@ -24,7 +24,12 @@ OS" helpers that aren't PTY-specific (`resolve_on_path`, `new_std_command`).
 **Owns.** `PtySession`, `SpawnOptions`, process lifecycle (`kill`, `pause`, `resume`, `try_wait`).
 Output is exposed as a plain `std::sync::mpsc::Receiver<Vec<u8>>`. Also `new_std_command`, the one
 sanctioned constructor for every non-PTY `std::process::Command` in the workspace — it suppresses
-the per-spawn console window on Windows GUI-subsystem release builds (decisions.md §10).
+the per-spawn console window on Windows GUI-subsystem release builds (decisions.md §10). And
+`new_detached_command`/`breakaway_is_forbidden_for_current_process` (decisions.md §14/§24): the
+one place `CREATE_BREAKAWAY_FROM_JOB` (Windows) / a fresh process group (unix) is spawned, so a
+`jerry-host` process can outlive the job-jobbed app or CLI that started it — used by
+`jerry_core::host_spawn` and, from `jerry-host`'s own `main.rs`, the self-adoption on the other
+side of that spawn.
 
 **Does not own.** ANSI/terminal-grid parsing (that's `crates/jerry-app/src/terminal/`), any git concern,
 any gpui dependency.
@@ -37,7 +42,12 @@ JSON-RPC 2.0 frame codec, the per-repository host registry, and a blocking socke
 Git-locality Command and Query implementations live here so standalone `jerry-cli` can run them.
 
 **Owns.** No threads, no listener, no sessions. Every variant a client can send is catalogued in
-`request.rs` and pinned by a JSON fixture under `fixtures/`.
+`request.rs` and pinned by a JSON fixture under `fixtures/`. `crate::host_spawn::spawn_or_connect`
+(decisions.md §24): resolve the registry for a repository, connect to a live version-matched
+host, flag a version mismatch, or spawn `jerry-host` detached and wait for its descriptor - the
+one implementation both `jerry host start` and (once wired) `jerry-app`'s own `HostRuntime` call,
+which is why this crate takes a real (non-dev) dependency on `jerry-pty`. `crate::jerry_binary::
+locate_named` finds any sibling binary this workspace ships (`jerry`, `jerry-host`).
 
 **Does not own.** Dispatch, the listener and the session table (`jerry-host`); anything `gpui`.
 
@@ -46,20 +56,28 @@ Git-locality Command and Query implementations live here so standalone `jerry-cl
 **Scope.** The session host: the one place a `Call` is authorized and executed. A dispatch
 thread woken by a channel, the AF_UNIX listener with a reader and writer per connection, the
 session table (`crate::session::SessionManager`, every PTY it spawned or is tracking - agents
-and plain terminal tabs alike), and notification fan-out to every connected client. In-process
-inside `jerry-app` through stage 2; its own process at stage 3.
+and plain terminal tabs alike), and notification fan-out to every connected client. Its own
+process from decisions.md §24 (`[[bin]] jerry-host`, `src/main.rs`) - a real, tested binary that
+self-registers in the host registry, listens, and runs until idle or told to stop
+(`Host::run_lifecycle`). `jerry-app`'s own production dispatch does not yet spawn-or-connect to
+it, though (§24's own "what did not move") - `HostRuntime` still only ever constructs an
+in-process `Host`, unchanged since decisions.md §23.
 
 **Owns.** Caller classification (an env-injected agent id the host itself handed out, or a
-human), `Invocability` and cwd confinement, `event/*` push. The session table and the real
-`jerry_pty::PtySession` behind each session it spawns (`SessionSpawn`/`SessionResize`/
-`SessionKill`/`SessionsQuery`, decisions.md §23) - `AgentTable` is now a thin view over it, kept
-for its pre-existing callers. The data-plane adapter (`SessionHandle`): an in-process byte
-stream and `write_input`, handed out directly, never through `Call`/`Report`.
+human), `Invocability` and cwd confinement, `event/*` push - now gated behind an explicit
+`event/subscribe` request rather than automatic on connect (§24), so a one-off request/response
+client does not count as "connected" for `Host::run_lifecycle`'s own idle check. The session
+table and the real `jerry_pty::PtySession` behind each session it spawns (`SessionSpawn`/
+`SessionResize`/`SessionKill`/`SessionsQuery`, decisions.md §23) - `AgentTable` is now a thin view
+over it, kept for its pre-existing callers. The data-plane adapter (`SessionHandle`): an
+in-process byte stream and `write_input`, handed out directly, never through `Call`/`Report` -
+still in-process only; the per-session socket #507 adds is not built yet.
 
 **Does not own (yet).** The wire contract and the Git-locality implementations (`jerry-core`);
 any rendering, anything `gpui`. The hook store (still `jerry-app`'s `hooks/store.rs`) and
 `jerry-app`'s own production pane-spawn path, which does not yet dispatch `SessionSpawn` -
-decisions.md §23 names the remaining work.
+decisions.md §23 names the remaining work. Nor does `jerry-app` yet spawn-or-connect to this
+process at all in production - decisions.md §24 names that remaining work too.
 
 ## `jerry-lsp`
 
@@ -75,8 +93,9 @@ on `jerry-pty`. Zero gpui dependency.
 ## `jerry-app`
 
 **Scope.** The GPUI desktop application: rendering, window/focus/keymap management, and
-orchestration of the three core crates. The only crate with a `[[bin]]` target (`src/main.rs`,
-packaged as `jerry` on release).
+orchestration of the three core crates. The only crate with a `gpui` `[[bin]]` target
+(`src/main.rs`, packaged as `Jerry`/`jerry-app` on release) - `jerry-cli` and `jerry-host` each
+ship their own non-`gpui` binary too.
 
 **Owns.** Everything visual, plus — today, and not by design — roughly 24k lines of code with no
 `gpui` dependency at all: `hooks/` (the Claude-hook HTTP side-channel), `text_history.rs`,
@@ -94,7 +113,10 @@ work, not done in this pass.
 **Scope.** The `jerry` command: what agents and humans type. Deliberately shallow. `clap` builds a
 `Request`, the transport decides whether a live Jerry serves this repository (`JERRY_HOST_SOCKET`,
 then `--instance`, then the registry), the `Report` becomes an exit code and output. Git-locality
-requests run in-process when no host serves the repository; anything else needs one.
+requests run in-process when no host serves the repository; anything else needs one. `jerry host
+start`/`jerry host stop` (decisions.md §24) are the exception to "deliberately shallow": `start`
+calls `jerry_core::host_spawn::spawn_or_connect` directly rather than going through a `Request` at
+all, since spawning a process is not a Command/Query.
 
 **Owns.** Argument parsing, the bi-mode choice as a pure function, the exit-code contract (0 done,
 1 action required, 2 usage, 3 refused, 4 no instance, 5 failed), and output: JSON only with

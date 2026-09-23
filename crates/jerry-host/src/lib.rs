@@ -24,8 +24,10 @@ use std::net::Shutdown;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 /// The dispatch loop, to run on whichever executor the embedding process provides.
 pub type DispatchFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
@@ -127,6 +129,13 @@ pub(crate) struct Inner {
     /// One handle per live socket connection, so shutdown can close them under their threads.
     connections: Mutex<Vec<Stream>>,
     shutting_down: AtomicBool,
+    /// [`Host::run_lifecycle`]'s own wake sender - always present (paired with `Host::
+    /// shutdown_rx` at construction, before anything could possibly connect and race it), so
+    /// `Self::request_shutdown` from the `Shutdown` command never has a window where it is a
+    /// silent no-op. Harmless when no lifecycle loop is running at all
+    /// (`HostRuntime::in_process`/test hosts never start one): the bounded channel just buffers
+    /// the one wake with nothing reading it.
+    shutdown_tx: std_mpsc::SyncSender<()>,
 }
 
 impl Inner {
@@ -163,6 +172,20 @@ impl Inner {
         self.shutting_down.load(Ordering::SeqCst)
     }
 
+    /// No live sessions and no subscribed client (`docs/architecture/decisions.md` §24) -
+    /// [`Host::run_lifecycle`]'s own idle check. A socket connection that never sent `event/
+    /// subscribe` (an ordinary request/response call) does not count.
+    pub(crate) fn is_idle(&self) -> bool {
+        self.sessions.list().is_empty() && self.fanout.sink_count() == 0
+    }
+
+    /// Wakes [`Host::run_lifecycle`] immediately, regardless of idleness - the `Shutdown`
+    /// command's own effect. Buffered harmlessly if no lifecycle loop is running yet or at all
+    /// (`Self::shutdown_tx`'s own docs).
+    pub(crate) fn request_shutdown(&self) {
+        let _ = self.shutdown_tx.try_send(());
+    }
+
     pub(crate) fn track_connection(&self, stream: Stream) {
         lock(&self.connections).push(stream);
     }
@@ -186,6 +209,9 @@ pub struct Host {
     inner: Arc<Inner>,
     dispatcher: Mutex<Option<JoinHandle<()>>>,
     listening: Mutex<Option<listener::Listening>>,
+    /// [`Self::run_lifecycle`]'s own receiver, paired with `Inner::shutdown_tx` at construction -
+    /// `Some` until the first (and only meaningful) call takes it.
+    shutdown_rx: Mutex<Option<std_mpsc::Receiver<()>>>,
 }
 
 impl Host {
@@ -221,6 +247,10 @@ impl Host {
         let fanout = fanout::Fanout::default();
         let sessions = SessionManager::new(fanout.clone());
         let agents = sessions.agent_table();
+        // Paired eagerly, here, rather than when `Self::run_lifecycle` is first called: a
+        // `Shutdown` command dispatched the instant this host starts accepting connections must
+        // never race an as-yet-unset sender (see `Inner::shutdown_tx`'s own docs).
+        let (shutdown_tx, shutdown_rx) = std_mpsc::sync_channel(1);
         let inner = Arc::new(Inner {
             jobs: Mutex::new(Some(jobs)),
             agents,
@@ -228,6 +258,7 @@ impl Host {
             fanout,
             connections: Mutex::new(Vec::new()),
             shutting_down: AtomicBool::new(false),
+            shutdown_tx,
         });
         let worker = Arc::clone(&inner);
         let dispatch: DispatchFuture = Box::pin(async move {
@@ -246,6 +277,7 @@ impl Host {
             inner,
             dispatcher: Mutex::new(None),
             listening: Mutex::new(None),
+            shutdown_rx: Mutex::new(Some(shutdown_rx)),
         };
         (host, dispatch)
     }
@@ -307,6 +339,64 @@ impl Host {
     /// thread; never for a UI thread.
     pub fn shutdown_and_join(&self) {
         self.shutdown().join();
+    }
+
+    /// Blocks until this host should exit: no live sessions and no subscribed client
+    /// (`Inner::is_idle`) for `config.linger`, or an explicit wake - the `Shutdown` command
+    /// (`Inner::request_shutdown`) or `jerry host stop`. Never called by an in-process/test host
+    /// (`docs/architecture/decisions.md` §24); only the standalone `jerry-host` binary's `main`
+    /// runs this, then calls [`Self::shutdown_and_join`] once it returns. A no-op on a second
+    /// call (`Self::shutdown_rx` already taken) - there is nothing left to lifecycle-manage.
+    ///
+    /// The one real timer in this crate (§16): idleness is inherently about elapsed time, so
+    /// `config.poll_interval` bounds a channel wait rather than this looping on its own. An
+    /// explicit wake breaks immediately, regardless of idleness - `Self::shutdown` already kills
+    /// every live session the same way an idle timeout would.
+    pub fn run_lifecycle(&self, config: LifecycleConfig) {
+        let Some(rx) = lock(&self.shutdown_rx).take() else {
+            return;
+        };
+        let mut idle_since: Option<Instant> = None;
+        loop {
+            match rx.recv_timeout(config.poll_interval) {
+                Ok(()) => break,
+                Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std_mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if self.inner.is_idle() {
+                let since = *idle_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= config.linger {
+                    break;
+                }
+            } else {
+                idle_since = None;
+            }
+        }
+    }
+}
+
+/// How long an idle [`Host`] lingers before [`Host::run_lifecycle`] lets it exit - long enough
+/// for an app relaunch or a CLI call to reattach without a fresh spawn, short enough that a
+/// genuinely abandoned host does not sit in the registry indefinitely.
+pub const LIFECYCLE_LINGER: Duration = Duration::from_secs(5);
+
+/// [`Host::run_lifecycle`]'s own tuning - a struct rather than two bare parameters so a caller
+/// only names what it overrides. `Default` is the real production shape; a test shortens both to
+/// run in milliseconds instead of seconds.
+#[derive(Debug, Clone, Copy)]
+pub struct LifecycleConfig {
+    /// How often an idle host rechecks - not itself the linger; several polls fit inside one
+    /// linger window so idleness is measured close to `linger`, not `linger + poll_interval`.
+    pub poll_interval: Duration,
+    pub linger: Duration,
+}
+
+impl Default for LifecycleConfig {
+    fn default() -> Self {
+        LifecycleConfig {
+            poll_interval: Duration::from_millis(500),
+            linger: LIFECYCLE_LINGER,
+        }
     }
 }
 
@@ -701,5 +791,170 @@ mod host_shutdown_tests {
             "shutting down the host must kill and confirm dead every session it still owns a \
              real process for, not just tear down the socket/fanout around it"
         );
+    }
+}
+
+/// `Host::run_lifecycle`'s own coverage (`docs/architecture/decisions.md` §24): an idle host
+/// exits after its configured linger, a subscribed client keeps it alive past that, and an
+/// explicit `Shutdown` command wakes it immediately regardless of idleness.
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::{Host, LifecycleConfig};
+    use jerry_core::client::{Client, Stream};
+    use jerry_core::wire::{read_frame, write_frame};
+    use jerry_core::{AppCommand, Call, Message, Report, Request, RequestId, Shutdown};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    use test_support::wait_until;
+
+    /// A registry-directory socket path short enough for every platform, removed on drop.
+    struct SocketPath {
+        path: PathBuf,
+        _temp: Option<tempfile::TempDir>,
+    }
+
+    impl Drop for SocketPath {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    fn socket_path(tag: &str) -> SocketPath {
+        if cfg!(windows) {
+            let dir = jerry_core::registry::runtime_dir().expect("runtime dir");
+            std::fs::create_dir_all(&dir).expect("runtime dir");
+            SocketPath {
+                path: dir.join(format!("l-{}-{tag}.sock", std::process::id())),
+                _temp: None,
+            }
+        } else {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            SocketPath {
+                path: temp.path().join(format!("{tag}.sock")),
+                _temp: Some(temp),
+            }
+        }
+    }
+
+    fn fast_config() -> LifecycleConfig {
+        LifecycleConfig {
+            poll_interval: Duration::from_millis(10),
+            linger: Duration::from_millis(60),
+        }
+    }
+
+    fn subscribe(stream: &mut Stream) {
+        write_frame(
+            stream,
+            &Message::Request {
+                id: RequestId::Number(0),
+                method: "event/subscribe".into(),
+                params: serde_json::Value::Null,
+            },
+        )
+        .expect("send event/subscribe");
+        read_frame(stream).expect("subscribe response");
+    }
+
+    #[test]
+    fn an_idle_host_with_no_sessions_and_no_clients_exits_after_the_linger() {
+        let host = Host::start().expect("host");
+        let config = fast_config();
+        let started = Instant::now();
+        host.run_lifecycle(config);
+        assert!(
+            started.elapsed() >= config.linger,
+            "must not exit before the configured linger elapses"
+        );
+        host.shutdown_and_join();
+    }
+
+    #[test]
+    fn a_subscribed_client_keeps_the_host_alive_until_it_disconnects() {
+        let host = Host::start().expect("host");
+        let socket = socket_path("subscribed");
+        host.listen(&socket.path).expect("listen");
+        let mut client = Stream::connect(&socket.path).expect("connect");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        subscribe(&mut client);
+
+        let config = fast_config();
+        let exited = std::sync::Arc::new(AtomicBool::new(false));
+        let host = &host;
+        std::thread::scope(|scope| {
+            let exited_writer = std::sync::Arc::clone(&exited);
+            scope.spawn(move || {
+                host.run_lifecycle(config);
+                exited_writer.store(true, Ordering::SeqCst);
+            });
+
+            // A real time budget well past the linger: if the subscription did not keep the
+            // host alive, `run_lifecycle` would already have returned.
+            let stayed_alive = !wait_until(config.linger * 5, || exited.load(Ordering::SeqCst));
+            assert!(
+                stayed_alive,
+                "a subscribed client must keep the host from exiting"
+            );
+
+            drop(client);
+            assert!(
+                wait_until(Duration::from_secs(5), || exited.load(Ordering::SeqCst)),
+                "the host must exit once its only subscriber disconnects and the linger elapses"
+            );
+        });
+        host.shutdown_and_join();
+    }
+
+    #[test]
+    fn an_explicit_shutdown_request_wakes_the_lifecycle_loop_immediately() {
+        let host = Host::start().expect("host");
+        let socket = socket_path("shutdown-request");
+        host.listen(&socket.path).expect("listen");
+        let mut subscriber = Stream::connect(&socket.path).expect("connect");
+        subscriber
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        subscribe(&mut subscriber);
+
+        // Deliberately much longer than any bound this test waits on: only the explicit
+        // `Shutdown` request below - never the linger - can make `run_lifecycle` return here.
+        let config = LifecycleConfig {
+            poll_interval: Duration::from_millis(10),
+            linger: Duration::from_secs(60),
+        };
+        let exited = std::sync::Arc::new(AtomicBool::new(false));
+        let host = &host;
+        std::thread::scope(|scope| {
+            let exited_writer = std::sync::Arc::clone(&exited);
+            scope.spawn(move || {
+                host.run_lifecycle(config);
+                exited_writer.store(true, Ordering::SeqCst);
+            });
+
+            let mut client =
+                Client::connect(&socket.path, Duration::from_secs(5)).expect("connect");
+            let report = client
+                .request(&Call::human(
+                    "/repo",
+                    Request::Command(AppCommand::Shutdown(Shutdown::default())),
+                ))
+                .expect("shutdown accepted");
+            assert_eq!(
+                report,
+                Report::Ok {
+                    outcome: serde_json::Value::Null
+                }
+            );
+
+            assert!(
+                wait_until(Duration::from_secs(5), || exited.load(Ordering::SeqCst)),
+                "an explicit shutdown request must wake the lifecycle loop, still-connected \
+                 subscriber and long linger notwithstanding"
+            );
+        });
+        host.shutdown_and_join();
     }
 }

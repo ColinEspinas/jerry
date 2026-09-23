@@ -8,7 +8,8 @@ use crate::{HostError, Inner};
 use futures::executor::block_on;
 use jerry_core::client::{Listener, Stream};
 use jerry_core::wire::{read_frame, rpc_code, write_frame, FrameError};
-use jerry_core::{Call, Message, RpcError};
+use jerry_core::{Call, Message, Report, RpcError};
+use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
@@ -73,7 +74,9 @@ fn serve(inner: Arc<Inner>, stream: Stream) {
     // The host keeps a handle so shutdown can close the socket under both threads.
     inner.track_connection(tracked);
     let (outbox, inbox) = mpsc::sync_channel::<Message>(SOCKET_BACKLOG);
-    let sink = inner.fanout().subscribe_socket(outbox.clone());
+    // Not auto-subscribed to the fanout on connect: a one-off request/response client (a
+    // `jerry` CLI call) must not count toward `Inner::is_idle`'s "connected client" half, nor
+    // receive events it never asked for. `event/subscribe`, below, opts a connection in.
 
     let writer = thread::Builder::new()
         .name("jerry-host-writer".into())
@@ -86,17 +89,21 @@ fn serve(inner: Arc<Inner>, stream: Stream) {
             }
         });
     if let Err(error) = writer {
-        inner.fanout().unsubscribe(sink);
         log::warn!("jerry-host: could not spawn a writer thread: {error}");
         return;
     }
 
     let reader_inner = Arc::clone(&inner);
+    let reader_outbox = outbox.clone();
     let reader = thread::Builder::new()
         .name("jerry-host-reader".into())
         .spawn(move || {
             let inner = reader_inner;
+            let outbox = reader_outbox;
             let mut stream = stream;
+            // `Some` once `event/subscribe` registers this connection as a fanout sink - at most
+            // once per connection; a repeat is answered `Ok` without opening a second sink.
+            let mut sink = None;
             loop {
                 let message = match read_frame(&mut stream) {
                     Ok(message) => message,
@@ -110,6 +117,19 @@ fn serve(inner: Arc<Inner>, stream: Stream) {
                     // Clients do not push to the host in protocol version 1.
                     continue;
                 };
+                if method == "event/subscribe" {
+                    sink.get_or_insert_with(|| inner.fanout().subscribe_socket(outbox.clone()));
+                    let ok = Report::Ok {
+                        outcome: Value::Null,
+                    };
+                    let result = serde_json::to_value(ok).map_err(|error| {
+                        RpcError::new(rpc_code::INTERNAL_ERROR, error.to_string())
+                    });
+                    if outbox.send(Message::Response { id, result }).is_err() {
+                        break;
+                    }
+                    continue;
+                }
                 let result = match Call::from_wire(&method, params) {
                     Ok(call) => match block_on(inner.submit(call)) {
                         Ok(result) => result,
@@ -127,10 +147,11 @@ fn serve(inner: Arc<Inner>, stream: Stream) {
                 }
             }
             // Both senders must go for the writer to end: this one, and the fanout's.
-            inner.fanout().unsubscribe(sink);
+            if let Some(sink) = sink {
+                inner.fanout().unsubscribe(sink);
+            }
         });
     if let Err(error) = reader {
-        inner.fanout().unsubscribe(sink);
         log::warn!("jerry-host: could not spawn a reader thread: {error}");
     }
 }
@@ -140,11 +161,39 @@ mod socket_tests {
     use crate::Host;
     use jerry_core::client::{Client, Stream};
     use jerry_core::request::HookEvent;
-    use jerry_core::wire::read_frame;
-    use jerry_core::{AgentId, AppQuery, Call, Message, Request};
+    use jerry_core::wire::{read_frame, write_frame};
+    use jerry_core::{AgentId, AppQuery, Call, Message, Report, Request, RequestId};
     use std::path::PathBuf;
     use std::time::Duration;
     use test_support::seed_empty_repo;
+
+    /// Sends `event/subscribe` on `stream` and waits for its `Ok` response - the real wire round
+    /// trip a subscribing client makes, not a direct `Fanout` call.
+    fn subscribe(stream: &mut Stream) {
+        write_frame(
+            stream,
+            &Message::Request {
+                id: RequestId::Number(0),
+                method: "event/subscribe".into(),
+                params: serde_json::Value::Null,
+            },
+        )
+        .expect("send event/subscribe");
+        let response = read_frame(stream).expect("subscribe response");
+        match response {
+            Message::Response {
+                result: Ok(value), ..
+            } => {
+                assert_eq!(
+                    serde_json::from_value::<Report>(value).expect("report"),
+                    Report::Ok {
+                        outcome: serde_json::Value::Null
+                    }
+                );
+            }
+            other => panic!("expected an ok response to event/subscribe, got {other:?}"),
+        }
+    }
 
     /// A socket path short enough for every platform, removed on drop.
     struct SocketPath {
@@ -185,11 +234,12 @@ mod socket_tests {
         host.agents()
             .register(id.clone(), repo.path().to_path_buf(), "Claude".into());
 
-        // A bare connection that only listens, opened before the event is produced.
+        // A connection that subscribes, opened before the event is produced.
         let mut watcher = Stream::connect(&socket.path).expect("watcher connects");
         watcher
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("timeout");
+        subscribe(&mut watcher);
 
         let mut client = Client::connect(&socket.path, Duration::from_secs(5)).expect("connect");
         let report = client
@@ -225,5 +275,51 @@ mod socket_tests {
             read_frame(&mut watcher).is_err(),
             "shutdown closes the connections that were still open"
         );
+    }
+
+    /// A plain request/response connection that never sent `event/subscribe` is not added as a
+    /// fanout sink (`docs/architecture/decisions.md` §24) - it must not receive a notification a
+    /// concurrent, real subscriber does.
+    #[test]
+    fn a_connection_that_never_subscribes_receives_no_push_events() {
+        let repo = seed_empty_repo();
+        let host = Host::start().expect("host");
+        let socket = socket_path("unsubscribed");
+        host.listen(&socket.path).expect("listen");
+        let id = AgentId::from("agent-10");
+        host.agents()
+            .register(id.clone(), repo.path().to_path_buf(), "Claude".into());
+
+        let mut plain = Stream::connect(&socket.path).expect("plain connects");
+        plain
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .expect("timeout");
+        let mut subscriber = Stream::connect(&socket.path).expect("subscriber connects");
+        subscriber
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        subscribe(&mut subscriber);
+
+        let mut client = Client::connect(&socket.path, Duration::from_secs(5)).expect("connect");
+        let hook = Request::Hook(HookEvent {
+            event: "PostToolUse".into(),
+            payload: serde_json::Value::Null,
+        });
+        let report = client
+            .request(&Call::agent(repo.path(), id, hook))
+            .expect("hook accepted");
+        assert!(report.is_ok(), "{report:?}");
+
+        let pushed = read_frame(&mut subscriber).expect("the real subscriber receives the event");
+        assert!(
+            matches!(pushed, Message::Notification { ref method, .. } if method == "event/hook"),
+            "{pushed:?}"
+        );
+        assert!(
+            read_frame(&mut plain).is_err(),
+            "a connection that never sent event/subscribe must not receive the same push"
+        );
+
+        host.shutdown_and_join();
     }
 }

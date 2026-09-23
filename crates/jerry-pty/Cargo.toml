@@ -36,6 +36,18 @@ filedescriptor = "0.8"
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.28", default-features = false, features = ["signal"] }
 
+# `crate::detached::breakaway_is_forbidden_for_current_process` (docs/architecture/decisions.md
+# §14/§24): the real `IsProcessInJob`/`QueryInformationJobObject` read a Windows-spawned
+# `jerry-host` needs before falling back to a visible error state instead of a silent in-job
+# spawn. Pinned to the exact version already resolved in Cargo.lock (via `gpui_platform`), so
+# this adds no new version surface.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
 # macOS only: there is no `/proc` there, so `child_pids_of`'s descendant walk goes through
 # `libproc`'s `proc_listchildpids` (declared in `<libproc.h>`, implemented in libSystem, which
 # every macOS binary already links) instead. Raw `libc` rather than the `libproc` crate for the

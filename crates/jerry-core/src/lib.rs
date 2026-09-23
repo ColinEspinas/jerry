@@ -14,6 +14,7 @@ pub mod command;
 pub mod commands;
 pub mod ctx;
 pub mod error;
+pub mod host_spawn;
 pub mod jerry_binary;
 pub mod mcp;
 pub mod method;
@@ -44,7 +45,9 @@ pub use queries::{
     RebaseStatusQuery, SessionsQuery, StatusOutcome, StatusQuery,
 };
 pub use report::Report;
-pub use request::{execute_locally, AppCommand, AppQuery, HookEvent, LocalDispatchError, Request};
+pub use request::{
+    execute_locally, AppCommand, AppQuery, HookEvent, LocalDispatchError, Request, Shutdown,
+};
 pub use session::{
     ExitStatusWire, SessionAgentInfo, SessionId, SessionKill, SessionKind, SessionRecord,
     SessionResize, SessionSpawn, SessionSpawnOutcome,

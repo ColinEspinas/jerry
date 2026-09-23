@@ -50,6 +50,12 @@ impl Fanout {
         self.lock().clear();
     }
 
+    /// How many sinks are registered right now - `Inner::is_idle`'s own "a connected `event/
+    /// subscribe` client counts as connected" half (`docs/architecture/decisions.md` §24).
+    pub(crate) fn sink_count(&self) -> usize {
+        self.lock().len()
+    }
+
     pub(crate) fn broadcast(&self, message: Message) {
         self.lock().retain(|(_, sink)| match sink {
             Sink::Local(sender) => sender.unbounded_send(message.clone()).is_ok(),

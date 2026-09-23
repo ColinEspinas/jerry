@@ -13,6 +13,10 @@ workspace = true
 # Git-locality Commands and Queries execute here, so standalone `jerry-cli` can run them
 # without linking any host or PTY machinery (decisions.md §15).
 jerry-git = { path = "../jerry-git" }
+# `crate::host_spawn`: the one spawn-or-connect implementation `jerry-app`'s `HostRuntime` and
+# `jerry host start` both call, so the real `CREATE_BREAKAWAY_FROM_JOB`/process-group FFI (§14)
+# is written once (docs/architecture/decisions.md §24).
+jerry-pty = { path = "../jerry-pty" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
