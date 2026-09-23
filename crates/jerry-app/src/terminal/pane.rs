@@ -965,29 +965,6 @@ impl TerminalPane {
         cx.notify();
     }
 
-    /// The control-plane twin of the `PtyOutput::Exited` handling in [`Self::attach_session`]'s
-    /// own output task, for a session whose data plane never produces one -
-    /// `crate::terminal::socket_adapter::SocketSessionAdapter`'s stream simply ends once the host
-    /// closes it (see that type's own module docs); the real exit status arrives separately, as
-    /// `event/session-exited` on the control plane (`docs/architecture/decisions.md` §24). The
-    /// one caller is `crate::work_surface::session_exited`'s own handler.
-    ///
-    /// A no-op once this pane already has no live session - a `SessionHandle`-backed pane (a bare
-    /// pane test, or the real-pty test fixture) already recorded its own exit from `PtyOutput::
-    /// Exited` by the time this event could plausibly arrive, so both signals reaching the same
-    /// pane is safe rather than double-firing [`TerminalPaneEvent::ProcessExited`].
-    pub(crate) fn mark_exited_from_event(&mut self, status: ExitStatus, cx: &mut Context<Self>) {
-        if self.session.is_none() {
-            return;
-        }
-        let clean = status.success();
-        self.exit_status = Some(status);
-        self.session = None;
-        self.grid.mark_ended();
-        cx.emit(TerminalPaneEvent::ProcessExited { clean });
-        cx.notify();
-    }
-
     /// Applies a Settings › Appearance "Terminal font size" edit
     /// (`crate::root::AdeApp`'s `adjust_terminal_font_size`, via
     /// `crate::work_surface::agents::Agents::set_terminal_font_size`) to this already-live pane - a

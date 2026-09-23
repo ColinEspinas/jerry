@@ -4,9 +4,15 @@
 //! calls `jerry_host::`/`jerry_pty::` beyond the trait itself: everything here is a plain socket
 //! read/write plus one injected callback for the one thing that still needs the control plane
 //! (`command/session-kill`, on [`SocketSessionAdapter::shutdown`]). No exit signal is
-//! synthesized: the socket just ends once the host closes it - the real exit status arrives
-//! separately as `event/session-exited`, which `crate::work_surface::session_exited` uses to mark
-//! a socket-attached pane exited.
+//! synthesized: the socket just ends once the host closes it.
+//!
+//! Real and unit-tested against a real socket pair (below), but **not yet wired into
+//! `Agents::spawn_inner`**: doing so reproducibly hung every UI test that spawns a real session
+//! and lets it reach an interactive prompt, inside `TestAppContext::run_until_parked` itself,
+//! after every one of this module's and the surrounding dispatch chain's own steps had already
+//! completed - see §24's own note on this. Root-causing that GPUI-test-executor interaction is
+//! this module's own follow-up, not a reason to drop the adapter itself.
+#![allow(dead_code)]
 
 use futures::channel::mpsc;
 use futures::SinkExt;
@@ -14,6 +20,7 @@ use jerry_core::SessionId;
 use jerry_pty::{PtyError, PtyOutput};
 use std::io::{self, Read, Write};
 use std::path::Path;
+use std::sync::mpsc as std_mpsc;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::thread;
 
@@ -27,7 +34,18 @@ const OUTPUT_CHANNEL_CAPACITY: usize = 256;
 
 pub(crate) struct SocketSessionAdapter {
     id: SessionId,
-    writer: Mutex<Stream>,
+    /// [`Self::write_input`]'s own non-blocking enqueue - an unbounded channel a dedicated writer
+    /// thread drains onto the real socket, mirroring `jerry_pty::PtySession::write_input`'s own
+    /// documented contract exactly (`SessionAdapter::write_input`'s docs): a caller on the GPUI
+    /// foreground thread must never block on a slow or stalled peer. A direct, synchronous socket
+    /// write here was this module's first, wrong draft - it blocked the pane's own output task
+    /// (itself running as part of the same foreground poll `TestAppContext::run_until_parked`
+    /// drives) answering a cursor-position report back to the pty, and deadlocked every UI test
+    /// that spawns a real session and lets it reach an interactive prompt.
+    input_tx: std_mpsc::Sender<Vec<u8>>,
+    /// A clone of the connection, held only for [`Self::shutdown`] to close - the writer thread
+    /// owns the one it actually writes through.
+    shutdown_stream: Mutex<Stream>,
     output: Mutex<Option<mpsc::Receiver<PtyOutput>>>,
     /// From `SessionsQuery`, resolved by the caller before construction - this type dispatches
     /// nothing itself, so a value that can only come from a Query is given, not fetched (see the
@@ -52,7 +70,8 @@ impl SocketSessionAdapter {
     ) -> io::Result<Self> {
         let stream = Stream::connect(socket)?;
         let mut reader = stream.try_clone()?;
-        let writer = stream;
+        let mut writer = stream.try_clone()?;
+        let shutdown_stream = stream;
 
         let (mut tx, rx) = mpsc::channel(OUTPUT_CHANNEL_CAPACITY);
         thread::Builder::new()
@@ -75,9 +94,21 @@ impl SocketSessionAdapter {
                 // see the module docs for why no synthetic `Exited` is sent here).
             })?;
 
+        let (input_tx, input_rx) = std_mpsc::channel::<Vec<u8>>();
+        thread::Builder::new()
+            .name("jerry-app-session-data-writer".into())
+            .spawn(move || {
+                for chunk in input_rx {
+                    if writer.write_all(&chunk).is_err() {
+                        break;
+                    }
+                }
+            })?;
+
         Ok(SocketSessionAdapter {
             id,
-            writer: Mutex::new(writer),
+            input_tx,
+            shutdown_stream: Mutex::new(shutdown_stream),
             output: Mutex::new(Some(rx)),
             process_id,
             kill: Box::new(kill),
@@ -90,10 +121,13 @@ impl SessionAdapter for SocketSessionAdapter {
         &self.id
     }
 
+    /// Enqueues onto the writer thread; never blocks on the socket itself (see
+    /// [`Self::input_tx`]'s own docs). The one real, honest failure is the writer thread having
+    /// already stopped (the peer closed its own read side).
     fn write_input(&self, data: &[u8]) -> Result<(), PtyError> {
-        lock(&self.writer)
-            .write_all(data)
-            .map_err(|error| PtyError::Remote(error.to_string()))
+        self.input_tx
+            .send(data.to_vec())
+            .map_err(|_| PtyError::Remote("the session's writer thread has stopped".to_string()))
     }
 
     fn take_output(&self) -> Option<mpsc::Receiver<PtyOutput>> {
@@ -123,9 +157,12 @@ impl SessionAdapter for SocketSessionAdapter {
     /// own end once the kill takes effect and the session's real exit is observed, exactly as an
     /// ordinary process exit does (`crate::data_plane`, in `jerry-host`).
     fn shutdown(&self) -> Result<(), PtyError> {
-        (self.kill)().map_err(PtyError::Remote)?;
-        let _ = lock(&self.writer).shutdown(std::net::Shutdown::Both);
-        Ok(())
+        let killed = (self.kill)().map_err(PtyError::Remote);
+        // Always closes this adapter's own connection, even when the kill dispatch itself
+        // failed: a failed `command/session-kill` must not also leave a live client believing
+        // the connection is still usable.
+        let _ = lock(&self.shutdown_stream).shutdown(std::net::Shutdown::Both);
+        killed
     }
 }
 
@@ -137,7 +174,6 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 mod socket_session_adapter_tests {
     use super::SocketSessionAdapter;
     use crate::terminal::pane::SessionAdapter;
-    use futures::StreamExt;
     use jerry_core::client::{Listener, Stream};
     use jerry_core::SessionId;
     use jerry_pty::PtyOutput;
@@ -180,12 +216,13 @@ mod socket_session_adapter_tests {
 
     fn recv_timeout(rx: &mut futures::channel::mpsc::Receiver<PtyOutput>) -> Option<PtyOutput> {
         let mut item = None;
-        wait_until(Duration::from_secs(5), || match rx.try_next() {
+        wait_until(Duration::from_secs(5), || match rx.try_recv() {
             Ok(value) => {
-                item = value;
+                item = Some(value);
                 true
             }
-            Err(_would_block) => false,
+            Err(ref error) if error.is_closed() => true,
+            Err(_empty) => false,
         });
         item
     }
@@ -296,11 +333,13 @@ mod socket_session_adapter_tests {
     #[test]
     fn the_stream_simply_ends_when_the_host_closes_it_no_synthetic_exit() {
         let (socket, accept) = spawn_acceptor("host-closes");
-        let adapter =
-            SocketSessionAdapter::connect(&socket.path, SessionId::from("session-12"), None, || {
-                Ok(())
-            })
-            .expect("connect");
+        let adapter = SocketSessionAdapter::connect(
+            &socket.path,
+            SessionId::from("session-12"),
+            None,
+            || Ok(()),
+        )
+        .expect("connect");
         let server = accept.join().expect("accept thread");
         let mut output = adapter.take_output().expect("output stream");
 
@@ -308,8 +347,8 @@ mod socket_session_adapter_tests {
 
         assert!(
             wait_until(Duration::from_secs(5), || matches!(
-                output.try_next(),
-                Ok(None)
+                output.try_recv(),
+                Err(ref error) if error.is_closed()
             )),
             "the stream must end, not hang, once the host closes its side"
         );

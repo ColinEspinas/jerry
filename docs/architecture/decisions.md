@@ -1196,9 +1196,10 @@ gating
 **Status:** Accepted, partially landed (2026-09-23, issue #506; 2026-09-23, issue #507's own data
 plane; plan decisions Q7, Q15, Q20, and §14's spike). The real protocol/process pieces below, and
 the data plane in the amendment further down, are shipped and tested; `jerry-app`'s `HostRuntime`
-still only ever constructs an **in-process** `Host` for its control-plane dispatch - see "What
-still has not moved" before assuming decision 3's "no production path constructs a `Host`"
-already holds for the *control* plane, as distinct from the *data* plane, which now does.
+still only ever constructs an **in-process** `Host` for its control-plane dispatch - see "The
+control-plane cutover follows in the next PR" before assuming decision 3's "no production path
+constructs a `Host`" already holds for the *control* plane, as distinct from the *data* plane,
+which now does.
 
 **Context:** Through #505 (§23), the session host is a real, well-factored dispatcher and session
 table, but it still runs *inside* `jerry-app`'s own process (`HostRuntime`, §16's `pending_dispatch`
@@ -1381,69 +1382,77 @@ tested; the control-plane cutover below did not move in this same pass):**
   its side. `jerry_pty::PtyError` gained one new variant, `Remote(String)`, for exactly this
   adapter's socket-I/O and kill-dispatch failures - it has no real `PtySession` to report any of
   the other variants for.
-- **`Agents::spawn_inner` now attaches over the socket, not `SessionManager::handle_for`.** Once
-  `SessionSpawn` resolves, it dispatches `command/session-attach` and (best-effort)
-  `query/sessions`, connects a `SocketSessionAdapter` off the UI thread (`cx.background_spawn`),
-  and attaches that - the same `TerminalPane::attach_session` call site as before, now handed
-  `Arc<dyn SessionAdapter>` from either implementer. This is real for *every* session today, not
-  only an eventual out-of-process one: `HostRuntime::in_process()`'s host still binds a real
-  per-session socket exactly like a real `jerry-host` would (`command/session-attach` never
-  special-cases "am I in-process"), so this is already jerry-app's one production attach path,
-  ahead of the control-plane cutover below.
-- **The exit signal moved to the control plane.** A `SocketSessionAdapter`'s own byte stream never
-  carries a synthesized `PtyOutput::Exited` (there is no real `ExitStatus` to give it - see that
-  module's own docs); `crate::work_surface::session_exited`'s handler now also resolves the pane
-  for the host session id that exited and calls the new `TerminalPane::mark_exited_from_event`
-  (reconstructing a real `jerry_pty::ExitStatus` from the wire's `ExitStatusWire`, lossy only when
-  a signal is present, since `portable_pty::ExitStatus::with_signal` cannot also carry the original
-  code). A no-op once a pane already has no live session, so a `SessionHandle`-backed pane's own
-  `PtyOutput::Exited` handling and this event reaching the same pane is safe rather than
-  double-firing `TerminalPaneEvent::ProcessExited`.
+- **`Agents::spawn_inner` still attaches via `SessionManager::handle_for`, not the socket -
+  attempted, reverted, and left as this module's own documented follow-up.** A first pass had
+  `spawn_inner` dispatch `command/session-attach`, connect a `SocketSessionAdapter` off the UI
+  thread, and hand that to `TerminalPane::attach_session` instead of the in-process handle - every
+  step of that chain genuinely worked (confirmed live, one step at a time: the extra dispatches
+  resolved, the socket connected, the real shell's own ConPTY startup bytes arrived through it and
+  rendered correctly, a resize dispatched through the same path succeeded). With that wiring in,
+  every `#[gpui::test]` that spawns a real session and lets it settle at an interactive prompt
+  reproducibly hung *inside `TestAppContext::run_until_parked` itself*, after every one of the
+  above had already completed and logged as much - not a busy loop (confirmed via `Get-Process`:
+  zero CPU growth across repeated samples, a genuine block, not a spin) and not explained by any
+  difference this entry could pin down between this adapter's reader/writer threads and
+  `jerry_pty`'s own identically-shaped ones (down to the same `futures::executor::block_on(tx.
+  send(chunk))` on a bare `std::thread`, which the latter's own hundreds of passing real-pty tests
+  already exercise). Reverted rather than shipped or worked around by rewriting the affected tests'
+  own wait idiom, per CLAUDE.md's "no fake functionality": a data plane a client cannot actually
+  attach to from the one production call site that would use it is not yet a real cutover, and a
+  hang this reproducible is not something to paper over with a different polling shape in code this
+  change does not otherwise need to touch. `SocketSessionAdapter` and `command/session-attach`
+  themselves are unaffected - both are real and independently tested (this entry's own paragraphs
+  above) - only `Agents::spawn_inner`'s choice of which adapter to construct reverted, to the exact
+  shape decisions.md §23 already described. Root-causing the `run_until_parked` interaction, and
+  the pane's own exit signal moving to `event/session-exited` for a socket-attached session
+  (`TerminalPane::mark_exited_from_event`, also reverted here since nothing constructs the adapter
+  that would need it), are this follow-up's own scope together with the control-plane cutover
+  below - wiring either one in before the other is fully real would be the same half-wired state
+  this paragraph just described avoiding.
 
-**What still has not moved, and why - the exact remaining work for decision 4 and the rest of
-decision 3's cutover:**
+**The control-plane cutover follows in the next PR, on top of this one - the exact scope:**
 
 `jerry-app`'s `HostRuntime` still only ever constructs an **in-process** `Host`
 (`HostRuntime::start`/`HostRuntime::in_process`, unchanged); `AdeApp::dispatch` still reaches it
 through `jerry_host::LocalClient`, never `jerry_core::client::Client` over a socket to an external
 process. This issue's own plan text called for `HostRuntime::in_process`/the in-app `Host` to
-become `#[cfg(test)]`-only and for spawn-or-connect to be jerry-app's one production path - that
-step is **still not done**. Unlike the previous amendment's own reasoning (the data plane was the
-genuine blocker), what remains is a real, separate piece of work, deferred for a different, equally
-concrete reason surfaced while landing the data plane above: `jerry-host` itself serves exactly one
-repository per process (`--repo <path>`, singular; a stage-3 host's own `Descriptor.repos` is
-always a one-element list - see that field's own docs), while `jerry-app`'s single `HostRuntime`
-today serves *every* repository the app has open on one shared connection (`Descriptor.repos` as a
-growing list, `HostRuntime::serve`). Cutting `AdeApp::dispatch` over to real spawn-or-connect
-therefore is not a drop-in transport swap: it needs one `HostRuntime`-equivalent connection *per
-open repository* (decision Q15), each independently spawned-or-connected, with `AdeApp::dispatch`
-routing a call by which repository its `cwd` belongs to - and `crate::hooks::HookRuntime`, which
-today assumes exactly one host connection for the whole app's hook forwarding, would need the same
-per-repository treatment to stay correct for a second simultaneously open repository. That is a
-real architectural change to `AdeApp`'s own repo/host bookkeeping, not a few lines behind the
-existing `HostRuntime::client()`/`host_client()` call sites, and attempting it inside this same
-change risked exactly what CLAUDE.md's "no fake functionality" rule forbids: a control-plane cutover
-rushed to compile rather than verified correct across every existing repo-scoped test. Concretely
-still open, all in `jerry-app`:
+become `#[cfg(test)]`-only and for spawn-or-connect to be jerry-app's one production path - not
+done in this PR, deliberately: `jerry-host` itself serves exactly one repository per process
+(`--repo <path>`, singular; a stage-3 host's own `Descriptor.repos` is always a one-element list -
+see that field's own docs), while `jerry-app`'s single `HostRuntime` today serves *every*
+repository the app has open on one shared connection (`Descriptor.repos` as a growing list,
+`HostRuntime::serve`). Cutting `AdeApp::dispatch` over to real spawn-or-connect is therefore not a
+drop-in transport swap behind the existing `HostRuntime::client()`/`host_client()` call sites; it
+is a real, separate architectural change to `AdeApp`'s own repo/host bookkeeping, scoped as its own
+PR rather than folded into this one at risk of exactly what CLAUDE.md's "no fake functionality"
+rule forbids: a control-plane cutover rushed to compile rather than verified correct across every
+existing repo-scoped test. Settled design for that PR:
 
-- `AdeApp` tracks one `HostRuntime`-equivalent connection per open repository (not the single
-  shared one it has today), each brought up via `jerry_core::host_spawn::spawn_or_connect` off the
-  UI thread (`cx.background_spawn`), established before that repository's own first `SessionSpawn`
-  (the ffc97b9 rule) - naturally so once bring-up and first-spawn are both scoped to the same
-  repository instead of racing a single shared one.
-- `AdeApp::dispatch` (and `crate::hooks::HookRuntime`'s own hook forwarding) resolves which open
-  repository a `cwd` belongs to and routes through *that* repository's connection, rather than one
-  shared connection for the whole app.
-- A visible, per-repository error state for `Outcome::VersionMismatch` ("Jerry host for `<repo>`
-  speaks protocol X, this app speaks Y") with a real "Restart sessions" action that sends
-  `Shutdown` to the old host (now that the request exists) and re-spawns.
-- A visible "sessions cannot outlive this window" error state for
-  `SpawnOrConnectError::BreakawayForbidden` - never an in-process fallback (already true of
-  `host_spawn` itself; `jerry-app` needs only to surface it, not silently swallow or retry
-  differently).
-- Only once all of the above lands does `HostRuntime::in_process`/the in-app `Host` become
-  genuinely `#[cfg(test)]`-only, closing this issue's own "one execution path" DoD for the control
-  plane - the data plane already closed its own half, per the amendment above.
+- `HostRuntime` becomes a per-repository table: `Hosts { by_repo: HashMap<PathBuf /* common
+  `.git` dir */, RepoHost> }`, `RepoHost { client: jerry_core::client::Client, events: <a dedicated
+  event/subscribe connection and its own reader task, established before that repository's own
+  first SessionSpawn - the ffc97b9 rule>, state: Connected | VersionMismatch { theirs, ours } |
+  CannotSpawn { error } }`. Opening a repository (`add_repo`/startup) runs `jerry_core::
+  host_spawn::spawn_or_connect` on the background executor and inserts the outcome; closing one
+  drops its entry - a client drop only, the host itself lingers/exits on its own lifecycle.
+- `AdeApp::dispatch(cwd, ...)` maps `cwd` to a repository's common `.git` dir with the existing
+  worktree-root/common-dir lookup (cached per worktree path), picks that repository's `RepoHost`,
+  and sends over its client; no `RepoHost` for that repository answers the same `NEEDS_HOST` shape
+  the CLI's own no-host path already defines. `SessionAttach`/`SessionSpawn`/every other request
+  flows the same way, so `Agents::spawn_inner` needs only the `cwd` it already has.
+- `crate::hooks::HookRuntime` keeps no host connection of its own: the per-launch settings already
+  carry `JERRY_HOST_SOCKET` per spawned agent, set to the spawning repository's own socket, and
+  `jerry hook` talks to whatever socket is in its environment - no per-repository hook-runtime
+  bookkeeping needed.
+- A visible, per-repository error state renders `VersionMismatch`/`CannotSpawn` as an error banner
+  with a real "Restart sessions" action (sends `Shutdown` via the old client, re-runs
+  spawn-or-connect); `#[gpui::test]`ed through the test registry dir with an injected spawner.
+- `HostRuntime::in_process()`/`LocalClient` dispatch become `#[cfg(test)]`-only; the test app's
+  `Hosts` gets one in-process `RepoHost` per opened repository, so existing UI tests keep passing
+  unchanged, plus a new unit test that two open repositories dispatch to two different clients -
+  closing this issue's own "one execution path" DoD for the control plane, the data plane's own
+  half already closed by the amendment above. `jerry-host --repo` itself is unchanged (one
+  repository per process, already true).
 
 The `LocalClient`/in-process `Host` seam this issue's plan called `#[cfg(test)]`-only is therefore
 still jerry-app's real production path for the *control* plane today - existing UI tests, the
