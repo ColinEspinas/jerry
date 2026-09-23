@@ -625,7 +625,11 @@ mod host_shutdown_tests {
     /// A real process that blocks until its stdin closes - genuinely still running by the time
     /// shutdown reaches it, the same idiom `crate::session::session_manager_tests`'s own
     /// `shell_options` helper uses for a real, short-lived command.
+    ///
+    /// Adopts this test process into a kill-on-close job first - see that helper's own docs
+    /// (GitHub issue #534) for why this crate needs its own call rather than `jerry-app`'s.
     fn blocking_shell_options() -> jerry_pty::SpawnOptions {
+        test_support::adopt_this_process();
         if cfg!(windows) {
             jerry_pty::SpawnOptions::new("cmd").args(["/d", "/c", "more"])
         } else {

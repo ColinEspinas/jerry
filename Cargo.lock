@@ -8062,6 +8062,7 @@ name = "test-support"
 version = "0.2.0"
 dependencies = [
  "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

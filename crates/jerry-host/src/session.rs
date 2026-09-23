@@ -443,7 +443,13 @@ mod session_manager_tests {
 
     /// A real, short-lived shell command for this platform - `cmd /c` on Windows, `sh -c`
     /// elsewhere, matching the issue's own test plan.
+    ///
+    /// Adopts this test process into a kill-on-close job first (GitHub issue #534): this crate
+    /// cannot depend on `jerry-app`, whose own job object backstops issue #482, so every fixture
+    /// here that spawns a real process needs this call to survive a nextest `TerminateProcess`
+    /// on timeout the same way.
     fn shell_options(script: &str) -> SpawnOptions {
+        test_support::adopt_this_process();
         if cfg!(windows) {
             SpawnOptions::new("cmd").args(["/c", script])
         } else {
