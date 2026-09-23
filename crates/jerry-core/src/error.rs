@@ -99,6 +99,7 @@ pub fn git_error_code(error: &jerry_git::Error) -> &'static str {
         E::RebaseAmendHeadMoved { .. } => "rebase-amend-head-moved",
         E::RebaseAmendIndexDirty { .. } => "rebase-amend-index-dirty",
         E::RebaseAlreadyInProgress { .. } => "rebase-already-in-progress",
+        E::RebaseWorktreeDirty { .. } => "rebase-worktree-dirty",
         E::CommitHasNoParentAndNoBranch { .. } => "commit-has-no-parent-and-no-branch",
         E::DiscardSourceUnborn { .. } => "discard-source-unborn",
         E::DiscardSourceIsMainWorktree { .. } => "discard-source-is-main-worktree",

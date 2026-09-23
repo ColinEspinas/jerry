@@ -3,14 +3,11 @@
 //! top of `jerry_git::rebase`, already covered for real by `jerry-git`'s own
 //! `tests/rebase_editor.rs`.
 //!
-//! Lives here, not in `src/commands.rs`'s own `#[cfg(test)]` module, for the same reason
-//! `jerry-git`'s equivalent tests do: `RebaseStart::execute` needs `jerry_binary::locate` to find
-//! a real, executable file, and `CARGO_BIN_EXE_<name>` is only reliable for an integration test -
-//! verified against this crate's own build (a cross-crate dev-dependency, and a `--lib` unit test
-//! referencing this exact same-package `[[bin]]`, both failed to see the environment variable at
-//! all). `ensure_jerry_binary()` copies this crate's own `jerry_core_test_jerry` `[[bin]]`
-//! (`src/bin/test_jerry.rs`) to sit beside this test binary's own executable, matching the real
-//! sibling-of-`current_exe` layout `jerry_binary::locate` looks for.
+//! An integration test, not `src/commands.rs`'s own `#[cfg(test)]` module, so `RebaseStart::
+//! execute`'s `jerry_binary::locate` call finds the real `jerry` binary `cargo build -p
+//! jerry-cli` produces, via `locate`'s third tier (`docs/architecture/decisions.md` §20) - never
+//! a test-only stand-in copied into a shared path, which once collided with cargo's own unhashed
+//! Windows `deps/jerry.exe` layout and corrupted the real CLI binary.
 
 // An integration test file is its own crate root - `src/lib.rs`'s crate-level
 // `cfg_attr(test, allow(...))` does not reach here, so it is repeated (CLAUDE.md's
@@ -26,18 +23,16 @@ use jerry_core::{
     RebasePlanEntryWire, RebaseSkip, RebaseStart, StopReasonWire,
 };
 use std::path::{Path, PathBuf};
-use std::sync::Once;
 use test_support::{commit, git, git_output, seed_empty_repo, TempDir};
 
-fn ensure_jerry_binary() {
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        let real = env!("CARGO_BIN_EXE_jerry_core_test_jerry");
-        let current_exe = std::env::current_exe().expect("current_exe");
-        let dir = current_exe.parent().expect("current_exe has a parent");
-        let name = if cfg!(windows) { "jerry.exe" } else { "jerry" };
-        std::fs::copy(real, dir.join(name)).expect("copy the test jerry binary into place");
-    });
+/// `RebaseStart::execute`'s own `jerry_binary::locate` call needs a real, executable `jerry` -
+/// asserted up front so a missing binary fails right here with an actionable cause, not as a
+/// downstream state assertion. Mirrors `jerry-app`'s own `assert_real_jerry_binary_available`.
+fn assert_real_jerry_binary_available() {
+    assert!(
+        jerry_core::jerry_binary::locate().is_some(),
+        "no real `jerry` binary found - run `cargo build -p jerry-cli` first"
+    );
 }
 
 fn ctx_for(worktree: &Path) -> Ctx {
@@ -77,7 +72,7 @@ fn conflicting_repo() -> (TempDir, String, String) {
 
 #[test]
 fn a_clean_plan_completes_and_the_status_query_shows_nothing_in_progress() {
-    ensure_jerry_binary();
+    assert_real_jerry_binary_available();
     let repo = seed_empty_repo();
     commit(repo.path(), "base.txt", "base\n", "base");
     let base = head(repo.path());
@@ -107,7 +102,7 @@ fn a_clean_plan_completes_and_the_status_query_shows_nothing_in_progress() {
 
 #[test]
 fn a_real_conflict_stops_the_rebase_and_a_second_start_is_denied_while_it_is_in_progress() {
-    ensure_jerry_binary();
+    assert_real_jerry_binary_available();
     let (repo, base, v2) = conflicting_repo();
     let ctx = ctx_for(repo.path());
 
@@ -129,8 +124,10 @@ fn a_real_conflict_stops_the_rebase_and_a_second_start_is_denied_while_it_is_in_
         other => panic!("expected StoppedForConflict, got {other:?}"),
     }
 
+    let second_start = validate_command(&start, &ctx);
     assert!(
-        matches!(validate_command(&start, &ctx), Report::Denied { ref code, .. } if code == "rebase-already-in-progress")
+        matches!(second_start, Report::Denied { ref code, .. } if code == "rebase-already-in-progress"),
+        "got {second_start:?}"
     );
 
     std::fs::write(repo.path().join("file.txt"), "resolved\n").expect("resolve");
@@ -160,7 +157,7 @@ fn continue_skip_and_abort_are_all_denied_with_no_rebase_in_progress() {
 
 #[test]
 fn skip_genuinely_skips_the_stopped_commit_and_continues() {
-    ensure_jerry_binary();
+    assert_real_jerry_binary_available();
     let (repo, base, v2) = conflicting_repo();
     commit(repo.path(), "other.txt", "3\n", "commit 3");
     let c3 = head(repo.path());
@@ -179,10 +176,11 @@ fn skip_genuinely_skips_the_stopped_commit_and_continues() {
             },
         ],
     };
-    assert!(matches!(
-        outcome(run_command(start, &ctx)),
-        RebaseOutcomeReport::StoppedForConflict { .. }
-    ));
+    let started = outcome(run_command(start, &ctx));
+    assert!(
+        matches!(started, RebaseOutcomeReport::StoppedForConflict { .. }),
+        "got {started:?}"
+    );
 
     assert_eq!(
         outcome(run_command(RebaseSkip::default(), &ctx)),
@@ -196,7 +194,7 @@ fn skip_genuinely_skips_the_stopped_commit_and_continues() {
 
 #[test]
 fn abort_restores_head_to_exactly_its_pre_rebase_state() {
-    ensure_jerry_binary();
+    assert_real_jerry_binary_available();
     let (repo, base, v2) = conflicting_repo();
     let before_head = head(repo.path());
     let ctx = ctx_for(repo.path());
@@ -208,10 +206,11 @@ fn abort_restores_head_to_exactly_its_pre_rebase_state() {
             action: RebaseActionWire::Pick,
         }],
     };
-    assert!(matches!(
-        outcome(run_command(start, &ctx)),
-        RebaseOutcomeReport::StoppedForConflict { .. }
-    ));
+    let started = outcome(run_command(start, &ctx));
+    assert!(
+        matches!(started, RebaseOutcomeReport::StoppedForConflict { .. }),
+        "got {started:?}"
+    );
 
     assert!(run_command(RebaseAbort::default(), &ctx).is_ok());
     assert_eq!(head(repo.path()), before_head);
@@ -219,7 +218,7 @@ fn abort_restores_head_to_exactly_its_pre_rebase_state() {
 
 #[test]
 fn amend_head_message_applies_after_a_message_less_reword_stop_then_continue_completes() {
-    ensure_jerry_binary();
+    assert_real_jerry_binary_available();
     let repo = seed_empty_repo();
     commit(repo.path(), "base.txt", "base\n", "base");
     let base = head(repo.path());
@@ -271,14 +270,16 @@ fn amend_head_message_is_denied_with_no_rebase_stopped() {
     let amend = AmendHeadMessage {
         message: "x".into(),
     };
+    let denied = validate_command(&amend, &ctx);
     assert!(
-        matches!(validate_command(&amend, &ctx), Report::Denied { ref code, .. } if code == "rebase-not-stopped")
+        matches!(denied, Report::Denied { ref code, .. } if code == "rebase-not-stopped"),
+        "got {denied:?}"
     );
 }
 
 #[test]
 fn the_status_query_reflects_a_real_stop_and_clears_once_completed() {
-    ensure_jerry_binary();
+    assert_real_jerry_binary_available();
     let repo = seed_empty_repo();
     commit(repo.path(), "base.txt", "base\n", "base");
     let base = head(repo.path());
@@ -293,10 +294,11 @@ fn the_status_query_reflects_a_real_stop_and_clears_once_completed() {
             action: RebaseActionWire::Edit,
         }],
     };
-    assert!(matches!(
-        outcome(run_command(start, &ctx)),
-        RebaseOutcomeReport::StoppedForEdit { .. }
-    ));
+    let started = outcome(run_command(start, &ctx));
+    assert!(
+        matches!(started, RebaseOutcomeReport::StoppedForEdit { .. }),
+        "got {started:?}"
+    );
 
     let mid_flight = status(run_query(&RebaseStatusQuery::default(), &ctx))
         .expect("a rebase is really in progress");
