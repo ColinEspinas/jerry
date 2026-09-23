@@ -25,14 +25,17 @@ OS" helpers that aren't PTY-specific (`resolve_on_path`, `new_std_command`).
 Output is exposed as a plain `std::sync::mpsc::Receiver<Vec<u8>>`. Also `new_std_command`, the one
 sanctioned constructor for every non-PTY `std::process::Command` in the workspace — it suppresses
 the per-spawn console window on Windows GUI-subsystem release builds (decisions.md §10). And
-`new_detached_command`/`breakaway_is_forbidden_for_current_process` (decisions.md §14/§24): the
-one place `CREATE_BREAKAWAY_FROM_JOB` (Windows) / a fresh process group (unix) is spawned, so a
-`jerry-host` process can outlive the job-jobbed app or CLI that started it — used by
-`jerry_core::host_spawn` and, from `jerry-host`'s own `main.rs`, the self-adoption on the other
-side of that spawn.
+`new_detached_command` (decisions.md §14/§24): the one place `CREATE_BREAKAWAY_FROM_JOB`
+(Windows) / a fresh process group (unix) is set, so a `jerry-host` process can outlive the
+job-jobbed app or CLI that started it — used by `jerry_core::host_spawn` and, from `jerry-host`'s
+own `main.rs`, the self-adoption on the other side of that spawn. Every call in this crate is a
+safe `std` wrapper — no `unsafe`. *Detecting* a forbidding job needs the real Win32
+`IsProcessInJob`/`QueryInformationJobObject` read, which stays out of this crate entirely and
+lives in `jerry-app`'s and `jerry-host`'s own `job_object.rs` instead (CLAUDE.md's unsafe list),
+injected into `jerry_core::host_spawn::spawn_or_connect_with` by whichever of those calls it.
 
 **Does not own.** ANSI/terminal-grid parsing (that's `crates/jerry-app/src/terminal/`), any git concern,
-any gpui dependency.
+any gpui dependency, and (deliberately) any `unsafe` code at all.
 
 ## `jerry-core`
 
@@ -44,12 +47,16 @@ Git-locality Command and Query implementations live here so standalone `jerry-cl
 **Owns.** No threads, no listener, no sessions. Every variant a client can send is catalogued in
 `request.rs` and pinned by a JSON fixture under `fixtures/`. `crate::host_spawn::spawn_or_connect`
 (decisions.md §24): resolve the registry for a repository, connect to a live version-matched
-host, flag a version mismatch, or spawn `jerry-host` detached and wait for its descriptor - the
+host, flag a version mismatch, or spawn `jerry-host` detached (claiming the right to via
+`Registry::claim`, so two racing callers cannot both spawn one) and wait for its descriptor - the
 one implementation both `jerry host start` and (once wired) `jerry-app`'s own `HostRuntime` call,
 which is why this crate takes a real (non-dev) dependency on `jerry-pty`. `crate::jerry_binary::
-locate_named` finds any sibling binary this workspace ships (`jerry`, `jerry-host`).
+locate_named` finds any sibling binary this workspace ships (`jerry`, `jerry-host`). No `unsafe`
+here either - detecting a job that forbids `CREATE_BREAKAWAY_FROM_JOB` is injected in by the
+caller (`jerry-app`'s or `jerry-host`'s own `job_object.rs`), never called directly.
 
-**Does not own.** Dispatch, the listener and the session table (`jerry-host`); anything `gpui`.
+**Does not own.** Dispatch, the listener and the session table (`jerry-host`); anything `gpui`;
+any `unsafe` code.
 
 ## `jerry-host`
 

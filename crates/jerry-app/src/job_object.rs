@@ -11,10 +11,11 @@
 
 use std::io;
 
+use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, JOBOBJECT_BASIC_LIMIT_INFORMATION,
+    AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JobObjectExtendedLimitInformation,
+    QueryInformationJobObject, SetInformationJobObject, JOBOBJECT_BASIC_LIMIT_INFORMATION,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
@@ -116,6 +117,47 @@ fn assign_process(job: HANDLE, process: HANDLE) -> io::Result<()> {
     Ok(())
 }
 
+/// Whether the job this process currently belongs to (if any) forbids `CREATE_BREAKAWAY_FROM_JOB`,
+/// read directly from the OS rather than guessed from a failed spawn's error code, exactly as
+/// `docs/architecture/decisions.md` §14's spike proved. `Ok(false)` also covers "not in a job at
+/// all", since nothing then forbids anything. This is the decision a caller of `jerry_core::
+/// host_spawn::spawn_or_connect_with` injects, since that crate stays free of this workspace's
+/// sanctioned Win32 FFI (`docs/architecture/decisions.md` §24): here, or `jerry-host`'s own
+/// `job_object.rs`, are the two places allowed to call it.
+pub fn breakaway_is_forbidden_for_current_process() -> io::Result<bool> {
+    let mut in_any_job: BOOL = 0;
+    // SAFETY: `GetCurrentProcess` returns this process's own valid pseudo-handle; a null job
+    // handle asks "in any job at all"; `in_any_job` addresses a live, uniquely borrowed stack
+    // `BOOL` the callee writes exactly once.
+    let ok = unsafe { IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &mut in_any_job) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if in_any_job == 0 {
+        return Ok(false);
+    }
+
+    let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    // SAFETY: a null job handle queries the calling process's own job (confirmed above to be a
+    // member of exactly one); the buffer pointer addresses a live, uniquely borrowed stack value
+    // sized exactly to `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`, which the callee writes into and
+    // does not retain past the call. The return-length pointer is null: the exact size asked for
+    // is already known.
+    let ok = unsafe {
+        QueryInformationJobObject(
+            std::ptr::null_mut(),
+            JobObjectExtendedLimitInformation,
+            std::ptr::from_mut(&mut info).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(info.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_BREAKAWAY_OK == 0)
+}
+
 #[cfg(test)]
 mod kill_on_close_job_tests {
     use super::{adopt_this_process_returning_job, assign_process, create_kill_on_close_job};
@@ -182,5 +224,19 @@ mod kill_on_close_job_tests {
             "a child spawned after adoption must be inside the job automatically"
         );
         child.kill_and_wait().expect("test child teardown");
+    }
+}
+
+#[cfg(test)]
+mod breakaway_detection_tests {
+    use super::breakaway_is_forbidden_for_current_process;
+
+    /// nextest gives every test its own process, so this test's own job membership (if any) is
+    /// whatever the test harness itself set up - never a job this test created, so the exact
+    /// answer is unknown, but the OS query must at least succeed rather than error.
+    #[test]
+    fn querying_this_process_own_job_information_succeeds_on_real_windows() {
+        breakaway_is_forbidden_for_current_process()
+            .expect("IsProcessInJob/QueryInformationJobObject must succeed for this process");
     }
 }

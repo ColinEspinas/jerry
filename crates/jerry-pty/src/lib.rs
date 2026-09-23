@@ -48,8 +48,6 @@ mod command;
 pub use command::new_std_command;
 
 mod detached;
-#[cfg(windows)]
-pub use detached::breakaway_is_forbidden_for_current_process;
 pub use detached::new_detached_command;
 
 pub use portable_pty::ExitStatus;
