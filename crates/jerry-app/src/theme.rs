@@ -3151,6 +3151,10 @@ mod stray_hex_tests {
     const THEME_LAYER: &[&str] = &[
         "jerry-app/src/theme.rs",
         "jerry-app/src/settings/builtin_themes.rs",
+        // jerry-ui's own theme layer (decisions.md §27) - its `Theme::default` is a real,
+        // citation-backed copy of this file's own `ColorToken` defaults, not a second,
+        // independently-drifting source of colour literals.
+        "jerry-ui/src/theme.rs",
     ];
 
     /// Every `.rs` file under `crates/`, as `(path relative to crates/, contents)`.
