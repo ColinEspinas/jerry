@@ -1714,20 +1714,59 @@ have the cross-*instance-visibility* gap the issue is about) and `hooks/mod.rs`'
 - **`seed_hook_runtime` ensures `AdeApp::hook_runtime` exists before it replays anything - it does
   not wait for a spawn to bring it up.** The one-shot bring-up `hook_injection_for` always needed
   (find the `jerry` binary, write the per-launch settings file, once per `AdeApp`) is factored into
-  its own `AdeApp::ensure_hook_runtime` (`hooks/flow.rs`), and `seed_hook_runtime` calls it before
-  dispatching `HooksQuery`. This matters for real: once #507 lands, a relaunch reattaches an
-  already-running agent's session without spawning anything at all, so `hook_injection_for`'s own
-  bring-up - gated on a spawn that "wants injection" - would never run, and a seed that only
-  replayed into an already-existing runtime would silently do nothing for exactly the case this
-  issue exists for. `ensure_hook_runtime` is keyed on the same `hook_runtime_tried` one-shot flag
-  either caller already shared (a failed attempt - hooks unsupported, no locatable binary - is not
-  retried by the other caller either), so there is still exactly one bring-up attempt per `AdeApp`,
-  from whichever of the two call sites reaches it first. Proven with no spawn anywhere in the test:
-  `hooks::integration_tests::a_relaunched_instance_replays_the_hosts_prior_hook_history_exactly_as_
-  the_live_path_would` seeds a real host with two hook events, opens a test app against it (`event/
-  hook`'s own subscription, `adopt_repo_host_for_test`) with `hook_runtime` never touched by hand,
-  and the seed itself brings the runtime up for real (a real `find_jerry_binary` - this machine's
-  own `jerry.exe` build - and a real settings-file write) before replaying.
+  a shared, pure `locate_and_start_hook_runtime` free function (`hooks/flow.rs`), so `hook_injection_
+  for`'s own synchronous contract (it must hand a caller-ready `HookInjection` back before `Agents::
+  spawn`'s own "the tab exists, here is its id" contract resolves) and `AdeApp::ensure_hook_runtime`
+  (`seed_hook_runtime`'s own caller, below) run the identical logic rather than two copies of it.
+  This matters for real: once #507 lands, a relaunch reattaches an already-running agent's session
+  without spawning anything at all, so `hook_injection_for`'s own bring-up - gated on a spawn that
+  "wants injection" - would never run, and a seed that only replayed into an already-existing
+  runtime would silently do nothing for exactly the case this issue exists for. Both callers share
+  the same `hook_runtime_tried` one-shot flag, so there is still exactly one bring-up attempt per
+  `AdeApp` (a failed attempt - hooks unsupported, no locatable binary - is not retried by the other
+  caller either), from whichever of the two reaches it first. Proven with no spawn anywhere in the
+  test: `hooks::integration_tests::a_relaunched_instance_replays_the_hosts_prior_hook_history_
+  exactly_as_the_live_path_would` seeds a real host with two hook events, opens a test app against
+  it (`event/hook`'s own subscription, `adopt_repo_host_for_test`) with `hook_runtime` never touched
+  by hand, and the seed itself brings the runtime up for real (a real `find_jerry_binary` - this
+  workspace's own built `jerry` binary - and a real settings-file write) before replaying.
+- **`ensure_hook_runtime`'s own bring-up runs off the UI thread; `hook_injection_for`'s does not,
+  and that split is deliberate, not an oversight.** `find_jerry_binary` (filesystem probes, a
+  `PATH` scan) and writing the settings file are both real I/O - a second review finding on this
+  issue. `AdeApp::ensure_hook_runtime` (called only by `seed_hook_runtime`, which has nothing
+  synchronous to hand back) now returns a `Task<()>`: it sets `hook_runtime_tried` *before*
+  spawning - so a second repository connecting concurrently sees the flag already set and never
+  starts a second attempt - then runs `locate_and_start_hook_runtime` on `cx.background_spawn` and
+  applies the resulting `HookRuntime` back through a later `Context::update`. `hook_injection_for`
+  keeps calling the same free function inline, synchronously, exactly as before this issue: its own
+  caller (`Agents::spawn`) needs the `HookInjection` (if any) before its own synchronous contract
+  resolves, and giving that up would mean redesigning the spawn flow itself, out of scope here.
+- **`find_jerry_binary` delegates to `jerry_core::jerry_binary::locate`, plus the existing `PATH`
+  fallback, instead of its own sibling/`bin/` probes - a fourth review finding, caught by CI on
+  unix, not Windows.** `find_jerry_binary`'s own two tiers only ever checked a sibling of the
+  *calling test binary itself* and a `bin/` next to it; `jerry_core::jerry_binary::locate` has a
+  third tier neither had - one directory up from a `deps/`-nested test binary, where cargo places
+  the real, unhashed `jerry` artifact. On Windows, cargo happens to *also* leave an unhashed copy
+  directly in `deps/`, so the missing tier was invisible there; unix never gets that copy, so
+  `ensure_hook_runtime`'s bring-up found nothing and `hook_runtime` stayed `None` - reached as a
+  bare `.expect("runtime")` panic in the no-spawn replay test, rather than a clear cause.
+  `crate::test_support::assert_real_jerry_binary_available` (pre-existing, `jerry_core::
+  jerry_binary::locate`'s own rebase-fixture precondition) now opens that test too, so a genuinely
+  missing binary fails there with an actionable message instead. The test's own wait for
+  `hook_runtime` to exist is now a real poll (`hook_runtime.as_ref().and_then(...)`, never a bare
+  `.expect` mid-loop), matching the off-thread bring-up the review finding above already made real.
+- **`HookRuntime::record` gained a per-agent dedup guard - the same entry can genuinely reach it
+  twice.** A repository's `event/hook` subscription (`spawn_consumer`) opens before
+  `seed_hook_runtime`'s own `HooksQuery` snapshot is taken, so a real entry recorded by the host in
+  that window is both pushed live *and* returned in the snapshot's `entries` - a third review
+  finding. `HookInbox::record`/`EditLog::record` are not idempotent (a repeated `Stop` doubles a
+  turn count, a repeated edit doubles the log), so `HookRuntime` now tracks the highest
+  `HookInboxEntry::seq` already applied per agent (`applied_seq`) and `Self::record` is a no-op for
+  a `seq` at or below that watermark, regardless of which path delivered it. `forget` clears an
+  agent's watermark alongside its inbox/edit facts, for the same reused-id hygiene both already
+  had. Proven deterministically, no host, no app: `hooks::integration_tests::the_same_entry_
+  delivered_twice_through_both_paths_is_applied_only_once` records a write-edit entry and a
+  turn-ending `Stop` entry, each delivered twice, and asserts exactly one edit and one turn.
 - **`HookAck` is real and dispatched for real**, both by `seed_hook_runtime` (one ack per agent,
   after replaying that agent's entries) and by `spawn_consumer` (one ack per live entry applied,
   best-effort, awaited but not retried on failure). The host's `HookStore::ack` prunes acknowledged

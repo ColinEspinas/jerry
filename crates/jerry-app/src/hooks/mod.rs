@@ -15,6 +15,7 @@ pub mod store;
 #[cfg(test)]
 mod integration_tests;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -35,6 +36,14 @@ pub struct HookRuntime {
     files: settings_file::HookFiles,
     inbox: Arc<Mutex<inbox::HookInbox>>,
     edits: Arc<Mutex<inbox::EditLog>>,
+    /// Highest [`jerry_core::HookInboxEntry::seq`] already applied, per agent - [`Self::record`]'s
+    /// own dedup guard (issue #532's review). The live `event/hook` consumer ([`spawn_consumer`])
+    /// subscribes before a connect-time replay (`crate::host::AdeApp::seed_hook_runtime`) takes
+    /// its own `HooksQuery` snapshot, so the identical real entry can reach `Self::record` twice;
+    /// `HookInbox::record`/`EditLog::record` are not idempotent (a repeated `Stop` would double a
+    /// turn count, a repeated edit would double-append), so this is what keeps a shared entry from
+    /// being counted twice regardless of which path delivered it first.
+    applied_seq: Arc<Mutex<HashMap<jerry_core::AgentId, u64>>>,
 }
 
 impl HookRuntime {
@@ -65,6 +74,7 @@ impl HookRuntime {
             files,
             inbox: Arc::new(Mutex::new(inbox::HookInbox::default())),
             edits: Arc::new(Mutex::new(inbox::EditLog::default())),
+            applied_seq: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -80,9 +90,28 @@ impl HookRuntime {
         }
     }
 
-    /// Records one raw `event/hook` entry - see [`spawn_consumer`].
+    /// Records one raw `event/hook` entry - see [`spawn_consumer`]. A no-op for an entry whose
+    /// `seq` was already applied for its agent - see [`Self::applied_seq`]'s own docs.
     fn record(&self, entry: &jerry_core::HookInboxEntry) {
+        if !self.mark_applied(entry) {
+            return;
+        }
         record_hook_notification(&self.inbox, &self.edits, entry);
+    }
+
+    /// `true` (and advances the watermark) the first time `entry.seq` is seen for its agent;
+    /// `false` for a `seq` already applied or older - [`Self::record`]'s own dedup guard.
+    fn mark_applied(&self, entry: &jerry_core::HookInboxEntry) -> bool {
+        let Ok(mut applied) = self.applied_seq.lock() else {
+            return false;
+        };
+        match applied.get(&entry.agent_id) {
+            Some(&highest) if entry.seq <= highest => false,
+            _ => {
+                applied.insert(entry.agent_id.clone(), entry.seq);
+                true
+            }
+        }
     }
 
     /// This agent's current hook fact, for [`crate::rail::status::derive_status`].
@@ -153,6 +182,9 @@ impl HookRuntime {
         }
         if let Ok(mut edits) = self.edits.lock() {
             edits.forget(id);
+        }
+        if let Ok(mut applied) = self.applied_seq.lock() {
+            applied.remove(&jerry_core::AgentId::from(id.to_string()));
         }
     }
 }

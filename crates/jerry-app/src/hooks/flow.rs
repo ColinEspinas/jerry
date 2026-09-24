@@ -1,6 +1,6 @@
 //! Recording what the hooks taught Jerry about each agent, onto disk (GitHub issue #239 phase 2).
 
-use gpui::{AppContext as _, Context, Window};
+use gpui::{AppContext as _, Context, Task, Window};
 
 use crate::root::AdeApp;
 use crate::work_surface::agents::ProcessKind;
@@ -118,40 +118,49 @@ impl AdeApp {
         if !wants_injection {
             return None;
         }
-        self.ensure_hook_runtime();
+        // Bring-up is attempted exactly once per `AdeApp` ([`Self::hook_runtime_tried`]'s own
+        // docs). Synchronous, on the calling thread - a real, pre-existing blocking call
+        // (`locate_and_start_hook_runtime`'s own docs): `Agents::spawn` needs the injection, if
+        // any, before its own synchronous "the tab exists, here is its id" contract resolves, so
+        // there is nothing to hand a background task here without redesigning that contract -
+        // out of scope for decisions.md §26's review finding. [`Self::ensure_hook_runtime`] is
+        // the off-thread twin for a caller with nothing synchronous to hand back.
+        if self.hook_runtime.is_none() && !self.hook_runtime_tried {
+            self.hook_runtime_tried = true;
+            self.hook_runtime = locate_and_start_hook_runtime();
+        }
         let runtime = self.hook_runtime.as_ref()?;
         let host_socket = self.host_socket_for(cwd)?;
         Some(runtime.injection(host_socket))
     }
 
-    /// Brings [`Self::hook_runtime`] up if it has not been tried yet - the one-shot bring-up
-    /// [`Self::hook_injection_for`] always needed before it had anything to inject, factored out
-    /// so `crate::host::AdeApp::seed_hook_runtime` (decisions.md §26) can ensure the same runtime
-    /// exists before it replays a repository's prior hook history into it, not only a spawn that
-    /// wants injection - a relaunch that reattaches an already-running agent's session spawns
-    /// nothing at all, so `hook_injection_for` would never otherwise run.
+    /// Brings [`Self::hook_runtime`] up in the background if it has not been tried yet - the
+    /// off-thread twin of [`Self::hook_injection_for`]'s own inline bring-up, for a caller with
+    /// nothing synchronous to hand back once it resolves (`crate::host::AdeApp::
+    /// seed_hook_runtime`, decisions.md §26's review finding: locating the `jerry` binary is real
+    /// filesystem/`PATH` I/O, and writing the settings file is a real write - neither belongs on
+    /// the UI thread). A relaunch that reattaches an already-running agent's session spawns
+    /// nothing at all, so `hook_injection_for` would never otherwise run - this is what lets the
+    /// seed bring the runtime up regardless.
     ///
-    /// Attempted exactly once per `AdeApp`, keyed on [`Self::hook_runtime_tried`] rather than on
-    /// `hook_runtime.is_none()`, because those differ precisely in the failure case: without it,
-    /// an instance that cannot start a runtime would re-run the whole attempt on every caller, and
-    /// re-log the same warning each time, for a condition (hooks unsupported, or the settings file
-    /// unwritable) that will not have changed since the last try.
-    pub(crate) fn ensure_hook_runtime(&mut self) {
+    /// [`Self::hook_runtime_tried`] is set *before* the background work starts, not after it
+    /// resolves, so a second caller racing this one (two repositories connecting back to back)
+    /// sees the flag already set and does not start a second attempt of its own. Returns a `Task`
+    /// the caller awaits before it needs [`Self::hook_runtime`] settled one way or the other -
+    /// already a real, immediately-resolving no-op once a bring-up has already been tried.
+    pub(crate) fn ensure_hook_runtime(&mut self, cx: &mut Context<Self>) -> Task<()> {
         if self.hook_runtime.is_some() || self.hook_runtime_tried {
-            return;
+            return cx.spawn(async move |_this, _cx| {});
         }
         self.hook_runtime_tried = true;
-        match crate::host::find_jerry_binary() {
-            Some(jerry_binary) => {
-                self.hook_runtime =
-                    crate::hooks::HookRuntime::start(&std::env::temp_dir(), &jerry_binary);
-            }
-            None => log::warn!(
-                "could not locate the `jerry` binary next to this executable, under its \
-                 bin/, or on PATH - agent hook injection is disabled; agent status will \
-                 use the terminal-title and quiescence signals only"
-            ),
-        }
+        cx.spawn(async move |this, cx| {
+            let runtime = cx
+                .background_spawn(async { locate_and_start_hook_runtime() })
+                .await;
+            let _ = this.update(cx, |this, _cx| {
+                this.hook_runtime = runtime;
+            });
+        })
     }
 
     /// Reconciles `~/.cursor/hooks.json` against the current `agents.cursor_hooks_enabled`
@@ -390,4 +399,24 @@ fn unix_now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// The real, blocking half of bringing a `HookRuntime` up: locate the `jerry` binary, then write
+/// its settings file - real filesystem/`PATH` I/O either way. Pure - no `self`, no GPUI - so a
+/// caller can run it inline ([`AdeApp::hook_injection_for`]'s own synchronous contract, unchanged)
+/// or hand it to `cx.background_spawn` ([`AdeApp::ensure_hook_runtime`]).
+fn locate_and_start_hook_runtime() -> Option<crate::hooks::HookRuntime> {
+    match crate::host::find_jerry_binary() {
+        Some(jerry_binary) => {
+            crate::hooks::HookRuntime::start(&std::env::temp_dir(), &jerry_binary)
+        }
+        None => {
+            log::warn!(
+                "could not locate the `jerry` binary next to this executable, under its \
+                 bin/, or on PATH - agent hook injection is disabled; agent status will \
+                 use the terminal-title and quiescence signals only"
+            );
+            None
+        }
+    }
 }
