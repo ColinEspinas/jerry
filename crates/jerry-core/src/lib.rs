@@ -14,6 +14,7 @@ pub mod command;
 pub mod commands;
 pub mod ctx;
 pub mod error;
+pub mod hooks;
 pub mod host_spawn;
 pub mod jerry_binary;
 pub mod mcp;
@@ -38,6 +39,7 @@ pub use commands::{
 };
 pub use ctx::{AgentId, Caller, Ctx};
 pub use error::Error;
+pub use hooks::{HookAck, HookAgentSnapshot, HookInboxEntry, HookKind, HookStatus, HooksQuery};
 pub use mcp::{all_tools, method_for_tool_name, tool_name, ToolSpec};
 pub use method::Method;
 pub use queries::{

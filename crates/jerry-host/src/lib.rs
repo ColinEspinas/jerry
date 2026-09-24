@@ -1,7 +1,7 @@
 //! The session host: the one place a `Call` is authorized and executed. Owns the dispatch
 //! thread, the socket listener, the session table (`crate::session`, every PTY it spawned or is
-//! tracking) and the notification fan-out. Every task here wakes on a channel, never on a timer.
-//! The hook store is not here yet; a request needing it is answered `NEEDS_HOST`. Zero `gpui`.
+//! tracking), the hook store (`crate::hooks`) and the notification fan-out. Every task here wakes
+//! on a channel, never on a timer. Zero `gpui`.
 
 // Only production code is held to `unwrap_used`/`expect_used` (`CLAUDE.md`).
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
@@ -9,9 +9,11 @@
 mod data_plane;
 mod dispatch;
 mod fanout;
+pub mod hooks;
 mod listener;
 mod session;
 
+pub use hooks::HookStore;
 pub use session::{SessionError, SessionHandle, SessionManager, SessionSpawnError};
 
 use futures::channel::{mpsc, oneshot};
@@ -130,6 +132,7 @@ pub(crate) struct Inner {
     jobs: Mutex<Option<mpsc::UnboundedSender<Job>>>,
     agents: AgentTable,
     sessions: SessionManager,
+    hooks: hooks::HookStore,
     fanout: fanout::Fanout,
     /// One handle per live socket connection, so shutdown can close them under their threads.
     connections: Mutex<Vec<Stream>>,
@@ -172,6 +175,10 @@ impl Inner {
 
     pub(crate) fn sessions(&self) -> &SessionManager {
         &self.sessions
+    }
+
+    pub(crate) fn hooks(&self) -> &hooks::HookStore {
+        &self.hooks
     }
 
     pub(crate) fn fanout(&self) -> &fanout::Fanout {
@@ -298,6 +305,7 @@ impl Host {
             jobs: Mutex::new(Some(jobs)),
             agents,
             sessions,
+            hooks: hooks::HookStore::default(),
             fanout,
             connections: Mutex::new(Vec::new()),
             shutting_down: AtomicBool::new(false),
@@ -336,6 +344,12 @@ impl Host {
     /// through `Call`/`Report` - see that method's own docs.
     pub fn sessions(&self) -> SessionManager {
         self.inner.sessions.clone()
+    }
+
+    /// The hook store (`docs/architecture/decisions.md` §26): the same one `HooksQuery`/
+    /// `HookAck`/the `hook` request path act on.
+    pub fn hooks(&self) -> hooks::HookStore {
+        self.inner.hooks.clone()
     }
 
     pub fn client(&self) -> LocalClient {
@@ -893,12 +907,37 @@ mod host_dispatch_tests {
         match received.expect("received") {
             Message::Notification { method, params } => {
                 assert_eq!(method, "event/hook");
-                assert_eq!(params["agent"], serde_json::json!("agent-2"));
+                assert_eq!(params["agent_id"], serde_json::json!("agent-2"));
                 assert_eq!(params["event"], serde_json::json!("Stop"));
                 assert_eq!(params["payload"]["turn"], serde_json::json!(3));
+                assert_eq!(params["seq"], serde_json::json!(0));
             }
             other => panic!("expected a notification, got {other:?}"),
         }
+
+        // The dispatcher's own bookkeeping, not just the fanned-out notification: `HooksQuery`
+        // answers from the same real host that just recorded the hook above.
+        let queried = block_on(client.request(Call::human(
+            repo.path(),
+            Request::Query(AppQuery::Hooks(jerry_core::HooksQuery {
+                agent: Some(id.clone()),
+            })),
+        )))
+        .expect("hooks query dispatched");
+        let Report::Ok { outcome } = queried else {
+            panic!("expected ok, got {queried:?}")
+        };
+        let snapshots = outcome.as_array().expect("array");
+        assert_eq!(snapshots.len(), 1, "{snapshots:?}");
+        assert_eq!(
+            snapshots[0]["status"]["agent_id"],
+            serde_json::json!("agent-2")
+        );
+        assert_eq!(snapshots[0]["status"]["kind"], serde_json::json!("done"));
+        assert_eq!(
+            snapshots[0]["entries"][0]["event"],
+            serde_json::json!("Stop")
+        );
 
         let anonymous = block_on(client.call(Call::human(
             repo.path(),
@@ -1077,6 +1116,164 @@ mod host_dispatch_tests {
         };
         assert_eq!(outcome[0]["id"], serde_json::json!("agent-3"));
         assert_eq!(outcome[0]["kind"], serde_json::json!("Claude"));
+        host.shutdown_and_join();
+    }
+
+    /// Decisions.md §26: "Allowed to agents for their own id only". A human may ask about anyone
+    /// (or everyone, with `agent: None`); an agent asking about a different id is refused
+    /// outright, the same `FORBIDDEN` code `classify`/`confine` already use.
+    #[test]
+    fn an_agent_may_only_ask_hooksquery_about_its_own_id() {
+        let repo = seed_empty_repo();
+        let host = Host::start().expect("host");
+        let client = host.client();
+        let id = AgentId::from("agent-hooks-1");
+        let other = AgentId::from("agent-hooks-2");
+        host.agents()
+            .register(id.clone(), repo.path().to_path_buf(), "Claude".into());
+        host.agents()
+            .register(other.clone(), repo.path().to_path_buf(), "Claude".into());
+
+        let own = block_on(client.request(Call::agent(
+            repo.path(),
+            id.clone(),
+            Request::Query(AppQuery::Hooks(jerry_core::HooksQuery {
+                agent: Some(id.clone()),
+            })),
+        )))
+        .expect("dispatched");
+        assert!(own.is_ok(), "{own:?}");
+
+        let denied = block_on(client.call(Call::agent(
+            repo.path(),
+            id.clone(),
+            Request::Query(AppQuery::Hooks(jerry_core::HooksQuery {
+                agent: Some(other.clone()),
+            })),
+        )))
+        .expect_err("an agent asking about another id must be refused");
+        assert_eq!(denied.code, rpc_code::FORBIDDEN);
+
+        let denied_all = block_on(client.call(Call::agent(
+            repo.path(),
+            id,
+            Request::Query(AppQuery::Hooks(jerry_core::HooksQuery { agent: None })),
+        )))
+        .expect_err("an agent asking about every agent must be refused too");
+        assert_eq!(denied_all.code, rpc_code::FORBIDDEN);
+        host.shutdown_and_join();
+    }
+
+    /// `HookAck` prunes the raw inbox but leaves the current status alone - proven indirectly
+    /// here through a real, observable effect: a second `HookAck` with a lower `up_to` than an
+    /// already-acknowledged one is a harmless no-op, never an error, and `HooksQuery` keeps
+    /// answering with the agent's latest status throughout.
+    #[test]
+    fn hook_ack_is_denied_to_agents_and_leaves_the_current_status_intact() {
+        let repo = seed_empty_repo();
+        let host = Host::start().expect("host");
+        let client = host.client();
+        let id = AgentId::from("agent-ack-1");
+        host.agents()
+            .register(id.clone(), repo.path().to_path_buf(), "Claude".into());
+
+        block_on(client.request(Call::agent(
+            repo.path(),
+            id.clone(),
+            Request::Hook(HookEvent {
+                event: "Stop".into(),
+                payload: serde_json::Value::Null,
+            }),
+        )))
+        .expect("hook dispatched");
+
+        let ack = Request::Command(AppCommand::HookAck(jerry_core::HookAck {
+            agent_id: id.clone(),
+            up_to: 0,
+        }));
+        let denied = block_on(client.call(Call::agent(repo.path(), id.clone(), ack.clone())))
+            .expect_err("an agent may not acknowledge its own inbox");
+        assert_eq!(denied.code, rpc_code::FORBIDDEN);
+
+        let acked = block_on(client.request(Call::human(repo.path(), ack))).expect("human may ack");
+        assert!(acked.is_ok(), "{acked:?}");
+
+        let still_there = block_on(client.request(Call::human(
+            repo.path(),
+            Request::Query(AppQuery::Hooks(jerry_core::HooksQuery {
+                agent: Some(id.clone()),
+            })),
+        )))
+        .expect("hooks query dispatched");
+        let Report::Ok { outcome } = still_there else {
+            panic!("expected ok, got {still_there:?}")
+        };
+        assert_eq!(
+            outcome[0]["status"]["kind"],
+            serde_json::json!("done"),
+            "acknowledging the raw inbox must not touch the current status: {outcome:?}"
+        );
+        assert_eq!(
+            outcome[0]["entries"],
+            serde_json::json!([]),
+            "the acknowledged entry must be pruned from the raw inbox: {outcome:?}"
+        );
+        host.shutdown_and_join();
+    }
+
+    /// Decisions.md §26: "cleared when the session is forgotten" - `HooksQuery` stops answering
+    /// for an agent the moment the host no longer knows about it, the same real mechanism
+    /// `AgentsQuery` already relies on (`SessionManager::agent_entries`'s own exit filtering)
+    /// rather than a second, separate removal path this store would have to keep in sync.
+    #[test]
+    fn hooksquery_stops_answering_for_an_agent_the_host_no_longer_knows_about() {
+        let repo = seed_empty_repo();
+        let host = Host::start().expect("host");
+        let client = host.client();
+        let id = AgentId::from("agent-forgotten-1");
+        host.agents()
+            .register(id.clone(), repo.path().to_path_buf(), "Claude".into());
+
+        block_on(client.request(Call::agent(
+            repo.path(),
+            id.clone(),
+            Request::Hook(HookEvent {
+                event: "Stop".into(),
+                payload: serde_json::Value::Null,
+            }),
+        )))
+        .expect("hook dispatched");
+        let present = block_on(client.request(Call::human(
+            repo.path(),
+            Request::Query(AppQuery::Hooks(jerry_core::HooksQuery {
+                agent: Some(id.clone()),
+            })),
+        )))
+        .expect("hooks query dispatched");
+        let Report::Ok { outcome } = present else {
+            panic!("expected ok, got {present:?}")
+        };
+        assert_eq!(
+            outcome.as_array().map(Vec::len),
+            Some(1),
+            "sanity check: the live agent's status must be answered first: {outcome:?}"
+        );
+
+        host.agents().forget(&id);
+        let gone = block_on(client.request(Call::human(
+            repo.path(),
+            Request::Query(AppQuery::Hooks(jerry_core::HooksQuery {
+                agent: Some(id.clone()),
+            })),
+        )))
+        .expect("hooks query dispatched");
+        assert_eq!(
+            gone,
+            Report::Ok {
+                outcome: serde_json::json!([])
+            },
+            "a forgotten agent's status must no longer be answered"
+        );
         host.shutdown_and_join();
     }
 

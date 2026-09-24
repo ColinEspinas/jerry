@@ -13,6 +13,7 @@ use crate::commands::{
 };
 use crate::ctx::Ctx;
 use crate::error::Error;
+use crate::hooks::{HookAck, HooksQuery};
 use crate::method::Method;
 use crate::queries::{
     AgentsQuery, MergeStatusQuery, RebaseStatusQuery, SessionsQuery, StatusQuery,
@@ -97,6 +98,7 @@ pub enum AppCommand {
     SessionStopPolicy(SessionStopPolicy),
     AttentionRaise(AttentionRaise),
     Shutdown(Shutdown),
+    HookAck(HookAck),
 }
 
 /// Every Query a client can send.
@@ -108,12 +110,14 @@ pub enum AppQuery {
     RebaseStatus(RebaseStatusQuery),
     Agents(AgentsQuery),
     Sessions(SessionsQuery),
+    Hooks(HooksQuery),
 }
 
 /// The kebab-case names of every `AppCommand` variant, for method lookup and tool listing.
 pub const COMMAND_NAMES: &[&str] = &[
     "amend-head-message",
     "attention-raise",
+    "hook-ack",
     "merge-abort",
     "merge-attempt",
     "merge-branch-into-current",
@@ -136,6 +140,7 @@ pub const COMMAND_NAMES: &[&str] = &[
 /// The kebab-case names of every `AppQuery` variant.
 pub const QUERY_NAMES: &[&str] = &[
     "agents",
+    "hooks",
     "merge-status",
     "rebase-status",
     "sessions",
@@ -189,6 +194,7 @@ macro_rules! each_command {
             AppCommand::SessionStopPolicy($c) => $body,
             AppCommand::AttentionRaise($c) => $body,
             AppCommand::Shutdown($c) => $body,
+            AppCommand::HookAck($c) => $body,
         }
     };
 }
@@ -215,6 +221,7 @@ impl AppCommand {
             AppCommand::SessionStopPolicy(_) => SessionStopPolicy::NAME,
             AppCommand::AttentionRaise(_) => AttentionRaise::NAME,
             AppCommand::Shutdown(_) => Shutdown::NAME,
+            AppCommand::HookAck(_) => HookAck::NAME,
         }
     }
 
@@ -286,6 +293,10 @@ impl AppCommand {
             AppCommand::Shutdown(_) => {
                 "Shut the connected Jerry host down, killing every session it still owns."
             }
+            AppCommand::HookAck(_) => {
+                "Acknowledge an agent's raw hook inbox up to a given entry, so the host may \
+                 prune what has already been durably applied."
+            }
         }
     }
 
@@ -312,6 +323,7 @@ impl AppCommand {
             AppCommand::SessionStopPolicy(_) => schema_of::<SessionStopPolicy>(),
             AppCommand::AttentionRaise(_) => schema_of::<AttentionRaise>(),
             AppCommand::Shutdown(_) => schema_of::<Shutdown>(),
+            AppCommand::HookAck(_) => schema_of::<HookAck>(),
         }
     }
 
@@ -333,6 +345,7 @@ macro_rules! each_query {
             AppQuery::RebaseStatus($q) => $body,
             AppQuery::Agents($q) => $body,
             AppQuery::Sessions($q) => $body,
+            AppQuery::Hooks($q) => $body,
         }
     };
 }
@@ -345,6 +358,7 @@ impl AppQuery {
             AppQuery::RebaseStatus(_) => RebaseStatusQuery::NAME,
             AppQuery::Agents(_) => AgentsQuery::NAME,
             AppQuery::Sessions(_) => SessionsQuery::NAME,
+            AppQuery::Hooks(_) => HooksQuery::NAME,
         }
     }
 
@@ -374,6 +388,10 @@ impl AppQuery {
                 "List every PTY session the connected Jerry is currently tracking, agents and \
                  plain terminal tabs alike."
             }
+            AppQuery::Hooks(_) => {
+                "Report the current hook-derived status of one agent, or every agent the \
+                 connected Jerry is tracking."
+            }
         }
     }
 
@@ -386,6 +404,7 @@ impl AppQuery {
             AppQuery::RebaseStatus(_) => schema_of::<RebaseStatusQuery>(),
             AppQuery::Agents(_) => schema_of::<AgentsQuery>(),
             AppQuery::Sessions(_) => schema_of::<SessionsQuery>(),
+            AppQuery::Hooks(_) => schema_of::<HooksQuery>(),
         }
     }
 
@@ -630,6 +649,19 @@ impl Request {
             (
                 "request-query-sessions",
                 Request::Query(AppQuery::Sessions(SessionsQuery::default())),
+            ),
+            (
+                "request-query-hooks",
+                Request::Query(AppQuery::Hooks(HooksQuery {
+                    agent: Some(crate::AgentId::from("agent-1")),
+                })),
+            ),
+            (
+                "request-command-hook-ack",
+                Request::Command(AppCommand::HookAck(HookAck {
+                    agent_id: crate::AgentId::from("agent-1"),
+                    up_to: 3,
+                })),
             ),
             (
                 "request-command-shutdown",

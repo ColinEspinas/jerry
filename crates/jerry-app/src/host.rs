@@ -15,8 +15,8 @@ use crate::terminal::socket_adapter::SocketSessionAdapter;
 use gpui::{AppContext, AsyncApp, Context, Task};
 use jerry_core::wire::rpc_code;
 use jerry_core::{
-    AppCommand, Call, Report, Request, RpcError, SessionAttach, SessionId, SessionKill,
-    SessionSnapshot, Shutdown,
+    AppCommand, AppQuery, Call, HookAck, HookAgentSnapshot, HooksQuery, Report, Request, RpcError,
+    SessionAttach, SessionId, SessionKill, SessionSnapshot, SessionsQuery, Shutdown,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -420,9 +420,11 @@ async fn ensure_repo_host_connected(
                     session_exited_events,
                     cx,
                 ));
-            repo_host
-                ._events
-                .push(crate::hooks::spawn_consumer(hook_events, cx));
+            repo_host._events.push(crate::hooks::spawn_consumer(
+                hook_events,
+                common_dir.clone(),
+                cx,
+            ));
             repo_host
                 ._events
                 .push(crate::work_surface::attention::spawn_consumer(
@@ -431,6 +433,7 @@ async fn ensure_repo_host_connected(
                 ));
         }
         this.hosts.by_repo.insert(common_dir.clone(), repo_host);
+        this.seed_hook_runtime(common_dir.clone(), cx);
     });
     common_dir
 }
@@ -450,6 +453,68 @@ impl AdeApp {
         }
         cx.spawn(async move |this, cx| {
             let _ = ensure_repo_host_connected(&this, cwd, cx).await;
+        })
+        .detach();
+    }
+
+    /// Decisions.md §26's own seed: ensures [`AdeApp::hook_runtime`] exists
+    /// ([`Self::ensure_hook_runtime`], off the UI thread) - a relaunch that reattaches an
+    /// already-running agent's session spawns nothing at all, so `Self::hook_injection_for`'s own
+    /// bring-up would never otherwise run - then dispatches `HooksQuery` for `common_dir`'s
+    /// repository and replays
+    /// every raw entry it returns into [`crate::hooks::apply_entry`], oldest first, per agent -
+    /// the same real processing a live `event/hook` notification takes
+    /// ([`crate::hooks::spawn_consumer`]), so a relaunched instance's rail renders an existing
+    /// agent's status exactly as it would have if this instance had been running the whole time.
+    /// Acknowledges what it replayed (`HookAck`, best-effort, one per agent) so the host's own
+    /// bounded inbox is pruned by real consumption. Best-effort throughout - a repository with no
+    /// live host answers `NEEDS_HOST` and this simply replays nothing, and hooks genuinely
+    /// unsupported on this machine leaves `hook_runtime` `None` exactly as `ensure_hook_runtime`
+    /// already logs. Called from both [`ensure_repo_host_connected`] (production) and
+    /// [`Self::adopt_repo_host_for_test`] (the test-only connection-adoption path), so a
+    /// test-adopted host behaves identically to a real one here rather than silently skipping
+    /// this step.
+    pub(crate) fn seed_hook_runtime(&mut self, common_dir: PathBuf, cx: &mut Context<Self>) {
+        // Both started now, run concurrently - `ensure_hook_runtime`'s own bring-up (off the UI
+        // thread) and this dispatch have nothing to wait on each other for.
+        let ensure = self.ensure_hook_runtime(cx);
+        let seed = self.dispatch(
+            common_dir.clone(),
+            Request::Query(AppQuery::Hooks(HooksQuery::default())),
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            ensure.await;
+            let Ok(Report::Ok { outcome }) = seed.await else {
+                return;
+            };
+            let Ok(snapshots) = serde_json::from_value::<Vec<HookAgentSnapshot>>(outcome) else {
+                return;
+            };
+            for snapshot in snapshots {
+                let Some(up_to) = snapshot.entries.last().map(|entry| entry.seq) else {
+                    continue;
+                };
+                let agent_id = snapshot.status.agent_id.clone();
+                let applied = this.update(cx, |this, _cx| {
+                    for entry in &snapshot.entries {
+                        crate::hooks::apply_entry(this, entry);
+                    }
+                });
+                if applied.is_err() {
+                    continue;
+                }
+                let ack = this.update(cx, |this, cx| {
+                    this.dispatch(
+                        common_dir.clone(),
+                        Request::Command(AppCommand::HookAck(HookAck { agent_id, up_to })),
+                        cx,
+                    )
+                });
+                if let Ok(task) = ack {
+                    let _ = task.await;
+                }
+            }
         })
         .detach();
     }
@@ -619,14 +684,15 @@ impl AdeApp {
         mut repo_host: RepoHost,
         cx: &mut Context<Self>,
     ) {
-        wire_test_repo_host_events(&mut repo_host, cx);
         // Canonicalized for the identical reason `ensure_repo_host_connected` is - see its own
         // docs: a symlinked temp-directory parent must not make this collide with a *different*
         // `Hosts::by_repo` entry than the one a real dispatch for the same repository resolves.
         let resolved = jerry_git::git_common_dir(&cwd).unwrap_or_else(|_| cwd.clone());
         let common_dir = dunce::canonicalize(&resolved).unwrap_or(resolved);
+        wire_test_repo_host_events(&mut repo_host, common_dir.clone(), cx);
         self.hosts.common_dir_of.insert(cwd, common_dir.clone());
-        self.hosts.by_repo.insert(common_dir, repo_host);
+        self.hosts.by_repo.insert(common_dir.clone(), repo_host);
+        self.seed_hook_runtime(common_dir, cx);
     }
 }
 
@@ -883,7 +949,11 @@ mod shutdown_repo_hosts_with_deadline_tests {
 /// `ensure_repo_host_connected`'s, since a test-adopted connection is always already fully
 /// connected (no async spawn-or-connect to await first).
 #[cfg(test)]
-fn wire_test_repo_host_events(repo_host: &mut RepoHost, cx: &mut Context<AdeApp>) {
+fn wire_test_repo_host_events(
+    repo_host: &mut RepoHost,
+    common_dir: PathBuf,
+    cx: &mut Context<AdeApp>,
+) {
     let events = match &repo_host.connection {
         Some(Connection::Remote(_)) => repo_host.socket.clone().and_then(|socket| {
             match (
@@ -921,7 +991,7 @@ fn wire_test_repo_host_events(repo_host: &mut RepoHost, cx: &mut Context<AdeApp>
             ));
         repo_host
             ._events
-            .push(crate::hooks::spawn_consumer(hook_events, cx));
+            .push(crate::hooks::spawn_consumer(hook_events, common_dir, cx));
         repo_host
             ._events
             .push(crate::work_surface::attention::spawn_consumer(
@@ -932,31 +1002,24 @@ fn wire_test_repo_host_events(repo_host: &mut RepoHost, cx: &mut Context<AdeApp>
 }
 
 /// Where the `jerry` CLI binary lives, for hook and skill injection (decision Q8,
-/// `docs/architecture/decisions.md` §17, §19): a sibling of this process's own executable, then
-/// `bin/jerry` next to it, then `PATH`. Neither found means `None`, so a caller never injects a
-/// command pointing at nothing.
+/// `docs/architecture/decisions.md` §17, §19, §26): `jerry_core::jerry_binary::locate` (a sibling
+/// of this process's own executable, then `bin/jerry` next to it, then one directory up - a cargo
+/// test binary's own exe lives in `target/<profile>/deps/`, not `target/<profile>/`, and unix's
+/// own `deps/` copy of a `[[bin]]` target is hash-suffixed, unlike Windows's, so only that third
+/// tier finds a real one from a unix test binary), then `PATH`. Neither found means `None`, so a
+/// caller never injects a command pointing at nothing.
 pub fn find_jerry_binary() -> Option<PathBuf> {
-    let current_exe = std::env::current_exe().ok()?;
-    locate_jerry_binary(&current_exe, jerry_pty::resolve_on_path)
+    locate_jerry_binary(jerry_core::jerry_binary::locate, jerry_pty::resolve_on_path)
 }
 
-/// [`find_jerry_binary`], with the executable path and the `PATH` lookup injected - the seam a
-/// test drives against a fake directory layout rather than this machine's real install.
+/// [`find_jerry_binary`], with both lookups injected - the seam a test drives deterministically.
+/// `jerry_core::jerry_binary::locate`'s own sibling/`bin/`/one-directory-up tiers already have
+/// their own tests in that crate; this composition is the only thing this crate owns here.
 fn locate_jerry_binary(
-    current_exe: &Path,
+    locate: impl FnOnce() -> Option<PathBuf>,
     resolve_on_path: impl FnOnce(&str) -> Option<PathBuf>,
 ) -> Option<PathBuf> {
-    let name = if cfg!(windows) { "jerry.exe" } else { "jerry" };
-    let dir = current_exe.parent()?;
-    let sibling = dir.join(name);
-    if sibling.is_file() {
-        return Some(sibling);
-    }
-    let nested = dir.join("bin").join(name);
-    if nested.is_file() {
-        return Some(nested);
-    }
-    resolve_on_path("jerry")
+    locate().or_else(|| resolve_on_path("jerry"))
 }
 
 #[cfg(test)]
@@ -964,80 +1027,35 @@ mod find_jerry_binary_tests {
     use super::locate_jerry_binary;
     use std::path::PathBuf;
 
-    /// A real, empty file at `path` - `locate_jerry_binary` only accepts what really exists, so
-    /// a fake layout needs a real (if empty) file at each candidate to be meaningful.
-    fn touch(path: &std::path::Path) {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).expect("create parent");
-        }
-        std::fs::write(path, b"").expect("write");
-    }
-
-    fn exe_name() -> &'static str {
-        if cfg!(windows) {
-            "jerry.exe"
-        } else {
-            "jerry"
-        }
-    }
-
+    /// `jerry_core::jerry_binary::locate`'s own sibling/`bin/`/one-directory-up tiers already have
+    /// their own tests in that crate (`crates/jerry-core/src/jerry_binary.rs`); this module proves
+    /// only the composition this crate itself owns - `locate`, then `PATH`.
     #[test]
-    fn a_sibling_of_the_running_executable_wins_over_path() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let current_exe = temp.path().join("jerry-app-bin").join("current-exe");
-        touch(&current_exe);
-        let sibling = current_exe.with_file_name(exe_name());
-        touch(&sibling);
-
-        let found = locate_jerry_binary(&current_exe, |_| {
-            panic!("must not fall back to PATH when a sibling exists")
-        });
-        assert_eq!(found, Some(sibling));
-    }
-
-    #[test]
-    fn a_bin_subdirectory_next_to_the_executable_is_the_second_place_checked() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let current_exe = temp.path().join("current-exe");
-        touch(&current_exe);
-        let nested = temp.path().join("bin").join(exe_name());
-        touch(&nested);
-
-        let found = locate_jerry_binary(&current_exe, |_| {
-            panic!("must not fall back to PATH when bin/jerry exists")
-        });
-        assert_eq!(found, Some(nested));
+    fn a_real_locate_result_wins_over_path() {
+        let found = locate_jerry_binary(
+            || Some(PathBuf::from("/real/jerry")),
+            |_| panic!("must not fall back to PATH when locate already found one"),
+        );
+        assert_eq!(found, Some(PathBuf::from("/real/jerry")));
     }
 
     #[test]
     fn path_is_the_last_resort() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let current_exe = temp.path().join("current-exe");
-        touch(&current_exe);
         let on_path = PathBuf::from("/usr/local/bin/jerry");
 
-        let found = locate_jerry_binary(&current_exe, |name| {
-            assert_eq!(name, "jerry");
-            Some(on_path.clone())
-        });
+        let found = locate_jerry_binary(
+            || None,
+            |name| {
+                assert_eq!(name, "jerry");
+                Some(on_path.clone())
+            },
+        );
         assert_eq!(found, Some(on_path));
     }
 
     #[test]
-    fn none_of_the_three_existing_is_a_real_none_not_a_broken_guess() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let current_exe = temp.path().join("current-exe");
-        touch(&current_exe);
-
-        assert_eq!(locate_jerry_binary(&current_exe, |_| None), None);
-    }
-
-    #[test]
-    fn an_executable_with_no_parent_directory_is_also_a_real_none() {
-        assert_eq!(
-            locate_jerry_binary(std::path::Path::new(""), |_| None),
-            None
-        );
+    fn neither_tier_is_a_real_none_not_a_broken_guess() {
+        assert_eq!(locate_jerry_binary(|| None, |_| None), None);
     }
 }
 
