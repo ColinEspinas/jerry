@@ -15,8 +15,8 @@ use crate::terminal::socket_adapter::SocketSessionAdapter;
 use gpui::{AppContext, AsyncApp, Context, Task};
 use jerry_core::wire::rpc_code;
 use jerry_core::{
-    AppCommand, AppQuery, Call, Report, Request, RpcError, SessionAttach, SessionId, SessionKill,
-    SessionRecord, SessionsQuery,
+    AppCommand, AppQuery, Call, HookStatus, HooksQuery, Report, Request, RpcError, SessionAttach,
+    SessionId, SessionKill, SessionRecord, SessionsQuery,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -412,6 +412,7 @@ async fn ensure_repo_host_connected(
                 .push(crate::hooks::spawn_consumer(hook_events, cx));
         }
         this.hosts.by_repo.insert(common_dir.clone(), repo_host);
+        this.seed_hook_status_cache(common_dir.clone(), cx);
     });
     common_dir
 }
@@ -431,6 +432,32 @@ impl AdeApp {
         }
         cx.spawn(async move |this, cx| {
             let _ = ensure_repo_host_connected(&this, cwd, cx).await;
+        })
+        .detach();
+    }
+
+    /// Decisions.md §26's own seed: dispatches `HooksQuery` for `common_dir`'s repository and
+    /// merges the answer into [`Self::hook_status_cache`], so an agent whose hooks fired before
+    /// this connection existed shows something real immediately, rather than nothing until its
+    /// own next live `event/hook`. Best-effort - a repository with no live host answers
+    /// `NEEDS_HOST` and this simply leaves the cache exactly as it already was. Called from both
+    /// [`ensure_repo_host_connected`] (production) and [`Self::adopt_repo_host_for_test`] (the
+    /// test-only connection-adoption path), so a test-adopted host behaves identically to a real
+    /// one here rather than silently skipping this step.
+    pub(crate) fn seed_hook_status_cache(&mut self, common_dir: PathBuf, cx: &mut Context<Self>) {
+        let seed = self.dispatch(
+            common_dir,
+            Request::Query(AppQuery::Hooks(HooksQuery::default())),
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            let Ok(Report::Ok { outcome }) = seed.await else {
+                return;
+            };
+            let Ok(statuses) = serde_json::from_value::<Vec<HookStatus>>(outcome) else {
+                return;
+            };
+            let _ = this.update(cx, |this, _cx| this.hook_status_cache.seed(statuses));
         })
         .detach();
     }
@@ -585,7 +612,8 @@ impl AdeApp {
         let resolved = jerry_git::git_common_dir(&cwd).unwrap_or_else(|_| cwd.clone());
         let common_dir = dunce::canonicalize(&resolved).unwrap_or(resolved);
         self.hosts.common_dir_of.insert(cwd, common_dir.clone());
-        self.hosts.by_repo.insert(common_dir, repo_host);
+        self.hosts.by_repo.insert(common_dir.clone(), repo_host);
+        self.seed_hook_status_cache(common_dir, cx);
     }
 }
 

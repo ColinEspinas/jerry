@@ -153,7 +153,11 @@ impl HookStore {
 /// own `crate::hooks::event::EventKind` documents at length, kept here only in its coarsest form:
 /// this store never sees enough of `jerry-app`'s own state (which question was already on record,
 /// for instance) to fold a nudge in any richer way, and does not try.
-fn derive_status(event: &str, payload: &Value) -> Option<(HookKind, Option<String>)> {
+///
+/// `pub`: `jerry-app`'s own local `HookStatusCache` (`crate::hooks::store` there) calls this same
+/// function to update its cache from each `event/hook` notification, so its coarse status can
+/// never drift from what this store itself would have computed for the identical event.
+pub fn derive_status(event: &str, payload: &Value) -> Option<(HookKind, Option<String>)> {
     match event {
         "SessionStart" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse" => {
             let message = payload

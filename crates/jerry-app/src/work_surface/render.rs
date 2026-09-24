@@ -496,6 +496,8 @@ impl AdeApp {
         if let Some(runtime) = &self.hook_runtime {
             runtime.forget(id);
         }
+        self.hook_status_cache
+            .forget(&jerry_core::AgentId::from(id.to_string()));
         self.agents.close(id, skip_focus_move, window, cx);
         if self
             .merge_flow

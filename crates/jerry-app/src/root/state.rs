@@ -355,6 +355,7 @@ impl AdeApp {
             hook_runtime_tried: false,
             hosts: crate::host::Hosts::default(),
             agent_status_state,
+            hook_status_cache: crate::hooks::store::HookStatusCache::default(),
             agent_status_path,
             agent_status_owned: std::collections::BTreeSet::new(),
             line_provenance: crate::provenance::store::ProvenanceStore::default(),

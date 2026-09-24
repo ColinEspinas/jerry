@@ -22,7 +22,6 @@ use futures::channel::mpsc;
 use futures::StreamExt;
 use gpui::{Context, Task};
 use jerry_core::Message;
-use serde_json::Value;
 
 use crate::root::AdeApp;
 use crate::work_surface::agents::AgentId;
@@ -81,9 +80,9 @@ impl HookRuntime {
         }
     }
 
-    /// Records one `event/hook` notification's params - see [`spawn_consumer`].
-    fn record(&self, params: Value) {
-        record_hook_notification(&self.inbox, &self.edits, params);
+    /// Records one raw `event/hook` entry - see [`spawn_consumer`].
+    fn record(&self, entry: &jerry_core::HookInboxEntry) {
+        record_hook_notification(&self.inbox, &self.edits, entry);
     }
 
     /// This agent's current hook fact, for [`crate::rail::status::derive_status`].
@@ -161,10 +160,13 @@ impl HookRuntime {
 /// Drains `events` for as long as the returned `Task` is held - one per repository connection
 /// (`crate::host::ensure_repo_host_connected`), all feeding the same [`HookRuntime`] regardless
 /// of which repository the notification came from, mirroring `crate::work_surface::
-/// worktree_created::spawn_consumer`'s own shape exactly. An `event/hook` that arrives before
-/// [`HookRuntime`] exists yet (hooks unsupported, or its lazy bring-up has not run -
-/// `crate::hooks::flow::AdeApp::hook_injection_for`) is silently dropped, the same as one
-/// arriving after it has already been torn down.
+/// worktree_created::spawn_consumer`'s own shape exactly. Also updates [`crate::hooks::store::
+/// HookStatusCache`] (decisions.md §26), independent of whether [`HookRuntime`] itself has
+/// started yet - the cache has no bring-up gate of its own. An `event/hook` whose params are not
+/// a real [`jerry_core::HookInboxEntry`], or one that arrives before [`HookRuntime`] exists yet
+/// (hooks unsupported, or its lazy bring-up has not run - `crate::hooks::flow::AdeApp::
+/// hook_injection_for`), is silently dropped for the runtime's own half, the same as one arriving
+/// after it has already been torn down.
 pub(crate) fn spawn_consumer(
     mut events: mpsc::UnboundedReceiver<Message>,
     cx: &mut Context<AdeApp>,
@@ -177,41 +179,35 @@ pub(crate) fn spawn_consumer(
             if method != "event/hook" {
                 continue;
             }
+            let Ok(entry) = serde_json::from_value::<jerry_core::HookInboxEntry>(params) else {
+                continue;
+            };
             let _ = this.update(cx, |app, _cx| {
+                app.hook_status_cache.apply(&entry);
                 if let Some(runtime) = &app.hook_runtime {
-                    runtime.record(params);
+                    runtime.record(&entry);
                 }
             });
         }
     })
 }
 
-/// Parses one `event/hook` notification's params (`{agent, cwd, event, payload}` -
-/// `jerry-host`'s own fan-out shape) and records it exactly as the old HTTP listener's
+/// Parses one `event/hook` entry's payload and records it exactly as the old HTTP listener's
 /// `read_and_record` did: an edit is appended before the inbox merge, and a `Before` snapshot is
 /// taken from disk at record time, not deferred to whenever a reader drains it.
 fn record_hook_notification(
     inbox: &Mutex<inbox::HookInbox>,
     edits: &Mutex<inbox::EditLog>,
-    params: Value,
+    entry: &jerry_core::HookInboxEntry,
 ) {
-    let Some(agent_id) = params
-        .get("agent")
-        .and_then(Value::as_str)
-        .and_then(|id| id.parse::<AgentId>().ok())
-    else {
-        // Not a recognizable `JERRY_AGENT_ID` (or none at all) - there is no rail row this could
-        // belong to.
+    let Ok(agent_id) = entry.agent_id.to_string().parse::<AgentId>() else {
+        // Not a recognizable `JERRY_AGENT_ID` - there is no rail row this could belong to.
         return;
     };
-    let Some(event_name) = params.get("event").and_then(Value::as_str) else {
+    let Ok(payload_bytes) = serde_json::to_vec(&entry.payload) else {
         return;
     };
-    let payload = params.get("payload").cloned().unwrap_or(Value::Null);
-    let Ok(payload_bytes) = serde_json::to_vec(&payload) else {
-        return;
-    };
-    let Some(report) = event::parse(event_name, &payload_bytes) else {
+    let Some(report) = event::parse(&entry.event, &payload_bytes) else {
         return;
     };
 

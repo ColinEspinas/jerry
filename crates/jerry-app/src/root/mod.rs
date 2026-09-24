@@ -507,6 +507,10 @@ pub struct AdeApp {
     /// on - see `crate::hooks::store`'s module docs, including the honest note that no UI reads
     /// it back yet.
     pub(crate) agent_status_state: crate::hooks::store::AgentStatusState,
+    /// The local mirror of `jerry-host`'s own coarse per-agent hook status
+    /// (`docs/architecture/decisions.md` §26) - see [`crate::hooks::store::HookStatusCache`]'s own
+    /// docs for what fills it and why nothing reads it back for rendering yet.
+    pub(crate) hook_status_cache: crate::hooks::store::HookStatusCache,
     /// Where [`Self::agent_status_state`] is persisted - a sibling of the real `settings.toml`, or
     /// `None` for a test that hasn't opted into real persistence, mirroring
     /// [`Self::review_baseline_path`].

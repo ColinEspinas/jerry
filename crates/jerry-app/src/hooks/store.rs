@@ -1,13 +1,155 @@
 //! Real, on-disk persistence for what Jerry learned about each agent from its hooks (GitHub
-//! issue #239, phase 2 - groundwork for issue #227).
+//! issue #239, phase 2 - groundwork for issue #227), plus [`HookStatusCache`], the local mirror
+//! of `jerry-host`'s own coarse per-agent `HookStatus` (`docs/architecture/decisions.md` §26).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::rail::status::Status;
+
+/// A local, incrementally-updated mirror of `jerry-host`'s own per-agent [`jerry_core::HookStatus`]
+/// (decisions.md §26) - filled once via `HooksQuery` when a repository's connection opens
+/// (`crate::host::ensure_repo_host_connected`) and kept current by applying each `event/hook`
+/// notification as it arrives ([`Self::apply`], called from [`crate::hooks::spawn_consumer`]).
+/// Exists so a freshly connected instance can show *something* real for an agent whose hooks
+/// fired before this instance ever connected, rather than nothing until its own next live event.
+/// The rail's own richer, local [`crate::hooks::HookRuntime`] (activity/question/edit/prompt,
+/// nudge-aware) is unaffected by this cache's existence - it is not wired into rail rendering, so
+/// no read site loses fidelity; see decisions.md §26 for the boundary this deliberately draws.
+#[derive(Debug, Clone, Default)]
+pub struct HookStatusCache {
+    entries: HashMap<jerry_core::AgentId, jerry_core::HookStatus>,
+}
+
+impl HookStatusCache {
+    /// Merges in a fresh `HooksQuery` answer - the repository-connect seed. Upserts by
+    /// `agent_id` rather than clearing first: this cache is shared across every open repository
+    /// (`crate::root::AdeApp::hook_status_cache` is one field, `HooksQuery` is dispatched per
+    /// repository), so a second repository connecting must not wipe the first one's entries.
+    pub fn seed(&mut self, statuses: Vec<jerry_core::HookStatus>) {
+        for status in statuses {
+            self.entries.insert(status.agent_id.clone(), status);
+        }
+    }
+
+    /// Applies one raw [`jerry_core::HookInboxEntry`] the same way `jerry-host`'s own `HookStore`
+    /// would have derived it - [`jerry_host::hooks::derive_status`], the identical real function,
+    /// not a second, independently-maintained copy of the rule that could drift from it. A no-op
+    /// for an event that is not a real lifecycle transition (the same rule that function's own
+    /// docs cover), so a nudge cannot regress an already-cached real fact here either.
+    pub fn apply(&mut self, entry: &jerry_core::HookInboxEntry) {
+        let Some((kind, message)) = jerry_host::hooks::derive_status(&entry.event, &entry.payload)
+        else {
+            return;
+        };
+        self.entries.insert(
+            entry.agent_id.clone(),
+            jerry_core::HookStatus {
+                agent_id: entry.agent_id.clone(),
+                kind,
+                message,
+                since: entry.received_at,
+                last_event: entry.event.clone(),
+            },
+        );
+    }
+
+    pub fn get(&self, agent_id: &jerry_core::AgentId) -> Option<&jerry_core::HookStatus> {
+        self.entries.get(agent_id)
+    }
+
+    /// Drops a closed agent's cached status - mirrors [`crate::hooks::HookRuntime::forget`]'s own
+    /// call site (`crate::work_surface::render::AdeApp::close_agent`), so a recycled id cannot
+    /// inherit a dead agent's cached status either.
+    pub fn forget(&mut self, agent_id: &jerry_core::AgentId) {
+        self.entries.remove(agent_id);
+    }
+}
+
+#[cfg(test)]
+mod hook_status_cache_tests {
+    use super::HookStatusCache;
+    use jerry_core::{AgentId, HookKind, HookStatus};
+
+    fn status(id: &str, kind: HookKind) -> HookStatus {
+        HookStatus {
+            agent_id: AgentId::from(id),
+            kind,
+            message: None,
+            since: 1_700_000_000,
+            last_event: "Stop".into(),
+        }
+    }
+
+    #[test]
+    fn seeding_merges_rather_than_replacing_another_repositorys_entries() {
+        // A real scenario: two open repositories, each seeding this one shared cache from its
+        // own `HooksQuery` - the second repository's seed must not erase the first's.
+        let mut cache = HookStatusCache::default();
+        cache.seed(vec![status("a-1", HookKind::Working)]);
+        cache.seed(vec![status("a-2", HookKind::Done)]);
+        assert_eq!(
+            cache.get(&AgentId::from("a-1")).unwrap().kind,
+            HookKind::Working
+        );
+        assert_eq!(
+            cache.get(&AgentId::from("a-2")).unwrap().kind,
+            HookKind::Done
+        );
+
+        // Re-seeding the same agent with a fresher status does overwrite that one entry.
+        cache.seed(vec![status("a-1", HookKind::Done)]);
+        assert_eq!(
+            cache.get(&AgentId::from("a-1")).unwrap().kind,
+            HookKind::Done
+        );
+    }
+
+    #[test]
+    fn applying_a_recognized_entry_updates_the_cached_status() {
+        let mut cache = HookStatusCache::default();
+        cache.apply(&jerry_core::HookInboxEntry {
+            agent_id: AgentId::from("a-1"),
+            event: "PermissionRequest".into(),
+            received_at: 1_700_000_000,
+            seq: 0,
+            payload: serde_json::json!({ "tool_name": "Bash" }),
+        });
+        let cached = cache.get(&AgentId::from("a-1")).expect("cached");
+        assert_eq!(cached.kind, HookKind::Waiting);
+        assert_eq!(cached.message.as_deref(), Some("Bash needs permission"));
+        assert_eq!(cached.last_event, "PermissionRequest");
+    }
+
+    #[test]
+    fn applying_an_unrecognized_event_leaves_the_cache_untouched() {
+        let mut cache = HookStatusCache::default();
+        cache.seed(vec![status("a-1", HookKind::Working)]);
+        cache.apply(&jerry_core::HookInboxEntry {
+            agent_id: AgentId::from("a-1"),
+            event: "PreCompact".into(),
+            received_at: 1_700_000_100,
+            seq: 1,
+            payload: serde_json::json!({}),
+        });
+        assert_eq!(
+            cache.get(&AgentId::from("a-1")).unwrap().kind,
+            HookKind::Working,
+            "an unrecognized event must not overwrite the seeded status"
+        );
+    }
+
+    #[test]
+    fn forgetting_an_agent_drops_its_cached_status() {
+        let mut cache = HookStatusCache::default();
+        cache.seed(vec![status("a-1", HookKind::Working)]);
+        cache.forget(&AgentId::from("a-1"));
+        assert!(cache.get(&AgentId::from("a-1")).is_none());
+    }
+}
 
 /// The status file's name, resolved next to the real `settings.toml` - mirrors
 /// `crate::review::baseline_state::REVIEW_BASELINE_FILE_NAME`.
