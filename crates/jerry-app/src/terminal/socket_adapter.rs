@@ -1,16 +1,17 @@
 //! [`SocketSessionAdapter`]: [`crate::terminal::pane::SessionAdapter`] over a session's real
-//! data-plane socket (`command/session-attach`, `docs/architecture/decisions.md` §24) - the
+//! data-plane socket (`command/session-attach`, `docs/architecture/decisions.md` §25) - the
 //! second implementer of that trait besides `jerry_host::SessionHandle`'s in-process one. Never
 //! calls `jerry_host::`/`jerry_pty::` beyond the trait itself: everything here is a plain socket
 //! read/write plus one injected callback for `command/session-kill`
 //! ([`SocketSessionAdapter::shutdown`]) - see decisions.md §16's amendment for why that closure
 //! must dispatch through `crate::repo_host::RemoteRepoHost`, never `jerry_host::LocalClient`. No
-//! exit signal is synthesized: the socket just ends once the host closes it. Wired into
-//! production by `crate::host::attach_remote_session`.
+//! exit signal is synthesized: the socket just ends once the host closes it. Carries the same
+//! attach's own [`jerry_core::SessionSnapshot`] ([`SessionAdapter::snapshot`]) for the pane to
+//! seed its grid from. Wired into production by `crate::host::attach_remote_session`.
 
 use futures::channel::mpsc;
 use futures::SinkExt;
-use jerry_core::SessionId;
+use jerry_core::{SessionId, SessionSnapshot};
 use jerry_pty::{PtyError, PtyOutput};
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -41,6 +42,10 @@ pub(crate) struct SocketSessionAdapter {
     /// owns the one it actually writes through.
     shutdown_stream: Mutex<Stream>,
     output: Mutex<Option<mpsc::Receiver<PtyOutput>>>,
+    /// This attach's own `command/session-attach` answer (`docs/architecture/decisions.md` §25) -
+    /// what [`crate::terminal::pane::TerminalPane::attach_session`] seeds its grid from before
+    /// consuming a single byte off [`Self::take_output`]'s stream, via [`SessionAdapter::snapshot`].
+    snapshot: SessionSnapshot,
     /// From `SessionsQuery`, resolved by the caller before construction - this type dispatches
     /// nothing itself, so a value that can only come from a Query is given, not fetched (see the
     /// module docs).
@@ -60,6 +65,7 @@ impl SocketSessionAdapter {
         socket: &Path,
         id: SessionId,
         process_id: Option<u32>,
+        snapshot: SessionSnapshot,
         kill: impl Fn() -> Result<(), String> + Send + Sync + 'static,
     ) -> io::Result<Self> {
         let stream = Stream::connect(socket)?;
@@ -104,6 +110,7 @@ impl SocketSessionAdapter {
             input_tx,
             shutdown_stream: Mutex::new(shutdown_stream),
             output: Mutex::new(Some(rx)),
+            snapshot,
             process_id,
             kill: Box::new(kill),
         })
@@ -158,6 +165,10 @@ impl SessionAdapter for SocketSessionAdapter {
         let _ = lock(&self.shutdown_stream).shutdown(std::net::Shutdown::Both);
         killed
     }
+
+    fn snapshot(&self) -> Option<jerry_core::SessionSnapshot> {
+        Some(self.snapshot.clone())
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -167,9 +178,10 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod socket_session_adapter_tests {
     use super::SocketSessionAdapter;
-    use crate::terminal::pane::SessionAdapter;
+    use crate::terminal::grid::TerminalGrid;
+    use crate::terminal::pane::{grid_cell_rows, SessionAdapter};
     use jerry_core::client::{Listener, Stream};
-    use jerry_core::SessionId;
+    use jerry_core::{SessionId, SessionSnapshot, SnapshotCell, SnapshotCellWidth};
     use jerry_pty::PtyOutput;
     use std::io::{Read, Write};
     use std::path::PathBuf;
@@ -208,6 +220,63 @@ mod socket_session_adapter_tests {
         }
     }
 
+    /// An empty, zero-size snapshot - every test that only cares about the byte stream, not
+    /// [`SessionAdapter::snapshot`] itself, passes this to [`SocketSessionAdapter::connect`].
+    fn empty_snapshot() -> SessionSnapshot {
+        SessionSnapshot {
+            rows: 0,
+            cols: 0,
+            cursor: None,
+            cells: Vec::new(),
+            scrollback: Vec::new(),
+        }
+    }
+
+    /// A one-row, real snapshot with one printed cell - just enough for
+    /// [`seeding_a_grid_from_the_adapters_own_snapshot_reproduces_its_content`] to prove
+    /// [`SessionAdapter::snapshot`] round-trips through a real [`TerminalGrid`], not just through
+    /// this type's own storage.
+    fn one_cell_snapshot() -> SessionSnapshot {
+        SessionSnapshot {
+            rows: 1,
+            cols: 3,
+            cursor: Some((0, 1)),
+            cells: vec![vec![
+                SnapshotCell {
+                    c: 'A',
+                    fg: (0xa7, 0xad, 0xb4),
+                    bg: (0x0d, 0x0f, 0x11),
+                    bold: false,
+                    italic: false,
+                    underline: false,
+                    strikethrough: false,
+                    width: SnapshotCellWidth::Narrow,
+                },
+                SnapshotCell {
+                    c: 'B',
+                    fg: (0xa7, 0xad, 0xb4),
+                    bg: (0x0d, 0x0f, 0x11),
+                    bold: false,
+                    italic: false,
+                    underline: false,
+                    strikethrough: false,
+                    width: SnapshotCellWidth::Narrow,
+                },
+                SnapshotCell {
+                    c: 'C',
+                    fg: (0xa7, 0xad, 0xb4),
+                    bg: (0x0d, 0x0f, 0x11),
+                    bold: false,
+                    italic: false,
+                    underline: false,
+                    strikethrough: false,
+                    width: SnapshotCellWidth::Narrow,
+                },
+            ]],
+            scrollback: Vec::new(),
+        }
+    }
+
     fn recv_timeout(rx: &mut futures::channel::mpsc::Receiver<PtyOutput>) -> Option<PtyOutput> {
         let mut item = None;
         wait_until(Duration::from_secs(5), || match rx.try_recv() {
@@ -235,11 +304,14 @@ mod socket_session_adapter_tests {
     #[test]
     fn bytes_from_the_socket_arrive_as_pty_output_bytes_in_order() {
         let (socket, accept) = spawn_acceptor("bytes-in-order");
-        let adapter =
-            SocketSessionAdapter::connect(&socket.path, SessionId::from("session-9"), None, || {
-                Ok(())
-            })
-            .expect("connect");
+        let adapter = SocketSessionAdapter::connect(
+            &socket.path,
+            SessionId::from("session-9"),
+            None,
+            empty_snapshot(),
+            || Ok(()),
+        )
+        .expect("connect");
         assert_eq!(adapter.id(), &SessionId::from("session-9"));
         let mut server = accept.join().expect("accept thread");
 
@@ -262,6 +334,51 @@ mod socket_session_adapter_tests {
         assert_eq!(collected, b"hello world");
     }
 
+    /// `docs/architecture/decisions.md` §25's own client-side half: the exact
+    /// [`jerry_core::SessionSnapshot`] a real `command/session-attach` answered with survives
+    /// through [`SocketSessionAdapter::connect`] and [`SessionAdapter::snapshot`], and, converted
+    /// via `crate::terminal::pane::grid_cell_rows`, seeds a real [`TerminalGrid`] that paints it
+    /// correctly - before a single byte off the socket itself is ever consumed.
+    #[test]
+    fn seeding_a_grid_from_the_adapters_own_snapshot_reproduces_its_content() {
+        let (socket, accept) = spawn_acceptor("seed-from-snapshot");
+        let snapshot = one_cell_snapshot();
+        let adapter = SocketSessionAdapter::connect(
+            &socket.path,
+            SessionId::from("session-13"),
+            None,
+            snapshot.clone(),
+            || Ok(()),
+        )
+        .expect("connect");
+        let _server = accept.join().expect("accept thread");
+
+        let seen = adapter
+            .snapshot()
+            .expect("a socket-attached session always carries a real snapshot");
+        assert_eq!(
+            seen, snapshot,
+            "the adapter must hand back exactly what it was constructed with"
+        );
+
+        let mut grid = TerminalGrid::new(seen.rows, seen.cols);
+        grid.seed_from_snapshot(
+            seen.cursor,
+            &grid_cell_rows(&seen.scrollback),
+            &grid_cell_rows(&seen.cells),
+        );
+
+        let palette = crate::terminal::grid::TerminalPalette::default();
+        let painted: String = grid.visible_rows(&palette)[0]
+            .iter()
+            .map(|cell| cell.c)
+            .collect();
+        assert_eq!(
+            painted, "ABC",
+            "the seeded grid must paint the snapshot's own content, not stay blank"
+        );
+    }
+
     #[test]
     fn write_input_reaches_the_socket_and_shutdown_calls_kill_then_closes() {
         let (socket, accept) = spawn_acceptor("write-and-kill");
@@ -271,6 +388,7 @@ mod socket_session_adapter_tests {
             &socket.path,
             SessionId::from("session-10"),
             None,
+            empty_snapshot(),
             move || {
                 killed_writer.store(true, Ordering::SeqCst);
                 Ok(())
@@ -305,6 +423,7 @@ mod socket_session_adapter_tests {
             &socket.path,
             SessionId::from("session-11"),
             None,
+            empty_snapshot(),
             || Err("the host refused session-kill".to_string()),
         )
         .expect("connect");
@@ -331,6 +450,7 @@ mod socket_session_adapter_tests {
             &socket.path,
             SessionId::from("session-12"),
             None,
+            empty_snapshot(),
             || Ok(()),
         )
         .expect("connect");

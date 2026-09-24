@@ -16,7 +16,7 @@ use gpui::{AppContext, AsyncApp, Context, Task};
 use jerry_core::wire::rpc_code;
 use jerry_core::{
     AppCommand, AppQuery, Call, Report, Request, RpcError, SessionAttach, SessionId, SessionKill,
-    SessionRecord, SessionsQuery,
+    SessionRecord, SessionSnapshot, SessionsQuery,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -616,12 +616,24 @@ pub(crate) async fn attach_remote_session(
             )
         })
         .map_err(|_| APP_DROPPED.to_string())?;
-    let socket = match attach_call.await {
-        Ok(Report::Ok { outcome }) => outcome
-            .get("socket")
-            .and_then(serde_json::Value::as_str)
-            .map(PathBuf::from)
-            .ok_or_else(|| "internal error: session-attach answered with no socket".to_string())?,
+    let (socket, snapshot) = match attach_call.await {
+        Ok(Report::Ok { outcome }) => {
+            let socket = outcome
+                .get("socket")
+                .and_then(serde_json::Value::as_str)
+                .map(PathBuf::from)
+                .ok_or_else(|| {
+                    "internal error: session-attach answered with no socket".to_string()
+                })?;
+            let snapshot = outcome
+                .get("snapshot")
+                .cloned()
+                .and_then(|value| serde_json::from_value::<SessionSnapshot>(value).ok())
+                .ok_or_else(|| {
+                    "internal error: session-attach answered with no snapshot".to_string()
+                })?;
+            (socket, snapshot)
+        }
         Ok(other) => return Err(format!("could not attach to this session: {other:?}")),
         Err(error) => return Err(error.message),
     };
@@ -669,7 +681,7 @@ pub(crate) async fn attach_remote_session(
     };
 
     cx.background_spawn(async move {
-        SocketSessionAdapter::connect(&socket, session_id, process_id, kill)
+        SocketSessionAdapter::connect(&socket, session_id, process_id, snapshot, kill)
             .map(|adapter| Arc::new(adapter) as Arc<dyn SessionAdapter>)
             .map_err(|error| error.to_string())
     })

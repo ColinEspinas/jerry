@@ -74,7 +74,7 @@ pub(crate) fn handle(inner: &Inner, call: Call) -> Result<Value, RpcError> {
         }
         Request::Command(AppCommand::SessionAttach(command)) => {
             to_value(match inner.sessions().attach(&command.id) {
-                Ok(socket) => Report::ok(&SessionAttachOutcome { socket }),
+                Ok((socket, snapshot)) => Report::ok(&SessionAttachOutcome { socket, snapshot }),
                 Err(SessionAttachError::AlreadyAttached(id)) => Report::Denied {
                     code: "session-already-attached".into(),
                     reason: format!("session {id} already has an attached client"),

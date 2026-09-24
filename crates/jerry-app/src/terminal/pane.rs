@@ -19,7 +19,10 @@ use gpui::{
     FocusHandle, Focusable, FontWeight, KeyDownEvent, Keystroke, Modifiers, Pixels,
     ScrollWheelEvent, Size, Task, Window,
 };
-use jerry_core::{AppCommand, Call, Report, Request, SessionResize};
+use jerry_core::{
+    AppCommand, Call, Report, Request, SessionResize, SessionSnapshot, SnapshotCell,
+    SnapshotCellWidth,
+};
 #[cfg(test)]
 use jerry_host::LocalClient;
 use jerry_host::SessionHandle;
@@ -606,6 +609,42 @@ pub(crate) trait SessionAdapter: Send + Sync {
     /// flow, GitHub issue #470) that must be certain before it proceeds. See
     /// `docs/architecture/decisions.md` §23 for why this doesn't also travel through `Call`/`Report`.
     fn shutdown(&self) -> Result<(), PtyError>;
+    /// The reattach snapshot this session started from, if any (`docs/architecture/decisions.md`
+    /// §25) - `None` for a freshly spawned session ([`SessionHandle`]'s own default impl below),
+    /// whose grid already starts empty and correct. [`TerminalPane::attach_session`] seeds its
+    /// own grid from this, converted to [`GridCell`], before consuming a single byte off
+    /// [`Self::take_output`]'s stream.
+    fn snapshot(&self) -> Option<SessionSnapshot> {
+        None
+    }
+}
+
+/// [`jerry_core::SnapshotCell`] rows -> [`GridCell`] rows - the wire shape a
+/// [`jerry_core::SessionSnapshot`] carries, converted to what [`TerminalGrid::seed_from_snapshot`]
+/// takes. `selected` is always `false`: a wire snapshot never carries a live UI selection (see
+/// [`jerry_core::SnapshotCell`]'s own docs).
+pub(crate) fn grid_cell_rows(rows: &[Vec<SnapshotCell>]) -> Vec<Vec<GridCell>> {
+    rows.iter()
+        .map(|row| row.iter().map(grid_cell_from_snapshot_cell).collect())
+        .collect()
+}
+
+fn grid_cell_from_snapshot_cell(cell: &SnapshotCell) -> GridCell {
+    GridCell {
+        c: cell.c,
+        fg: cell.fg,
+        bg: cell.bg,
+        bold: cell.bold,
+        italic: cell.italic,
+        underline: cell.underline,
+        strikethrough: cell.strikethrough,
+        selected: false,
+        width: match cell.width {
+            SnapshotCellWidth::Narrow => CellWidth::Narrow,
+            SnapshotCellWidth::Wide => CellWidth::Wide,
+            SnapshotCellWidth::Spacer => CellWidth::Spacer,
+        },
+    }
 }
 
 impl SessionAdapter for SessionHandle {
@@ -913,6 +952,14 @@ impl TerminalPane {
             cx.notify();
             return;
         };
+        // Captured before `Self::seed_from_snapshot` (if it runs) latches `resize_latch.grid` to
+        // the snapshot's own dimensions - a real target this pane already computed from its own
+        // measured content box, if rendering ever reached that far before this attach resolved,
+        // must not be lost underneath the snapshot's (possibly stale, pre-detach) size.
+        let pending_real_target = self.resize_latch.grid;
+        if let Some(snapshot) = session.snapshot() {
+            self.seed_from_snapshot(&snapshot);
+        }
         self.session = Some(session);
         self.control_plane = control_plane;
         if self.doomed {
@@ -935,7 +982,7 @@ impl TerminalPane {
         // The pane may already have rendered (and computed a target grid size) before this
         // attached - there was no live session yet for that call to reach, so retry it now that
         // one exists, rather than waiting for the next resize to reach the pty.
-        if let Some(target) = self.resize_latch.grid {
+        if let Some(target) = pending_real_target {
             self.resize_to(target.0, target.1, cx);
         }
         cx.notify();
@@ -1010,6 +1057,29 @@ impl TerminalPane {
         });
 
         self._task = Some(task);
+    }
+
+    /// Seeds this pane's own grid with `snapshot`'s content before this session's first live byte
+    /// is ever consumed (`docs/architecture/decisions.md` §25) - what makes a reattached pane
+    /// paint its session's real history immediately rather than a blank grid that only catches up
+    /// once new output arrives. Latches [`Self::resize_latch`] to the snapshot's own dimensions
+    /// (the host already resized the real pty to them before answering attach - see
+    /// `jerry_core::SessionAttach`'s own docs) and marks [`Self::settled_real_size`] `true`: a
+    /// reattached grid is already at a real, meaningful size, never the placeholder [`Self::new`]
+    /// used before any session existed, so the "first real resize discards inherited placeholder
+    /// scrollback" correction ([`Self::maybe_resize_pty`]) must never fire for it and wipe the
+    /// real history this just seeded.
+    fn seed_from_snapshot(&mut self, snapshot: &SessionSnapshot) {
+        let dims = (snapshot.rows, snapshot.cols);
+        self.grid.resize(snapshot.rows, snapshot.cols);
+        self.grid.seed_from_snapshot(
+            snapshot.cursor,
+            &grid_cell_rows(&snapshot.scrollback),
+            &grid_cell_rows(&snapshot.cells),
+        );
+        self.resize_latch.grid = Some(dims);
+        self.resize_latch.session = Some(dims);
+        self.settled_real_size = true;
     }
 
     /// Records that this pane's process could not be started - a real, honest failure (denied by
@@ -3064,7 +3134,7 @@ mod control_plane_resize_tests {
     use gpui::{AppContext as _, TestAppContext};
     use jerry_core::{
         AppCommand, AppQuery, Call, Report, Request, SessionAttach, SessionId, SessionKill,
-        SessionRecord, SessionSpawn, SessionsQuery,
+        SessionRecord, SessionSnapshot, SessionSpawn, SessionsQuery,
     };
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -3137,24 +3207,29 @@ mod control_plane_resize_tests {
                 .as_str()
                 .expect("the outcome carries a real socket path"),
         );
+        let snapshot: SessionSnapshot = serde_json::from_value(outcome["snapshot"].clone())
+            .expect("the outcome carries a real snapshot");
 
         let kill_id = session_id.clone();
         let kill_cwd = cwd.clone();
         let kill_remote = remote.clone();
-        let adapter =
-            SocketSessionAdapter::connect(&data_socket, session_id.clone(), None, move || {
-                match kill_remote.dispatch(Call::human(
-                    kill_cwd.clone(),
-                    Request::Command(AppCommand::SessionKill(SessionKill {
-                        id: kill_id.clone(),
-                    })),
-                )) {
-                    Ok(Report::Ok { .. }) => Ok(()),
-                    Ok(other) => Err(format!("{other:?}")),
-                    Err(error) => Err(error.message),
-                }
-            })
-            .expect("connect to the real data plane");
+        let adapter = SocketSessionAdapter::connect(
+            &data_socket,
+            session_id.clone(),
+            None,
+            snapshot,
+            move || match kill_remote.dispatch(Call::human(
+                kill_cwd.clone(),
+                Request::Command(AppCommand::SessionKill(SessionKill {
+                    id: kill_id.clone(),
+                })),
+            )) {
+                Ok(Report::Ok { .. }) => Ok(()),
+                Ok(other) => Err(format!("{other:?}")),
+                Err(error) => Err(error.message),
+            },
+        )
+        .expect("connect to the real data plane");
 
         let spec = TerminalSpec::command(PathBuf::from("sh"), Vec::new(), cwd.clone());
         let pane = cx.new(|cx| TerminalPane::new(spec, ROW_FONT_SIZE_PX, cx));

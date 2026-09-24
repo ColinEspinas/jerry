@@ -214,15 +214,17 @@ impl Command for SessionKill {
     }
 }
 
-/// Attaches to a live session's data plane (`docs/architecture/decisions.md` §24's cutover):
-/// answers with the path to a per-session socket that, from the moment a client connects, carries
-/// raw bytes both ways - the host's own `PtyOutput::Bytes` payloads verbatim in order out, input
-/// bytes in. Never `PtyOutput`-framed on the wire: bytes are not a control-plane concern (§23).
-/// `Locality::Session`, `Invocability::Denied` to agents (an agent already owns its own real pty).
-/// Never actually executed through [`Command::execute`] - see [`SessionSpawn`]'s docs. Exactly one
-/// attach at a time per session: a second call while one is live answers `Report::Denied` with
-/// code `session-already-attached`, handled directly by `jerry-host`'s dispatcher rather than
-/// through this trait impl, exactly like `SessionSpawn`/`SessionResize`/`SessionKill`.
+/// Attaches to a live session's data plane (`docs/architecture/decisions.md` §25's reattach
+/// cutover): answers with the path to a per-session socket that, from the moment a client
+/// connects, carries raw bytes both ways - the host's own `PtyOutput::Bytes` payloads verbatim in
+/// order out, input bytes in - continuing from the [`SessionAttachOutcome::snapshot`] point, plus
+/// that snapshot itself. Never `PtyOutput`-framed on the wire: bytes are not a control-plane
+/// concern (§23). `Locality::Session`, `Invocability::Denied` to agents (an agent already owns
+/// its own real pty). Never actually executed through [`Command::execute`] - see [`SessionSpawn`]'s
+/// docs. Exactly one attach at a time per session: a second call while one is live answers
+/// `Report::Denied` with code `session-already-attached`, handled directly by `jerry-host`'s
+/// dispatcher rather than through this trait impl, exactly like
+/// `SessionSpawn`/`SessionResize`/`SessionKill`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SessionAttach {
     pub id: SessionId,
@@ -231,6 +233,54 @@ pub struct SessionAttach {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionAttachOutcome {
     pub socket: PathBuf,
+    /// A structured rendering of the session's own headless grid at the moment of attach - what
+    /// a reattaching pane paints *before* the first byte off `socket` ever arrives (§25). Never a
+    /// raw byte replay (the pre-attach buffer §24 introduced is gone): a byte stream replayed
+    /// after a resize renders at the *old* size until the child reacts, which is exactly the
+    /// artifact both `zed`'s and warp's own reattach implementations independently ran into and
+    /// abandoned - see this type's own docs for why a snapshot sidesteps it entirely.
+    pub snapshot: SessionSnapshot,
+}
+
+/// One cell of a [`SessionSnapshot`] - the wire twin of `jerry_term::grid::GridCell`, minus
+/// `selected` (meaningless for a snapshot with no live UI selection behind it). `jerry-core` does
+/// not depend on `jerry-term`/`alacritty_terminal` at all (§4: no threads, no rendering-adjacent
+/// dependencies in the wire-contract crate) - `jerry-host` converts field-by-field from its own
+/// `jerry_term::grid::GridCell` when answering a real attach.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotCell {
+    pub c: char,
+    pub fg: (u8, u8, u8),
+    pub bg: (u8, u8, u8),
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strikethrough: bool,
+    pub width: SnapshotCellWidth,
+}
+
+/// The wire twin of `jerry_term::grid::CellWidth` - see [`SnapshotCell`]'s own docs for why this
+/// crate keeps its own copy rather than depending on `jerry-term` for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SnapshotCellWidth {
+    Narrow,
+    Wide,
+    Spacer,
+}
+
+/// A structured, palette-resolved rendering of a session's own headless grid, carried by
+/// [`SessionAttachOutcome`] (`docs/architecture/decisions.md` §25). `cells` is exactly
+/// `rows * cols` cells (`cells[r][c]`, row-major); `scrollback` is real retained history above
+/// the visible screen, oldest first, bounded by `jerry-host`'s own named cap - never the whole
+/// history a long-lived session may have accumulated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSnapshot {
+    pub rows: u16,
+    pub cols: u16,
+    /// The cursor's own `(row, col)` within `cells` - `None` when the child process has hidden it.
+    pub cursor: Option<(u16, u16)>,
+    pub cells: Vec<Vec<SnapshotCell>>,
+    pub scrollback: Vec<Vec<SnapshotCell>>,
 }
 
 impl Command for SessionAttach {

@@ -4504,6 +4504,7 @@ dependencies = [
  "futures",
  "jerry-core",
  "jerry-pty",
+ "jerry-term",
  "libc",
  "log",
  "serde_json",

@@ -2,17 +2,17 @@
 //! socket per session, bound the moment [`crate::session::SessionManager::spawn`] starts the
 //! session and torn down when [`crate::session::SessionManager::forget_session`] forgets it. From
 //! the moment a client connects, the byte stream is raw and bidirectional - no JSON-RPC framing,
-//! no `PtyOutput` envelope. Output produced before any client connects is buffered here, bounded
-//! and drop-oldest, so a late-attaching client still sees recent output; the host closes the
-//! connection once the session exits and every buffered byte has been delivered. Exactly one
+//! no `PtyOutput` envelope; the host closes the connection once the session exits. Exactly one
 //! attach at a time, enforced for real at the socket layer - a second connection while one is
 //! already served is accepted and dropped; [`crate::session::SessionManager::attach`]'s own
 //! `Report::Denied` is an earlier, friendlier rejection of the common case, not the guarantee.
+//! Output produced before a client connects is never buffered here (§25 replaced that with a
+//! structured [`jerry_core::SessionSnapshot`] at the control-plane layer - see
+//! [`crate::session::SessionManager::attach`]'s own docs for why a raw byte replay was dropped).
 
 use jerry_core::client::{Listener, Stream};
 use jerry_core::registry::{fresh_u32, MAX_SOCKET_PATH_BYTES};
 use jerry_pty::PtySession;
-use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::Shutdown as NetShutdown;
@@ -21,11 +21,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
-
-/// How many bytes of already-produced output a session buffers for a client that has not
-/// attached yet - drop-oldest once full, so a pane that attaches a moment late still sees recent
-/// output without this growing unbounded for a session nobody ever attaches to.
-const PRE_ATTACH_BUFFER_CAP_BYTES: usize = 256 * 1024;
 
 /// How many not-yet-written chunks a live connection's writer may fall behind by before
 /// [`DataPlane::push`] starts blocking the relay thread that calls it - the same backstop shape
@@ -50,11 +45,10 @@ pub enum DataPlaneBindError {
 }
 
 struct Shared {
-    buffer: VecDeque<u8>,
-    /// `Some` for exactly as long as a client is attached and being served - registered and
-    /// snapshotted atomically with `buffer` in [`serve_one`], so no byte pushed after that
-    /// snapshot is ever missed or duplicated. Dropping it (here, or in [`DataPlane::mark_exited`])
-    /// is what unblocks that connection's writer thread and closes the socket.
+    /// `Some` for exactly as long as a client is attached and being served - registered in
+    /// [`serve_one`], so no byte pushed after that registration is ever missed. Dropping it (here,
+    /// or in [`DataPlane::mark_exited`]) is what unblocks that connection's writer thread and
+    /// closes the socket.
     sink: Option<std_mpsc::SyncSender<Vec<u8>>>,
 }
 
@@ -67,10 +61,9 @@ pub(crate) struct DataPlane {
     /// Set for as long as a real connection is being served - the socket-layer half of "exactly
     /// one attach at a time" (see the module docs).
     attached: AtomicBool,
-    /// Set once the session's `Exited` item has been observed - a data point only, checked by no
-    /// code here (an already-exited session may still be attached to once, to drain the buffer);
-    /// documents the state honestly for anything reading it back later (`docs/architecture/
-    /// decisions.md` §24's own PR2 groundwork).
+    /// Set once the session's `Exited` item has been observed, so [`serve_one`] can close a late
+    /// attach's connection immediately rather than waiting on a sink nothing will ever signal
+    /// again.
     exited: AtomicBool,
     stopped: AtomicBool,
 }
@@ -105,10 +98,7 @@ impl DataPlane {
         })?;
         let data_plane = Arc::new(DataPlane {
             socket: socket.clone(),
-            shared: Mutex::new(Shared {
-                buffer: VecDeque::new(),
-                sink: None,
-            }),
+            shared: Mutex::new(Shared { sink: None }),
             attached: AtomicBool::new(false),
             exited: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
@@ -141,28 +131,12 @@ impl DataPlane {
         self.attached.load(Ordering::SeqCst)
     }
 
-    /// How many bytes the pre-attach buffer currently holds - a deterministic, real condition a
-    /// test can `wait_until` on (rather than a blind sleep) to know the relay thread has pushed
-    /// something before that test's own client ever attaches.
-    #[cfg(test)]
-    pub(crate) fn buffered_len(&self) -> usize {
-        lock(&self.shared).buffer.len()
-    }
-
-    /// Appends `chunk` to the pre-attach buffer (bounded, drop-oldest) and, when a client is
-    /// currently attached, forwards it to that connection's writer thread in the same order -
-    /// called only by the session's own relay thread, so pushes are never reordered against each
-    /// other.
+    /// Forwards `chunk` to the currently attached client's writer thread, if any - called only by
+    /// the session's own relay thread, so pushes are never reordered against each other. Silently
+    /// dropped when nobody is attached: there is no pre-attach buffer to catch it in (§25's own
+    /// `SessionSnapshot` is what a *later* attach paints from instead).
     pub(crate) fn push(&self, chunk: &[u8]) {
         let mut shared = lock(&self.shared);
-        shared.buffer.extend(chunk.iter().copied());
-        let overflow = shared
-            .buffer
-            .len()
-            .saturating_sub(PRE_ATTACH_BUFFER_CAP_BYTES);
-        if overflow > 0 {
-            shared.buffer.drain(..overflow);
-        }
         if let Some(sink) = &shared.sink {
             if sink.send(chunk.to_vec()).is_err() {
                 shared.sink = None;
@@ -204,8 +178,8 @@ fn socket_file_name(pid: u32, fresh: u32) -> String {
     format!("d-{pid:x}-{fresh:08x}.sock")
 }
 
-/// Serves exactly one connection to completion: replays the buffer snapshot, then relays new
-/// pushes and forwards the client's own bytes to `process` until either side closes. A second
+/// Serves exactly one connection to completion: relays new pushes and forwards the client's own
+/// bytes to `process` until either side closes. A second
 /// connection arriving while one is already being served is accepted and dropped immediately -
 /// the module docs' own "exactly one attach" guarantee.
 fn serve_one(state: &Arc<DataPlane>, stream: Stream, process: &Arc<Mutex<PtySession>>) {
@@ -223,20 +197,12 @@ fn serve_one(state: &Arc<DataPlane>, stream: Stream, process: &Arc<Mutex<PtySess
     };
 
     let (tx, rx) = std_mpsc::sync_channel::<Vec<u8>>(LIVE_SINK_BACKLOG);
-    let snapshot: Vec<u8> = {
-        let mut shared = lock(&state.shared);
-        shared.sink = Some(tx);
-        shared.buffer.iter().copied().collect()
-    };
-    if !snapshot.is_empty() && writer_stream.write_all(&snapshot).is_err() {
-        lock(&state.shared).sink = None;
-        state.attached.store(false, Ordering::SeqCst);
-        return;
-    }
+    lock(&state.shared).sink = Some(tx);
     // The session had already exited by the time this connection registered: `mark_exited` ran
     // and dropped its sink strictly before this one was ever installed, so nothing will ever
-    // signal this `rx` again - waiting on it would hang forever rather than close. The buffer
-    // snapshot just delivered is everything this late attach will ever see.
+    // signal this `rx` again - waiting on it would hang forever rather than close. Whatever this
+    // late attach needed to see was already delivered as this attach's own `SessionSnapshot`
+    // (`SessionManager::attach`), not replayed here.
     if state.exited.load(Ordering::SeqCst) {
         lock(&state.shared).sink = None;
         let _ = writer_stream.shutdown(NetShutdown::Both);
