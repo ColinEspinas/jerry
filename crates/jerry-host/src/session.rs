@@ -184,6 +184,7 @@ impl SessionManager {
         agent: Option<SessionAgentInfo>,
         options: SpawnOptions,
     ) -> Result<(SessionId, Arc<SessionHandle>), SessionSpawnError> {
+        let (rows, cols) = (options.rows, options.cols);
         let mut session = jerry_pty::spawn(options)?;
         let raw_output = session
             .take_output()
@@ -199,6 +200,8 @@ impl SessionManager {
             started_at: unix_now(),
             exit: None,
             process_id,
+            rows,
+            cols,
         };
         let process = Arc::new(Mutex::new(session));
         let data_plane = DataPlane::bind(&self.sockets_dir, Arc::clone(&process))?;
@@ -260,14 +263,21 @@ impl SessionManager {
         lock(&self.entries).get(id)?.handle.clone()
     }
 
-    /// Resizes a session's real pty. `NotOwned` for an `AgentTable`-compatibility registration,
-    /// which has no process to resize.
+    /// Resizes a session's real pty and records the new size on its own `SessionRecord`
+    /// (`SessionsQuery`'s own real, observable proof a resize actually took effect - the one a
+    /// socket-attached, out-of-process `TerminalPane` has to verify against, since it has no
+    /// in-process `PtySession` to read the applied size back from directly). `NotOwned` for an
+    /// `AgentTable`-compatibility registration, which has no process to resize.
     pub fn resize(&self, id: &SessionId, rows: u16, cols: u16) -> Result<(), SessionError> {
         self.process_for(id)?
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .resize(rows, cols)
-            .map_err(SessionError::from)
+            .resize(rows, cols)?;
+        if let Some(entry) = lock(&self.entries).get_mut(id) {
+            entry.record.rows = rows;
+            entry.record.cols = cols;
+        }
+        Ok(())
     }
 
     /// Kills a session's process tree. Non-blocking, like `jerry_pty::PtySession::kill` itself:
@@ -350,6 +360,8 @@ impl SessionManager {
             started_at: unix_now(),
             exit: None,
             process_id: None,
+            rows: 0,
+            cols: 0,
         };
         lock(&self.entries).insert(
             id,

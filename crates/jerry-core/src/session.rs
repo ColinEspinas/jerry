@@ -82,6 +82,14 @@ pub struct SessionRecord {
     /// rather than a control-plane round trip of its own, since a session's pid never changes
     /// once spawned - set once, at spawn time, and left as-is once the session exits.
     pub process_id: Option<u32>,
+    /// This session's real pty size - set at spawn time, updated on every real `SessionResize`
+    /// dispatched against it (`SessionManager::resize`, never through `Command::execute` - see
+    /// `SessionSpawn`'s own docs). `0` for an `AgentTable`-compatibility registration with no pty
+    /// to size at all. What a socket-attached (out-of-process) `TerminalPane`'s own resize
+    /// dispatch has to verify against, since it has no in-process `PtySession` to read the applied
+    /// size back from directly (`docs/architecture/decisions.md` §24's amendment).
+    pub rows: u16,
+    pub cols: u16,
 }
 
 /// Spawns a new PTY session in the caller's worktree, owned by the host from then on

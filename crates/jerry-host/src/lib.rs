@@ -49,6 +49,8 @@ pub enum HostError {
     },
     #[error("already listening on {}", path.display())]
     AlreadyListening { path: PathBuf },
+    #[error(transparent)]
+    SocketDirectory(#[from] jerry_core::registry::RegistryError),
 }
 
 /// One agent this host is tracking: the worktree it's confined to, and which CLI it runs -
@@ -315,14 +317,23 @@ impl Host {
         }
     }
 
-    /// Accepts socket clients at `socket`. The registry descriptor should be published only
-    /// after this returns, so a discoverable entry always has a listener behind it.
+    /// Accepts socket clients at `socket`, first ensuring its parent directory exists (the same
+    /// `ensure_private_dir` `DataPlane::bind` already calls for a per-session socket - every
+    /// caller, `main.rs`'s production bind and every test's in-process one alike, needs this, not
+    /// just the data plane's own). A caller that binds under a directory nothing has created yet
+    /// (a fresh CI runner's own `$TMPDIR`, before anything else has touched it) used to fail here
+    /// with a raw `NotFound`, invisible as anything but "every Command in this test errors". The
+    /// registry descriptor should be published only after this returns, so a discoverable entry
+    /// always has a listener behind it.
     pub fn listen(&self, socket: &Path) -> Result<(), HostError> {
         let mut listening = lock(&self.listening);
         if let Some(existing) = &*listening {
             return Err(HostError::AlreadyListening {
                 path: existing.socket().to_path_buf(),
             });
+        }
+        if let Some(parent) = socket.parent() {
+            jerry_core::registry::ensure_private_dir(parent)?;
         }
         *listening = Some(listener::listen(Arc::clone(&self.inner), socket)?);
         Ok(())
@@ -492,6 +503,53 @@ impl LocalClient {
     /// Every notification the host emits from now on, to await in a channel-woken task.
     pub fn subscribe(&self) -> mpsc::UnboundedReceiver<Message> {
         self.inner.fanout.subscribe_local()
+    }
+}
+
+#[cfg(test)]
+mod listen_tests {
+    use super::Host;
+    use jerry_core::client::Client;
+    use jerry_core::{AppQuery, Call, Request};
+    use std::time::Duration;
+
+    /// The regression this exists to make impossible again: unlike `DataPlane::bind`'s per-session
+    /// sockets (`session::session_manager_tests::spawn_creates_its_own_sockets_directory_when_it_
+    /// does_not_exist_yet`), `Host::listen`'s own control-plane bind had no directory-creation step
+    /// at all - a fresh runner whose socket directory nothing had created yet (a `#[cfg(test)]`
+    /// in-process `RepoHost` on a CI worker with no shared runtime dir left over from an earlier
+    /// test, unlike this machine's own) failed the bind outright, so every `Call` a test then
+    /// dispatched against that host answered a connection error - indistinguishable, from the
+    /// dispatching side, from "nothing downstream ran" (the real Linux/macOS CI regression this
+    /// test would have caught before it shipped). A definitely-fresh, never-created directory
+    /// makes the bug deterministic on every platform, matching the data-plane test's own reasoning
+    /// for why it does not rely on unrelated test ordering.
+    #[test]
+    fn listen_creates_its_own_socket_directory_when_it_does_not_exist_yet() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        // Short on purpose - the same margin-for-macOS's-own-long-$TMPDIR reasoning as the
+        // data-plane test this mirrors.
+        let socket = temp.path().join("nc").join("h.sock");
+        assert!(
+            !socket.parent().expect("parent").exists(),
+            "sanity check: truly not created yet"
+        );
+        let host = Host::start().expect("host");
+        host.listen(&socket)
+            .expect("listen must succeed even when its own directory does not exist yet");
+
+        let repo = test_support::seed_empty_repo();
+        let mut client =
+            Client::connect(&socket, Duration::from_secs(5)).expect("connect to the real socket");
+        let report = client
+            .request(&Call::human(
+                repo.path(),
+                Request::Query(AppQuery::Status(Default::default())),
+            ))
+            .expect("a real request over the newly bound socket");
+        assert!(report.is_ok(), "{report:?}");
+
+        host.shutdown_and_join();
     }
 }
 

@@ -233,6 +233,16 @@ async fn connect_repo_host(common_dir: PathBuf, cx: &mut AsyncApp) -> RepoHost {
     }
 }
 
+/// Starts and binds a throwaway, always-fresh in-process host for a test that has never before
+/// opened this repository - `#[cfg(test)]`'s own stand-in for `connect_production_repo_host`,
+/// never a real spawn-or-connect. Panics (rather than modeling `RepoHostState::CannotSpawn`) if
+/// binding fails: unlike production, where a real `jerry-host` genuinely can be unreachable, a
+/// throwaway host failing to bind its own socket in a test is always a fixture bug - a directory
+/// nothing created yet, a path over `MAX_SOCKET_PATH_BYTES` - never a real state any test should
+/// have to model or a caller should have to notice indirectly through every dispatch answering a
+/// confusing error. `RepoHost::for_test_unavailable`/`RepoHost::adopt_repo_host_for_test` remain
+/// the real, deliberate way to construct a broken connection for testing the error-banner paths
+/// themselves.
 #[cfg(test)]
 async fn start_in_process_repo_host(cx: &mut AsyncApp) -> RepoHost {
     let started = cx
@@ -247,14 +257,12 @@ async fn start_in_process_repo_host(cx: &mut AsyncApp) -> RepoHost {
             host.listen(&socket).map(|()| (host, socket, dispatch))
         })
         .await;
-    let (host, socket, dispatch) = match started {
-        Ok(started) => started,
-        Err(error) => {
-            return RepoHost::unavailable(RepoHostState::CannotSpawn {
-                error: error.to_string(),
-            })
-        }
-    };
+    let (host, socket, dispatch) = started.unwrap_or_else(|error| {
+        panic!(
+            "a test's own throwaway in-process host must always be able to bind its socket - \
+             this is a fixture bug, not a state any test should model: {error}"
+        )
+    });
     cx.background_spawn(dispatch).detach();
     let client = host.client();
     RepoHost {
@@ -331,13 +339,24 @@ async fn ensure_repo_host_connected(
     cwd: PathBuf,
     cx: &mut AsyncApp,
 ) -> PathBuf {
+    // `jerry_git::git_common_dir` absolutizes `--git-common-dir`'s own (often relative) output
+    // against whatever spelling of `cwd` it was given - so a worktree reached through a symlinked
+    // temp-directory parent (macOS's own `/var` -> `/private/var`) and the repository's own root,
+    // reached through the already-canonical spelling `crate::test_support::temp_repo` hands out,
+    // resolve to two *different strings* for the same real directory. Canonicalizing here, once,
+    // is what makes them collide into the same `Hosts::by_repo` key regardless of which spelling
+    // of `cwd` a caller happened to pass in - `dunce::canonicalize`, not `std::fs::canonicalize`,
+    // since the latter's Windows `\\?\`-prefixed form is one `git` itself rejects
+    // (`crate::test_support::canonicalized`'s own identical reasoning).
     let common_dir = cx
         .background_spawn({
             let cwd = cwd.clone();
-            async move { jerry_git::git_common_dir(&cwd) }
+            async move {
+                let resolved = jerry_git::git_common_dir(&cwd).unwrap_or_else(|_| cwd.clone());
+                dunce::canonicalize(&resolved).unwrap_or(resolved)
+            }
         })
-        .await
-        .unwrap_or_else(|_| cwd.clone());
+        .await;
     let already_open = this
         .update(cx, |this, _cx| {
             this.hosts.common_dir_of.insert(cwd, common_dir.clone());
@@ -474,18 +493,35 @@ impl AdeApp {
         None
     }
 
-    /// The repository `cwd` belongs to's own dispatch handle, for a caller (`TerminalPane::
-    /// attach_session`) that needs to reach the control plane directly for something narrower
-    /// than a full [`Self::dispatch`] call - `SessionResize` (decisions.md §23).
-    /// [`Self::sessions_for`]'s own reasoning: real only for a `#[cfg(test)]` in-process
-    /// repository.
-    pub fn host_client_for(&self, cwd: &Path) -> Option<jerry_host::LocalClient> {
+    /// The `#[cfg(test)]` in-process half of [`Self::control_plane_for`] - real only for a
+    /// `#[cfg(test)]` in-process repository, matching [`Self::sessions_for`]'s own reasoning.
+    #[cfg(test)]
+    fn host_client_for(&self, cwd: &Path) -> Option<jerry_host::LocalClient> {
         let common_dir = self.hosts.common_dir_for(cwd)?;
-        #[cfg_attr(not(test), allow(unused))]
-        let connection = &self.hosts.repo_host_for(common_dir)?.connection;
-        #[cfg(test)]
-        if let Some(Connection::InProcess { client, .. }) = connection {
+        if let Some(Connection::InProcess { client, .. }) =
+            &self.hosts.repo_host_for(common_dir)?.connection
+        {
             return Some(client.clone());
+        }
+        None
+    }
+
+    /// The `ControlPlane` handle a newly attached `TerminalPane` needs for its own
+    /// `SessionResize` dispatch (`TerminalPane::attach_session`, decisions.md §23 - resize never
+    /// travels on the data plane) - `ControlPlane::Remote` for a production `Connection::Remote`
+    /// repository (or a test that swapped one in via `RepoHost::for_test_remote`),
+    /// `ControlPlane::InProcess` for a `#[cfg(test)]` in-process one. `None` only when the
+    /// repository has no working connection at all.
+    pub(crate) fn control_plane_for(
+        &self,
+        cwd: &Path,
+    ) -> Option<crate::terminal::pane::ControlPlane> {
+        if let Some(remote) = self.remote_host_for(cwd) {
+            return Some(crate::terminal::pane::ControlPlane::Remote(remote));
+        }
+        #[cfg(test)]
+        if let Some(client) = self.host_client_for(cwd) {
+            return Some(crate::terminal::pane::ControlPlane::InProcess(client));
         }
         None
     }
@@ -552,7 +588,11 @@ impl AdeApp {
         cx: &mut Context<Self>,
     ) {
         wire_test_repo_host_events(&mut repo_host, cx);
-        let common_dir = jerry_git::git_common_dir(&cwd).unwrap_or_else(|_| cwd.clone());
+        // Canonicalized for the identical reason `ensure_repo_host_connected` is - see its own
+        // docs: a symlinked temp-directory parent must not make this collide with a *different*
+        // `Hosts::by_repo` entry than the one a real dispatch for the same repository resolves.
+        let resolved = jerry_git::git_common_dir(&cwd).unwrap_or_else(|_| cwd.clone());
+        let common_dir = dunce::canonicalize(&resolved).unwrap_or(resolved);
         self.hosts.common_dir_of.insert(cwd, common_dir.clone());
         self.hosts.by_repo.insert(common_dir, repo_host);
     }
@@ -801,7 +841,7 @@ mod app_dispatch_tests {
     use crate::test_support::{open_test_app, temp_repo};
     use gpui::TestAppContext;
     use jerry_core::wire::rpc_code;
-    use jerry_core::{AppQuery, Report, Request};
+    use jerry_core::{AppCommand, AppQuery, Report, Request, SessionSpawn, SessionsQuery};
     use std::path::PathBuf;
 
     #[gpui::test]
@@ -1043,6 +1083,223 @@ mod app_dispatch_tests {
                 );
             }
             other => panic!("expected ok, got {other:?}"),
+        }
+    }
+
+    /// The defensive half of `ensure_repo_host_connected`'s own `dunce::canonicalize` step: a
+    /// worktree reached through a real symlinked parent - standing in for macOS's own ambient
+    /// `/var` -> `/private/var` (this test makes its own, so the invariant is checked on every
+    /// platform, not only wherever an ambient symlink happens to differ) - must dispatch through
+    /// the *same* host entry the repository's own canonical path already opened, never a second,
+    /// independent one: a session spawned through the symlinked path must be visible through a
+    /// `SessionsQuery` against the canonical path too.
+    #[gpui::test]
+    async fn a_worktree_path_reached_through_a_symlinked_parent_dispatches_through_the_same_host(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = temp_repo();
+        let (app, cx) = open_test_app(cx, repo.to_path_buf());
+        cx.run_until_parked();
+
+        let symlink_parent = tempfile::TempDir::new().expect("tempdir");
+        let symlinked_repo = symlink_parent.path().join("repo-via-symlink");
+        #[cfg(unix)]
+        let created = std::os::unix::fs::symlink(repo.path(), &symlinked_repo).is_ok();
+        #[cfg(windows)]
+        let created = std::os::windows::fs::symlink_dir(repo.path(), &symlinked_repo).is_ok();
+        if !created {
+            // A sandboxed or unprivileged environment may refuse real symlink creation
+            // (`SeCreateSymbolicLinkPrivilege` on Windows without Developer Mode) - a graceful
+            // skip, not a hard failure, matching `hooks::integration_tests::skip_or_fail`'s own
+            // reasoning for an environment-dependent precondition this test does not control.
+            eprintln!(
+                "skipping a_worktree_path_reached_through_a_symlinked_parent_dispatches_through_the_same_host: \
+                 could not create a real symlink in this environment"
+            );
+            return;
+        }
+
+        #[cfg(windows)]
+        let idle_command = (PathBuf::from("cmd"), Vec::new());
+        #[cfg(not(windows))]
+        let idle_command = (PathBuf::from("sh"), Vec::new());
+        let (program, args) = idle_command;
+        let spawn_report = app
+            .update(cx, |app, cx| {
+                app.dispatch(
+                    symlinked_repo.clone(),
+                    Request::Command(AppCommand::SessionSpawn(SessionSpawn {
+                        program,
+                        args,
+                        env: Vec::new(),
+                        rows: 24,
+                        cols: 80,
+                        agent: None,
+                    })),
+                    cx,
+                )
+            })
+            .await
+            .expect("spawn through the symlinked path must succeed");
+        let Report::Ok { outcome } = spawn_report else {
+            panic!("expected ok, got {spawn_report:?}")
+        };
+        let session_id = outcome["id"]
+            .as_str()
+            .expect("the outcome carries a real session id")
+            .to_owned();
+
+        let sessions_report = app
+            .update(cx, |app, cx| {
+                app.dispatch(
+                    repo.to_path_buf(),
+                    Request::Query(AppQuery::Sessions(SessionsQuery::default())),
+                    cx,
+                )
+            })
+            .await
+            .expect("query through the repository's own canonical path must succeed");
+        let Report::Ok { outcome } = sessions_report else {
+            panic!("expected ok, got {sessions_report:?}")
+        };
+        let ids: Vec<String> = outcome
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|record| record["id"].as_str().expect("id").to_owned())
+            .collect();
+        assert!(
+            ids.contains(&session_id),
+            "a session spawned through a symlinked path to this repository must be visible \
+             through the repository's own canonical path too - proving both resolved to the \
+             same host; {ids:?} did not contain {session_id}"
+        );
+    }
+
+    /// The identical invariant the symlink test above checks, exercised through a path
+    /// `dunce::canonicalize` resolves without needing any OS-level symlink privilege - a trailing
+    /// `.` component, still the exact same real directory. Kept alongside the symlink test rather
+    /// than instead of it: this one runs unconditionally on every platform (including a
+    /// sandboxed Windows environment that refuses real symlink creation, where the symlink test
+    /// above gracefully skips), so the fix has at least one always-real proof here even where the
+    /// symlink case cannot be exercised.
+    #[gpui::test]
+    async fn a_worktree_path_with_a_redundant_component_dispatches_through_the_same_host(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = temp_repo();
+        let (app, cx) = open_test_app(cx, repo.to_path_buf());
+        cx.run_until_parked();
+
+        let redundant_path = repo.path().join(".");
+
+        #[cfg(windows)]
+        let idle_command = (PathBuf::from("cmd"), Vec::new());
+        #[cfg(not(windows))]
+        let idle_command = (PathBuf::from("sh"), Vec::new());
+        let (program, args) = idle_command;
+        let spawn_report = app
+            .update(cx, |app, cx| {
+                app.dispatch(
+                    redundant_path,
+                    Request::Command(AppCommand::SessionSpawn(SessionSpawn {
+                        program,
+                        args,
+                        env: Vec::new(),
+                        rows: 24,
+                        cols: 80,
+                        agent: None,
+                    })),
+                    cx,
+                )
+            })
+            .await
+            .expect("spawn through the redundant-component path must succeed");
+        let Report::Ok { outcome } = spawn_report else {
+            panic!("expected ok, got {spawn_report:?}")
+        };
+        let session_id = outcome["id"]
+            .as_str()
+            .expect("the outcome carries a real session id")
+            .to_owned();
+
+        let sessions_report = app
+            .update(cx, |app, cx| {
+                app.dispatch(
+                    repo.to_path_buf(),
+                    Request::Query(AppQuery::Sessions(SessionsQuery::default())),
+                    cx,
+                )
+            })
+            .await
+            .expect("query through the repository's own canonical path must succeed");
+        let Report::Ok { outcome } = sessions_report else {
+            panic!("expected ok, got {sessions_report:?}")
+        };
+        let ids: Vec<String> = outcome
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|record| record["id"].as_str().expect("id").to_owned())
+            .collect();
+        assert!(
+            ids.contains(&session_id),
+            "a session spawned through a redundant-component path to this repository must be \
+             visible through the repository's own canonical path too - proving both resolved to \
+             the same host; {ids:?} did not contain {session_id}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod in_process_test_host_socket_length_tests {
+    use jerry_core::registry::{runtime_dir_for, Os, MAX_SOCKET_PATH_BYTES};
+    use std::ffi::OsString;
+
+    fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
+        move |key| {
+            pairs
+                .iter()
+                .find(|(candidate, _)| *candidate == key)
+                .map(|(_, value)| OsString::from(*value))
+        }
+    }
+
+    /// `start_in_process_repo_host`'s own `th-<pid>-<fresh>.sock` naming, worst case, against
+    /// every platform's runtime directory shape - the same margin check `jerry-host`'s own
+    /// `data_plane::socket_length_tests` runs for its data-plane sockets, applied here since this
+    /// test-only control socket is one byte longer (`"th-"` vs `"d-"`) and had never itself been
+    /// checked.
+    #[test]
+    fn every_platforms_runtime_dir_leaves_real_margin_for_the_in_process_test_hosts_own_socket() {
+        let cases = [
+            (
+                Os::Windows,
+                vec![("LOCALAPPDATA", r"C:\Users\someone\AppData\Local")],
+            ),
+            (
+                Os::MacOs,
+                vec![
+                    (
+                        "TMPDIR",
+                        "/private/var/folders/36/0123456789abcdefghijklmnop/T/",
+                    ),
+                    ("USER", "someuser"),
+                ],
+            ),
+            (Os::Unix, vec![("XDG_RUNTIME_DIR", "/run/user/4294967295")]),
+        ];
+        let worst_case_name = format!("th-{:x}-{:08x}.sock", u32::MAX, u32::MAX);
+        for (os, pairs) in cases {
+            let dir = runtime_dir_for(os, &env(&pairs)).expect("runtime dir");
+            let socket = dir.join(&worst_case_name);
+            let len = socket.as_os_str().len();
+            assert!(
+                len <= MAX_SOCKET_PATH_BYTES,
+                "{os:?}: {} is {len} bytes, over the {MAX_SOCKET_PATH_BYTES}-byte limit - a \
+                 test's own in-process repo host would fail to bind its control socket",
+                socket.display()
+            );
         }
     }
 }

@@ -761,9 +761,9 @@ impl Agents {
                     .sessions_for(&spawn_cwd)
                     .and_then(|sessions| sessions.handle_for(&session_id));
                 this.agents.set_host_session_id(id, session_id.clone());
-                (handle, this.host_client_for(&spawn_cwd))
+                (handle, this.control_plane_for(&spawn_cwd))
             });
-            let Ok((in_process_handle, client)) = attached else {
+            let Ok((in_process_handle, control_plane)) = attached else {
                 return; // the app itself was dropped before this could even be asked
             };
             let adapter: Arc<dyn SessionAdapter> = match in_process_handle {
@@ -791,7 +791,7 @@ impl Agents {
                 }
             };
             let attach_outcome = spawn_pane.update(cx, |pane, cx| {
-                pane.attach_session(adapter.clone(), client, cx)
+                pane.attach_session(adapter.clone(), control_plane, cx)
             });
             if attach_outcome.is_err() {
                 // The pane entity itself is already gone - not just doomed, which `TerminalPane::
