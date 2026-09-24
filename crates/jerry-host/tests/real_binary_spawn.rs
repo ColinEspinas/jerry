@@ -14,7 +14,7 @@ use jerry_core::host_spawn::{spawn_or_connect, Outcome};
 use jerry_core::registry::{probe, Liveness, Registry};
 use jerry_core::{
     AppCommand, AppQuery, Call, Caller, Ctx, Report, Request, SessionAttach, SessionId,
-    SessionKill, SessionRecord, SessionSpawn, SessionsQuery, Shutdown,
+    SessionKill, SessionRecord, SessionSnapshot, SessionSpawn, SessionsQuery, Shutdown,
 };
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -345,6 +345,147 @@ fn a_session_survives_its_spawning_clients_disconnect_and_a_fresh_client_still_r
         &mut data_stream_again,
         b"jerry-dod-marker-after",
         Duration::from_secs(15),
+    );
+
+    fresh_client
+        .request(&Call::human(
+            repo.path(),
+            Request::Command(AppCommand::SessionKill(SessionKill { id: session_id })),
+        ))
+        .expect("kill the real session");
+    fresh_client
+        .request(&Call::human(
+            repo.path(),
+            Request::Command(AppCommand::Shutdown(Shutdown::default())),
+        ))
+        .expect("shut the real host down");
+    assert!(
+        wait_until(Duration::from_secs(10), || probe(&descriptor.socket)
+            == Liveness::Dead),
+        "the real jerry-host process must exit once told to stop"
+    );
+}
+
+/// Issue #507's own DoD, against the real compiled binary: output a session produces while no
+/// client is attached at all - the "app" fully closed, not merely one pane detached - is still
+/// visible after a fresh attach, through the real `docs/architecture/decisions.md` §25 snapshot
+/// mechanism (never a raw byte replay, which never existed for a client attaching after the
+/// producing bytes were already gone). `external`-tier because it spawns the real `jerry-host`
+/// binary; run directly on this platform (see this crate's own builder notes) rather than only in
+/// CI's dedicated nightly job.
+#[test]
+#[ignore = "external: jerry-host; see docs/testing.md"]
+fn output_produced_while_no_client_is_attached_is_visible_in_the_snapshot_after_a_fresh_attach() {
+    let test = short_registry("reattach-dod");
+    let repo = seed_empty_repo();
+    let common = Ctx::from_cwd(repo.path(), Caller::Human)
+        .expect("a real repository")
+        .repo_path;
+
+    let outcome = spawn_or_connect(
+        test.registry.dir().to_path_buf(),
+        &common,
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    )
+    .expect("a real jerry-host binary must spawn and publish its descriptor");
+    let (mut client, descriptor) = match outcome {
+        Outcome::Connected { client, descriptor } => (client, descriptor),
+        Outcome::VersionMismatch { descriptor } => {
+            panic!("unexpected version mismatch against a freshly built binary: {descriptor:?}")
+        }
+    };
+
+    let (program, args) = interactive_shell();
+    let spawn_report = client
+        .request(&Call::human(
+            repo.path(),
+            Request::Command(AppCommand::SessionSpawn(SessionSpawn {
+                program,
+                args,
+                env: Vec::new(),
+                rows: 24,
+                cols: 80,
+                agent: None,
+            })),
+        ))
+        .expect("the real host accepts a real spawn");
+    let Report::Ok { outcome } = spawn_report else {
+        panic!("expected ok, got {spawn_report:?}")
+    };
+    let session_id = SessionId(
+        outcome["id"]
+            .as_str()
+            .expect("the outcome carries a real session id")
+            .to_owned(),
+    );
+
+    // The one and only "client" (standing in for `jerry-app`) attaches once, writes the real
+    // output, sees it echoed for real, then disconnects completely - control plane and data plane
+    // both - and never reconnects. Everything from here on runs with genuinely no client attached
+    // at all, exactly "the app closed" describes.
+    let attach_report = client
+        .request(&Call::human(
+            repo.path(),
+            Request::Command(AppCommand::SessionAttach(SessionAttach {
+                id: session_id.clone(),
+            })),
+        ))
+        .expect("attach must succeed against a session with no client yet");
+    let Report::Ok { outcome } = attach_report else {
+        panic!("expected ok, got {attach_report:?}")
+    };
+    let socket = PathBuf::from(
+        outcome["socket"]
+            .as_str()
+            .expect("the outcome carries a real socket path"),
+    );
+    let mut data_stream = Stream::connect(&socket).expect("connect to the real data plane");
+    write_line(&mut data_stream, "echo jerry-reattach-dod-marker");
+    read_until_contains(
+        &mut data_stream,
+        b"jerry-reattach-dod-marker",
+        Duration::from_secs(15),
+    );
+    drop(data_stream);
+    drop(client);
+
+    assert!(
+        wait_until(Duration::from_secs(10), || probe(&descriptor.socket)
+            != Liveness::Dead),
+        "the real jerry-host process must still be alive with no client attached at all - this \
+         is what makes the reattach below a real relaunch scenario, not a same-session replay"
+    );
+
+    // "Relaunch": a fresh client (`jerry-app` starting back up) reconnects and attaches again.
+    // The marker must already be in the snapshot itself - painted before a single further byte
+    // off this new socket is ever read - not something this test has to wait for the child to
+    // print again.
+    let mut fresh_client =
+        Client::connect(&descriptor.socket, Duration::from_secs(5)).expect("reconnect");
+    let attach_again = fresh_client
+        .request(&Call::human(
+            repo.path(),
+            Request::Command(AppCommand::SessionAttach(SessionAttach {
+                id: session_id.clone(),
+            })),
+        ))
+        .expect("re-attach must succeed now that the first client is fully gone");
+    let Report::Ok { outcome } = attach_again else {
+        panic!("expected ok, got {attach_again:?}")
+    };
+    let snapshot: SessionSnapshot = serde_json::from_value(outcome["snapshot"].clone())
+        .expect("the outcome carries a real snapshot");
+    let painted: String = snapshot
+        .cells
+        .iter()
+        .chain(snapshot.scrollback.iter())
+        .flat_map(|row| row.iter().map(|cell| cell.c))
+        .collect();
+    assert!(
+        painted.contains("jerry-reattach-dod-marker"),
+        "output produced while no client was attached at all must be visible in the reattach \
+         snapshot: {painted:?}"
     );
 
     fresh_client
