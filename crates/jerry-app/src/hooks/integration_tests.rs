@@ -164,8 +164,10 @@ fn jerry_hook_reaches_a_real_host_over_a_real_socket_and_the_notification_can_be
         panic!("expected a notification");
     };
     assert_eq!(method, "event/hook");
-    assert_eq!(params["agent"], serde_json::json!(agent_id.to_string()));
+    assert_eq!(params["agent_id"], serde_json::json!(agent_id.to_string()));
     assert_eq!(params["event"], serde_json::json!("PreToolUse"));
+    let entry: jerry_core::HookInboxEntry =
+        serde_json::from_value(params).expect("a real HookInboxEntry");
 
     // Exactly what `HookRuntime`'s own consumer task does with each notification - the free
     // function both it and this test call, so a change to the parsing/recording logic is caught
@@ -173,7 +175,7 @@ fn jerry_hook_reaches_a_real_host_over_a_real_socket_and_the_notification_can_be
     // inside a deterministic test.
     let inbox = std::sync::Mutex::new(crate::hooks::inbox::HookInbox::default());
     let edits = std::sync::Mutex::new(crate::hooks::inbox::EditLog::default());
-    super::record_hook_notification(&inbox, &edits, params);
+    super::record_hook_notification(&inbox, &edits, &entry);
     let inbox = inbox.into_inner().expect("lock");
     let record = inbox
         .get(agent_id)
@@ -185,6 +187,59 @@ fn jerry_hook_reaches_a_real_host_over_a_real_socket_and_the_notification_can_be
     );
 
     host.shutdown_and_join();
+}
+
+/// Decisions.md §26's review finding: the live `event/hook` subscription opens before a
+/// connect-time replay takes its own `HooksQuery` snapshot, so the identical real entry can reach
+/// `HookRuntime::record` through both paths. Neither `HookInbox::record` nor `EditLog::record` is
+/// idempotent (a repeated `Stop` would double a turn count, a repeated edit would double-append),
+/// so this proves the `seq`-keyed dedup guard directly - no host, no app, fully deterministic.
+#[test]
+fn the_same_entry_delivered_twice_through_both_paths_is_applied_only_once() {
+    let hook_settings_dir = tempfile::tempdir().expect("hook settings dir");
+    let runtime = crate::hooks::HookRuntime::start(hook_settings_dir.path(), Path::new("jerry"))
+        .expect("a directly-given jerry_binary path always starts a real runtime");
+
+    let agent_id: crate::work_surface::agents::AgentId = 51;
+    let wire_agent_id = jerry_core::AgentId::from(agent_id.to_string());
+
+    let write_entry = jerry_core::HookInboxEntry {
+        agent_id: wire_agent_id.clone(),
+        event: "PostToolUse".to_owned(),
+        received_at: 1_700_000_000,
+        seq: 0,
+        payload: serde_json::json!({ "tool_name": "Write", "tool_input": { "file_path": "a.rs" } }),
+    };
+    let stop_entry = jerry_core::HookInboxEntry {
+        agent_id: wire_agent_id,
+        event: "Stop".to_owned(),
+        received_at: 1_700_000_001,
+        seq: 1,
+        // A real object, not `Value::Null` - `event::parse` requires every payload to be a JSON
+        // object (its own docs: "a payload that isn't a JSON object" forges nothing), and `Stop`
+        // itself needs no fields.
+        payload: serde_json::json!({}),
+    };
+
+    // Each entry delivered twice - once as the live consumer would, once as a connect-time
+    // replay would (`crate::hooks::apply_entry`'s own docs on why both are real).
+    runtime.record(&write_entry);
+    runtime.record(&write_entry);
+    runtime.record(&stop_entry);
+    runtime.record(&stop_entry);
+
+    let (edits, dropped) = runtime.drain_edits();
+    assert_eq!(
+        edits.len(),
+        1,
+        "the duplicate Write must not double the edit log: {edits:?}"
+    );
+    assert_eq!(dropped, 0);
+    assert_eq!(
+        runtime.run_facts_for(agent_id).turns,
+        1,
+        "the duplicate Stop must not double the turn count"
+    );
 }
 
 /// The app's own per-repository `event/hook` subscription and `HookRuntime`, driven through the
@@ -312,6 +367,165 @@ async fn a_hook_dispatched_through_the_apps_own_host_reaches_its_hook_runtimes_c
         ),
         Status::Run,
         "the real round-tripped hook fact must be what decides the status"
+    );
+}
+
+/// Decisions.md §26: a repository's connection replays the host's prior hook history through the
+/// *same* real pipeline (`crate::hooks::apply_entry` -> `HookRuntime::record` -> `event::parse` +
+/// `HookInbox`) a live `event/hook` notification already takes - never a separate, coarser cache -
+/// so a relaunched instance's rail renders an agent's status exactly as the live-event path would
+/// have. The host's own bounded inbox is pruned by the real `HookAck` this replay dispatches, not
+/// just left for the per-agent cap to catch up with eventually.
+#[gpui::test]
+async fn a_relaunched_instance_replays_the_hosts_prior_hook_history_exactly_as_the_live_path_would(
+    cx: &mut TestAppContext,
+) {
+    // The real precondition this whole test depends on - fails loudly and actionably right here
+    // if `jerry` was never built, rather than downstream as `hook_runtime` silently staying `None`
+    // (`AdeApp::ensure_hook_runtime`'s own bring-up gate has no other way to report that).
+    crate::test_support::assert_real_jerry_binary_available();
+
+    let repo = test_support::seed_empty_repo();
+    let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
+
+    let registry = registry_dir("replay");
+    let instance = jerry_core::registry::Registry::open(registry.path.clone())
+        .expect("registry")
+        .allocate()
+        .expect("instance");
+    let host = jerry_host::Host::start_at(registry.path.clone()).expect("host must start");
+    host.listen(&instance.socket).expect("listen");
+    let socket = instance.socket;
+    let agent_id: crate::work_surface::agents::AgentId = 88;
+    let wire_agent_id = jerry_core::AgentId::from(agent_id.to_string());
+    host.agents().register(
+        wire_agent_id.clone(),
+        repo.path().to_path_buf(),
+        "Claude".into(),
+    );
+    // Kept across the `host` move below - `LocalClient` is a cheap `Arc` clone, not a borrow.
+    let client = host.client();
+
+    let payloads: [(&str, serde_json::Value); 2] = [
+        (
+            "PreToolUse",
+            serde_json::json!({ "tool_name": "Bash", "tool_input": { "command": "cargo test" } }),
+        ),
+        // A real object, not `Value::Null` - `event::parse` treats a non-object payload as
+        // unparseable and records nothing, which would make this event a no-op rather than the
+        // real turn boundary this test means to replay.
+        ("Stop", serde_json::json!({})),
+    ];
+
+    // Two real hook events already on record with the host *before* this instance ever connects.
+    for (event, payload) in &payloads {
+        let report = client
+            .request(jerry_core::Call::agent(
+                repo.path(),
+                wire_agent_id.clone(),
+                jerry_core::Request::Hook(jerry_core::HookEvent {
+                    event: (*event).to_owned(),
+                    payload: payload.clone(),
+                }),
+            ))
+            .await
+            .expect("hook dispatched");
+        assert!(report.is_ok(), "{report:?}");
+    }
+
+    // The reference: exactly what the live `event/hook` path (`record_hook_notification`) would
+    // have computed for the identical two events, in the identical order - pure, no host, no app.
+    let mut reference = crate::hooks::inbox::HookInbox::default();
+    for (event, payload) in &payloads {
+        let bytes = serde_json::to_vec(payload).expect("payload serializes");
+        if let Some(parsed) = crate::hooks::event::parse(event, &bytes) {
+            reference.record(agent_id, parsed);
+        }
+    }
+    let expected_report = reference
+        .get(agent_id)
+        .expect("reference record")
+        .report
+        .clone();
+
+    // No spawn anywhere in this test, and `app.hook_runtime` is never touched by hand: the seed
+    // itself must bring the runtime up (`AdeApp::ensure_hook_runtime`, decisions.md §26) before it
+    // has anything to replay into - the real scenario a relaunch that reattaches an already-running
+    // agent's session hits, since that spawns nothing at all and would otherwise never reach
+    // `hook_injection_for`'s own bring-up.
+    let repo_host = crate::host::RepoHost::for_test_in_process(host, socket);
+    app.update(cx, |app, cx| {
+        app.adopt_repo_host_for_test(repo.path().to_path_buf(), repo_host, cx);
+    });
+
+    // Two real things this loop waits out, both real async work rather than something a single
+    // `run_until_parked` is guaranteed to have already observed: `ensure_hook_runtime`'s own
+    // bring-up runs on `cx.background_spawn` (decisions.md §26's second review finding), so
+    // `hook_runtime` itself may still be `None` for a poll or two; and the seed's `HooksQuery`
+    // dispatch reaches a real, in-process host whose dispatch thread is a genuine OS thread
+    // (`docs/architecture/decisions.md` §15) - the same reason `crate::work_surface::
+    // session_exited`'s own tests poll rather than trust a single `run_until_parked` to have
+    // already observed a reply that thread had not necessarily sent yet.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut seeded_fact = None;
+    while seeded_fact.is_none() && std::time::Instant::now() < deadline {
+        cx.run_until_parked();
+        seeded_fact = app.read_with(cx, |app, _| {
+            app.hook_runtime
+                .as_ref()
+                .and_then(|runtime| runtime.signal_for(agent_id).fact)
+        });
+    }
+    assert_eq!(
+        seeded_fact,
+        Some(expected_report.fact),
+        "the replayed rail signal must equal exactly what the live event/hook path would have \
+         produced for the identical two events"
+    );
+    let (activity, question) = app.read_with(cx, |app, _| {
+        app.hook_runtime
+            .as_ref()
+            .expect("runtime")
+            .text_for(agent_id)
+    });
+    assert_eq!(activity, expected_report.activity);
+    assert_eq!(question, expected_report.question);
+
+    // The host's own raw inbox for this agent is now empty - the app's own `HookAck`, not just
+    // the per-agent cap, pruned it once these entries were durably replayed.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut snapshots: Vec<jerry_core::HookAgentSnapshot> = Vec::new();
+    while std::time::Instant::now() < deadline {
+        cx.run_until_parked();
+        let queried = app
+            .update(cx, |app, cx| {
+                app.dispatch(
+                    repo.path().to_path_buf(),
+                    jerry_core::Request::Query(jerry_core::AppQuery::Hooks(
+                        jerry_core::HooksQuery {
+                            agent: Some(wire_agent_id.clone()),
+                        },
+                    )),
+                    cx,
+                )
+            })
+            .await
+            .expect("hooks query dispatched");
+        let jerry_core::Report::Ok { outcome } = queried else {
+            panic!("expected ok, got {queried:?}")
+        };
+        snapshots = serde_json::from_value(outcome).expect("snapshots");
+        if snapshots
+            .first()
+            .is_some_and(|snapshot| snapshot.entries.is_empty())
+        {
+            break;
+        }
+    }
+    assert_eq!(snapshots.len(), 1, "{snapshots:?}");
+    assert!(
+        snapshots[0].entries.is_empty(),
+        "the app's own replay must have acknowledged every entry it consumed: {snapshots:?}"
     );
 }
 

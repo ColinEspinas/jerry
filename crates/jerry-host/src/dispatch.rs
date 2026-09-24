@@ -11,10 +11,12 @@ use crate::session::{SessionAttachError, SessionError};
 use crate::Inner;
 use jerry_core::wire::rpc_code;
 use jerry_core::{
-    execute_locally, permits, AppCommand, AppQuery, Call, Caller, Ctx, Error, LocalDispatchError,
-    Message, Report, Request, RpcError, SessionAttachOutcome, SessionSpawnOutcome,
+    execute_locally, permits, AgentId, AppCommand, AppQuery, Call, Caller, Ctx, Error,
+    LocalDispatchError, Message, Report, Request, RpcError, SessionAttachOutcome,
+    SessionSpawnOutcome,
 };
 use serde_json::Value;
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
@@ -37,14 +39,13 @@ pub(crate) fn handle(inner: &Inner, call: Call) -> Result<Value, RpcError> {
                     "a hook event needs an agent identity",
                 ));
             };
+            let entry =
+                inner
+                    .hooks()
+                    .record(id.clone(), event.event.clone(), event.payload.clone());
             inner.fanout().broadcast(Message::Notification {
                 method: "event/hook".into(),
-                params: serde_json::json!({
-                    "agent": id,
-                    "cwd": call.cwd,
-                    "event": event.event,
-                    "payload": event.payload,
-                }),
+                params: serde_json::to_value(&entry).unwrap_or(Value::Null),
             });
             to_value(Report::Ok {
                 outcome: Value::Null,
@@ -58,6 +59,27 @@ pub(crate) fn handle(inner: &Inner, call: Call) -> Result<Value, RpcError> {
         // `Locality::Session`, answered directly from `inner.sessions()` rather than through
         // `execute_locally` (decisions.md §23).
         Request::Query(AppQuery::Sessions(_)) => to_value(Report::ok(&inner.sessions().list())),
+        // `HooksQuery` is the same shape again (decisions.md §26), with one addition no other
+        // Session-locality query needs: an agent caller may only ask about its own id, a
+        // data-dependent rule `Invocability` alone cannot express (`Hooks::invocability` stays
+        // `Allowed` so a human may ask about anyone).
+        Request::Query(AppQuery::Hooks(query)) => {
+            if let Caller::Agent { id } = &caller {
+                if query.agent.as_ref() != Some(id) {
+                    return Err(RpcError::new(
+                        rpc_code::FORBIDDEN,
+                        "an agent may only ask about its own hook status",
+                    ));
+                }
+            }
+            to_value(Report::ok(&hooks_entries(inner, query.agent.as_ref())))
+        }
+        Request::Command(AppCommand::HookAck(command)) => {
+            inner.hooks().ack(&command.agent_id, command.up_to);
+            to_value(Report::Ok {
+                outcome: Value::Null,
+            })
+        }
         Request::Command(AppCommand::SessionSpawn(command)) => {
             if let Some(agent) = &command.agent {
                 if inner.sessions().agent_is_live(&agent.agent_id) {
@@ -154,6 +176,39 @@ fn agents_entries(inner: &Inner) -> Vec<jerry_core::AgentsEntry> {
             kind: record.kind,
             worktree: record.worktree,
         })
+        .collect()
+}
+
+/// `HooksQuery`'s real answer: every status this host's `HookStore` holds for an agent it still
+/// knows about, filtered to `agent` when given. "Still knows about" mirrors `SessionManager::
+/// agent_entries`'s own exit-based filtering (decisions.md §23) rather than a second, separate
+/// removal path - the real mechanism behind decisions.md §26's "cleared when the session is
+/// forgotten": once `inner.agents()` stops listing an id, `HooksQuery` stops answering for it too,
+/// even though the store's own bounded map may still hold a stale entry until eviction.
+fn hooks_entries(inner: &Inner, agent: Option<&AgentId>) -> Vec<jerry_core::HookAgentSnapshot> {
+    let known: HashSet<AgentId> = inner
+        .agents()
+        .list()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    let snapshots: Vec<(
+        AgentId,
+        jerry_core::HookStatus,
+        Vec<jerry_core::HookInboxEntry>,
+    )> = match agent {
+        Some(id) => inner
+            .hooks()
+            .snapshot(id)
+            .map(|(status, entries)| (id.clone(), status, entries))
+            .into_iter()
+            .collect(),
+        None => inner.hooks().snapshots(),
+    };
+    snapshots
+        .into_iter()
+        .filter(|(id, _, _)| known.contains(id))
+        .map(|(_, status, entries)| jerry_core::HookAgentSnapshot { status, entries })
         .collect()
 }
 

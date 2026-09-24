@@ -15,6 +15,7 @@ pub mod store;
 #[cfg(test)]
 mod integration_tests;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -22,7 +23,6 @@ use futures::channel::mpsc;
 use futures::StreamExt;
 use gpui::{Context, Task};
 use jerry_core::Message;
-use serde_json::Value;
 
 use crate::root::AdeApp;
 use crate::work_surface::agents::AgentId;
@@ -36,6 +36,14 @@ pub struct HookRuntime {
     files: settings_file::HookFiles,
     inbox: Arc<Mutex<inbox::HookInbox>>,
     edits: Arc<Mutex<inbox::EditLog>>,
+    /// Highest [`jerry_core::HookInboxEntry::seq`] already applied, per agent - [`Self::record`]'s
+    /// own dedup guard (issue #532's review). The live `event/hook` consumer ([`spawn_consumer`])
+    /// subscribes before a connect-time replay (`crate::host::AdeApp::seed_hook_runtime`) takes
+    /// its own `HooksQuery` snapshot, so the identical real entry can reach `Self::record` twice;
+    /// `HookInbox::record`/`EditLog::record` are not idempotent (a repeated `Stop` would double a
+    /// turn count, a repeated edit would double-append), so this is what keeps a shared entry from
+    /// being counted twice regardless of which path delivered it first.
+    applied_seq: Arc<Mutex<HashMap<jerry_core::AgentId, u64>>>,
 }
 
 impl HookRuntime {
@@ -66,6 +74,7 @@ impl HookRuntime {
             files,
             inbox: Arc::new(Mutex::new(inbox::HookInbox::default())),
             edits: Arc::new(Mutex::new(inbox::EditLog::default())),
+            applied_seq: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -81,9 +90,28 @@ impl HookRuntime {
         }
     }
 
-    /// Records one `event/hook` notification's params - see [`spawn_consumer`].
-    fn record(&self, params: Value) {
-        record_hook_notification(&self.inbox, &self.edits, params);
+    /// Records one raw `event/hook` entry - see [`spawn_consumer`]. A no-op for an entry whose
+    /// `seq` was already applied for its agent - see [`Self::applied_seq`]'s own docs.
+    fn record(&self, entry: &jerry_core::HookInboxEntry) {
+        if !self.mark_applied(entry) {
+            return;
+        }
+        record_hook_notification(&self.inbox, &self.edits, entry);
+    }
+
+    /// `true` (and advances the watermark) the first time `entry.seq` is seen for its agent;
+    /// `false` for a `seq` already applied or older - [`Self::record`]'s own dedup guard.
+    fn mark_applied(&self, entry: &jerry_core::HookInboxEntry) -> bool {
+        let Ok(mut applied) = self.applied_seq.lock() else {
+            return false;
+        };
+        match applied.get(&entry.agent_id) {
+            Some(&highest) if entry.seq <= highest => false,
+            _ => {
+                applied.insert(entry.agent_id.clone(), entry.seq);
+                true
+            }
+        }
     }
 
     /// This agent's current hook fact, for [`crate::rail::status::derive_status`].
@@ -155,18 +183,35 @@ impl HookRuntime {
         if let Ok(mut edits) = self.edits.lock() {
             edits.forget(id);
         }
+        if let Ok(mut applied) = self.applied_seq.lock() {
+            applied.remove(&jerry_core::AgentId::from(id.to_string()));
+        }
+    }
+}
+
+/// Applies one raw entry to [`AdeApp::hook_runtime`] - the one real path both [`spawn_consumer`]
+/// (a live `event/hook` notification) and `crate::host::AdeApp::seed_hook_runtime` (a
+/// repository-connect replay, decisions.md §26) feed an entry through, so a relaunched instance's
+/// rail renders exactly what it would have if it had been running the whole time. A no-op while
+/// [`HookRuntime`] has not started yet (hooks unsupported, or its lazy bring-up has not run -
+/// `crate::hooks::flow::AdeApp::hook_injection_for`) - the same silent drop an early live event
+/// already had.
+pub(crate) fn apply_entry(app: &AdeApp, entry: &jerry_core::HookInboxEntry) {
+    if let Some(runtime) = &app.hook_runtime {
+        runtime.record(entry);
     }
 }
 
 /// Drains `events` for as long as the returned `Task` is held - one per repository connection
 /// (`crate::host::ensure_repo_host_connected`), all feeding the same [`HookRuntime`] regardless
 /// of which repository the notification came from, mirroring `crate::work_surface::
-/// worktree_created::spawn_consumer`'s own shape exactly. An `event/hook` that arrives before
-/// [`HookRuntime`] exists yet (hooks unsupported, or its lazy bring-up has not run -
-/// `crate::hooks::flow::AdeApp::hook_injection_for`) is silently dropped, the same as one
-/// arriving after it has already been torn down.
+/// worktree_created::spawn_consumer`'s own shape exactly. Acknowledges what it applied
+/// (`HookAck`, best-effort, decisions.md §26) so the host's own bounded inbox is pruned by real
+/// consumption, not just its cap. An `event/hook` whose params are not a real
+/// [`jerry_core::HookInboxEntry`] is silently dropped.
 pub(crate) fn spawn_consumer(
     mut events: mpsc::UnboundedReceiver<Message>,
+    common_dir: PathBuf,
     cx: &mut Context<AdeApp>,
 ) -> Task<()> {
     cx.spawn(async move |this, cx| {
@@ -177,41 +222,50 @@ pub(crate) fn spawn_consumer(
             if method != "event/hook" {
                 continue;
             }
-            let _ = this.update(cx, |app, _cx| {
-                if let Some(runtime) = &app.hook_runtime {
-                    runtime.record(params);
-                }
+            let Ok(entry) = serde_json::from_value::<jerry_core::HookInboxEntry>(params) else {
+                continue;
+            };
+            if this
+                .update(cx, |app, _cx| apply_entry(app, &entry))
+                .is_err()
+            {
+                continue;
+            }
+            let ack = this.update(cx, |app, cx| {
+                app.dispatch(
+                    common_dir.clone(),
+                    jerry_core::Request::Command(jerry_core::AppCommand::HookAck(
+                        jerry_core::HookAck {
+                            agent_id: entry.agent_id.clone(),
+                            up_to: entry.seq,
+                        },
+                    )),
+                    cx,
+                )
             });
+            if let Ok(task) = ack {
+                let _ = task.await;
+            }
         }
     })
 }
 
-/// Parses one `event/hook` notification's params (`{agent, cwd, event, payload}` -
-/// `jerry-host`'s own fan-out shape) and records it exactly as the old HTTP listener's
+/// Parses one `event/hook` entry's payload and records it exactly as the old HTTP listener's
 /// `read_and_record` did: an edit is appended before the inbox merge, and a `Before` snapshot is
 /// taken from disk at record time, not deferred to whenever a reader drains it.
 fn record_hook_notification(
     inbox: &Mutex<inbox::HookInbox>,
     edits: &Mutex<inbox::EditLog>,
-    params: Value,
+    entry: &jerry_core::HookInboxEntry,
 ) {
-    let Some(agent_id) = params
-        .get("agent")
-        .and_then(Value::as_str)
-        .and_then(|id| id.parse::<AgentId>().ok())
-    else {
-        // Not a recognizable `JERRY_AGENT_ID` (or none at all) - there is no rail row this could
-        // belong to.
+    let Ok(agent_id) = entry.agent_id.to_string().parse::<AgentId>() else {
+        // Not a recognizable `JERRY_AGENT_ID` - there is no rail row this could belong to.
         return;
     };
-    let Some(event_name) = params.get("event").and_then(Value::as_str) else {
+    let Ok(payload_bytes) = serde_json::to_vec(&entry.payload) else {
         return;
     };
-    let payload = params.get("payload").cloned().unwrap_or(Value::Null);
-    let Ok(payload_bytes) = serde_json::to_vec(&payload) else {
-        return;
-    };
-    let Some(report) = event::parse(event_name, &payload_bytes) else {
+    let Some(report) = event::parse(&entry.event, &payload_bytes) else {
         return;
     };
 

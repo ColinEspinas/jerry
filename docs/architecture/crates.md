@@ -78,13 +78,22 @@ table and the real `jerry_pty::PtySession` behind each session it spawns (`Sessi
 `SessionResize`/`SessionKill`/`SessionsQuery`, decisions.md §23) - `AgentTable` is now a thin view
 over it, kept for its pre-existing callers. The data-plane adapter (`SessionHandle`): an
 in-process byte stream and `write_input`, handed out directly, never through `Call`/`Report` -
-still in-process only; the per-session socket #507 adds is not built yet.
+still in-process only; the per-session socket #507 adds is not built yet. The hook store
+(`crate::hooks::HookStore`, decisions.md §26): a bounded, per-agent raw inbox plus a coarse,
+derived `HookStatus`, updated by the real `hook` request path and answered by `HooksQuery`/
+`HookAck`, so a hook posted through one client is visible to every other one watching the same
+host - `jerry-app`'s own richer, rendering-tuned parsing (`hooks/event.rs`, nudge-aware
+activity/question/edit/prompt) deliberately stays in `jerry-app`, fed by the same `event/hook`
+notification this store now also broadcasts as a typed `HookInboxEntry`.
 
 **Does not own (yet).** The wire contract and the Git-locality implementations (`jerry-core`);
-any rendering, anything `gpui`. The hook store (still `jerry-app`'s `hooks/store.rs`) and
-`jerry-app`'s own production pane-spawn path, which does not yet dispatch `SessionSpawn` -
-decisions.md §23 names the remaining work. Nor does `jerry-app` yet spawn-or-connect to this
-process at all in production - decisions.md §24 names that remaining work too.
+any rendering, anything `gpui`. `jerry-app`'s own production pane-spawn path, which does not yet
+dispatch `SessionSpawn` - decisions.md §23 names the remaining work. Nor does `jerry-app` yet
+spawn-or-connect to this process at all in production - decisions.md §24 names that remaining
+work too. The Claude-hook agent's own persisted, cross-restart history (`jerry-app`'s
+`hooks/store.rs::AgentStatusState`, issue #227) - a different concern from the live `HookStore`
+above, already solved by its own on-disk cross-instance merge; decisions.md §26 covers why it
+was not folded into this move.
 
 ## `jerry-lsp`
 
