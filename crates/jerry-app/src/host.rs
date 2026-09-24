@@ -19,11 +19,17 @@
 
 use crate::repo_host::RemoteRepoHost;
 use crate::root::AdeApp;
+use crate::terminal::pane::SessionAdapter;
+use crate::terminal::socket_adapter::SocketSessionAdapter;
 use gpui::{AppContext, AsyncApp, Context, Task};
 use jerry_core::wire::rpc_code;
-use jerry_core::{Call, Report, Request, RpcError};
+use jerry_core::{
+    AppCommand, AppQuery, Call, Report, Request, RpcError, SessionAttach, SessionId, SessionKill,
+    SessionRecord, SessionsQuery,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 #[cfg(not(test))]
 use std::time::Duration;
 
@@ -34,6 +40,24 @@ pub(crate) enum RepoHostState {
     Connected,
     VersionMismatch { theirs: u32, ours: u32 },
     CannotSpawn { error: String },
+}
+
+impl RepoHostState {
+    /// The one-line message [`crate::rail::render::AdeApp::render_repo_host_error_banner`] shows
+    /// for a non-[`Self::Connected`] state - `None` for `Connected` itself, since that has nothing
+    /// to show.
+    pub(crate) fn error_message(&self) -> Option<String> {
+        match self {
+            RepoHostState::Connected => None,
+            RepoHostState::VersionMismatch { theirs, ours } => Some(format!(
+                "this repository's session host speaks protocol version {theirs}, this app \
+                 speaks {ours} - restart its sessions once both match"
+            )),
+            RepoHostState::CannotSpawn { error } => Some(format!(
+                "could not start this repository's session host: {error}"
+            )),
+        }
+    }
 }
 
 enum Connection {
@@ -59,11 +83,8 @@ pub(crate) struct RepoHost {
 }
 
 impl RepoHost {
-    /// Not yet read anywhere: the per-repository error banner (`VersionMismatch`/`CannotSpawn`,
-    /// with a real "Restart sessions" action) is this cutover's own remaining "UI states" step,
-    /// tracked in decisions.md §24 - real, tested infrastructure ([`Hosts::entries`] iterates
-    /// exactly this) ahead of its one production consumer rather than guessed at once needed.
-    #[allow(dead_code)]
+    /// Read by [`AdeApp::repo_host_state_for`] - `crate::rail::render`'s own per-repository error
+    /// banner (`VersionMismatch`/`CannotSpawn`, with a real "Restart sessions" action).
     pub(crate) fn state(&self) -> &RepoHostState {
         &self.state
     }
@@ -181,14 +202,6 @@ impl Hosts {
 
     fn repo_host_for(&self, common_dir: &Path) -> Option<&RepoHost> {
         self.by_repo.get(common_dir)
-    }
-
-    /// Every repository currently connected, for a UI that lists per-repository error states -
-    /// [`RepoHost::state`]'s own docs: real, tested, ahead of its one production consumer
-    /// (decisions.md §24's remaining "UI states" step).
-    #[allow(dead_code)]
-    pub(crate) fn entries(&self) -> impl Iterator<Item = (&PathBuf, &RepoHost)> {
-        self.by_repo.iter()
     }
 
     /// The socket a spawned agent belonging to `cwd`'s repository should carry as its
@@ -447,9 +460,9 @@ impl AdeApp {
     /// caller that needs to attach to a spawned session's data-plane adapter (`SessionManager::
     /// handle_for`) rather than dispatch a Command - see `docs/architecture/decisions.md` §23.
     /// Real only for a `#[cfg(test)]` in-process repository: a production (`Connection::Remote`)
-    /// one has no in-process table to reach into at all - `Agents::spawn_inner`'s own migration
-    /// to `SocketSessionAdapter` for that case is this cutover's still-pending "adapter wiring"
-    /// step, tracked in decisions.md §24. `None` also for a `cwd` with no connection yet.
+    /// one has no in-process table to reach into at all - `attach_remote_session` is
+    /// `Agents::spawn_inner`'s own path for that case instead. `None` also for a `cwd` with no
+    /// connection yet.
     pub fn sessions_for(&self, cwd: &Path) -> Option<jerry_host::SessionManager> {
         let common_dir = self.hosts.common_dir_for(cwd)?;
         #[cfg_attr(not(test), allow(unused))]
@@ -483,6 +496,44 @@ impl AdeApp {
         self.hosts.socket_for(cwd)
     }
 
+    /// The repository `cwd` belongs to's own connection state, for `crate::rail::render`'s
+    /// per-repository error banner - `None` for a repository this instance has never resolved a
+    /// connection for at all (including one still resolving), which is not itself an error.
+    pub(crate) fn repo_host_state_for(&self, cwd: &Path) -> Option<RepoHostState> {
+        let common_dir = self.hosts.common_dir_for(cwd)?;
+        Some(self.hosts.repo_host_for(common_dir)?.state().clone())
+    }
+
+    /// The real "Restart sessions" action on `crate::rail::render`'s per-repository error banner:
+    /// drops the repository `cwd` belongs to's own stale entry (a `VersionMismatch`/`CannotSpawn`
+    /// state has no live connection to shut down - only a genuinely `Connected` one would, and
+    /// this is never offered for that state) and re-runs [`Self::open_repo_host`] as if this were
+    /// the first time this instance had ever seen the repository. Also drops the `cwd` -> common
+    /// dir cache entry, not just `Hosts::by_repo`'s: `Self::open_repo_host`'s own early-return
+    /// guard checks that cache alone, so leaving it behind would make this a silent no-op.
+    pub(crate) fn restart_repo_host(&mut self, cwd: PathBuf, cx: &mut Context<Self>) {
+        if let Some(common_dir) = self.hosts.common_dir_of.remove(&cwd) {
+            self.hosts.by_repo.remove(&common_dir);
+        }
+        self.open_repo_host(cwd, cx);
+    }
+
+    /// The repository `cwd` belongs to's own [`RemoteRepoHost`], for `attach_remote_session`'s
+    /// synchronous `command/session-kill` dispatch on [`SessionAdapter::shutdown`] - a plain
+    /// blocking call safe from any thread (§16's amendment), never through [`Self::dispatch`]/
+    /// GPUI's executor, since `shutdown` is a synchronous trait method with no `.await` of its
+    /// own to run one under. Real for a production `Connection::Remote` repository, and for a
+    /// test that swapped one in via `RepoHost::for_test_remote`; `None` for a `#[cfg(test)]`
+    /// in-process repository (which kills through `SessionManager::kill` directly instead - see
+    /// [`Self::sessions_for`]) or one with no working connection at all.
+    fn remote_host_for(&self, cwd: &Path) -> Option<RemoteRepoHost> {
+        let common_dir = self.hosts.common_dir_for(cwd)?;
+        match &self.hosts.repo_host_for(common_dir)?.connection {
+            Some(Connection::Remote(remote)) => Some(remote.clone()),
+            _ => None,
+        }
+    }
+
     /// Test-only: installs `repo_host` (already connected, typically [`RepoHost::for_test_remote`]
     /// or [`RepoHost::for_test_in_process`]) as the connection for the repository `cwd` belongs
     /// to, in place of whatever `Self::open_repo_host` would otherwise resolve - see that
@@ -505,6 +556,93 @@ impl AdeApp {
         self.hosts.common_dir_of.insert(cwd, common_dir.clone());
         self.hosts.by_repo.insert(common_dir, repo_host);
     }
+}
+
+/// Resolves `session_id`'s own real, attachable adapter for `Agents::spawn_resolved` to hand to a
+/// pane, for a repository with no in-process table to reach into at all (`AdeApp::sessions_for`
+/// answering `None` - a production `Connection::Remote`, or a test that swapped one in via
+/// `RepoHost::for_test_remote`): dispatches a real `command/session-attach` for the socket, a
+/// `SessionsQuery` for the session's own pid (`SocketSessionAdapter::connect`'s own docs - a
+/// value only a Query can resolve, never fetched by the adapter itself), then connects
+/// off the UI thread. `Err` is a real, honest attach failure the caller reports as a failed spawn,
+/// never a silent no-op.
+pub(crate) async fn attach_remote_session(
+    this: &gpui::WeakEntity<AdeApp>,
+    cwd: PathBuf,
+    session_id: SessionId,
+    cx: &mut AsyncApp,
+) -> Result<Arc<dyn SessionAdapter>, String> {
+    const APP_DROPPED: &str = "the app itself was dropped before this session could attach";
+
+    let attach_call = this
+        .update(cx, |this, cx| {
+            this.dispatch(
+                cwd.clone(),
+                Request::Command(AppCommand::SessionAttach(SessionAttach {
+                    id: session_id.clone(),
+                })),
+                cx,
+            )
+        })
+        .map_err(|_| APP_DROPPED.to_string())?;
+    let socket = match attach_call.await {
+        Ok(Report::Ok { outcome }) => outcome
+            .get("socket")
+            .and_then(serde_json::Value::as_str)
+            .map(PathBuf::from)
+            .ok_or_else(|| "internal error: session-attach answered with no socket".to_string())?,
+        Ok(other) => return Err(format!("could not attach to this session: {other:?}")),
+        Err(error) => return Err(error.message),
+    };
+
+    // Never fatal on its own - a session whose pid could not be resolved still attaches, just
+    // without `SessionsQuery::process_id` ever answering for it (the pane header falls back to
+    // showing none, exactly as `SocketSessionAdapter::process_id`'s own docs describe).
+    let sessions_call = this.update(cx, |this, cx| {
+        this.dispatch(
+            cwd.clone(),
+            Request::Query(AppQuery::Sessions(SessionsQuery::default())),
+            cx,
+        )
+    });
+    let process_id = match sessions_call {
+        Ok(task) => match task.await {
+            Ok(Report::Ok { outcome }) => serde_json::from_value::<Vec<SessionRecord>>(outcome)
+                .ok()
+                .and_then(|records| records.into_iter().find(|record| record.id == session_id))
+                .and_then(|record| record.process_id),
+            _ => None,
+        },
+        Err(_) => None,
+    };
+
+    let remote = this
+        .update(cx, |this, _cx| this.remote_host_for(&cwd))
+        .map_err(|_| APP_DROPPED.to_string())?
+        .ok_or_else(|| {
+            "internal error: this repository has no remote session host to kill through".to_string()
+        })?;
+    let kill_id = session_id.clone();
+    let kill_cwd = cwd.clone();
+    let kill = move || -> Result<(), String> {
+        match remote.dispatch(Call::human(
+            kill_cwd.clone(),
+            Request::Command(AppCommand::SessionKill(SessionKill {
+                id: kill_id.clone(),
+            })),
+        )) {
+            Ok(Report::Ok { .. }) => Ok(()),
+            Ok(other) => Err(format!("{other:?}")),
+            Err(error) => Err(error.message),
+        }
+    };
+
+    cx.background_spawn(async move {
+        SocketSessionAdapter::connect(&socket, session_id, process_id, kill)
+            .map(|adapter| Arc::new(adapter) as Arc<dyn SessionAdapter>)
+            .map_err(|error| error.to_string())
+    })
+    .await
 }
 
 /// [`AdeApp::adopt_repo_host_for_test`]'s own event wiring - a synchronous twin of

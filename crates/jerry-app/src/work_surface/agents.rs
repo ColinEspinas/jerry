@@ -753,25 +753,45 @@ impl Agents {
                 return;
             };
             let attached = this.update(cx, |this, _cx| {
+                // Real only for a `#[cfg(test)]` in-process repository - a production
+                // `Connection::Remote` one (or a test that swapped one in via `RepoHost::
+                // for_test_remote`) always answers `None` here, and attaches over the socket
+                // instead, below.
                 let handle = this
                     .sessions_for(&spawn_cwd)
                     .and_then(|sessions| sessions.handle_for(&session_id));
                 this.agents.set_host_session_id(id, session_id.clone());
                 (handle, this.host_client_for(&spawn_cwd))
             });
-            let Ok((Some(handle), client)) = attached else {
-                let _ = spawn_pane.update(cx, |pane, cx| {
-                    pane.mark_spawn_failed(
-                        "internal error: the session host could not hand back this session's \
-                         adapter"
-                            .to_string(),
+            let Ok((in_process_handle, client)) = attached else {
+                return; // the app itself was dropped before this could even be asked
+            };
+            let adapter: Arc<dyn SessionAdapter> = match in_process_handle {
+                Some(handle) => handle,
+                None => {
+                    match crate::host::attach_remote_session(
+                        &this,
+                        spawn_cwd.clone(),
+                        session_id.clone(),
                         cx,
                     )
-                });
-                return;
+                    .await
+                    {
+                        Ok(adapter) => adapter,
+                        Err(message) => {
+                            let _ = spawn_pane.update(cx, |pane, cx| {
+                                pane.mark_spawn_failed(
+                                    format!("could not attach to this session: {message}"),
+                                    cx,
+                                )
+                            });
+                            return;
+                        }
+                    }
+                }
             };
             let attach_outcome = spawn_pane.update(cx, |pane, cx| {
-                pane.attach_session(handle.clone(), client, cx)
+                pane.attach_session(adapter.clone(), client, cx)
             });
             if attach_outcome.is_err() {
                 // The pane entity itself is already gone - not just doomed, which `TerminalPane::
@@ -784,7 +804,7 @@ impl Agents {
                 // issue #530's own regression).
                 cx.background_executor()
                     .spawn(async move {
-                        if let Err(err) = handle.shutdown() {
+                        if let Err(err) = adapter.shutdown() {
                             log::warn!(
                                 "failed to shut down a session whose pane was already gone by \
                                  attach time: {err}"
@@ -1572,5 +1592,97 @@ mod pending_exit_tests {
             !agents.has_pending_exit_for_test(&session_id),
             "no exit was ever recorded - there must be nothing pending"
         );
+    }
+}
+
+#[cfg(test)]
+mod remote_attach_tests {
+    use super::ProcessKind;
+    use crate::host::RepoHost;
+    use crate::test_support::{open_test_app, temp_repo};
+    use gpui::TestAppContext;
+    use std::time::Duration;
+    use test_support::wait_until;
+
+    /// The regression this module exists to make impossible again: a real, out-of-process
+    /// `Connection::Remote` repository (`RepoHost::for_test_remote` - the same shape a real
+    /// spawned `jerry-host` process gives `AdeApp`) spawns a real, idling shell through `Agents::
+    /// spawn`'s own production path (`crate::host::attach_remote_session`), lets it settle at its
+    /// interactive prompt, then closes it - all driven through `cx.run_until_parked()`, exactly
+    /// the call an earlier, reverted wiring attempt hung inside forever (decisions.md §16's
+    /// amendment has the exact mechanism: a `kill` closure that `block_on`ed a `LocalClient`
+    /// request from inside a `cx.background_executor` task - the same task shape `Agents::close`'s
+    /// own real shutdown path uses). `attach_remote_session`'s own `kill` closure dispatches
+    /// through `RemoteRepoHost` instead - a plain blocking call to a dedicated worker thread, safe
+    /// from any context - so both bounded waits below are expected to actually complete rather
+    /// than being killed by nextest's own slow-timeout, which is exactly how the original bug
+    /// would show up here instead.
+    #[gpui::test]
+    async fn a_real_idle_shell_over_a_remote_connection_attaches_and_closes_without_hanging(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = temp_repo();
+        let (app, cx) = open_test_app(cx, repo.to_path_buf());
+        cx.run_until_parked();
+
+        let host = jerry_host::Host::start().expect("host");
+        let socket_dir = jerry_core::registry::runtime_dir().expect("runtime dir");
+        let socket = socket_dir.join(format!(
+            "ra-{:x}-{:08x}.sock",
+            std::process::id(),
+            jerry_core::registry::fresh_u32()
+        ));
+        host.listen(&socket).expect("listen");
+        let client = jerry_core::client::Client::connect(&socket, Duration::from_secs(5))
+            .expect("connect to the real socket");
+        let repo_host =
+            RepoHost::for_test_remote(client, socket).expect("wrap the real connection");
+        app.update(cx, |app, cx| {
+            app.adopt_repo_host_for_test(repo.to_path_buf(), repo_host, cx);
+        });
+
+        let id = app
+            .update_in(cx, |app, window, cx| {
+                app.new_agent(ProcessKind::Shell, window, cx);
+                app.agents.iter().last().map(|agent| agent.id)
+            })
+            .expect("a real shell tab was created");
+
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                cx.run_until_parked();
+                app.read_with(cx, |app, cx| {
+                    app.agents
+                        .iter()
+                        .find(|agent| agent.id == id)
+                        .is_some_and(|agent| {
+                            agent.pane.read(cx).spawn_error().is_none()
+                                && agent
+                                    .pane
+                                    .read(cx)
+                                    .visible_text_lines()
+                                    .iter()
+                                    .any(|line| !line.trim().is_empty())
+                        })
+                })
+            }),
+            "the real shell must attach over the remote socket and produce real prompt output, \
+             with run_until_parked never hanging while it settles"
+        );
+
+        app.update_in(cx, |app, window, cx| {
+            app.close_agent(id, window, cx);
+        });
+
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                cx.run_until_parked();
+                app.read_with(cx, |app, _| !app.agents.iter().any(|agent| agent.id == id))
+            }),
+            "closing the tab must really kill the remote session - through RemoteRepoHost, never \
+             a block_on over LocalClient - with run_until_parked never hanging while it does"
+        );
+
+        host.shutdown_and_join();
     }
 }

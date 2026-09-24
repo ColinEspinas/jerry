@@ -703,6 +703,9 @@ impl AdeApp {
             .size_full()
             .child(self.render_sidebar_strip(&cells, cx))
             .child(self.render_rail_filter_row(view, cx))
+            .when_some(self.render_repo_host_error_banner(cx), |el, banner| {
+                el.child(banner)
+            })
             .when_some(self.render_worktrees_error_banner(), |el, banner| {
                 el.child(banner)
             })
@@ -718,6 +721,64 @@ impl AdeApp {
             // ([`Self::rail_scroll_handle`]) - genuinely few rows, no virtualization needed.
             .child(self.render_sidebar_body(view, &groups, &problems, cx))
             .child(self.render_rail_footer(cx))
+    }
+
+    /// A visible error banner for the focused repository's own session-host connection
+    /// (`RepoHostState::VersionMismatch`/`CannotSpawn`, `docs/architecture/decisions.md` §24) - a
+    /// repository with no working connection at all otherwise fails silently: every dispatch into
+    /// it already answers a real, typed error (`AdeApp::dispatch`), but nothing told the user why.
+    /// "Restart sessions" drops the stale connection and re-attempts spawn-or-connect
+    /// (`AdeApp::restart_repo_host`); `Connected` (the ordinary case) shows nothing.
+    pub(in crate::rail) fn render_repo_host_error_banner(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let repo_path = self.focused_repo_path();
+        let message = self.repo_host_state_for(&repo_path)?.error_message()?;
+        Some(
+            div()
+                .id("rail-repo-host-error")
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .px(px(10.0))
+                .py(px(6.0))
+                .bg(theme::status::FAIL_BG)
+                .border_b_1()
+                .border_color(theme::border::RAIL_INNER)
+                .child(
+                    div()
+                        .flex_1()
+                        .font(font(theme::font::MONO))
+                        .text_size(self.ui_text_size(10.0))
+                        .text_color(theme::status::FAIL)
+                        .child(message),
+                )
+                .child(
+                    div()
+                        .id("rail-repo-host-restart")
+                        .debug_selector(|| "rail-repo-host-restart".to_string())
+                        .flex_none()
+                        .cursor_pointer()
+                        .px(px(8.0))
+                        .py(px(2.0))
+                        .rounded(px(4.0))
+                        .border_1()
+                        .border_color(theme::status::FAIL)
+                        .hover(|el| el.bg(theme::status::FAIL_BG.resolve().opacity(0.7)))
+                        .font(font(theme::font::MONO))
+                        .text_size(self.ui_text_size(10.0))
+                        .text_color(theme::status::FAIL)
+                        .child("Restart sessions")
+                        .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                            let repo_path = this.focused_repo_path();
+                            this.restart_repo_host(repo_path, cx);
+                            cx.notify();
+                        })),
+                ),
+        )
     }
 
     /// A visible error banner for [`Self::worktrees_error`] (`jerry_git::list_worktrees_porcelain`
@@ -1972,6 +2033,89 @@ impl AdeApp {
                     .child(status)
             })
             .child(prune_button)
+    }
+}
+
+#[cfg(test)]
+mod repo_host_banner_tests {
+    use crate::host::{RepoHost, RepoHostState};
+    use crate::test_support::{open_test_app, temp_repo};
+    use gpui::TestAppContext;
+
+    /// The ordinary case (a working in-process test connection, exactly what `open_test_app`
+    /// already wires up) shows no banner at all; swapping in a broken one (`RepoHost::
+    /// for_test_unavailable`, the same real error-reporting branch `crate::host::
+    /// app_dispatch_tests` exercises against `AdeApp::dispatch`) makes the banner appear.
+    #[gpui::test]
+    async fn a_connected_repository_shows_no_banner_but_a_broken_one_does(cx: &mut TestAppContext) {
+        let repo = temp_repo();
+        let (app, cx) = open_test_app(cx, repo.to_path_buf());
+        cx.run_until_parked();
+
+        assert!(
+            app.update(cx, |app, cx| app
+                .render_repo_host_error_banner(cx)
+                .is_none()),
+            "an ordinarily connected repository must show no banner at all"
+        );
+
+        app.update(cx, |app, cx| {
+            app.adopt_repo_host_for_test(
+                repo.to_path_buf(),
+                RepoHost::for_test_unavailable(RepoHostState::CannotSpawn {
+                    error: "no jerry-host binary was found".to_string(),
+                }),
+                cx,
+            );
+        });
+
+        assert!(
+            app.update(cx, |app, cx| app
+                .render_repo_host_error_banner(cx)
+                .is_some()),
+            "a repository with no working connection must show the banner"
+        );
+    }
+
+    /// "Restart sessions"'s own real effect (`AdeApp::restart_repo_host`, the click handler's one
+    /// line of glue beyond this): the stale entry is dropped and a fresh connection is opened,
+    /// exactly as if this repository had never been seen before - here, a fresh in-process test
+    /// host, standing in for a fresh real spawn-or-connect in production.
+    #[gpui::test]
+    async fn restart_sessions_drops_the_stale_state_and_reconnects(cx: &mut TestAppContext) {
+        let repo = temp_repo();
+        let (app, cx) = open_test_app(cx, repo.to_path_buf());
+        cx.run_until_parked();
+
+        app.update(cx, |app, cx| {
+            app.adopt_repo_host_for_test(
+                repo.to_path_buf(),
+                RepoHost::for_test_unavailable(RepoHostState::CannotSpawn {
+                    error: "no jerry-host binary was found".to_string(),
+                }),
+                cx,
+            );
+        });
+        assert!(
+            app.update(cx, |app, cx| app
+                .render_repo_host_error_banner(cx)
+                .is_some()),
+            "sanity check: the broken state must show a banner before restarting"
+        );
+
+        app.update(cx, |app, cx| {
+            let repo_path = app.focused_repo_path();
+            app.restart_repo_host(repo_path, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            app.update(cx, |app, cx| app
+                .render_repo_host_error_banner(cx)
+                .is_none()),
+            "Restart sessions must really drop the stale entry and reconnect, not just change \
+             what the banner happens to say"
+        );
     }
 }
 

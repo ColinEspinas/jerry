@@ -6,13 +6,15 @@
 //! (`command/session-kill`, on [`SocketSessionAdapter::shutdown`]). No exit signal is
 //! synthesized: the socket just ends once the host closes it.
 //!
-//! Real and unit-tested against a real socket pair (below), but **not yet wired into
-//! `Agents::spawn_inner`**: doing so reproducibly hung every UI test that spawns a real session
-//! and lets it reach an interactive prompt, inside `TestAppContext::run_until_parked` itself,
-//! after every one of this module's and the surrounding dispatch chain's own steps had already
-//! completed - see §24's own note on this. Root-causing that GPUI-test-executor interaction is
-//! this module's own follow-up, not a reason to drop the adapter itself.
-#![allow(dead_code)]
+//! Wired into production by `crate::host::attach_remote_session`, `Agents::spawn_inner`'s own
+//! path for a repository with no in-process table to reach into at all (a production
+//! `Connection::Remote`). An earlier attempt at this wiring reproducibly hung
+//! `TestAppContext::run_until_parked` - root-caused since (decisions.md §16's amendment) to a
+//! `kill` closure that dispatched through `jerry_host::LocalClient` with `futures::executor::
+//! block_on`, deadlocking GPUI's single-threaded test scheduler. `attach_remote_session`'s own
+//! `kill` closure dispatches through `crate::repo_host::RemoteRepoHost` instead - a plain blocking
+//! call to a dedicated worker thread, safe from any context - which is what makes this wiring
+//! safe now.
 
 use futures::channel::mpsc;
 use futures::SinkExt;

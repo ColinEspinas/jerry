@@ -1221,18 +1221,16 @@ not folded into this one as a partial pass. Tracked as issue #532's own scope, n
 ## 24. `jerry-host` becomes its own process: the binary, spawn-or-connect, lifecycle, version
 gating
 
-**Status:** Accepted, mostly landed (2026-09-23, issue #506; 2026-09-23, issue #507's own data
-plane; 2026-09-24, issue #506's own control-plane cutover; plan decisions Q7, Q15, Q20, and §14's
-spike). The real protocol/process pieces below, the data plane, and the control-plane cutover
-(`Hosts`/`RepoHost`, one real per-repository connection with its own event subscriptions, and
-per-repository `JERRY_HOST_SOCKET` injection - see the second amendment further down) are all
-shipped and tested. What is still open, tracked as this issue's own remaining scope rather than a
-new issue: `Agents::spawn_inner` still attaches a spawned session through `SessionManager::
-handle_for` rather than `SocketSessionAdapter` (the data-plane amendment's own "attempted,
-reverted" paragraph - still the case, now that the GPUI deadlock behind that revert has a proven
-fix in `RemoteRepoHost`, §16's amendment), the per-repository error banner has no UI consumer yet
-(`RepoHost::state`/`Hosts::entries` are real and tested, just unread by any render code), and the
-external "a host survives the CLI's own death, bytes keep flowing" DoD test has not yet been run.
+**Status:** Accepted, fully landed (2026-09-23, issue #506; 2026-09-23, issue #507's own data
+plane; 2026-09-24, issue #506's own control-plane cutover and, the same day, its adapter
+wiring/error banner/external DoD test; plan decisions Q7, Q15, Q20, and §14's spike). The real
+protocol/process pieces below, the data plane, the control-plane cutover (`Hosts`/`RepoHost`, one
+real per-repository connection with its own event subscriptions, and per-repository
+`JERRY_HOST_SOCKET` injection), and the third amendment's closing work (`SocketSessionAdapter`
+wired into `Agents::spawn_inner` for real, the per-repository error banner, and the external DoD
+test) are all shipped and tested. The one genuinely separate item the third amendment's own closing
+paragraph carves out - a socket-attached pane's resize has no out-of-process dispatch path yet - is
+tracked as new follow-up work, not this issue's own remaining scope.
 
 **Context:** Through #505 (§23), the session host is a real, well-factored dispatcher and session
 table, but it still runs *inside* `jerry-app`'s own process (`HostRuntime`, §16's `pending_dispatch`
@@ -1530,18 +1528,54 @@ adapter wiring, error-banner UI, and external DoD test below remain open):**
   repository (documented gap: `Agents::spawn_inner`'s own migration to `SocketSessionAdapter`,
   below, is what would make these meaningful in production too).
 
-**Still open, this issue's own remaining scope:**
+**Amended 2026-09-24 (#506 part 3 - adapter wiring, the error banner, and the external DoD test,
+closing this issue's own remaining scope):**
 
-- **`Agents::spawn_inner` still attaches via `SessionManager::handle_for`, not
-  `SocketSessionAdapter`.** The GPUI hang that caused this to be reverted in the data-plane
-  amendment above has a proven root cause and a proven-safe fix now (`RemoteRepoHost`, this
-  amendment's own second bullet) - wiring `SocketSessionAdapter` into `spawn_inner` for real is
-  this issue's own next step, not a new one.
-- **No UI consumer for the per-repository error banner yet.** `RepoHost::state()`/`Hosts::entries()`
-  are real and tested (`app_dispatch_tests::a_version_mismatched_repository_answers_
-  unsupported_version_not_silently`/`a_repository_that_could_not_spawn_a_host_answers_needs_
-  host_not_silently`), just not yet read by any render code - a `VersionMismatch`/`CannotSpawn`
-  repository today answers a real, typed `RpcError` on every dispatch rather than showing a banner
-  with a "Restart sessions" action.
-- **The external DoD test - a host surviving the CLI's own death with bytes still flowing - has
-  not yet been run.**
+- **`Agents::spawn_inner` now attaches through `SocketSessionAdapter` for a production
+  `Connection::Remote` repository, real for the first time.** `crate::host::attach_remote_session`
+  is the new seam `Agents::spawn_resolved` falls back to whenever `AdeApp::sessions_for` answers
+  `None` (a production repository, or a test that swapped one in via `RepoHost::for_test_remote`):
+  it dispatches a real `command/session-attach` (through the ordinary `AdeApp::dispatch`, off the
+  UI thread) for the socket, a `SessionsQuery` for the session's own pid
+  (`SocketSessionAdapter::connect`'s own docs - a value only a Query can resolve), then connects
+  over the socket off the UI thread. `SocketSessionAdapter::shutdown`'s `command/session-kill`
+  dispatches through `AdeApp::remote_host_for`'s `RemoteRepoHost` directly - a plain blocking call
+  to a dedicated worker thread, never through `AdeApp::dispatch`/GPUI's executor, since `shutdown`
+  is a synchronous trait method with no `.await` of its own to run one under (§16's amendment is
+  exactly why this distinction matters). The `#[cfg(test)]` in-process path
+  (`SessionManager::handle_for`) is unchanged. Regression-tested by `work_surface::agents::
+  remote_attach_tests::a_real_idle_shell_over_a_remote_connection_attaches_and_closes_without_
+  hanging` - a real, out-of-process `RepoHost::for_test_remote` connection, a real idling shell
+  attached and settled at its prompt, then closed through `Agents::close`'s own real
+  `cx.background_executor().spawn(session.shutdown())` shape, the exact call the original,
+  reverted wiring hung inside forever. It does not; nextest's own slow-timeout would have caught it
+  if it still did.
+- **The per-repository error banner is real, in `crate::rail::render`.**
+  `AdeApp::repo_host_state_for(cwd)` (a clone of `RepoHost::state()`) gates
+  `render_repo_host_error_banner`, shown in the rail alongside the existing worktree-listing and
+  selection-notice banners for the currently focused repository; `RepoHostState::error_message`
+  gives its text. "Restart sessions" calls `AdeApp::restart_repo_host`, which drops both the stale
+  `Hosts::by_repo` entry and its `common_dir_of` cache entry (leaving the latter behind would make
+  `Self::open_repo_host`'s own early-return guard silently no-op the restart) and re-opens the
+  repository exactly as if this were the first time this instance had ever seen it.
+  `rail::render::repo_host_banner_tests` covers both the gating (connected vs. broken) and the
+  restart's own real effect.
+- **The external DoD test - a session surviving its spawning client's own disconnect, with bytes
+  still flowing - is written and has been run here, on Windows.**
+  `crates/jerry-host/tests/real_binary_spawn.rs`'s `a_session_survives_its_spawning_clients_
+  disconnect_and_a_fresh_client_still_reaches_it`: a real, separate `jerry-host` binary, a real
+  spawned shell, real bytes over the real data-plane socket both before and after the original
+  client - both its data-plane stream and its control-plane `Client` - disconnects without ever
+  sending `Shutdown`. The host is confirmed still alive (`registry::probe`, never `Liveness::
+  Dead`), a fresh `Client` reconnects and finds the same session still alive through a real
+  `SessionsQuery`, and a fresh attach still carries real bytes both ways. Not `#[ignore]`d: unlike
+  an `external` `#[ignore = "external: <binary>"]` test, this needs no third-party binary, only
+  `jerry-host`'s own already-built one - the same reasoning `real_binary_spawn.rs`'s existing
+  `spawn_or_connect_starts_a_real_jerry_host_binary_and_a_second_call_reuses_it` test already
+  applies - so it is a permanent regression test in the ordinary gate, not a one-off manual check.
+
+This closes every item this issue's plan named as its own scope. What is left is genuinely
+separate follow-up work, tracked as new issues rather than folded back into this entry: `Agents`'
+resize path (`TerminalPane::host_client: Option<LocalClient>`) still has no out-of-process
+counterpart, so resizing a socket-attached pane is a silent no-op rather than a real dispatch - a
+`SessionResize` call for a production repository, unlike attach and kill, has nowhere to go yet.
