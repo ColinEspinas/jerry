@@ -1631,3 +1631,84 @@ app's whole lifetime), but whichever issue first needs to actually drop a `RepoH
 own detached-sessions work, or a later one) must make `RepoHost`'s `Drop` shut down its
 subscription sockets so those threads actually exit, not just leave the entry unreachable while
 its threads keep running.
+
+## 27. `jerry-ui`: a design-system crate on the Zed `gpui` pin, not on `gpui-base`
+
+**Status:** Accepted, partially landed (2026-09-24, issue #503 part B). The crate, its theming
+tier, and four real migrated call sites are shipped and tested; the remaining hand-rolled call
+sites are follow-up issues, not done in this pass.
+
+**Context:** Part A (draft PR #526, `spike/503-gpui-base`) priced building `jerry-ui` on top of
+`gpui-base`/gpui-kit's own `gpui-pre` fork instead of this workspace's Zed git `gpui` pin. Verdict:
+FAIL. Moving the pin decouples this workspace from the exact commit every other crate here is
+verified against, `gpui_base::dock` only covers 18 of the tab-strip's real states (no settle/slide
+animation, needs a real per-tab `Entity` `TabRef` isn't), and `gpui_base::focus_trap` shares zero
+surface with `root/focus.rs`'s actual problem (capture/restore per overlay, not Tab-cycling
+containment). The decision, recorded on issue #503 itself: build `jerry-ui` as Jerry's own
+components on the Zed pin, borrowing gpui-kit's *theming patterns* - never its code, never its
+dependency.
+
+**Decision:**
+
+- **`crates/jerry-ui`** is the second, and only other, crate in this workspace allowed a `gpui`
+  dependency (CLAUDE.md, `crates.md`). It depends on `gpui` alone - no `jerry-app`, no core crate,
+  no settings/file I/O of its own. `jerry-app` constructs a `jerry_ui::Theme`
+  (`crate::theme::jerry_ui_theme()`, this crate's new bridge function) from its own *live*
+  resolved `ColorToken` palette and hands it to every component by value; `jerry-ui` never reaches
+  outward for one. This is the same "render code draws the outcome it's handed" shape CLAUDE.md's
+  architecture section already asks of `jerry-app` itself, applied to a component library that has
+  no state of its own to begin with.
+- **Borrowed from gpui-kit, as pattern only:** the semantic colour tier over a larger literal
+  palette (`jerry_ui::theme::Colors`/`StatusColors`, mirroring `crates/jerry-app/src/theme.rs`'s
+  own `ColorToken` defaults token-for-token - see that module's own doc citations), non-colour
+  scales (`Spacing`/`Radius`/`Motion`/`Dimensions`), and a declarative `{ rest, hover, active,
+  focused, disabled, selected }` state map (`jerry_ui::StateStyle`) so a component states its own
+  look once instead of hand-writing a `.hover(|s| s.bg(..))` chain per call site.
+  **Not borrowed:** no gpui-kit source, no `gpui-component` source either - none of the six
+  components built this pass (`Button`, `IconButton`, `Banner`, `ListRow`, `Badge`, `Divider`)
+  needed to copy anything from it, so the "copy-and-own, keep attribution" allowance the spike
+  decision left open goes unused here; a future component that does lean on real
+  `gpui-component` source should say so explicitly, with its license and attribution kept intact,
+  rather than silently blending it in.
+- **The semantic-tier rule:** render code passes a component a token
+  (`theme.colors.text_muted`, `theme.spacing.md`, `theme.radius.pill`), never a raw hex literal or
+  a bare `px()` magic number, the same discipline `crates/jerry-app/src/theme.rs`'s own
+  `ColorToken` convention already enforces for that crate's ~270-key palette - `jerry-ui`'s tier is
+  just smaller, purpose-built for its own six components rather than the whole app.
+- **Four real call sites migrated**, proving the API against real screens and real tests rather
+  than a components gallery nobody uses: `rail::render::render_worktrees_error_banner` and
+  `render_repo_host_error_banner` (the latter is "the repo-host error banner" - the design brief's
+  own name for it, with a `jerry_ui::Button` "Restart sessions" action) onto `jerry_ui::Banner`;
+  `render_worktree_row`/`render_agent_row`'s selected/hover shell onto `jerry_ui::ListRow`;
+  `settings::widgets`'s "Open file" button and `settings::render::render_theme_action_button` (the
+  Themes page's Import/Export buttons, 7 call sites) onto `jerry_ui::Button`. Each migration kept
+  every existing `debug_selector` string, click handler, and tooltip unchanged - only the shell
+  construction moved.
+- **`render_worktree_selection_notice_banner`** (the amber "selection recovered" dismissible
+  banner immediately below the two migrated banners in the same file) was deliberately **not**
+  migrated in this pass - out of the design brief's explicit scope, left as a hand-rolled call
+  site alongside the rest of the follow-up list below, not an oversight.
+- **Known gap:** `jerry_ui::Theme` has no `Settings.appearance.interface_scale_percent`
+  equivalent yet, so the two migrated banners' text stopped scaling with that setting (both were
+  `self.ui_text_size(10.0)` before; `jerry_ui::Banner` is a fixed `px(10.0)`). Real, visible only
+  at a non-default scale, documented on both call sites' own doc comments rather than silently
+  dropped.
+- **Follow-up, one issue per surface**, each carrying a real count of remaining hand-rolled
+  `.bg(`/`.rounded`/`.text_color(` instances that fit an existing `jerry_ui` shape: `rail/
+  render.rs` (the selection-notice banner above, plus everything past the two migrated rows),
+  `settings/render.rs` and `settings/widgets.rs` (the six other card/control shapes this pass
+  didn't touch), `work_surface/render.rs`, `sidebar/render.rs`, `title_bar/render.rs`,
+  `status_bar/render.rs` - the survey behind this issue counted 404 `.bg(`, 191 `.rounded`, and
+  547 `.text_color(` call sites across `crates/jerry-app/src` before this pass; migrating four of
+  them is a proof, not a completion. A presentational `Tab`/`TabStrip` component and a `Tooltip`
+  wrapper were scoped out of this pass too: the tab strip's real behaviour (drag reorder, settle
+  animation) has no safe small slice to extract yet, and GPUI already ships a real tooltip
+  mechanism `crate::root::widgets::text_tooltip` already wraps cleanly - re-wrapping it in
+  `jerry-ui` today would add a layer with nothing real behind it.
+
+**Consequences:** A new component earns its place in `jerry-ui` only once three or more real
+`jerry-app` call sites share its shape (the survey threshold this issue used) - it is not a
+staging ground for speculative components nobody has migrated onto yet. The `ColorToken`-to-
+`Theme` bridge (`jerry_ui_theme()`) is the one place a future custom-theme-file key would need a
+matching `jerry_ui::schema::ColorSchema` field if that ever becomes user-editable; today only the
+built-in Jerry Dark values flow through it.
