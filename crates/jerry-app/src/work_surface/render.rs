@@ -3920,6 +3920,27 @@ mod tab_scoping_tests {
     /// (`a_real_pty_process_setting_its_title_is_captured_and_classified`); injecting here keeps
     /// *this* module's subject - what the tab strip does with a title once one exists - free of
     /// a real process's scheduling.
+    /// Freezes agent `id`'s pane (`TerminalPane::freeze_input_for_test`) before this test ever
+    /// pumps the executor, so a real spawned process's own output - including its ConPTY startup
+    /// handshake's own OSC 0 title - can never race this module's synthetic `set_live_title`
+    /// injections (GitHub issue #524, #543). Call once per pane, right after spawning it and
+    /// before the first `cx.run_until_parked()`.
+    fn freeze_pane_for_test(
+        app: &gpui::Entity<AdeApp>,
+        cx: &mut gpui::VisualTestContext,
+        id: AgentId,
+    ) {
+        let pane = app.read_with(cx, |app, _| {
+            app.agents
+                .iter()
+                .find(|agent| agent.id == id)
+                .expect("a live agent")
+                .pane
+                .clone()
+        });
+        pane.update(cx, |pane, _cx| pane.freeze_input_for_test());
+    }
+
     fn set_live_title(
         app: &gpui::Entity<AdeApp>,
         cx: &mut gpui::VisualTestContext,
@@ -4068,6 +4089,10 @@ mod tab_scoping_tests {
             );
             (first_id, second_id)
         });
+        // Freeze both panes before this test ever pumps the executor - see
+        // `freeze_pane_for_test`'s own docs (GitHub issue #524, #543).
+        freeze_pane_for_test(&app, cx, first_id);
+        freeze_pane_for_test(&app, cx, second_id);
         cx.run_until_parked();
 
         set_live_title(&app, cx, first_id, "\u{2733} Claude Code");
@@ -4118,13 +4143,16 @@ mod tab_scoping_tests {
                 cx,
             )
         });
+        // Freeze the real shell's own output before this test ever pumps the executor - see
+        // `freeze_pane_for_test`'s own docs (GitHub issue #524, #543). This cannot undo whatever
+        // the real process already wrote before this line (its own ConPTY startup handshake);
+        // `set_live_title(.., "")` below still clears that explicitly.
+        freeze_pane_for_test(&app, cx, shell_id);
         cx.run_until_parked();
         // A real Windows `cmd.exe` sets its own OSC 0 title (its own full executable path) as
-        // part of its ConPTY startup handshake - genuinely, not a fixture artifact - and the
-        // pane's output task now processes that the moment it arrives rather than only on a
-        // polling interval (`docs/architecture/decisions.md` §8's amendment), so by the time
-        // `run_until_parked` above returns it may already have landed. Clearing it explicitly is
-        // what actually puts this pane in the "titleless" state this test means to exercise.
+        // part of its ConPTY startup handshake - genuinely, not a fixture artifact. Clearing it
+        // explicitly is what actually puts this pane in the "titleless" state this test means to
+        // exercise.
         set_live_title(&app, cx, shell_id, "");
         cx.run_until_parked();
 

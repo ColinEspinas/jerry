@@ -1064,6 +1064,10 @@ mod code_view_cache_tests {
         );
     }
 
+    /// GitHub issue #543: the real wall clock raced a slow CI runner (`left: 8, right: 4` on
+    /// macOS) between the two renders this test means to keep inside one throttle window. Drives
+    /// `AdeApp::file_view_freshness_clock_override` explicitly instead, so both "still inside the
+    /// window" and "the window has passed" are asserted against a clock this test fully controls.
     #[gpui::test]
     fn renders_within_the_throttle_window_do_not_pick_up_a_fresh_on_disk_change(
         cx: &mut TestAppContext,
@@ -1075,6 +1079,11 @@ mod code_view_cache_tests {
         let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         app.update_in(cx, |app, window, cx| {
             app.open_file_view(file_path.clone(), window, cx);
+        });
+
+        let mut clock = std::time::Instant::now();
+        app.update(cx, |app, _| {
+            app.file_view_freshness_clock_override = Some(clock);
         });
         app.update(cx, |app, cx| {
             app.render_center_pane(cx);
@@ -1097,6 +1106,13 @@ mod code_view_cache_tests {
         )
         .expect("rewrite sample.rs");
 
+        // One millisecond later on the injected clock - still well inside
+        // `FILE_FRESHNESS_CHECK_INTERVAL`, regardless of how much real wall-clock time this
+        // process actually took to reach this line.
+        clock += std::time::Duration::from_millis(1);
+        app.update(cx, |app, _| {
+            app.file_view_freshness_clock_override = Some(clock);
+        });
         app.update(cx, |app, cx| {
             app.render_center_pane(cx);
         });
@@ -1121,9 +1137,10 @@ mod code_view_cache_tests {
             "no reload should have been dispatched while the freshness check was throttled"
         );
 
-        // Clear the throttle - the change is now observed.
+        // Past the throttle window on the same injected clock - the change is now observed.
+        clock += FILE_FRESHNESS_CHECK_INTERVAL;
         app.update(cx, |app, _| {
-            app.file_view_last_freshness_check = None;
+            app.file_view_freshness_clock_override = Some(clock);
         });
         app.update(cx, |app, cx| {
             app.render_center_pane(cx);

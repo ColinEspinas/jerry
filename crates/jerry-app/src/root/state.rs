@@ -487,6 +487,8 @@ impl AdeApp {
             file_view_cache: None,
             diff_highlight_cache: None,
             file_view_last_freshness_check: None,
+            #[cfg(test)]
+            file_view_freshness_clock_override: None,
             file_load_state: FileLoadState::Idle,
             file_view_changed_lines: HashSet::new(),
             minimap_panel_bounds: gpui::Bounds::default(),
