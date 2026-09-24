@@ -1631,3 +1631,118 @@ app's whole lifetime), but whichever issue first needs to actually drop a `RepoH
 own detached-sessions work, or a later one) must make `RepoHost`'s `Drop` shut down its
 subscription sockets so those threads actually exit, not just leave the entry unreachable while
 its threads keep running.
+
+## 26. The live hook store moves into `jerry-host`, behind `HooksQuery`/`HookAck`; the persisted
+history and the rendering-tuned parser both stay in `jerry-app`
+
+**Status:** Accepted (2026-09-24, issue #532).
+
+**Context:** §23's "what still has not moved" named `hooks/store.rs` as the one remaining piece of
+per-instance state, on the strength of the same reasoning that already moved sessions and agents:
+a hook posted to one `jerry-app`/`jerry-cli`/`jerry-mcp` instance was only ever visible to that
+instance. Reading the actual code turned up two different things both plausibly called "the hook
+store": `hooks/store.rs`'s own `AgentStatusState` (issue #227's on-disk, cross-restart history,
+already merged across instances by its own file-based `save_merged_at`, so it does not actually
+have the cross-*instance-visibility* gap the issue is about) and `hooks/mod.rs`'s `HookRuntime`
+(the live, in-memory, genuinely single-instance `HookInbox`/`EditLog` a rail row reads via
+`signal_for`/`text_for`). The second one is the real target - it is what `AgentsQuery`/
+`SessionsQuery` solved the identical problem for - and this decision is scoped to it alone.
+
+**Decision:**
+
+- **`jerry-core` gains `hooks.rs`**: `HookKind` (`Waiting`/`Working`/`Done`/`Error` - the same
+  four-way split `jerry-app`'s own `hooks::event::HookFact` already made, for the same reason),
+  `HookStatus { agent_id, kind, message, since, last_event }` (one coarse fact per agent),
+  `HookInboxEntry { agent_id, event, received_at, seq, payload }` (one raw entry, bounded), and
+  the `HooksQuery { agent: Option<AgentId> }` / `HookAck { agent_id, up_to }` catalogue entries -
+  cataloged, fixtured (`fixtures/request-query-hooks.json`, `fixtures/request-command-hook-ack.json`)
+  and round-tripped exactly like every other `AppQuery`/`AppCommand` variant (§15).
+- **`jerry-host` gains `hooks.rs`**: `HookStore`, a bounded map from `AgentId` to (a per-agent raw
+  inbox, capped at `HOOK_INBOX_CAP_PER_AGENT` entries, drop-oldest; a coarse `HookStatus`), plus
+  the map itself capped at `MAX_TRACKED_AGENTS` (mirroring `jerry_app::hooks::inbox`'s own
+  identical cap and reasoning) so an unbounded stream of invented agent ids cannot grow it forever
+  even before `HookAck` or eviction-on-forget ever runs. `dispatch.rs`'s existing `Hook` arm now
+  calls `HookStore::record` before broadcasting, and broadcasts the resulting typed
+  `HookInboxEntry` on `event/hook` in place of the previous ad hoc `{agent, cwd, event, payload}`
+  object - the same notification, a typed payload. `HooksQuery`/`HookAck` are answered directly
+  from `inner.hooks()`, exactly like `AgentsQuery`/`SessionsQuery` before them: never actually
+  reached through `Query::run`/`Command::execute`. An agent caller may only ask about its own id -
+  a data-dependent rule `Invocability` cannot express on its own, so `HooksQuery` stays
+  `Invocability::Allowed` and the dispatcher itself refuses any other id as `FORBIDDEN`, the same
+  vocabulary `classify`/`confine` already use for the identical shape of refusal.
+- **"Cleared when the session is forgotten" is query-time filtering, not a second removal path.**
+  `HooksQuery`'s dispatch cross-references `inner.agents().list()` and drops any status for an
+  agent the host no longer knows about - the same mechanism `SessionManager::agent_entries`'s own
+  exit filter already gives `AgentsQuery` "for free" (§23), not a new hook into `SessionManager::
+  forget_agent`/`forget_session`. This was a deliberate scope boundary, not an oversight: the
+  builder for this issue was constrained to dispatch.rs's hook arms plus a new `hooks.rs` module,
+  precisely so this change and #507's own concurrent `session.rs`/`data_plane.rs` work would not
+  collide - and `SessionManager`'s public surface already gives the query-time answer everything
+  it needs without touching that file at all. The underlying map still empties eventually (the
+  `MAX_TRACKED_AGENTS` eviction above), just not the instant an agent is forgotten.
+- **The host derives `HookStatus.kind`/`message` with its own small, real function**
+  (`jerry_host::hooks::derive_status`, `pub` for the next bullet's reuse) rather than reusing
+  `jerry-app`'s own `hooks::event::parse`. The two are deliberately not the same code: `event::
+  parse` is ~350 lines of rendering-tuned business logic (nudge-vs-transition classification so a
+  generic notification cannot overwrite a `PermissionRequest`'s real question, per-tool argument
+  extraction, truncation widths sized for the rail's own row width, run-level accumulation of
+  turns/first-prompt) that has no reason to exist in a crate `jerry-cli`/`jerry-mcp` also link, and
+  moving it there was explicitly out of scope for the same "keep jerry-host's changes small" reason
+  as the bullet above. `derive_status` is real, not a placeholder - it reads the same real payload
+  fields (`tool_name`, `notification_type`, `error_message`, …) and treats an unrecognized event or
+  a non-blocking `Notification` as "no change" rather than fabricating a status - but it is
+  intentionally coarser: it does not reproduce `EventKind`'s nudge-suppression nuance (a
+  `Notification` never overwrites a *richer* previous message the way `jerry-app`'s own
+  `merge_nudge` does), only whether it should overwrite the coarse `kind` at all.
+- **`jerry-app`'s `hooks/store.rs` gains `HookStatusCache`**, a local mirror of the host's
+  `HookStatus` per agent - seeded via a real `HooksQuery` dispatch the moment a repository's
+  connection opens (`AdeApp::seed_hook_status_cache`, called from both `ensure_repo_host_connected`
+  and the test-only `adopt_repo_host_for_test`, so a test-adopted host seeds identically to a real
+  one rather than silently skipping the step) and kept current by `hooks/mod.rs`'s existing
+  `spawn_consumer`, which now deserializes each `event/hook` notification into a typed
+  `HookInboxEntry` and calls `HookStatusCache::apply` - itself calling the identical
+  `jerry_host::hooks::derive_status` the host used to build the notification in the first place, so
+  the cache can never compute a different answer than the host already gave. Seeding *merges*
+  rather than replacing: the cache is one field spanning every open repository, `HooksQuery` is
+  dispatched per repository, and a naive clear-then-insert would let a second repository's connect
+  erase the first repository's entries.
+- **`hooks/mod.rs`'s existing rich local pipeline (`HookRuntime`/`HookInbox`/`EditLog`,
+  `hooks/event.rs`'s `parse`/`merge_nudge`, `hooks/inbox.rs`) is unchanged in behavior** - only
+  adapted from digging fields out of a raw `serde_json::Value` to reading the typed
+  `HookInboxEntry` the notification now carries (`record_hook_notification`'s new signature). The
+  rail (`signal_for`/`text_for`/`session_id_for`/`run_facts_for`/`drain_edits`) still reads this
+  local pipeline exclusively; `HookStatusCache` is not wired into any render site by this issue.
+  This is a deliberate, narrower scope than the issue's own text suggested ("rewrite every
+  read/write site... to dispatch a Command/Query instead"): the rich pipeline's own fidelity
+  (activity vs. question kept apart, per-file edit tracking for issue #284, turns/first-prompt/
+  session-id for issue #227, nudge-aware merging) has no lossless counterpart in the coarse
+  `HookStatus` the host now answers with, and collapsing it down to match `HooksQuery`'s shape
+  would be a real rendering regression, not a refactor. What moved is exactly the piece that had a
+  real cross-instance-visibility gap and a coarse-enough shape to move safely; the rest stays,
+  documented rather than silently left as if untouched.
+- **The persisted, cross-restart history (`AgentStatusState`, issue #227) is untouched and stays
+  in `jerry-app`.** It is not the store this issue's motivating problem is about: it already
+  merges across instances via its own `save_merged_at` (a real file-based CRDT-shaped merge, not
+  in-memory state one instance holds exclusively), and its fields (`files_changed`/`insertions`/
+  `deletions`, `ended_at_unix`, the five-way `Status`) are rendering/history-specific in exactly the
+  way `HookStatus`'s deliberately coarse four-way `kind` is not meant to carry.
+- **`HookAck` is real but not yet dispatched anywhere in `jerry-app`.** The Command exists,
+  round-trips, is denied to agents, and is proven against a real host (`hook_ack_is_denied_to_
+  agents_and_leaves_the_current_status_intact`), but `hooks/mod.rs`'s consumer does not call it
+  after applying an entry - the host's own `HOOK_INBOX_CAP_PER_AGENT` FIFO already bounds memory
+  regardless, so this is a real, deferred optimization (letting the host prune acknowledged
+  entries early) rather than something correctness depends on. A future caller has a real, tested
+  Command to dispatch when this is worth doing.
+- **`jerry hooks [--agent <id>] [--json]`** (`crates/jerry-cli/src/lib.rs`) lists `HooksQuery`'s
+  answer, one line as `<agent_id>\t<kind>\t<message>`, mirroring `jerry agents`/`jerry sessions`
+  exactly - the MCP tool catalogue picks up `HooksQuery`/`HookAck` automatically, since both are
+  now `AppQuery`/`AppCommand` variants `Request::examples()` already covers.
+
+**Consequences:** A hook posted to one instance is now visible to every other one watching the
+same host - the issue's own motivating problem - for the coarse status a `HooksQuery` answers
+with; the rail's own richer status still depends on that instance having seen the live event
+itself (or, since this issue, the connect-time seed narrowing that gap to "before this instance
+ever connected" rather than "for this instance's whole lifetime"). `hooks/event.rs`'s ~350 lines
+and `hooks/inbox.rs`'s own tests are unmodified by this issue, deliberately - see the scope bullet
+above. `crates/jerry-host/src/session.rs` and `data_plane.rs` were not touched, keeping this
+change small alongside issue #507's own concurrent work on those files.
