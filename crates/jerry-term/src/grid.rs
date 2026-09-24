@@ -1,7 +1,7 @@
 //! ANSI/VT100 terminal grid emulation via `alacritty_terminal::Term`.
 
-use crate::terminal::mouse::{MouseEncoding, MouseProtocol, MouseTracking};
-use crate::terminal::osc::{OscWatcher, Progress};
+use crate::mouse::{MouseEncoding, MouseProtocol, MouseTracking};
+use crate::osc::{OscWatcher, Progress};
 use alacritty_terminal::event::{Event as AlacEvent, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll as AlacScroll};
 use alacritty_terminal::index::{Column, Line, Point as AlacPoint, Side};
@@ -508,6 +508,39 @@ impl TerminalGrid {
         rows
     }
 
+    /// The cursor's own `(row, col)` in this grid's current `(rows, cols)` - `None` when the
+    /// child process has hidden it (`\x1b[?25l`). Used for a reattach snapshot
+    /// (`docs/architecture/decisions.md` §25): a headless grid is never scrolled back
+    /// (`Self::scroll_display` is only ever called from `crate::terminal::pane`'s own UI-driven
+    /// scrollbar), so unlike [`Self::visible_rows`] this needs no `display_offset` correction.
+    pub fn cursor_position(&self) -> Option<(u16, u16)> {
+        let content = self.term.renderable_content();
+        (content.cursor.shape != CursorShape::Hidden)
+            .then_some(content.cursor.point)
+            .map(|point| (point.line.0.max(0) as u16, point.column.0 as u16))
+    }
+
+    /// Up to `cap` lines of real scrollback history, oldest first, in the same per-cell shape
+    /// [`Self::visible_rows`] uses - the bounded tail a reattach snapshot carries
+    /// (`docs/architecture/decisions.md` §25), read directly off `Term`'s own retained `Grid`
+    /// rather than through `renderable_content()`'s viewport-scoped `display_iter`. Never
+    /// includes the on-screen rows [`Self::visible_rows`] already covers.
+    pub fn scrollback_tail(&self, palette: &TerminalPalette, cap: usize) -> Vec<Vec<GridCell>> {
+        let grid = self.term.grid();
+        let available = grid.history_size();
+        let take = available.min(cap);
+        (0..take)
+            .rev()
+            .map(|offset_from_top| {
+                let line = Line(-(offset_from_top as i32) - 1);
+                (&grid[line])
+                    .into_iter()
+                    .map(|cell| grid_cell_from_alacritty(cell, false, false, palette))
+                    .collect()
+            })
+            .collect()
+    }
+
     // -------------------------------------------------------------- scrollback (issue #331)
 
     /// Scrolls the viewport into (or back out of) retained scrollback history. A thin wrapper
@@ -862,7 +895,7 @@ mod grid_emulation_tests {
         assert_eq!(
             grid.progress(),
             Some(Progress {
-                state: crate::terminal::osc::ProgressState::Normal,
+                state: crate::osc::ProgressState::Normal,
                 percent: Some(60)
             })
         );
@@ -1716,8 +1749,8 @@ mod selection_tests {
 
 #[cfg(test)]
 mod mouse_protocol_tests {
-    use crate::terminal::grid::TerminalGrid;
-    use crate::terminal::mouse::{MouseEncoding, MouseTracking};
+    use crate::grid::TerminalGrid;
+    use crate::mouse::{MouseEncoding, MouseTracking};
 
     fn grid_after(bytes: &[u8]) -> TerminalGrid {
         let mut grid = TerminalGrid::new(5, 20);

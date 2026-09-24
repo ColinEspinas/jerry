@@ -1,0 +1,29 @@
+[package]
+name = "jerry-term"
+version = { workspace = true }
+edition = { workspace = true }
+publish = { workspace = true }
+license = { workspace = true }
+description = "The gpui-free VT100/grid engine shared by jerry-app's own rendered pane and jerry-host's headless per-session grid (docs/architecture/decisions.md §25)"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Real ANSI/grid terminal emulation. Pinned to the exact git rev `vendor/zed/Cargo.toml` itself
+# pins, so this is the same fork/version Zed's own `terminal` crate verified against - copied
+# verbatim from `crates/jerry-app/Cargo.toml`'s own former pin, not re-derived.
+# `vte` (alacritty_terminal's own VT100 parser) is used via `alacritty_terminal`'s own re-export
+# (`alacritty_terminal::vte`) rather than as a separate top-level dependency here, so there's no
+# risk of it drifting to a different `vte` version than the one `alacritty_terminal` itself was
+# built against.
+alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "4c129667ce56611becdc82de6e28218c80e2e88f" }
+
+[dev-dependencies]
+# The workspace's shared fixtures (`wait_until`, real-pty test helpers) - deliberately gpui-free,
+# so depending on it here cannot violate decisions.md §1.
+test-support = { path = "../test-support" }
+# grid.rs's own real-pty tests (moved here verbatim from jerry-app) spawn a real child directly
+# to prove the VT parser against genuine terminal output, never a hand-built byte string.
+jerry-pty = { path = "../jerry-pty" }
+futures = { workspace = true }
