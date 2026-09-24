@@ -4416,6 +4416,7 @@ dependencies = [
  "jerry-host",
  "jerry-lsp",
  "jerry-pty",
+ "jerry-ui",
  "libc",
  "log",
  "notify",

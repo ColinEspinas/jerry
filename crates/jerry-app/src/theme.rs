@@ -203,6 +203,61 @@ pub fn theme_is_light(window_background: Rgba) -> bool {
     hsla.l > 0.5
 }
 
+/// Builds a real `jerry_ui::Theme` from this app's own *live* resolved palette
+/// ([`ColorToken::resolve`], via every token's `Into<Hsla>`) - the one place this crate's
+/// ~270-key palette becomes `jerry-ui`'s much smaller semantic tier. Called fresh at every
+/// render site that draws a `jerry_ui` component (not cached), so a custom theme swap
+/// ([`set_current_theme`]) repaints a migrated component exactly like every hand-rolled call
+/// site around it. Non-colour tokens read this crate's own `radius`/`zone`/`band` constants
+/// directly, for the same reason - `jerry_ui::theme::Motion` has no equivalent here yet, so
+/// that tier alone falls back to `jerry_ui::Theme::default`'s own values.
+pub fn jerry_ui_theme() -> jerry_ui::Theme {
+    jerry_ui::Theme {
+        colors: jerry_ui::theme::Colors {
+            surface: surface::CARD.into(),
+            surface_raised: surface::POPOVER.into(),
+            surface_hover: surface::ROW_HOVER_ALT.into(),
+            surface_selected: surface::ROW_SELECTED.into(),
+            border: border::BUTTON.into(),
+            border_disabled: border::BUTTON_DISABLED.into(),
+            text: text::PRIMARY.into(),
+            text_muted: text::MUTED.into(),
+            text_disabled: text::GHOSTER.into(),
+            text_on_accent: text::SELECTED.into(),
+            accent: syntax::FUNCTION.into(),
+            accent_hover: button::BLUE_BG_HOVER.into(),
+            status: jerry_ui::theme::StatusColors {
+                ok: status::REVIEW.into(),
+                ok_bg: status::REVIEW_BG.into(),
+                warn: status::ASK.into(),
+                warn_bg: status::ASK_BG.into(),
+                fail: status::FAIL.into(),
+                fail_bg: status::FAIL_BG.into(),
+                info: status::RUN.into(),
+                info_bg: status::RUN_BG.into(),
+            },
+        },
+        spacing: jerry_ui::theme::Spacing {
+            xs: px(4.0),
+            sm: px(6.0),
+            md: px(8.0),
+            lg: px(10.0),
+            xl: px(16.0),
+        },
+        radius: jerry_ui::theme::Radius {
+            sm: radius::CHIP,
+            md: radius::BUTTON,
+            lg: radius::CARD,
+            pill: radius::PILL,
+        },
+        motion: jerry_ui::Theme::default().motion,
+        dimensions: jerry_ui::theme::Dimensions {
+            rail_width: zone::RAIL_WIDTH,
+            tab_height: band::CHROME_HEADER,
+        },
+    }
+}
+
 /// Real OKLCH colour maths - the perceptual space this palette is authored and derived in.
 mod oklch {
     use super::Rgba;
@@ -4238,5 +4293,19 @@ mod syntax_palette_tests {
                 );
             }
         }
+    }
+}
+
+/// Proves the `jerry_ui` migration is visually neutral (issue #503's design brief, item 5): with
+/// no custom theme installed (Jerry Dark, the identity case - see [`CURRENT_THEME`]'s own docs),
+/// [`super::jerry_ui_theme`]'s output must equal `jerry_ui::Theme::default`'s own hand-copied
+/// literals exactly, token by token - not "close enough", a real `assert_eq!`.
+#[cfg(test)]
+mod jerry_ui_theme_tests {
+    use super::jerry_ui_theme;
+
+    #[test]
+    fn jerry_dark_produces_exactly_jerry_uis_own_default_theme() {
+        assert_eq!(jerry_ui_theme(), jerry_ui::Theme::default());
     }
 }

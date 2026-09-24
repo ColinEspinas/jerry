@@ -194,34 +194,15 @@ impl AdeApp {
                 },
             ))
             .child(
-                div()
-                    .id("settings-open-file")
-                    .flex_none()
-                    .h(px(20.0))
-                    .px(px(8.0))
-                    .rounded(theme::radius::BUTTON)
-                    .border_1()
-                    .flex()
-                    .items_center()
-                    .font(font(theme::font::SANS))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_size(self.ui_text_size(10.5))
-                    .child("Open file")
-                    .when(is_json, |el| {
-                        // No real settings.json file exists to open - see this method's docs.
-                        el.cursor_default()
-                            .border_color(theme::border::BUTTON_DISABLED)
-                            .text_color(theme::text::GHOSTER)
-                    })
-                    .when(!is_json, |el| {
-                        el.cursor_pointer()
-                            .border_color(theme::border::BUTTON)
-                            .text_color(theme::text::MUTED)
-                            .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
-                            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                                this.open_settings_file(cx);
-                            }))
-                    }),
+                // `jerry_ui::Button` (decisions.md §27) - `is_json` disables it outright rather
+                // than attaching an inert click handler, since no real `settings.json` file
+                // exists to open (see this method's own docs).
+                jerry_ui::Button::new("settings-open-file", "Open file", theme::jerry_ui_theme())
+                    .disabled(is_json)
+                    .font_family(theme::font::SANS)
+                    .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                        this.open_settings_file(cx);
+                    })),
             )
     }
 

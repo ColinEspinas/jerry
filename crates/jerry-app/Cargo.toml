@@ -28,6 +28,8 @@ jerry-lsp = { path = "../jerry-lsp" }
 # The contract crate and the in-process session host (decisions.md §15, §16).
 jerry-core = { path = "../jerry-core" }
 jerry-host = { path = "../jerry-host" }
+# Jerry's design-system crate (decisions.md §27) - theming tokens and reusable components.
+jerry-ui = { path = "../jerry-ui" }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 # `crate::terminal::pane`'s poll-free output loop awaits `jerry_pty::PtyOutput` directly
