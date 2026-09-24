@@ -4548,6 +4548,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "jerry-ui"
+version = "0.2.0"
+dependencies = [
+ "gpui",
+ "serde",
+ "thiserror 1.0.69",
+ "toml 0.8.23",
+]
+
+[[package]]
 name = "jiff"
 version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -37,8 +37,11 @@ observation made against a debug build is trustworthy.
 ## Architecture
 
 Dependencies point inward. `jerry-git`, `jerry-pty`, `jerry-lsp` are pure domain/infrastructure crates
-with **zero `gpui` dependency** — that must never change. `crates/jerry-app` is the only crate allowed to
-depend on `gpui`. Full detail and the reasoning behind each rule:
+with **zero `gpui` dependency** — that must never change. `crates/jerry-app` and `crates/jerry-ui` are
+the only two crates allowed to depend on `gpui`. `jerry-ui` (Jerry's design-system crate: theming
+tokens plus reusable components) depends on `gpui` and nothing else of ours — not `jerry-app`, not any
+core crate — so `jerry-app` constructs its `Theme` and passes it in rather than `jerry-ui` reaching for
+app state. Full detail and the reasoning behind each rule:
 [`docs/architecture/overview.md`](docs/architecture/overview.md),
 [`docs/architecture/crates.md`](docs/architecture/crates.md),
 [`docs/architecture/decisions.md`](docs/architecture/decisions.md).

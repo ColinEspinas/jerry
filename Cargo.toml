@@ -8,6 +8,9 @@ members = [
     "crates/jerry-host",
     "crates/jerry-cli",
     "crates/jerry-app",
+    # Jerry's design-system crate (docs/architecture/decisions.md §27) - the second, and only
+    # other, crate in this workspace allowed to depend on `gpui`.
+    "crates/jerry-ui",
     # Dev-dependency only, and deliberately gpui-free so the core crates can use it too
     # (docs/architecture/decisions.md §1, docs/testing.md).
     "crates/test-support",
