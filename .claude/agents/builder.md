@@ -28,6 +28,10 @@ behind it.
 Test runs on a machine with a real `claude` on `PATH` spawn real agent sessions unless the
 branch already has the ui-tier stub (GitHub issue #530); until then strip that directory from
 `PATH` for every `cargo nextest` invocation. Run `cargo nextest run --workspace` once, at the end,
-and compare failures by name against your base commit; never rerun a suite to "see if it passes".
+and compare failures by name against a saved baseline for your base commit
+(`%LOCALAPPDATA%\jerry-dev\baselines\<base-sha>.txt`; create it from one run of the base commit
+only if it does not exist yet); never rerun a suite to "see if it passes". Cross-target clippy
+(`--target x86_64-unknown-linux-gnu`) covers only the gpui-free crates you touched. Use a private
+`CARGO_TARGET_DIR` inside your worktree; dependencies come from the machine-wide sccache.
 
 In your report, separate what genuinely works from what merely compiles.
