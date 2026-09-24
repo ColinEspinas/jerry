@@ -28,6 +28,10 @@ jerry-lsp = { path = "../jerry-lsp" }
 # The contract crate and the in-process session host (decisions.md §15, §16).
 jerry-core = { path = "../jerry-core" }
 jerry-host = { path = "../jerry-host" }
+# The gpui-free VT100/grid engine (`crate::terminal::grid`/`mouse`/`osc` re-export it wholesale -
+# decisions.md §25) - shared with `jerry-host`'s own headless per-session grid rather than
+# duplicated, since it never depended on `gpui` even while it lived in this crate.
+jerry-term = { path = "../jerry-term" }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 # `crate::terminal::pane`'s poll-free output loop awaits `jerry_pty::PtyOutput` directly
@@ -37,14 +41,6 @@ anyhow = { workspace = true }
 futures = { workspace = true }
 env_logger = "0.11"
 log = "0.4"
-# Real ANSI/grid terminal emulation, replacing step 3's hand-rolled plain-text scan (see
-# `crate::terminal_pane`'s module docs). Pinned to the exact git rev `vendor/zed/Cargo.toml`
-# itself pins, so this is the same fork/version Zed's own `terminal` crate verified against.
-# `vte` (alacritty_terminal's own VT100 parser) is used via `alacritty_terminal`'s own
-# re-export (`alacritty_terminal::vte`, see `crate::terminal_grid`'s docs) rather than as a
-# separate top-level dependency here, so there's no risk of it drifting to a different `vte`
-# version than the one `alacritty_terminal` itself was built against.
-alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "4c129667ce56611becdc82de6e28218c80e2e88f" }
 # Real Rust syntax highlighting for Surface C's File view (`crate::code_view`) - pinned to the
 # exact versions `vendor/zed/Cargo.toml` itself pins (`tree-sitter = "0.26.9"`,
 # `tree-sitter-rust = "0.24.2"`), so this is the same grammar/bindings pair Zed's own `language`

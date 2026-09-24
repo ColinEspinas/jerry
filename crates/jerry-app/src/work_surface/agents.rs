@@ -783,81 +783,117 @@ impl Agents {
                 });
                 return;
             };
-            let attached = this.update(cx, |this, _cx| {
-                // Real only for a `#[cfg(test)]` in-process repository - a production
-                // `Connection::Remote` one (or a test that swapped one in via `RepoHost::
-                // for_test_remote`) always answers `None` here, and attaches over the socket
-                // instead, below.
-                let handle = this
-                    .sessions_for(&spawn_cwd)
-                    .and_then(|sessions| sessions.handle_for(&session_id));
-                let pending_exit = this.agents.set_host_session_id(id, session_id.clone());
-                (handle, this.control_plane_for(&spawn_cwd), pending_exit)
-            });
-            let Ok((in_process_handle, control_plane, pending_exit)) = attached else {
-                return; // the app itself was dropped before this could even be asked
-            };
-            if let Some((pane, status)) = pending_exit {
-                // This exact session already exited before this attach round trip even resolved
-                // (real on Linux - `Agents::pending_exits`'s own docs) - the process is already
-                // gone, so there is nothing left to attach. Apply the real exit directly and stop
-                // here, rather than attaching a (moot) adapter to a process that no longer exists:
-                // a socket-attached session's own data-plane adapter synthesizes no exit signal of
-                // its own, so this is the only place such a session's real exit is ever observed
-                // (decisions.md §25).
-                pane.update(cx, |pane, cx| pane.mark_exited_from_event(&status, cx));
-                return;
-            }
-            let adapter: Arc<dyn SessionAdapter> = match in_process_handle {
-                Some(handle) => handle,
-                None => {
-                    match crate::host::attach_remote_session(
-                        &this,
-                        spawn_cwd.clone(),
-                        session_id.clone(),
-                        cx,
-                    )
-                    .await
-                    {
-                        Ok(adapter) => adapter,
-                        Err(message) => {
-                            let _ = spawn_pane.update(cx, |pane, cx| {
-                                pane.mark_spawn_failed(
-                                    format!("could not attach to this session: {message}"),
-                                    cx,
-                                )
-                            });
-                            return;
-                        }
-                    }
-                }
-            };
-            let attach_outcome = spawn_pane.update(cx, |pane, cx| {
-                pane.attach_session(adapter.clone(), control_plane, cx)
-            });
-            if attach_outcome.is_err() {
-                // The pane entity itself is already gone - not just doomed, which `TerminalPane::
-                // attach_session` already handles on its own by leaving the session for whichever
-                // caller is already polling `TerminalPane::take_session_for_teardown` to pick up
-                // and shut down. Nothing will ever reach this session through a pane again, so
-                // this task must kill it itself rather than silently drop the handle: unlike the
-                // old direct `jerry_pty::spawn`, `SessionManager` keeps a session's real process
-                // alive independent of any pane, so dropping the handle alone leaks it (GitHub
-                // issue #530's own regression).
-                cx.background_executor()
-                    .spawn(async move {
-                        if let Err(err) = adapter.shutdown() {
-                            log::warn!(
-                                "failed to shut down a session whose pane was already gone by \
-                                 attach time: {err}"
-                            );
-                        }
-                    })
-                    .detach();
-            }
+            attach_pane_to_session(&this, id, spawn_cwd, session_id, spawn_pane, cx).await;
         });
         self._spawn_tasks.push(spawn_task);
         id
+    }
+
+    /// Reattaches a tab to an already-live host session instead of spawning a fresh process
+    /// (`docs/architecture/decisions.md` §26, decision Q21's reconnect-on-launch reconciliation):
+    /// creates the pane and its table entry exactly like [`Self::spawn`] does, but skips
+    /// `SessionSpawn` entirely and attaches straight to `session_id` - what makes a reattached
+    /// tab paint its session's real history immediately (`SessionAttach`'s own snapshot) instead
+    /// of looking like a fresh, empty spawn. The caller is responsible for the tab's own slot in
+    /// `crate::root::AdeApp::tab_order` - this only creates the agent and its pane.
+    // Eight parameters, the same count `Self::spawn`'s own already-`#[allow]`'d shape has (that
+    // method's own docs) - every one a distinct value the caller already has, so bundling into a
+    // struct would add a type built and destructured once, not reduce anything.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_reattached(
+        &mut self,
+        kind: ProcessKind,
+        cwd: PathBuf,
+        terminal_font_size_px: f32,
+        shell_override: Option<&str>,
+        session_id: jerry_core::SessionId,
+        window: &mut Window,
+        cx: &mut Context<AdeApp>,
+    ) -> AgentId {
+        let spec = kind.spec(cwd.clone(), shell_override, None);
+        let (id, pane) =
+            self.register_agent(kind, cwd.clone(), spec, terminal_font_size_px, window, cx);
+        let spawn_pane = pane.downgrade();
+        let spawn_cwd = cwd;
+        let attach_task = cx.spawn(async move |this, cx| {
+            attach_pane_to_session(&this, id, spawn_cwd, session_id, spawn_pane, cx).await;
+        });
+        self._spawn_tasks.push(attach_task);
+        id
+    }
+
+    /// Creates a tab that shows as already-exited, for a persisted tab whose recorded
+    /// `host_session_id` the host no longer has a live session for (decision Q21's own third
+    /// reconciliation case) - `status` is the host's own last-known real exit status, `None` when
+    /// the host has no memory of the session at all rather than a genuine observed exit. Never
+    /// dispatches `SessionSpawn` or attaches anything: there is no process left to reach.
+    // Eight parameters - see `Self::spawn_reattached`'s own identical justification just above.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_gone(
+        &mut self,
+        kind: ProcessKind,
+        cwd: PathBuf,
+        terminal_font_size_px: f32,
+        shell_override: Option<&str>,
+        status: Option<jerry_core::ExitStatusWire>,
+        window: &mut Window,
+        cx: &mut Context<AdeApp>,
+    ) -> AgentId {
+        let spec = kind.spec(cwd.clone(), shell_override, None);
+        let (id, pane) = self.register_agent(kind, cwd, spec, terminal_font_size_px, window, cx);
+        let status = status.unwrap_or(jerry_core::ExitStatusWire {
+            success: false,
+            code: 0,
+            signal: None,
+        });
+        pane.update(cx, |pane, cx| pane.mark_restored_as_gone(&status, cx));
+        id
+    }
+
+    /// The real shared half of [`Self::spawn_resolved`]/[`Self::spawn_reattached`]/
+    /// [`Self::spawn_gone`]: allocates a fresh id, creates the pane, wires its
+    /// [`TerminalPaneEvent`] subscription, and registers the new [`Agent`] - everything that
+    /// never depends on *how* (or whether) a real process ends up attached to it.
+    fn register_agent(
+        &mut self,
+        kind: ProcessKind,
+        cwd: PathBuf,
+        spec: TerminalSpec,
+        terminal_font_size_px: f32,
+        window: &mut Window,
+        cx: &mut Context<AdeApp>,
+    ) -> (AgentId, Entity<TerminalPane>) {
+        let id = self.next_id;
+        self.next_id += 1;
+        let pane = cx.new(|cx| TerminalPane::new(spec, terminal_font_size_px, cx));
+        let pane_subscription = cx.subscribe_in(
+            &pane,
+            window,
+            move |app, _pane, event, window, cx| match event {
+                TerminalPaneEvent::OpenPath { path, line } => {
+                    app.open_terminal_link(path.clone(), *line, window, cx);
+                }
+                TerminalPaneEvent::ProcessExited { clean } => {
+                    if *clean {
+                        app.close_agent(id, window, cx);
+                    }
+                }
+            },
+        );
+        self.agents.push(Agent {
+            id,
+            kind,
+            cwd: cwd.clone(),
+            pane: pane.clone(),
+            spawned_at: Instant::now(),
+            spawned_at_unix: unix_now(),
+            session_id: None,
+            host_session_id: None,
+            _pane_subscription: pane_subscription,
+        });
+        self.active = Some(id);
+        self.active_by_cwd.insert(cwd, id);
+        (id, pane)
     }
 
     /// Test-only: overrides an already-spawned agent's recorded [`ProcessKind`] without
@@ -1133,6 +1169,120 @@ pub(crate) async fn collect_doomed_sessions(
         }
     }
     doomed_sessions
+}
+
+/// The shared tail of [`Agents::spawn_resolved`]'s post-`SessionSpawn` continuation and
+/// [`Agents::spawn_reattached`]'s own continuation: given a real `session_id` already known to
+/// the host, records it on the agent table, attaches `spawn_pane` to whichever handle actually
+/// serves it (in-process, `crate::host::attach_remote_session` over the socket otherwise), and
+/// applies a pending exit if the session already ended before this ever got here - a socket-
+/// attached session's own data-plane adapter synthesizes no exit signal of its own, so the
+/// control plane (`Agents::pending_exits`) is the only place such an exit is ever observed
+/// (`docs/architecture/decisions.md` §25).
+async fn attach_pane_to_session(
+    this: &WeakEntity<AdeApp>,
+    agent_id: AgentId,
+    cwd: PathBuf,
+    session_id: jerry_core::SessionId,
+    spawn_pane: WeakEntity<TerminalPane>,
+    cx: &mut AsyncApp,
+) {
+    let attached = this.update(cx, |this, _cx| {
+        // Real only for a `#[cfg(test)]` in-process repository - a production `Connection::
+        // Remote` one (or a test that swapped one in via `RepoHost::for_test_remote`) always
+        // answers `None` here, and attaches over the socket instead, below.
+        let handle = this
+            .sessions_for(&cwd)
+            .and_then(|sessions| sessions.handle_for(&session_id));
+        let pending_exit = this
+            .agents
+            .set_host_session_id(agent_id, session_id.clone());
+        (handle, this.control_plane_for(&cwd), pending_exit)
+    });
+    let Ok((in_process_handle, control_plane, pending_exit)) = attached else {
+        return; // the app itself was dropped before this could even be asked
+    };
+    if let Some((pane, status)) = pending_exit {
+        pane.update(cx, |pane, cx| pane.mark_exited_from_event(&status, cx));
+        return;
+    }
+    let adapter: Arc<dyn SessionAdapter> = match in_process_handle {
+        Some(handle) => handle,
+        None => {
+            match crate::host::attach_remote_session(this, cwd.clone(), session_id.clone(), cx)
+                .await
+            {
+                Ok(adapter) => adapter,
+                Err(message) => {
+                    let _ = spawn_pane.update(cx, |pane, cx| {
+                        pane.mark_spawn_failed(
+                            format!("could not attach to this session: {message}"),
+                            cx,
+                        )
+                    });
+                    return;
+                }
+            }
+        }
+    };
+    // The real control-plane round trip just above (`command/session-attach`, resolving a real
+    // socket) is not instantaneous - a fast-exiting session's own real exit can land in
+    // `Agents::pending_exits` while it was in flight, exactly the race `Self::
+    // set_host_session_id`'s own docs describe, just discovered a moment later than the identical
+    // check above. Calling it again is what catches that: idempotent on `host_session_id` itself
+    // (already set), and a second, real answer from `pending_exits` if a new one arrived. A
+    // socket-attached session's own data-plane adapter synthesizes no exit signal of its own
+    // (decisions.md §25), so this is the last place such a session's exit would ever be observed
+    // if this check were skipped too - the real bug `e35f731` fixed for the check above, applying
+    // identically here.
+    let pending_exit_after_round_trip = this
+        .update(cx, |this, _cx| {
+            this.agents
+                .set_host_session_id(agent_id, session_id.clone())
+        })
+        .ok()
+        .flatten();
+    if let Some((pane, status)) = pending_exit_after_round_trip {
+        pane.update(cx, |pane, cx| pane.mark_exited_from_event(&status, cx));
+        // Never attached, so nothing owns this connection's own cleanup but this task - the
+        // session is already dead either way, so a failed shutdown here is not worth surfacing.
+        let _ = adapter.shutdown();
+        return;
+    }
+    let attach_outcome = spawn_pane.update(cx, |pane, cx| {
+        pane.attach_session(adapter.clone(), control_plane, cx)
+    });
+    if attach_outcome.is_ok() {
+        // The synchronous persist `Agents::spawn`'s own caller already made (`AdeApp::
+        // record_worktree_session`, from every real spawn site) recorded `host_session_id:
+        // None` - `Self::set_host_session_id` above is what first learns the real id, and only
+        // once this attach's own real `SessionSpawn`/`SessionAttach` round trip has resolved.
+        // Without a second persist here, a tab closed (or a window quit) before any *other*
+        // tab mutation happened to re-persist first would be recorded with no id to reattach
+        // by at all - a relaunch's own reconciliation (`docs/architecture/decisions.md` §25)
+        // would then always fall back to a fresh spawn instead of finding this session still
+        // live, even though it plainly still is.
+        let _ = this.update(cx, |this, cx| this.record_worktree_session(cx));
+    }
+    if attach_outcome.is_err() {
+        // The pane entity itself is already gone - not just doomed, which `TerminalPane::
+        // attach_session` already handles on its own by leaving the session for whichever caller
+        // is already polling `TerminalPane::take_session_for_teardown` to pick up and shut down.
+        // Nothing will ever reach this session through a pane again, so this task must kill it
+        // itself rather than silently drop the handle: unlike the old direct `jerry_pty::spawn`,
+        // `SessionManager` keeps a session's real process alive independent of any pane, so
+        // dropping the handle alone leaks it (GitHub issue #530's own regression).
+        cx.background_executor()
+            .spawn(async move {
+                if let Err(err) = adapter.shutdown() {
+                    log::warn!(
+                        "failed to shut down a session whose pane was already gone by attach \
+                         time: {err}"
+                    );
+                }
+            })
+            .detach();
+    }
 }
 
 /// Real wall-clock seconds since the Unix epoch, for [`Agent::spawned_at_unix`]. Mirrors
@@ -1657,6 +1807,7 @@ mod remote_attach_tests {
     use crate::host::RepoHost;
     use crate::test_support::{open_test_app, temp_repo};
     use gpui::TestAppContext;
+    use jerry_core::Report;
     use std::time::Duration;
     use test_support::wait_until;
 
@@ -1737,6 +1888,103 @@ mod remote_attach_tests {
             }),
             "closing the tab must really kill the remote session - through RemoteRepoHost, never \
              a block_on over LocalClient - with run_until_parked never hanging while it does"
+        );
+
+        host.shutdown_and_join();
+    }
+
+    /// `docs/architecture/decisions.md` §25's own disconnect-vs-kill rule, at the socket-attached
+    /// path specifically: dropping the test app that holds a `SocketSessionAdapter` (closing its
+    /// window, the real trigger for GPUI to actually release the root view - see
+    /// `crate::test_support::dropping_a_test_app_leaves_no_spawned_agent_process_behind`'s own
+    /// identical pattern) must disconnect that adapter, never kill the session it was attached
+    /// to. Checked through a *second*, entirely independent client connection to the same real
+    /// host - the one honest way to prove the session outlived the app that spawned it, since
+    /// nothing about the (now-dropped) app's own state could be trusted to answer that question.
+    #[gpui::test]
+    async fn dropping_the_app_leaves_a_socket_attached_session_alive(cx: &mut TestAppContext) {
+        let repo = temp_repo();
+        let (app, cx) = open_test_app(cx, repo.to_path_buf());
+        cx.run_until_parked();
+
+        let host = jerry_host::Host::start().expect("host");
+        let socket_dir = jerry_core::registry::runtime_dir().expect("runtime dir");
+        let socket = socket_dir.join(format!(
+            "da-{:x}-{:08x}.sock",
+            std::process::id(),
+            jerry_core::registry::fresh_u32()
+        ));
+        host.listen(&socket).expect("listen");
+        let client = jerry_core::client::Client::connect(&socket, Duration::from_secs(5))
+            .expect("connect to the real socket");
+        let repo_host =
+            RepoHost::for_test_remote(client, socket.clone()).expect("wrap the real connection");
+        app.update(cx, |app, cx| {
+            app.adopt_repo_host_for_test(repo.to_path_buf(), repo_host, cx);
+        });
+
+        let id = app
+            .update_in(cx, |app, window, cx| {
+                app.new_agent(ProcessKind::Shell, window, cx);
+                app.agents.iter().last().map(|agent| agent.id)
+            })
+            .expect("a real shell tab was created");
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                cx.run_until_parked();
+                app.read_with(cx, |app, cx| {
+                    app.agents
+                        .iter()
+                        .find(|agent| agent.id == id)
+                        .is_some_and(|agent| {
+                            agent.pane.read(cx).spawn_error().is_none()
+                                && agent
+                                    .pane
+                                    .read(cx)
+                                    .visible_text_lines()
+                                    .iter()
+                                    .any(|line| !line.trim().is_empty())
+                        })
+                })
+            }),
+            "the real shell must attach over the remote socket and produce real prompt output"
+        );
+
+        // Standing in for the app itself closing - see `crate::work_surface::session::
+        // session_restore_tests`'s own `a_relaunch_against_a_still_running_host_reattaches_and_
+        // shows_the_snapshot` for why both steps (dropping the entity *and* removing its window)
+        // are required for GPUI to actually release the root view, and so this pane's own
+        // `SocketSessionAdapter`, right here rather than at some later, unobserved point.
+        drop(app);
+        for window in cx.windows() {
+            let _ = window.update(cx, |_, window, _| window.remove_window());
+        }
+        cx.run_until_parked();
+
+        let mut fresh_client = jerry_core::client::Client::connect(&socket, Duration::from_secs(5))
+            .expect("a second, independent connection to the same still-running host");
+        let report = fresh_client
+            .request(&jerry_core::Call::human(
+                repo.to_path_buf(),
+                jerry_core::Request::Query(jerry_core::AppQuery::Sessions(
+                    jerry_core::SessionsQuery::default(),
+                )),
+            ))
+            .expect("a fresh SessionsQuery must reach the still-running host");
+        let Report::Ok { outcome } = report else {
+            panic!("expected a real SessionsQuery answer, got {report:?}");
+        };
+        let sessions: Vec<jerry_core::SessionRecord> =
+            serde_json::from_value(outcome).expect("a real session list");
+        assert_eq!(
+            sessions.len(),
+            1,
+            "the app closing must not have spawned a duplicate or removed the real session"
+        );
+        assert!(
+            sessions[0].exit.is_none(),
+            "the session must still be alive - a plain app/window/pane drop only disconnects, \
+             it never kills (docs/architecture/decisions.md §25)"
         );
 
         host.shutdown_and_join();

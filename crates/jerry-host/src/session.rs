@@ -14,6 +14,7 @@ use futures::executor::block_on;
 use futures::{SinkExt, StreamExt};
 use jerry_core::{
     AgentId, ExitStatusWire, Message, SessionAgentInfo, SessionId, SessionKind, SessionRecord,
+    SessionSnapshot, SnapshotCell, SnapshotCellWidth,
 };
 use jerry_pty::{PtyError, PtyOutput, PtySession, SpawnOptions};
 use std::collections::HashMap;
@@ -28,6 +29,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// blocks - the same bound `jerry_pty`'s own output channel uses, so relaying never becomes the
 /// tighter constraint on throughput.
 const RELAY_CHANNEL_CAPACITY: usize = 256;
+
+/// How many lines of real scrollback history a [`jerry_core::SessionSnapshot`] carries
+/// (`docs/architecture/decisions.md` §25) - bounded so a long-lived session's own retained
+/// history never makes a reattach's own control-plane message unbounded.
+const SNAPSHOT_SCROLLBACK_CAP_LINES: usize = 200;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -73,6 +79,11 @@ struct Entry {
     /// shut down (socket file removed) by [`SessionManager::forget_session`] or
     /// [`SessionManager::shutdown_all`].
     data_plane: Option<Arc<DataPlane>>,
+    /// This session's own headless grid (`jerry_term::grid::TerminalGrid`, decisions.md §25) -
+    /// `Some` exactly when `handle`/`data_plane` are. Fed the identical bytes `data_plane` is, by
+    /// the same relay thread ([`spawn_relay`]), so [`SessionManager::attach`] can answer a real
+    /// [`jerry_core::SessionSnapshot`] instead of a raw byte replay.
+    grid: Option<Arc<Mutex<jerry_term::grid::TerminalGrid>>>,
 }
 
 /// The data-plane adapter handed to the one attaching client at spawn time (decisions.md §23):
@@ -205,6 +216,8 @@ impl SessionManager {
         };
         let process = Arc::new(Mutex::new(session));
         let data_plane = DataPlane::bind(&self.sockets_dir, Arc::clone(&process))?;
+        let grid = Arc::new(Mutex::new(jerry_term::grid::TerminalGrid::new(rows, cols)));
+        let relay_process = Arc::clone(&process);
         let handle = Arc::new(SessionHandle {
             id: id.clone(),
             process,
@@ -216,19 +229,35 @@ impl SessionManager {
                 record,
                 handle: Some(Arc::clone(&handle)),
                 data_plane: Some(Arc::clone(&data_plane)),
+                grid: Some(Arc::clone(&grid)),
             },
         );
-        spawn_relay(id.clone(), raw_output, relay_tx, data_plane, self.clone())
-            .map_err(SessionSpawnError::Relay)?;
+        spawn_relay(
+            id.clone(),
+            raw_output,
+            relay_tx,
+            data_plane,
+            grid,
+            relay_process,
+            self.clone(),
+        )
+        .map_err(SessionSpawnError::Relay)?;
         Ok((id, handle))
     }
 
-    /// [`crate::data_plane::DataPlane`]'s own socket path for an already-spawned session -
-    /// `command/session-attach`'s real answer (`docs/architecture/decisions.md` §24). Checked
-    /// against the socket layer's own `attached` flag as an earlier, friendlier rejection of the
-    /// common case; the socket layer itself is what actually enforces "exactly one attach at a
-    /// time" (`crate::data_plane`'s own module docs) against a race with this check.
-    pub fn attach(&self, id: &SessionId) -> Result<PathBuf, SessionAttachError> {
+    /// [`crate::data_plane::DataPlane`]'s own socket path, plus a real
+    /// [`jerry_core::SessionSnapshot`] of this session's own headless grid at this exact moment -
+    /// `command/session-attach`'s real answer (`docs/architecture/decisions.md` §25). The byte
+    /// stream on the returned socket continues from the snapshot point; there is no separate
+    /// pre-attach byte buffer to replay (§24's own buffer is gone - a byte replay after a resize
+    /// renders at the wrong size until the child reacts, which the snapshot sidesteps entirely).
+    /// Checked against the socket layer's own `attached` flag as an earlier, friendlier rejection
+    /// of the common case; the socket layer itself is what actually enforces "exactly one attach
+    /// at a time" (`crate::data_plane`'s own module docs) against a race with this check.
+    pub fn attach(
+        &self,
+        id: &SessionId,
+    ) -> Result<(PathBuf, Option<u32>, SessionSnapshot), SessionAttachError> {
         let entries = lock(&self.entries);
         let entry = entries
             .get(id)
@@ -240,17 +269,44 @@ impl SessionManager {
         if data_plane.attached() {
             return Err(SessionAttachError::AlreadyAttached(id.clone()));
         }
-        Ok(data_plane.socket_path().to_path_buf())
+        // Structurally always `Some` alongside `data_plane` (both set together in `Self::spawn`,
+        // never independently) - a graceful empty snapshot rather than a panic if that invariant
+        // is ever violated, since this is a real answer over the wire, never a place to `expect`.
+        let snapshot = entry
+            .grid
+            .as_ref()
+            .map(|grid| snapshot_from_grid(&lock(grid)))
+            .unwrap_or_else(|| SessionSnapshot {
+                rows: 0,
+                cols: 0,
+                cursor: None,
+                cells: Vec::new(),
+                scrollback: Vec::new(),
+            });
+        // Armed under this same `entries` lock, right alongside the snapshot it pairs with - the
+        // real fix for a real bug: `DataPlane::push` had nowhere to put a byte the relay thread
+        // produced between this exact snapshot and the client's own, later, real connect (a
+        // genuine gap - the control-plane round trip a caller needs before it can even attempt
+        // that connect is not instantaneous). `serve_one` drains this arm's own queue into the
+        // connection before anything else once it registers - see `DataPlane::arm_for_attach`'s
+        // own docs for the bounded, "never serve a gapped stream" contract this keeps.
+        data_plane.arm_for_attach();
+        Ok((
+            data_plane.socket_path().to_path_buf(),
+            entry.record.process_id,
+            snapshot,
+        ))
     }
 
-    /// [`crate::data_plane::DataPlane::buffered_len`] for the session's own pre-attach buffer -
-    /// `0` for an unknown id, matching `DataPlane`'s own test-only accessor.
+    /// [`crate::data_plane::DataPlane::pending_len`] for the session's own armed-but-not-yet-
+    /// connected queue - `0` for an unknown id, matching that method's own contract for an unarmed
+    /// data plane.
     #[cfg(test)]
-    pub(crate) fn buffered_len_for_test(&self, id: &SessionId) -> usize {
+    pub(crate) fn pending_len_for_test(&self, id: &SessionId) -> usize {
         lock(&self.entries)
             .get(id)
             .and_then(|entry| entry.data_plane.as_ref())
-            .map(|data_plane| data_plane.buffered_len())
+            .map(|data_plane| data_plane.pending_len())
             .unwrap_or(0)
     }
 
@@ -276,6 +332,12 @@ impl SessionManager {
         if let Some(entry) = lock(&self.entries).get_mut(id) {
             entry.record.rows = rows;
             entry.record.cols = cols;
+            // Keeps a reattach snapshot honest about the real pty size - without this, a client
+            // that resized then detached and reattached would paint the *old* geometry until the
+            // next byte arrived, exactly the artifact the snapshot exists to avoid (§25).
+            if let Some(grid) = &entry.grid {
+                lock(grid).resize(rows, cols);
+            }
         }
         Ok(())
     }
@@ -283,12 +345,29 @@ impl SessionManager {
     /// Kills a session's process tree. Non-blocking, like `jerry_pty::PtySession::kill` itself:
     /// the real exit status arrives asynchronously as an `Exited` item, observed by the same
     /// relay thread [`Self::spawn`] started, which publishes `event/session-exited` from it.
+    /// Idempotent for a session that has already exited: `record_exit` clears [`Entry::handle`]
+    /// the moment the real process is confirmed dead (there is nothing left to signal), but a
+    /// caller racing its own cleanup against a real, fast exit - the common case for a short-lived
+    /// one-shot script, real on unix - must not see that as a failure. Still a real `NotOwned`
+    /// for an `AgentTable`-only registration, which never had a process to kill in the first
+    /// place (`Entry::record.exit` distinguishes the two: `None` for that case, `Some` for an
+    /// exited real session).
     pub fn kill(&self, id: &SessionId) -> Result<(), SessionError> {
-        self.process_for(id)?
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .kill()
-            .map_err(SessionError::from)
+        match self.process_for(id) {
+            Ok(process) => process
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .kill()
+                .map_err(SessionError::from),
+            Err(SessionError::NotOwned(_)) if self.already_exited(id) => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn already_exited(&self, id: &SessionId) -> bool {
+        lock(&self.entries)
+            .get(id)
+            .is_some_and(|entry| entry.record.exit.is_some())
     }
 
     fn process_for(&self, id: &SessionId) -> Result<Arc<Mutex<PtySession>>, SessionError> {
@@ -369,6 +448,7 @@ impl SessionManager {
                 record,
                 handle: None,
                 data_plane: None,
+                grid: None,
             },
         );
     }
@@ -523,11 +603,24 @@ fn agent_session_id(agent_id: &AgentId) -> SessionId {
 /// none yet), and recording the session's exit on `manager` and `data_plane` the moment `Exited`
 /// is observed, before forwarding it downstream. Ends the moment `Exited` is forwarded, or the
 /// moment the downstream receiver (the attached client) is dropped, whichever comes first.
+///
+/// Also answers `grid`'s own [`jerry_term::grid::TerminalGrid::take_pending_pty_writes`] back
+/// into `process` whenever [`DataPlane::push`] reports a chunk as dropped (no client attached or
+/// armed to ever see it) - a real ConPTY's own startup handshake sends a cursor-position query
+/// (`ESC[6n`) and blocks its *entire* output stream on a real reply, so a session spawned before
+/// any client has attached (the ordinary "guaranteed startup shell" case) would otherwise hang
+/// forever with no output ever reaching anyone, real or headless. `crate::terminal::pane`'s own
+/// client-side task in `jerry-app` answers the identical query once a client *is* attached (or is
+/// racing to attach - `push`'s own `true` there means the client's own grid will see, and answer,
+/// these same bytes itself); only `push` answering `false` here is the signal this thread must
+/// step in instead, so a query is never answered twice.
 fn spawn_relay(
     id: SessionId,
     mut raw: futures_mpsc::Receiver<PtyOutput>,
     mut relay_tx: futures_mpsc::Sender<PtyOutput>,
     data_plane: Arc<DataPlane>,
+    grid: Arc<Mutex<jerry_term::grid::TerminalGrid>>,
+    process: Arc<Mutex<PtySession>>,
     manager: SessionManager,
 ) -> io::Result<()> {
     thread::Builder::new()
@@ -535,10 +628,30 @@ fn spawn_relay(
         .spawn(move || {
             while let Some(item) = block_on(raw.next()) {
                 match &item {
-                    PtyOutput::Bytes(chunk) => data_plane.push(chunk),
+                    PtyOutput::Bytes(chunk) => {
+                        let captured = data_plane.push(chunk);
+                        let pending_writes = {
+                            let mut grid = lock(&grid);
+                            grid.append_bytes(chunk);
+                            if captured {
+                                Vec::new()
+                            } else {
+                                grid.take_pending_pty_writes()
+                            }
+                        };
+                        if !pending_writes.is_empty() {
+                            if let Err(err) = lock(&process).write_input(&pending_writes) {
+                                log::warn!(
+                                    "jerry-host: failed to answer a terminal query for \
+                                     session {id} with no client attached yet: {err}"
+                                );
+                            }
+                        }
+                    }
                     PtyOutput::Exited(status) => {
                         manager.record_exit(&id, status);
                         data_plane.mark_exited();
+                        lock(&grid).mark_ended();
                     }
                 }
                 let exited = matches!(item, PtyOutput::Exited(_));
@@ -548,6 +661,46 @@ fn spawn_relay(
             }
         })
         .map(|_join_handle| ())
+}
+
+/// A real [`SessionSnapshot`] of `grid`'s current state - [`SessionManager::attach`]'s own answer
+/// for a reattaching client to paint immediately, before a single further byte off the socket
+/// ever arrives (`docs/architecture/decisions.md` §25). Colors are resolved against the one
+/// palette this app has: `jerry_term::grid::TerminalPalette::default()` is a literal transcription
+/// of the app's real (and currently only) theme, not a placeholder - see that type's own docs.
+fn snapshot_from_grid(grid: &jerry_term::grid::TerminalGrid) -> SessionSnapshot {
+    let palette = jerry_term::grid::TerminalPalette::default();
+    let (cols, rows) = grid.dimensions();
+    SessionSnapshot {
+        rows,
+        cols,
+        cursor: grid.cursor_position(),
+        cells: convert_rows(grid.visible_rows_plain(&palette)),
+        scrollback: convert_rows(grid.scrollback_tail(&palette, SNAPSHOT_SCROLLBACK_CAP_LINES)),
+    }
+}
+
+fn convert_rows(rows: Vec<Vec<jerry_term::grid::GridCell>>) -> Vec<Vec<SnapshotCell>> {
+    rows.into_iter()
+        .map(|row| row.into_iter().map(convert_cell).collect())
+        .collect()
+}
+
+fn convert_cell(cell: jerry_term::grid::GridCell) -> SnapshotCell {
+    SnapshotCell {
+        c: cell.c,
+        fg: cell.fg,
+        bg: cell.bg,
+        bold: cell.bold,
+        italic: cell.italic,
+        underline: cell.underline,
+        strikethrough: cell.strikethrough,
+        width: match cell.width {
+            jerry_term::grid::CellWidth::Narrow => SnapshotCellWidth::Narrow,
+            jerry_term::grid::CellWidth::Wide => SnapshotCellWidth::Wide,
+            jerry_term::grid::CellWidth::Spacer => SnapshotCellWidth::Spacer,
+        },
+    }
 }
 
 /// Real wall-clock seconds since the Unix epoch, matching `jerry_app::work_surface::agents::
@@ -763,6 +916,36 @@ mod session_manager_tests {
         );
     }
 
+    /// A real, fast-exiting one-shot session, killed only after it has genuinely already exited -
+    /// the exact race a short-lived child wins on unix (a `sh -c "echo ..."` regularly beats the
+    /// caller's own cleanup to the punch). `record_exit` clears `Entry::handle` the moment the
+    /// real process is confirmed dead, so a naive `kill` would answer `NotOwned` here - a real
+    /// bug this test pins, distinct from [`an_agent_table_registration_is_listed_but_cannot_be_resized_or_killed`]'s
+    /// own `NotOwned`, which is a registration that never had a process at all.
+    #[test]
+    fn killing_a_session_that_already_exited_is_not_an_error() {
+        let manager = SessionManager::new(Fanout::default(), crate::default_sockets_dir());
+        let (id, handle) = manager
+            .spawn(
+                PathBuf::from("/repo"),
+                None,
+                shell_options("echo already-gone"),
+            )
+            .expect("spawn");
+        let mut output = handle.take_output().expect("output stream");
+        let (_bytes, status) = drain_until_exit(&handle, &mut output, Duration::from_secs(10));
+        assert!(
+            status.success(),
+            "sanity check: a plain echo exits clean: {status:?}"
+        );
+
+        let result = manager.kill(&id);
+        assert!(
+            result.is_ok(),
+            "killing a session that already exited must be a real no-op, not an error: {result:?}"
+        );
+    }
+
     #[test]
     fn resizing_or_killing_an_unknown_id_is_a_real_typed_error() {
         let manager = SessionManager::new(Fanout::default(), crate::default_sockets_dir());
@@ -806,6 +989,104 @@ mod session_manager_tests {
 
         manager.forget_agent(&agent_id);
         assert!(manager.worktree_of_agent(&agent_id).is_none());
+    }
+
+    /// `docs/architecture/decisions.md` §25's own reattach snapshot, proven against a real
+    /// spawn: content the child produced before anyone ever attached still shows up in
+    /// [`SessionManager::attach`]'s own `SessionSnapshot`, since the headless grid
+    /// ([`spawn_relay`], `super::snapshot_from_grid`) is fed the same bytes the data-plane socket
+    /// is - not a raw byte buffer replayed over that socket, which issue #506's own §24 buffer
+    /// this replaces never guaranteed correctly sized output after a resize (this type's own
+    /// docs). `manager.attach` never marks the socket as attached by itself (only a real
+    /// `Stream::connect` does, in `crate::data_plane::serve_one`), so polling it here is safe.
+    #[test]
+    fn attach_answers_a_real_snapshot_reflecting_output_produced_before_anyone_attaches() {
+        let manager = SessionManager::new(Fanout::default(), crate::default_sockets_dir());
+        let (id, handle) = manager
+            .spawn(
+                PathBuf::from("/repo"),
+                None,
+                shell_options("echo jerry-snapshot-marker"),
+            )
+            .expect("spawn");
+        let mut output = handle.take_output().expect("output stream");
+
+        let mut seen = Vec::new();
+        let mut answered = false;
+        let mut last_snapshot_text = String::new();
+        let found = wait_until(Duration::from_secs(10), || {
+            if let Some(PtyOutput::Bytes(chunk)) =
+                recv_timeout(&mut output, Duration::from_millis(200))
+            {
+                seen.extend_from_slice(&chunk);
+                answer_cursor_position_query(&handle, &seen, &mut answered);
+            }
+            let (_socket, _process_id, snapshot) = manager
+                .attach(&id)
+                .expect("attach must succeed while nobody has really connected yet");
+            last_snapshot_text = snapshot_text(&snapshot);
+            last_snapshot_text.contains("jerry-snapshot-marker")
+        });
+        assert!(
+            found,
+            "the reattach snapshot must reflect real output produced before any client ever \
+             attached: last snapshot text {last_snapshot_text:?}, last raw bytes seen {:?}",
+            String::from_utf8_lossy(&seen)
+        );
+
+        manager.kill(&id).expect("kill");
+    }
+
+    /// `docs/architecture/decisions.md` §25: "reattach after resize = `SessionResize` then
+    /// attach, snapshot rendered at the new size, never raw replay." A resize that lands between
+    /// two attaches of the same still-live session must be reflected the *second* time, not just
+    /// on the next byte the child happens to print.
+    #[test]
+    fn attach_after_a_resize_renders_the_snapshot_at_the_new_size() {
+        let manager = SessionManager::new(Fanout::default(), crate::default_sockets_dir());
+        let sleep = if cfg!(windows) {
+            "ping -n 30 127.0.0.1 >NUL"
+        } else {
+            "sleep 30"
+        };
+        let (id, _handle) = manager
+            .spawn(PathBuf::from("/repo"), None, shell_options(sleep))
+            .expect("spawn");
+
+        let (_socket, _process_id, before) = manager.attach(&id).expect("attach before any resize");
+        assert_eq!(
+            (before.rows, before.cols),
+            (24, 80),
+            "sanity check: SpawnOptions::new's own default size"
+        );
+
+        manager.resize(&id, 40, 120).expect("resize");
+        let (_socket, _process_id, after) = manager.attach(&id).expect("attach after resize");
+        assert_eq!(
+            (after.rows, after.cols),
+            (40, 120),
+            "a reattach after a resize must render the snapshot at the new size, never the size \
+             the session was originally spawned at"
+        );
+        assert_eq!(
+            after.cells.len(),
+            40,
+            "the cells themselves must actually be reshaped, not just the reported dimensions"
+        );
+        assert_eq!(after.cells[0].len(), 120);
+
+        manager.kill(&id).expect("kill");
+    }
+
+    /// Every visible-then-scrollback cell's own character, concatenated in reading order - enough
+    /// to search for a marker string without the test caring exactly which row it landed on.
+    fn snapshot_text(snapshot: &jerry_core::SessionSnapshot) -> String {
+        snapshot
+            .cells
+            .iter()
+            .chain(snapshot.scrollback.iter())
+            .flat_map(|row| row.iter().map(|cell| cell.c))
+            .collect()
     }
 }
 
@@ -934,7 +1215,7 @@ mod data_plane_tests {
             .spawn(PathBuf::from("/repo"), None, interactive_shell_options())
             .expect("spawn");
 
-        let socket = manager.attach(&id).expect("attach");
+        let (socket, _process_id, _snapshot) = manager.attach(&id).expect("attach");
         let mut stream = Stream::connect(&socket).expect("connect to the data-plane socket");
         stream
             .set_read_timeout(Some(Duration::from_millis(50)))
@@ -966,6 +1247,49 @@ mod data_plane_tests {
         );
     }
 
+    /// A real bug this test pins: `SessionManager::attach` captures a real snapshot, but the
+    /// control-plane round trip a caller needs before it can even attempt the real data-plane
+    /// connect that follows is not instantaneous - real output the relay thread pushes in that
+    /// gap used to have nowhere to land (`DataPlane::push` dropped it outright, since nobody was
+    /// connected and the old pre-attach buffer §25 removed no longer existed to catch it either).
+    /// `DataPlane::arm_for_attach` closes it: this drives real input through the session's own
+    /// in-process handle (standing in for the caller's real, slower round trip) *between*
+    /// `attach` and the real `Stream::connect` that follows it, and proves the resulting bytes
+    /// still reach the client - through the armed pending queue, not a raw replay.
+    #[test]
+    fn output_produced_between_attach_and_connect_is_not_lost() {
+        let manager = SessionManager::new(Fanout::default(), crate::default_sockets_dir());
+        let (id, handle) = manager
+            .spawn(PathBuf::from("/repo"), None, interactive_shell_options())
+            .expect("spawn");
+
+        let (socket, _process_id, _snapshot) =
+            manager.attach(&id).expect("attach arms the data plane");
+
+        // Real output produced strictly *after* this attach's own snapshot and strictly *before*
+        // anything connects - exactly the gap `DataPlane::arm_for_attach`'s own queue exists for.
+        handle
+            .write_input(b"echo jerry-gap-marker\r\n")
+            .expect("write to the real pty");
+        assert!(
+            wait_until(Duration::from_secs(10), || manager
+                .pending_len_for_test(&id)
+                > 0),
+            "sanity check: the relay thread must have pushed something into the armed pending \
+             queue before this test ever connects"
+        );
+
+        let mut stream = Stream::connect(&socket).expect("connect to the data-plane socket");
+        let seen = read_until_contains(&mut stream, b"jerry-gap-marker", Duration::from_secs(15));
+        assert!(
+            String::from_utf8_lossy(&seen).contains("jerry-gap-marker"),
+            "output produced between attach and connect must still reach the client: {:?}",
+            String::from_utf8_lossy(&seen)
+        );
+
+        manager.kill(&id).expect("kill");
+    }
+
     #[test]
     fn a_second_attach_is_denied_until_the_first_disconnects() {
         let manager = SessionManager::new(Fanout::default(), crate::default_sockets_dir());
@@ -978,7 +1302,7 @@ mod data_plane_tests {
             .spawn(PathBuf::from("/repo"), None, shell_options_for_test(sleep))
             .expect("spawn");
 
-        let socket = manager.attach(&id).expect("first attach");
+        let (socket, _process_id, _snapshot) = manager.attach(&id).expect("first attach");
         let first = Stream::connect(&socket).expect("first connection");
 
         assert!(
@@ -997,49 +1321,6 @@ mod data_plane_tests {
         );
 
         manager.kill(&id).expect("kill");
-    }
-
-    #[test]
-    fn output_produced_before_any_client_attaches_is_still_delivered() {
-        let manager = SessionManager::new(Fanout::default(), crate::default_sockets_dir());
-        let (id, _handle) = manager
-            .spawn(
-                PathBuf::from("/repo"),
-                None,
-                shell_options_for_test("echo jerry-pre-attach-marker"),
-            )
-            .expect("spawn");
-
-        // A real, deterministic wait on the pre-attach buffer actually holding something -
-        // never a blind sleep - before this test's own client ever attaches. On Windows this is
-        // ConPTY's own startup handshake bytes (its Device Status Report query among them, see
-        // `answer_cursor_position_query`'s docs): those are pushed immediately, unlike the
-        // `echo` command's own output, which - per `docs/architecture/decisions.md` §23 - ConPTY
-        // withholds until something answers that query, which nothing does here on purpose.
-        assert!(
-            wait_until(Duration::from_secs(10), || manager
-                .buffered_len_for_test(&id)
-                > 0),
-            "sanity check: the session must have produced some output before anyone attaches"
-        );
-
-        let socket = manager.attach(&id).expect("a late attach is still allowed");
-        let mut stream = Stream::connect(&socket).expect("connect to the data-plane socket");
-        // The very first bytes delivered are the buffer snapshot itself, so this needle is
-        // whatever the buffer already held the moment this connection registered - real,
-        // pre-attach output, not anything produced by this client's own connection.
-        read_until_contains(&mut stream, pre_attach_needle(), Duration::from_secs(10));
-    }
-
-    /// What [`output_produced_before_any_client_attaches_is_still_delivered`] looks for - see
-    /// that test's own docs for why this differs by platform.
-    #[cfg(windows)]
-    fn pre_attach_needle() -> &'static [u8] {
-        CURSOR_POSITION_QUERY
-    }
-    #[cfg(not(windows))]
-    fn pre_attach_needle() -> &'static [u8] {
-        b"jerry-pre-attach-marker"
     }
 
     /// [`session_manager_tests::shell_options`]'s exact one-shot-script shape, duplicated here

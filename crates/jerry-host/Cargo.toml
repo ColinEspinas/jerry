@@ -19,6 +19,9 @@ jerry-core = { path = "../jerry-core" }
 # (decisions.md §23) - the one place in this workspace besides `jerry-app` that links PTY
 # machinery.
 jerry-pty = { path = "../jerry-pty" }
+# The headless per-session grid every real spawn feeds bytes through (decisions.md §25) - the
+# same gpui-free VT100/grid engine `jerry-app`'s own rendered pane uses.
+jerry-term = { path = "../jerry-term" }
 futures = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

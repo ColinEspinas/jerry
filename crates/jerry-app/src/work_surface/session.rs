@@ -4,10 +4,12 @@
 
 use std::path::{Path, PathBuf};
 
-use gpui::{Context, Window};
+use gpui::{AsyncApp, Context, Task, WeakEntity, Window};
+use jerry_core::{AppQuery, Report, Request, SessionRecord, SessionsQuery};
 
 use crate::root::AdeApp;
 use crate::work_surface::agents::{AgentKind, ProcessKind};
+use crate::work_surface::session_reconcile::{reconcile, ReconciledTab};
 use crate::work_surface::state::TabRef;
 use crate::work_surface::tab_order_state::{worktree_key, SessionTab};
 
@@ -54,11 +56,13 @@ impl AdeApp {
                 TabRef::File(relative) => Some(SessionTab::File(cwd.join(relative))),
                 TabRef::Agent(id) => {
                     let agent = self.agents.iter().find(|agent| agent.id == *id)?;
+                    let host_session_id = agent.host_session_id.as_ref().map(ToString::to_string);
                     Some(match agent.kind {
-                        ProcessKind::Shell => SessionTab::Shell,
+                        ProcessKind::Shell => SessionTab::Shell { host_session_id },
                         ProcessKind::Agent(kind) => SessionTab::Agent {
                             kind,
                             session_id: self.live_agent_session_id(agent, kind),
+                            host_session_id,
                         },
                     })
                 }
@@ -88,18 +92,27 @@ impl AdeApp {
     }
 
     /// Reopens `cwd`'s persisted tab session for real - the read side of this module, and the one
-    /// place tabs are ever created from a persisted record.
+    /// place tabs are ever created from a persisted record. Reconciling against the repository's
+    /// real, live session list (decision Q21) needs a real `SessionsQuery` round trip, so the
+    /// actual tab creation happens inside an async continuation
+    /// ([`Self::apply_restored_session`]) once that resolves. Returns the real task driving that
+    /// continuation (`Task::ready(())` for the "nothing to restore" fast paths below) rather than
+    /// detaching it here: [`crate::root::AdeApp::spawn_initial_shell_for_opened_repo`]'s own
+    /// "is this worktree genuinely empty" guaranteed-shell check must observe this worktree's
+    /// real, fully-restored agents before it answers honestly - awaiting this is how it does
+    /// that. A caller with no such continuation of its own (`Self::select_worktree`) simply keeps
+    /// the task alive in `crate::root::AdeApp::_session_restore_tasks` instead.
     pub(crate) fn restore_worktree_session(
         &mut self,
         cwd: PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Task<()> {
         if cwd != self.file_tree_root {
-            return;
+            return Task::ready(());
         }
         if !self.session_restored.insert(cwd.clone()) {
-            return;
+            return Task::ready(());
         }
         // Deliberately *after* the mark above, not before it. A window with no persisted state at
         // all has, trivially, nothing to restore - and marking it restored anyway is what keeps
@@ -109,89 +122,162 @@ impl AdeApp {
         // stop maintaining the in-memory [`Self::tab_order_state`] a `None`-path window still
         // reads back through `Self::combined_tab_order`.
         if self.tab_order_path.is_none() {
-            return;
+            return Task::ready(());
         }
         let tabs = self.tab_order_state.session_tabs(&cwd);
         if tabs.is_empty() {
-            return;
+            return Task::ready(());
+        }
+
+        cx.spawn_in(window, async move |this, cx| {
+            let live = fetch_live_sessions(&this, cwd.clone(), cx).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.apply_restored_session(cwd, tabs, live, window, cx);
+            });
+        })
+    }
+
+    /// The real tab-creation half of [`Self::restore_worktree_session`], run once a real
+    /// `SessionsQuery` for `cwd` has resolved (`live` - empty if the host could not be reached at
+    /// all, which degrades every tab to [`ReconciledTab::Fallback`]/[`ReconciledTab::Gone`]
+    /// rather than blocking the restore). [`reconcile`] decides, per persisted tab, whether it
+    /// reattaches to a real live session, falls back to the pre-existing spawn/`--resume` path, or
+    /// shows as already-exited - and separately reports every live session under `cwd` that
+    /// answers to no persisted tab at all, recorded on [`crate::root::AdeApp::detached_sessions`]
+    /// for the rail's own "Detached sessions" section.
+    fn apply_restored_session(
+        &mut self,
+        cwd: PathBuf,
+        tabs: Vec<SessionTab>,
+        live: Vec<SessionRecord>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (reconciled, detached) = reconcile(&tabs, &live, &cwd);
+        if detached.is_empty() {
+            self.detached_sessions.remove(&cwd);
+        } else {
+            self.detached_sessions.insert(cwd.clone(), detached);
         }
 
         // Built as each tab is really restored, so a skipped entry leaves no gap behind: the
         // restored strip is exactly the tabs that genuinely came back, in their remembered
         // relative order.
         let mut order: Vec<TabRef> = Vec::new();
-        for tab in tabs {
-            match tab {
-                SessionTab::File(absolute) => {
-                    let Ok(relative) = absolute.strip_prefix(&cwd) else {
-                        continue;
+        for reconciled_tab in reconciled {
+            match reconciled_tab {
+                ReconciledTab::Reattach { tab, session_id } => {
+                    let Some(kind) = process_kind_of(&tab) else {
+                        continue; // a file tab never reconciles to `Reattach` - see `reconcile`'s docs
                     };
-                    let relative = relative.to_path_buf();
-                    // `is_file`, not `exists`: a path that has since become a *directory* is as
-                    // unopenable as a deleted one, and opening a tab for it would leave the code
-                    // surface showing a real error for a file the user never asked for.
-                    if !absolute.is_file() {
-                        self.note_session_restore_failure(format!(
-                            "{} was open last session but no longer exists - its tab was not \
-                             reopened",
-                            absolute.display()
-                        ));
-                        continue;
-                    }
-                    if !self.open_files().contains(&relative) {
-                        self.open_files_mut().push(relative.clone());
-                    }
-                    order.push(TabRef::File(relative));
-                }
-                SessionTab::Shell => {
-                    let id = self.agents.spawn(
-                        ProcessKind::Shell,
-                        cwd.clone(),
-                        self.settings.appearance.terminal_font_size,
-                        self.settings.terminal.shell_override(),
-                        // A shell, so no hook injection - `Agents::spawn` would discard one anyway.
-                        None,
-                        window,
-                        cx,
-                    );
-                    // GitHub issue #225: a restored shell is a real agent like any other and needs
-                    // a real review baseline too, exactly as
-                    // `Self::spawn_initial_shell_for_opened_repo`'s own spawn does.
-                    self.capture_review_baseline(id, cx);
-                    order.push(TabRef::Agent(id));
-                }
-                SessionTab::Agent {
-                    kind,
-                    session_id: Some(session_id),
-                } if kind.resume_args(&session_id).is_some() => {
-                    let hook_injection = self.hook_injection_for(ProcessKind::Agent(kind), &cwd);
-                    let id = self.agents.spawn_resume(
+                    let id = self.agents.spawn_reattached(
                         kind,
                         cwd.clone(),
                         self.settings.appearance.terminal_font_size,
                         self.settings.terminal.shell_override(),
-                        hook_injection.as_ref(),
                         session_id,
                         window,
                         cx,
                     );
+                    // GitHub issue #225: a reattached tab is a real agent like any other and
+                    // needs a real review baseline too.
                     self.capture_review_baseline(id, cx);
                     order.push(TabRef::Agent(id));
                 }
-                SessionTab::Agent { kind, session_id } => {
-                    debug_assert!(
-                        session_id
-                            .as_deref()
-                            .and_then(|session_id| kind.resume_args(session_id))
-                            .is_none(),
-                        "the resumable case is handled by the arm above"
+                ReconciledTab::Gone { tab, status } => {
+                    let Some(kind) = process_kind_of(&tab) else {
+                        continue;
+                    };
+                    let id = self.agents.spawn_gone(
+                        kind,
+                        cwd.clone(),
+                        self.settings.appearance.terminal_font_size,
+                        self.settings.terminal.shell_override(),
+                        status,
+                        window,
+                        cx,
                     );
-                    self.note_session_restore_failure(format!(
-                        "a {} agent was open last session but has no resumable session id - its \
-                         tab was not reopened (a fresh agent would not be the same conversation)",
-                        kind.label()
-                    ));
+                    order.push(TabRef::Agent(id));
                 }
+                ReconciledTab::Fallback { tab } => match tab {
+                    SessionTab::File(absolute) => {
+                        let Ok(relative) = absolute.strip_prefix(&cwd) else {
+                            continue;
+                        };
+                        let relative = relative.to_path_buf();
+                        // `is_file`, not `exists`: a path that has since become a *directory* is
+                        // as unopenable as a deleted one, and opening a tab for it would leave
+                        // the code surface showing a real error for a file the user never asked
+                        // for.
+                        if !absolute.is_file() {
+                            self.note_session_restore_failure(format!(
+                                "{} was open last session but no longer exists - its tab was not \
+                                 reopened",
+                                absolute.display()
+                            ));
+                            continue;
+                        }
+                        if !self.open_files().contains(&relative) {
+                            self.open_files_mut().push(relative.clone());
+                        }
+                        order.push(TabRef::File(relative));
+                    }
+                    SessionTab::Shell { .. } => {
+                        let id = self.agents.spawn(
+                            ProcessKind::Shell,
+                            cwd.clone(),
+                            self.settings.appearance.terminal_font_size,
+                            self.settings.terminal.shell_override(),
+                            // A shell, so no hook injection - `Agents::spawn` would discard one
+                            // anyway.
+                            None,
+                            window,
+                            cx,
+                        );
+                        // GitHub issue #225: a restored shell is a real agent like any other and
+                        // needs a real review baseline too, exactly as
+                        // `Self::spawn_initial_shell_for_opened_repo`'s own spawn does.
+                        self.capture_review_baseline(id, cx);
+                        order.push(TabRef::Agent(id));
+                    }
+                    SessionTab::Agent {
+                        kind,
+                        session_id: Some(session_id),
+                        ..
+                    } if kind.resume_args(&session_id).is_some() => {
+                        let hook_injection =
+                            self.hook_injection_for(ProcessKind::Agent(kind), &cwd);
+                        let id = self.agents.spawn_resume(
+                            kind,
+                            cwd.clone(),
+                            self.settings.appearance.terminal_font_size,
+                            self.settings.terminal.shell_override(),
+                            hook_injection.as_ref(),
+                            session_id,
+                            window,
+                            cx,
+                        );
+                        self.capture_review_baseline(id, cx);
+                        order.push(TabRef::Agent(id));
+                    }
+                    SessionTab::Agent {
+                        kind, session_id, ..
+                    } => {
+                        debug_assert!(
+                            session_id
+                                .as_deref()
+                                .and_then(|session_id| kind.resume_args(session_id))
+                                .is_none(),
+                            "the resumable case is handled by the arm above"
+                        );
+                        self.note_session_restore_failure(format!(
+                            "a {} agent was open last session but has no resumable session id - \
+                             its tab was not reopened (a fresh agent would not be the same \
+                             conversation)",
+                            kind.label()
+                        ));
+                    }
+                },
             }
         }
 
@@ -216,6 +302,68 @@ impl AdeApp {
         cx.notify();
     }
 
+    /// Reattaches one of [`crate::root::AdeApp::detached_sessions`]'s own rows as a real tab -
+    /// `crate::rail::render::AdeApp::render_detached_sessions_banner`'s own click handler
+    /// (decision Q21's "opening one creates the tab and attaches"). A no-op if `session_id` is no
+    /// longer listed (a stale click racing the session's own real exit, or a second click on the
+    /// row that already fired). Removes the entry from [`crate::root::AdeApp::detached_sessions`]
+    /// the same instant it reattaches - a tab now genuinely owns it, so listing it as detached too
+    /// would offer the same session through two doors.
+    pub(crate) fn open_detached_session(
+        &mut self,
+        worktree: PathBuf,
+        session_id: jerry_core::SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(records) = self.detached_sessions.get_mut(&worktree) else {
+            return;
+        };
+        let Some(index) = records.iter().position(|record| record.id == session_id) else {
+            return;
+        };
+        let record = records.remove(index);
+        if records.is_empty() {
+            self.detached_sessions.remove(&worktree);
+        }
+
+        let kind = match &record.agent {
+            Some(info) => match AgentKind::from_label(&info.kind) {
+                Some(kind) => ProcessKind::Agent(kind),
+                // An agent kind this build doesn't recognize - honest refusal (matching
+                // `Self::apply_restored_session`'s own unresumable-agent case) rather than
+                // guessing it is a plain shell.
+                None => {
+                    self.note_session_restore_failure(format!(
+                        "a detached session was running an unrecognized agent kind ({}) and \
+                         was not reopened",
+                        info.kind
+                    ));
+                    return;
+                }
+            },
+            None => ProcessKind::Shell,
+        };
+        let id = self.agents.spawn_reattached(
+            kind,
+            worktree.clone(),
+            self.settings.appearance.terminal_font_size,
+            self.settings.terminal.shell_override(),
+            session_id,
+            window,
+            cx,
+        );
+        self.capture_review_baseline(id, cx);
+
+        let mut order = self.tab_order.get(&worktree).cloned().unwrap_or_default();
+        order.push(TabRef::Agent(id));
+        self.tab_order.insert(worktree.clone(), order);
+        self.agents.activate_for_worktree(&worktree);
+        self.focus_newly_spawned_agent(window, cx);
+        self.record_worktree_session(cx);
+        cx.notify();
+    }
+
     /// Records one real "this tab could not be reopened, and here is why" - logged as it happens
     /// and kept on [`Self::session_restore_notices`], oldest dropped first past
     /// [`MAX_SESSION_RESTORE_NOTICES`].
@@ -229,6 +377,46 @@ impl AdeApp {
     }
 }
 
+/// A real `SessionsQuery` for `cwd`'s repository, for [`AdeApp::restore_worktree_session`]'s own
+/// reconciliation pass - the empty list on any failure (no host connection, a malformed answer),
+/// so an unreachable host degrades every tab to [`ReconciledTab::Fallback`]/[`ReconciledTab::
+/// Gone`] rather than blocking the restore (`Self::note_session_restore_failure`'s own "one
+/// degraded tab never fails the rest" rule, applied one level up).
+async fn fetch_live_sessions(
+    this: &WeakEntity<AdeApp>,
+    cwd: PathBuf,
+    cx: &mut AsyncApp,
+) -> Vec<SessionRecord> {
+    let dispatch = this.update(cx, |this, cx| {
+        this.dispatch(
+            cwd,
+            Request::Query(AppQuery::Sessions(SessionsQuery::default())),
+            cx,
+        )
+    });
+    let Ok(dispatch) = dispatch else {
+        return Vec::new();
+    };
+    match dispatch.await {
+        Ok(Report::Ok { outcome }) => {
+            serde_json::from_value::<Vec<SessionRecord>>(outcome).unwrap_or_default()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The [`ProcessKind`] a [`SessionTab::Shell`]/[`SessionTab::Agent`] restores as - `None` for
+/// [`SessionTab::File`], which [`reconcile`] never resolves to [`ReconciledTab::Reattach`]/
+/// [`ReconciledTab::Gone`] in the first place (see that function's own docs), so a caller seeing
+/// `None` here has a real invariant violation to skip past defensively, not a case to handle.
+fn process_kind_of(tab: &SessionTab) -> Option<ProcessKind> {
+    match tab {
+        SessionTab::File(_) => None,
+        SessionTab::Shell { .. } => Some(ProcessKind::Shell),
+        SessionTab::Agent { kind, .. } => Some(ProcessKind::Agent(*kind)),
+    }
+}
+
 /// End-to-end coverage for the real thing this module exists to do: quit Jerry, launch it again,
 /// and get your tabs back.
 #[cfg(test)]
@@ -238,6 +426,8 @@ mod session_restore_tests {
     use crate::rail::status::Status;
     use crate::settings::store as settings_store;
     use gpui::TestAppContext;
+    use std::time::Duration;
+    use test_support::wait_until;
 
     /// A real linked worktree of `repo`, created under `container` (worktrees live outside the
     /// repo - `crate::rail::repo::Repo::path`'s own docs).
@@ -274,6 +464,49 @@ mod session_restore_tests {
                 cx,
             )
         })
+    }
+
+    /// Like [`launch`], but for a test that must attach `repo_path` to a specific, already-
+    /// connected [`crate::host::RepoHost`] (typically [`crate::host::RepoHost::for_test_remote`])
+    /// rather than whatever [`AdeApp::new_with_settings`] would otherwise resolve on its own.
+    ///
+    /// Built with no repo at all (`repo_path: None`, `use_remembered_repo: false`) - not just
+    /// `repo_path: None`, which alone would still resolve `repo_path` from a settings file an
+    /// earlier launch already populated (`AdeApp::new_with_settings`'s own "no CLI argument"
+    /// decision table falls back to the last-focused remembered repo) - so nothing here calls
+    /// `AdeApp::add_repo`, and so nothing starts `Self::open_repo_host`'s own default,
+    /// asynchronous connect for `repo_path`, until the explicit `open_repo_in_current_window`
+    /// call below runs against a connection this already adopted. Without this ordering, a
+    /// caller that instead calls `launch(cx, Some(repo_path), ..)` and adopts afterward is
+    /// racing that eager default connect, and losing that race is a real, reproducible failure,
+    /// not a hypothetical one: the default connect's own throwaway, in-process `jerry_host::Host`
+    /// can win, spawn the worktree's guaranteed startup shell onto *itself*, and then get
+    /// silently replaced (and, since dropping a test-only in-process `Host` shuts it down, killed,
+    /// per `docs/architecture/decisions.md` §25) the moment adoption's own `Hosts::by_repo` insert
+    /// overwrites it.
+    fn launch_against_adopted_host(
+        cx: &mut TestAppContext,
+        repo_path: PathBuf,
+        repo_host: crate::host::RepoHost,
+        settings_path: PathBuf,
+    ) -> (gpui::Entity<AdeApp>, &mut gpui::VisualTestContext) {
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            AdeApp::new_with_settings(
+                None,
+                false,
+                settings_store::Settings::default(),
+                Some(settings_path),
+                window,
+                cx,
+            )
+        });
+        app.update(cx, |app, cx| {
+            app.adopt_repo_host_for_test(repo_path.clone(), repo_host, cx);
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.open_repo_in_current_window(repo_path, window, cx);
+        });
+        (app, cx)
     }
 
     /// The index of `path` in the live worktree list, so a test can select a worktree the same way
@@ -843,6 +1076,159 @@ mod session_restore_tests {
             app.read_with(cx, |app, _| app.session_restore_notices.is_empty()),
             "and a tab that was never recorded is not a refusal - `closed.txt` still exists on \
              disk; it simply wasn't open"
+        );
+    }
+
+    /// This issue's own DoD, at the `#[gpui::test]` level (`docs/architecture/decisions.md`
+    /// §26, decision Q21): a real, still-running host survives the app itself closing - the two
+    /// "launches" below share one real `jerry_host::Host` and never shut it down between them,
+    /// standing in for the real, separate `jerry-host` process a relaunch in production would
+    /// find already alive. The second launch's own reconnect-on-launch reconciliation
+    /// (`Self::restore_worktree_session`) must find that session still live via a real
+    /// `SessionsQuery`, reattach it in place (never a fresh spawn), and its pane must already
+    /// show the real output written before this relaunch - the attach snapshot
+    /// (`docs/architecture/decisions.md` §25), not something this test has to wait to arrive a
+    /// second time.
+    #[gpui::test]
+    fn a_relaunch_against_a_still_running_host_reattaches_and_shows_the_snapshot(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = crate::test_support::temp_repo();
+        let repo_path = repo.to_path_buf();
+        let settings_dir = crate::test_support::temp_root();
+        let settings_path = settings_dir.path().join("settings.toml");
+
+        let host = jerry_host::Host::start().expect("host");
+        let socket_dir = jerry_core::registry::runtime_dir().expect("runtime dir");
+        let socket = socket_dir.join(format!(
+            "rr-{:x}-{:08x}.sock",
+            std::process::id(),
+            jerry_core::registry::fresh_u32()
+        ));
+        host.listen(&socket).expect("listen");
+
+        const MARKER: &str = "jerry-still-running-marker";
+
+        // ---- Launch 1: attach the real shared host via `launch_against_adopted_host`, which
+        // adopts it before this window's own default `Self::open_repo_host` connect could ever
+        // start - see that helper's own docs for the real race this avoids.
+        {
+            let client = jerry_core::client::Client::connect(&socket, Duration::from_secs(5))
+                .expect("connect to the real socket");
+            let repo_host = crate::host::RepoHost::for_test_remote(client, socket.clone())
+                .expect("wrap the real connection");
+            let (app, cx) = launch_against_adopted_host(
+                cx,
+                repo_path.clone(),
+                repo_host,
+                settings_path.clone(),
+            );
+            cx.run_until_parked();
+
+            let id = app
+                .read_with(cx, |app, _| app.agents.iter().next().map(|agent| agent.id))
+                .expect("the guaranteed startup shell is a real agent");
+            // The real socket attach (`crate::host::attach_remote_session`) runs its own real
+            // background threads - a single `run_until_parked` can return before they finish,
+            // exactly like `remote_attach_tests`' own real-socket coverage - so this polls for
+            // real attach readiness rather than assuming one park is enough. Deliberately never
+            // waits for the *bare, unconfigured shell's own default prompt* to look non-empty
+            // first: whether a plain `sh`/`cmd` prints anything at all before a real command runs
+            // is shell-config-dependent (an empty `$PS1` on a minimal CI image prints nothing),
+            // and not something this test's own correctness should hinge on - `send_prompt`
+            // itself already refuses honestly (`false`) until `TerminalPane::session` is real, so
+            // retrying it directly is the precise, portable "is this genuinely attached yet" gate.
+            let mut sent = false;
+            assert!(
+                wait_until(Duration::from_secs(15), || {
+                    cx.run_until_parked();
+                    if sent {
+                        return true;
+                    }
+                    sent = app.update(cx, |app, cx| {
+                        let Some(agent) = app.agents.iter().find(|agent| agent.id == id) else {
+                            return false;
+                        };
+                        let pane = agent.pane.clone();
+                        pane.update(cx, |pane, cx| {
+                            pane.send_prompt(&format!("echo {MARKER}"), cx)
+                        })
+                    });
+                    sent
+                }),
+                "the real shell must attach over the remote socket and accept a real prompt \
+                 within the real timeout"
+            );
+            assert!(
+                wait_until(Duration::from_secs(15), || {
+                    cx.run_until_parked();
+                    app.read_with(cx, |app, cx| {
+                        app.agents
+                            .iter()
+                            .find(|agent| agent.id == id)
+                            .is_some_and(|agent| {
+                                agent
+                                    .pane
+                                    .read(cx)
+                                    .visible_text_lines()
+                                    .iter()
+                                    .any(|line| line.contains(MARKER))
+                            })
+                    })
+                }),
+                "the real shell must have echoed the marker back before this window closes"
+            );
+
+            // Standing in for the app itself closing. GPUI only releases an entity whose last
+            // handle was dropped during `flush_effects`, which runs inside an app update -
+            // dropping `app` and letting this block end is not enough on its own
+            // (`crate::test_support::dropping_a_test_app_leaves_no_spawned_agent_process_behind`'s
+            // own identical pattern) - closing the window is what actually drops the `AdeApp`
+            // root view, and everything it owns down to this pane's own `SocketSessionAdapter`,
+            // along with it. The real host, and the real session it owns, are untouched: nothing
+            // here ever sends `Shutdown` or `command/session-kill`.
+            drop(app);
+            for window in cx.windows() {
+                let _ = window.update(cx, |_, window, _| window.remove_window());
+            }
+            cx.run_until_parked();
+        }
+
+        // ---- Launch 2: a fresh AdeApp, the same real host still running, a real persisted
+        // layout naming that session's own `host_session_id`. ----
+        let client = jerry_core::client::Client::connect(&socket, Duration::from_secs(5))
+            .expect("reconnect to the still-running host");
+        let repo_host = crate::host::RepoHost::for_test_remote(client, socket.clone())
+            .expect("wrap the real connection");
+        let (app, cx) =
+            launch_against_adopted_host(cx, repo_path.clone(), repo_host, settings_path);
+        cx.run_until_parked();
+
+        assert_eq!(
+            app.read_with(cx, |app, _| app.agents.iter().count()),
+            1,
+            "the session reattached in place - never a second, fresh shell stacked on top of it"
+        );
+        let id = app
+            .read_with(cx, |app, _| app.agents.iter().next().map(|agent| agent.id))
+            .expect("the reattached shell is a real agent");
+        let shows_the_snapshot = app.read_with(cx, |app, cx| {
+            app.agents
+                .iter()
+                .find(|agent| agent.id == id)
+                .is_some_and(|agent| {
+                    agent
+                        .pane
+                        .read(cx)
+                        .visible_text_lines()
+                        .iter()
+                        .any(|line| line.contains(MARKER))
+                })
+        });
+        assert!(
+            shows_the_snapshot,
+            "the reattached pane must already show the marker written before this relaunch - \
+             the real attach snapshot, not a blank grid waiting for new output"
         );
     }
 }

@@ -1,7 +1,7 @@
 //! ANSI/VT100 terminal grid emulation via `alacritty_terminal::Term`.
 
-use crate::terminal::mouse::{MouseEncoding, MouseProtocol, MouseTracking};
-use crate::terminal::osc::{OscWatcher, Progress};
+use crate::mouse::{MouseEncoding, MouseProtocol, MouseTracking};
+use crate::osc::{OscWatcher, Progress};
 use alacritty_terminal::event::{Event as AlacEvent, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll as AlacScroll};
 use alacritty_terminal::index::{Column, Line, Point as AlacPoint, Side};
@@ -40,25 +40,27 @@ impl Dimensions for GridSize {
 #[derive(Debug, Clone, Default)]
 struct TermEventSink {
     /// Bytes the VT parser generated as a reply owed back to the pty, appended in arrival order.
-    pty_writes: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+    /// `Arc<Mutex<>>`, not `Rc<RefCell<>>`: `TerminalGrid` (this sink's own owner, via `Term`) is
+    /// shared across real OS threads on the host side (`jerry-host`'s per-session relay thread,
+    /// `docs/architecture/decisions.md` §25, via `Arc<Mutex<TerminalGrid>>`), which requires every
+    /// field to be `Send` - an `Rc`/`RefCell` pair is not.
+    pty_writes: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     /// The pending window-title change, if one arrived since [`Self::take_title_update`] last
     /// looked. Two levels of `Option` on purpose, and they mean different things: the outer one
     /// is "did a title event happen at all", the inner one is "what it set the title to" -
     /// `Some(None)` is a real [`AlacEvent::ResetTitle`] clearing the title, which a single
     /// `Option<String>` could not tell apart from "nothing happened".
-    title: std::rc::Rc<std::cell::RefCell<Option<Option<String>>>>,
+    title: std::sync::Arc<std::sync::Mutex<Option<Option<String>>>>,
 }
 
 impl EventListener for TermEventSink {
     fn send_event(&self, event: AlacEvent) {
         match event {
             AlacEvent::PtyWrite(text) => {
-                self.pty_writes
-                    .borrow_mut()
-                    .extend_from_slice(text.as_bytes());
+                lock(&self.pty_writes).extend_from_slice(text.as_bytes());
             }
-            AlacEvent::Title(title) => *self.title.borrow_mut() = Some(Some(title)),
-            AlacEvent::ResetTitle => *self.title.borrow_mut() = Some(None),
+            AlacEvent::Title(title) => *lock(&self.title) = Some(Some(title)),
+            AlacEvent::ResetTitle => *lock(&self.title) = Some(None),
             _ => {}
         }
     }
@@ -68,8 +70,16 @@ impl TermEventSink {
     /// Takes the pending title change, if any - see [`Self::title`]'s docs for what each layer
     /// of the returned `Option` means.
     fn take_title_update(&self) -> Option<Option<String>> {
-        self.title.borrow_mut().take()
+        lock(&self.title).take()
     }
+}
+
+/// Recovers from a poisoned lock rather than panicking: a panic on one caller's watch must not
+/// permanently brick every other holder of the same `Arc<Mutex<_>>`.
+fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// One rendered grid cell: a character plus the styling attributes this pane's renderer draws.
@@ -349,6 +359,38 @@ fn grid_cell_from_alacritty(
     }
 }
 
+/// Appends the real ANSI [`TerminalGrid::seed_from_snapshot`] needs to reproduce one row of
+/// already-resolved cells - one real SGR set (colors always truecolor, since a snapshot cell only
+/// carries resolved RGB, never the original named/indexed color) per cell, then the character
+/// itself. [`CellWidth::Spacer`] cells are skipped entirely: the preceding [`CellWidth::Wide`]
+/// character already advances the real cursor two columns when the VT parser detects its own
+/// display width, so printing anything for the spacer's own column would duplicate it.
+fn push_row(bytes: &mut Vec<u8>, row: &[GridCell]) {
+    for cell in row {
+        if matches!(cell.width, CellWidth::Spacer) {
+            continue;
+        }
+        bytes.extend_from_slice(
+            format!(
+                "\x1b[0;38;2;{};{};{};48;2;{};{};{}{}{}{}{}m",
+                cell.fg.0,
+                cell.fg.1,
+                cell.fg.2,
+                cell.bg.0,
+                cell.bg.1,
+                cell.bg.2,
+                if cell.bold { ";1" } else { "" },
+                if cell.italic { ";3" } else { "" },
+                if cell.underline { ";4" } else { "" },
+                if cell.strikethrough { ";9" } else { "" },
+            )
+            .as_bytes(),
+        );
+        let mut utf8 = [0u8; 4];
+        bytes.extend_from_slice(cell.c.encode_utf8(&mut utf8).as_bytes());
+    }
+}
+
 /// An `alacritty_terminal::Term`-backed grid: bytes from a running child process (via
 /// `jerry-pty`, fed in through [`TerminalGrid::append_bytes`]) are parsed as real ANSI/VT100 and
 /// land in a real cursor-addressed grid.
@@ -430,7 +472,7 @@ impl TerminalGrid {
     /// case - a plain `Vec` (not an `Option`) so the caller can check emptiness without an extra
     /// match arm.
     pub fn take_pending_pty_writes(&mut self) -> Vec<u8> {
-        std::mem::take(&mut *self.events.pty_writes.borrow_mut())
+        std::mem::take(&mut *lock(&self.events.pty_writes))
     }
 
     /// Resizes the grid to match a new pty size. Must be called alongside `PtySession::resize`
@@ -471,9 +513,27 @@ impl TerminalGrid {
     /// fg/bg swapped, so the renderer doesn't need to separately overlay a cursor glyph, and
     /// every cell inside the live selection is flagged [`GridCell::selected`].
     pub fn visible_rows(&self, palette: &TerminalPalette) -> Vec<Vec<GridCell>> {
+        self.visible_rows_inner(palette, true)
+    }
+
+    /// [`Self::visible_rows`] without the cursor's fg/bg inverse-video swap - the raw cell
+    /// content a reattach snapshot's own `cells` must carry (`docs/architecture/decisions.md`
+    /// §25). A client re-seeding its own grid from these ([`Self::seed_from_snapshot`]) already
+    /// learns the real cursor position separately ([`Self::cursor_position`]) and computes the
+    /// identical swap itself the next time it calls [`Self::visible_rows`] - baking the swap in
+    /// here would double it away to nothing once that happens.
+    pub fn visible_rows_plain(&self, palette: &TerminalPalette) -> Vec<Vec<GridCell>> {
+        self.visible_rows_inner(palette, false)
+    }
+
+    fn visible_rows_inner(
+        &self,
+        palette: &TerminalPalette,
+        highlight_cursor: bool,
+    ) -> Vec<Vec<GridCell>> {
         let content = self.term.renderable_content();
-        let cursor_point =
-            (content.cursor.shape != CursorShape::Hidden).then_some(content.cursor.point);
+        let cursor_visible = highlight_cursor && content.cursor.shape != CursorShape::Hidden;
+        let cursor_point = cursor_visible.then_some(content.cursor.point);
         let selection = content.selection;
         // GitHub issue #331: `display_iter`'s own `point.line` is viewport-relative, running
         // negative for history rows once `display_offset > 0` - see the module docs' scrollback
@@ -506,6 +566,84 @@ impl TerminalGrid {
         }
 
         rows
+    }
+
+    /// The cursor's own `(row, col)` in this grid's current `(rows, cols)` - `None` when the
+    /// child process has hidden it (`\x1b[?25l`). Used for a reattach snapshot
+    /// (`docs/architecture/decisions.md` §25): a headless grid is never scrolled back
+    /// (`Self::scroll_display` is only ever called from `crate::terminal::pane`'s own UI-driven
+    /// scrollbar), so unlike [`Self::visible_rows`] this needs no `display_offset` correction.
+    pub fn cursor_position(&self) -> Option<(u16, u16)> {
+        let content = self.term.renderable_content();
+        (content.cursor.shape != CursorShape::Hidden)
+            .then_some(content.cursor.point)
+            .map(|point| (point.line.0.max(0) as u16, point.column.0 as u16))
+    }
+
+    /// Up to `cap` lines of real scrollback history, oldest first, in the same per-cell shape
+    /// [`Self::visible_rows`] uses - the bounded tail a reattach snapshot carries
+    /// (`docs/architecture/decisions.md` §25), read directly off `Term`'s own retained `Grid`
+    /// rather than through `renderable_content()`'s viewport-scoped `display_iter`. Never
+    /// includes the on-screen rows [`Self::visible_rows`] already covers.
+    pub fn scrollback_tail(&self, palette: &TerminalPalette, cap: usize) -> Vec<Vec<GridCell>> {
+        let grid = self.term.grid();
+        let available = grid.history_size();
+        let take = available.min(cap);
+        (0..take)
+            .rev()
+            .map(|offset_from_top| {
+                let line = Line(-(offset_from_top as i32) - 1);
+                (&grid[line])
+                    .into_iter()
+                    .map(|cell| grid_cell_from_alacritty(cell, false, false, palette))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Rebuilds this grid's own `Term` state from a reattach snapshot (`docs/architecture/
+    /// decisions.md` §25), through the exact same [`Self::append_bytes`] parser every other byte
+    /// goes through: synthesizes the minimal SGR + cursor-position escapes needed to reproduce
+    /// `scrollback` (oldest first) then `cells` exactly, so the real `Term` genuinely holds that
+    /// content and any further live bytes the session's data-plane socket sends apply against it
+    /// correctly - never a static picture swapped out the moment the first real byte arrives.
+    /// Must be called on a grid already [`Self::resize`]d to `cells`' own `(rows, cols)`, before
+    /// any byte from that session's live stream is ever appended - calling it afterward would
+    /// silently clobber whatever those bytes had already drawn.
+    pub fn seed_from_snapshot(
+        &mut self,
+        cursor: Option<(u16, u16)>,
+        scrollback: &[Vec<GridCell>],
+        cells: &[Vec<GridCell>],
+    ) {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"\x1b[H");
+        let mut rows = scrollback.iter().chain(cells.iter()).peekable();
+        while let Some(row) = rows.next() {
+            push_row(&mut bytes, row);
+            // Printing more lines than the screen holds is what pushes the oldest of them into
+            // real scrollback (`scrollback.len()` of them do, `cells.len() == screen_lines`
+            // never does) - the same mechanism any real program's own output relies on. A
+            // trailing newline after the very last row would push one line too many, scrolling
+            // the oldest *visible* row away as well.
+            if rows.peek().is_some() {
+                bytes.extend_from_slice(b"\r\n");
+            }
+        }
+        self.append_bytes(&bytes);
+
+        // Positions within the just-printed viewport (`cells`' own row/col space, matching
+        // `SessionSnapshot::cursor`'s docs) - real cursor-addressing bytes, not a stored field,
+        // so `Self::cursor_position`/`Self::visible_rows` read the same real `Term` cursor state
+        // a live session would have left behind.
+        match cursor {
+            Some((row, col)) => {
+                let mut sequence = format!("\x1b[{};{}H", row + 1, col + 1).into_bytes();
+                sequence.extend_from_slice(b"\x1b[?25h");
+                self.append_bytes(&sequence);
+            }
+            None => self.append_bytes(b"\x1b[?25l"),
+        }
     }
 
     // -------------------------------------------------------------- scrollback (issue #331)
@@ -862,7 +1000,7 @@ mod grid_emulation_tests {
         assert_eq!(
             grid.progress(),
             Some(Progress {
-                state: crate::terminal::osc::ProgressState::Normal,
+                state: crate::osc::ProgressState::Normal,
                 percent: Some(60)
             })
         );
@@ -1714,10 +1852,164 @@ mod selection_tests {
     }
 }
 
+/// `TerminalGrid::seed_from_snapshot` (`docs/architecture/decisions.md` §25): a reattaching
+/// client's own grid must end up indistinguishable from the live grid the snapshot was taken
+/// from, both in what it paints and in how it reacts to whatever bytes arrive next.
+#[cfg(test)]
+mod seed_from_snapshot_tests {
+    use super::*;
+
+    fn row_text(row: &[GridCell]) -> String {
+        row.iter().map(|cell| cell.c).collect::<String>()
+    }
+
+    #[test]
+    fn a_seeded_grid_paints_the_same_visible_rows_as_the_live_grid_it_was_snapshotted_from() {
+        let mut live = TerminalGrid::new(5, 20);
+        live.append_bytes(b"\x1b[1;1Hhello\x1b[3;5H\x1b[1;31mred\x1b[0m");
+        let palette = TerminalPalette::default();
+        let cursor = live.cursor_position();
+        let cells = live.visible_rows_plain(&palette);
+
+        let mut seeded = TerminalGrid::new(5, 20);
+        seeded.seed_from_snapshot(cursor, &[], &cells);
+
+        assert_eq!(
+            seeded.visible_rows_plain(&palette),
+            cells,
+            "a freshly seeded grid must reproduce the exact cells it was seeded from"
+        );
+    }
+
+    #[test]
+    fn the_real_cursor_position_is_restored_and_highlighted_on_the_next_live_render() {
+        let mut live = TerminalGrid::new(5, 20);
+        live.append_bytes(b"\x1b[3;5HX");
+        let palette = TerminalPalette::default();
+        let cursor = live.cursor_position();
+        // Row 3, col 5 (1-based, from the CSI above) is `X`'s own cell; alacritty advances the
+        // real cursor past it once printed, landing one column further right.
+        assert_eq!(
+            cursor,
+            Some((2, 5)),
+            "sanity check: alacritty's own cursor tracking"
+        );
+        let cells = live.visible_rows_plain(&palette);
+
+        let mut seeded = TerminalGrid::new(5, 20);
+        seeded.seed_from_snapshot(cursor, &[], &cells);
+
+        assert_eq!(seeded.cursor_position(), Some((2, 5)));
+        let live_rendered = live.visible_rows(&palette);
+        let seeded_rendered = seeded.visible_rows(&palette);
+        assert_eq!(
+            seeded_rendered, live_rendered,
+            "a live render of the seeded grid (cursor highlight included) must match a live \
+             render of the grid it was snapshotted from - not a doubled-up swap from baking the \
+             highlight into the seeded cell twice"
+        );
+    }
+
+    #[test]
+    fn a_hidden_cursor_stays_hidden_after_seeding() {
+        let mut live = TerminalGrid::new(5, 20);
+        live.append_bytes(b"\x1b[?25l");
+        assert_eq!(live.cursor_position(), None, "sanity check: hidden");
+
+        let palette = TerminalPalette::default();
+        let mut seeded = TerminalGrid::new(5, 20);
+        seeded.seed_from_snapshot(None, &[], &live.visible_rows_plain(&palette));
+
+        assert_eq!(seeded.cursor_position(), None);
+    }
+
+    #[test]
+    fn scrollback_lands_above_the_visible_screen_in_reading_order() {
+        let mut live = TerminalGrid::new(3, 20);
+        for i in 0..9 {
+            live.append_bytes(format!("line {i}\r\n").as_bytes());
+        }
+        let palette = TerminalPalette::default();
+        let visible = live.visible_rows_plain(&palette);
+        let scrollback = live.scrollback_tail(&palette, 200);
+        assert!(
+            !scrollback.is_empty(),
+            "sanity check: nine lines on a three-row screen must have pushed some into history"
+        );
+
+        let mut seeded = TerminalGrid::new(3, 20);
+        seeded.seed_from_snapshot(None, &scrollback, &visible);
+
+        assert_eq!(
+            seeded.visible_rows(&palette),
+            visible,
+            "the visible screen must be exactly what it was at snapshot time, not shifted by the \
+             scrollback lines printed ahead of it"
+        );
+        seeded.scroll_display(ScrollAmount::Top);
+        assert_eq!(
+            row_text(&seeded.visible_rows(&palette)[0]).trim(),
+            "line 0",
+            "and the real scrollback must be reachable by scrolling, oldest line first"
+        );
+    }
+
+    #[test]
+    fn a_wide_character_survives_the_round_trip_without_duplicating_its_spacer() {
+        let mut live = TerminalGrid::new(3, 20);
+        live.append_bytes("\u{4f60}\u{597d}".as_bytes()); // 你好, two wide characters
+        let palette = TerminalPalette::default();
+        let cells = live.visible_rows_plain(&palette);
+
+        let mut seeded = TerminalGrid::new(3, 20);
+        seeded.seed_from_snapshot(None, &[], &cells);
+        let seeded_row = &seeded.visible_rows(&palette)[0];
+
+        // `row_text` (unlike this check) includes every cell verbatim, spacers included - see
+        // its own docs. What must never duplicate is the *painted* characters, skipping spacers.
+        let painted: String = seeded_row
+            .iter()
+            .filter(|cell| cell.width != CellWidth::Spacer)
+            .map(|cell| cell.c)
+            .collect();
+        assert!(
+            painted.starts_with("\u{4f60}\u{597d}"),
+            "the wide characters must reappear exactly once each, not doubled by also printing \
+             their own spacer's blank: painted {painted:?}"
+        );
+        assert_eq!(
+            seeded_row[1].width,
+            CellWidth::Spacer,
+            "你's own spacer column must still be a real spacer, not a second narrow cell"
+        );
+    }
+
+    #[test]
+    fn live_bytes_appended_after_seeding_apply_against_the_real_seeded_content() {
+        let mut live = TerminalGrid::new(3, 20);
+        live.append_bytes(b"\x1b[1;1Horiginal");
+        let palette = TerminalPalette::default();
+        let cursor = live.cursor_position();
+        let cells = live.visible_rows_plain(&palette);
+
+        let mut seeded = TerminalGrid::new(3, 20);
+        seeded.seed_from_snapshot(cursor, &[], &cells);
+        // A real backspace-and-retype, exactly as the live session's own next bytes would - only
+        // meaningful if the seeded grid genuinely holds "original" already, not an empty screen:
+        // five backspaces from the end land right after "ori", so "later" overwrites "ginal".
+        seeded.append_bytes(b"\x08\x08\x08\x08\x08later");
+
+        assert_eq!(
+            row_text(&seeded.visible_rows(&palette)[0]).trim_end(),
+            "orilater"
+        );
+    }
+}
+
 #[cfg(test)]
 mod mouse_protocol_tests {
-    use crate::terminal::grid::TerminalGrid;
-    use crate::terminal::mouse::{MouseEncoding, MouseTracking};
+    use crate::grid::TerminalGrid;
+    use crate::mouse::{MouseEncoding, MouseTracking};
 
     fn grid_after(bytes: &[u8]) -> TerminalGrid {
         let mut grid = TerminalGrid::new(5, 20);

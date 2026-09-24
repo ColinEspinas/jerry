@@ -710,6 +710,8 @@ impl AdeApp {
             _tab_order_save_task: None,
             session_restored: HashSet::new(),
             session_restore_notices: Vec::new(),
+            _session_restore_tasks: TaskPool::new(),
+            detached_sessions: HashMap::new(),
             selected_worktree_by_repo,
             tab_drag_insertion: None,
             dragging_tab: None,
@@ -989,38 +991,52 @@ impl AdeApp {
         // `crate::work_surface::session::AdeApp::restore_worktree_session`'s own docs. A no-op
         // whenever `Self::select_worktree` already restored this worktree a moment ago (the
         // ordinary path), and whenever there is nothing recorded at all.
-        self.restore_worktree_session(cwd.clone(), window, cx);
-        if self.agents.iter_for_cwd(cwd.clone()).next().is_none() {
-            let startup_agent = self.agents.spawn(
-                ProcessKind::Shell,
-                cwd.clone(),
-                self.settings.appearance.terminal_font_size,
-                self.settings.terminal.shell_override(),
-                None,
-                window,
-                cx,
-            );
-            // GitHub issue #225: the startup shell is a real agent like any other and needs a
-            // real review baseline too - see `crate::review::flow::AdeApp::
-            // capture_review_baseline`'s docs for why this is hooked at the `Agents::spawn` call
-            // site rather than inside `Agents` itself. Missing this would leave exactly one agent
-            // - the one every window starts with - permanently without a review.
-            self.capture_review_baseline(startup_agent, cx);
-            // The guaranteed startup shell is a real tab like any other, so it is part of this
-            // worktree's persisted session too - see `crate::work_surface::session`.
-            self.record_worktree_session(cx);
-        }
-        // Makes this worktree's own tab the globally active one, whether it was just spawned
-        // above or was already running from an earlier visit.
-        self.agents.activate_for_worktree(&cwd);
-        // `focus_newly_spawned_agent`, not a bare `Agents::focus_active`: a focused window must
-        // never be left with `Window::focus == None` (see this crate's `OverlayFocus`/
-        // `restore_focus` docs), but it must equally never point focus at a terminal pane that
-        // isn't in the rendered tree. "Open Folder…" is reachable *with Settings open* (the File
-        // menu is an unconditional sibling of the Settings/workspace-body swap), and Settings
-        // replaces the entire workspace body - so that guard is a real one here, not a formality.
-        self.focus_newly_spawned_agent(window, cx);
-        cx.notify();
+        //
+        // The restore itself is asynchronous now (decision Q21's reconciliation needs a real
+        // `SessionsQuery` round trip against the repo's host) - the guaranteed-shell check below
+        // must wait for that real answer before it can honestly ask "is this worktree empty", or
+        // a repo with a whole persisted session would get a redundant extra shell stacked on top
+        // of it on every single launch, exactly the bug this ordering exists to prevent.
+        let restore = self.restore_worktree_session(cwd.clone(), window, cx);
+        let task = cx.spawn_in(window, async move |this, cx| {
+            restore.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.agents.iter_for_cwd(cwd.clone()).next().is_none() {
+                    let startup_agent = this.agents.spawn(
+                        ProcessKind::Shell,
+                        cwd.clone(),
+                        this.settings.appearance.terminal_font_size,
+                        this.settings.terminal.shell_override(),
+                        None,
+                        window,
+                        cx,
+                    );
+                    // GitHub issue #225: the startup shell is a real agent like any other and
+                    // needs a real review baseline too - see `crate::review::flow::AdeApp::
+                    // capture_review_baseline`'s docs for why this is hooked at the `Agents::
+                    // spawn` call site rather than inside `Agents` itself. Missing this would
+                    // leave exactly one agent - the one every window starts with - permanently
+                    // without a review.
+                    this.capture_review_baseline(startup_agent, cx);
+                    // The guaranteed startup shell is a real tab like any other, so it is part of
+                    // this worktree's persisted session too - see `crate::work_surface::session`.
+                    this.record_worktree_session(cx);
+                }
+                // Makes this worktree's own tab the globally active one, whether it was just
+                // spawned above or was already running from an earlier visit.
+                this.agents.activate_for_worktree(&cwd);
+                // `focus_newly_spawned_agent`, not a bare `Agents::focus_active`: a focused
+                // window must never be left with `Window::focus == None` (see this crate's
+                // `OverlayFocus`/`restore_focus` docs), but it must equally never point focus at
+                // a terminal pane that isn't in the rendered tree. "Open Folder…" is reachable
+                // *with Settings open* (the File menu is an unconditional sibling of the
+                // Settings/workspace-body swap), and Settings replaces the entire workspace body
+                // - so that guard is a real one here, not a formality.
+                this.focus_newly_spawned_agent(window, cx);
+                cx.notify();
+            });
+        });
+        self._session_restore_tasks.push(task);
     }
 
     /// [`Self::load_worktrees`] for the two real "this repo is being opened for genuine work"
@@ -1153,7 +1169,11 @@ impl AdeApp {
                             // re-roots the file tree/diff, activates the worktree's own remembered
                             // tab, and moves focus. Reimplementing a partial copy here is exactly
                             // how the opening path would drift away from an ordinary rail click.
-                            this.select_worktree(index, window, cx);
+                            // `restore: false` - `Self::spawn_initial_shell_for_opened_repo` right
+                            // below is this path's own real restore owner; see `Self::
+                            // select_worktree_maybe_restoring`'s own docs for the race a second,
+                            // independent restore call here would open.
+                            this.select_worktree_maybe_restoring(index, false, window, cx);
                         }
                     }
                     // Runs whether or not a worktree was selectable: a repo with no usable
@@ -1610,6 +1630,30 @@ impl AdeApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.select_worktree_maybe_restoring(index, true, window, cx);
+    }
+
+    /// [`Self::select_worktree`]'s own real body, plus a `restore` gate
+    /// [`Self::load_worktrees_for_opened_repo`]'s `WorktreeLoadIntent::Opening` continuation
+    /// needs: that path already calls [`Self::spawn_initial_shell_for_opened_repo`] right after
+    /// selecting the worktree it just opened, and *that* call is the one that must own
+    /// [`Self::restore_worktree_session`] end to end (it awaits the real reconciliation before
+    /// deciding whether a guaranteed shell is needed - see that method's own docs). A second,
+    /// independent `restore_worktree_session` call for the same `cwd` right here would not
+    /// re-run the reconciliation (the `session_restored` guard makes it a genuine no-op) but
+    /// *would* answer `Task::ready(())` instead of a task that actually waits for it - `Self::
+    /// spawn_initial_shell_for_opened_repo`'s own `restore.await` would then resolve before a
+    /// single tab came back, see an apparently-still-empty worktree, and spawn a real, redundant
+    /// guaranteed shell on top of whatever the *other* (real, still in-flight) reconciliation was
+    /// about to restore. `restore: false` is exactly `WorktreeLoadIntent::Opening`'s escape from
+    /// that race; every other caller keeps `select_worktree`'s original, restoring behavior.
+    fn select_worktree_maybe_restoring(
+        &mut self,
+        index: usize,
+        restore: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(item) = self.worktrees.get(index) else {
             return;
         };
@@ -1659,8 +1703,15 @@ impl AdeApp {
         // `Self::file_tree_root` onto this worktree, and restoring file tabs before that would
         // file them under whichever worktree was just left (`Self::open_files_mut` is keyed by
         // that root). It also moves focus, which the restore then re-does for whatever it spawned.
-        // A no-op for a worktree already restored in this window, or with nothing recorded.
-        self.restore_worktree_session(path, window, cx);
+        // A no-op for a worktree already restored in this window, or with nothing recorded. No
+        // continuation of this window's own needs the real restore to have finished (unlike
+        // `Self::spawn_initial_shell_for_opened_repo`'s own guaranteed-shell check) - kept alive
+        // in `Self::_session_restore_tasks` purely so it isn't cancelled by being dropped here.
+        // Skipped when `restore` is false - see this method's own callers' docs for why.
+        if restore {
+            let task = self.restore_worktree_session(path, window, cx);
+            self._session_restore_tasks.push(task);
+        }
     }
 
     /// The shared core of "something completely different is now the single-repo-scoped root

@@ -142,6 +142,13 @@ pub struct PersistedTab {
     /// Claude agent that closed before any hook reported one - both genuinely unresumable, and
     /// treated as such rather than downgraded to a fresh spawn.
     pub session_id: Option<String>,
+    /// [`TAB_KIND_SHELL`] and [`TAB_KIND_AGENT`]: the host's own `jerry_core::SessionId` this
+    /// tab's process last ran as (`crate::work_surface::agents::Agent::host_session_id`,
+    /// `docs/architecture/decisions.md` §26). Reconciled against a real `SessionsQuery` at
+    /// reconnect - `None` for a tab whose `SessionSpawn` never resolved before quit, or a record
+    /// written by a build before this field existed, either of which falls back to
+    /// [`Self::session_id`]'s own CLI-level resume instead.
+    pub host_session_id: Option<String>,
 }
 
 /// The stable on-disk spelling of a [`SessionTab`]'s kind - see [`PersistedTab::kind`].
@@ -154,10 +161,13 @@ pub const TAB_KIND_AGENT: &str = "agent";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionTab {
     File(PathBuf),
-    Shell,
+    Shell {
+        host_session_id: Option<String>,
+    },
     Agent {
         kind: AgentKind,
         session_id: Option<String>,
+        host_session_id: Option<String>,
     },
 }
 
@@ -169,10 +179,13 @@ impl PersistedTab {
     fn decode(&self, root: &Path) -> Option<SessionTab> {
         match self.kind.as_str() {
             TAB_KIND_FILE => absolute_from_key(root, self.path.as_deref()?).map(SessionTab::File),
-            TAB_KIND_SHELL => Some(SessionTab::Shell),
+            TAB_KIND_SHELL => Some(SessionTab::Shell {
+                host_session_id: self.host_session_id.clone(),
+            }),
             TAB_KIND_AGENT => Some(SessionTab::Agent {
                 kind: AgentKind::from_label(self.agent.as_deref()?)?,
                 session_id: self.session_id.clone(),
+                host_session_id: self.host_session_id.clone(),
             }),
             _ => None,
         }
@@ -188,14 +201,20 @@ impl PersistedTab {
                 path: Some(relative_key(root, path)?),
                 ..PersistedTab::default()
             }),
-            SessionTab::Shell => Some(PersistedTab {
+            SessionTab::Shell { host_session_id } => Some(PersistedTab {
                 kind: TAB_KIND_SHELL.to_owned(),
+                host_session_id: host_session_id.clone(),
                 ..PersistedTab::default()
             }),
-            SessionTab::Agent { kind, session_id } => Some(PersistedTab {
+            SessionTab::Agent {
+                kind,
+                session_id,
+                host_session_id,
+            } => Some(PersistedTab {
                 kind: TAB_KIND_AGENT.to_owned(),
                 agent: Some(kind.label().to_owned()),
                 session_id: session_id.clone(),
+                host_session_id: host_session_id.clone(),
                 ..PersistedTab::default()
             }),
         }
@@ -317,7 +336,7 @@ impl TabOrderState {
             .into_iter()
             .filter_map(|tab| match tab {
                 SessionTab::File(path) => Some(path),
-                SessionTab::Shell | SessionTab::Agent { .. } => None,
+                SessionTab::Shell { .. } | SessionTab::Agent { .. } => None,
             })
             .collect()
     }
@@ -540,10 +559,13 @@ mod tests {
         let root = Path::new("/repo/worktree-a");
         let session = vec![
             SessionTab::File(root.join("src/main.rs")),
-            SessionTab::Shell,
+            SessionTab::Shell {
+                host_session_id: Some("session-7".to_owned()),
+            },
             SessionTab::Agent {
                 kind: AgentKind::Claude,
                 session_id: Some("5af4c210-34fa-4ab2-9c35-f6ceab76551c".to_owned()),
+                host_session_id: Some("session-8".to_owned()),
             },
             SessionTab::File(root.join("README.md")),
         ];
@@ -568,6 +590,7 @@ mod tests {
             &[SessionTab::Agent {
                 kind: AgentKind::Codex,
                 session_id: None,
+                host_session_id: None,
             }],
         );
         assert_eq!(
@@ -575,6 +598,7 @@ mod tests {
             vec![SessionTab::Agent {
                 kind: AgentKind::Codex,
                 session_id: None,
+                host_session_id: None,
             }]
         );
     }
@@ -587,7 +611,9 @@ mod tests {
             root,
             &[
                 SessionTab::File(root.join("a.rs")),
-                SessionTab::Shell,
+                SessionTab::Shell {
+                    host_session_id: None,
+                },
                 SessionTab::File(root.join("b.rs")),
             ],
         );
@@ -647,7 +673,12 @@ mod tests {
         let root = Path::new("/repo/worktree-a");
         assert_eq!(
             TabOrderState::load_at(&path).session_tabs(root),
-            vec![SessionTab::File(root.join("a.rs")), SessionTab::Shell],
+            vec![
+                SessionTab::File(root.join("a.rs")),
+                SessionTab::Shell {
+                    host_session_id: None
+                }
+            ],
         );
     }
 

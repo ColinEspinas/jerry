@@ -238,7 +238,7 @@ fn legacy_report(code: u8, cell: MouseCell) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod encoding_tests {
-    use crate::terminal::mouse::{
+    use crate::mouse::{
         MouseAction, MouseCell, MouseEncoding, MouseModifiers, MouseProtocol, MouseReportButton,
         MouseTracking,
     };

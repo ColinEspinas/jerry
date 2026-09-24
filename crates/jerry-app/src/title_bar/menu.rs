@@ -177,7 +177,7 @@ impl AdeApp {
     /// `theme::text::DIM`/`theme::surface::CHIP_NEUTRAL` (or, for the two command-style rows and
     /// the one destructive row, their own distinct colors) every pre-issue-#235 `*_menu_rows`
     /// builder already used for this exact row. [`MenuCommand::NewAgentPane`]'s real chip is
-    /// dynamic ([`Self::menu_command_row`] resolves it directly instead) - this arm, and the four
+    /// dynamic ([`Self::menu_command_row`] resolves it directly instead) - this arm, and the five
     /// macOS-application-menu-only commands (the popover never renders a row for them at all, see
     /// [`crate::title_bar::menu_model::MenuCommand::app_menu_rows`]'s own docs), are never
     /// actually shown; kept only so this match stays total rather than reaching for a wildcard
@@ -313,7 +313,8 @@ impl AdeApp {
             | MenuCommand::Hide
             | MenuCommand::HideOthers
             | MenuCommand::ShowAll
-            | MenuCommand::Quit => (
+            | MenuCommand::Quit
+            | MenuCommand::QuitAndStopAllAgents => (
                 "?",
                 theme::text::DIM.into(),
                 theme::surface::CHIP_NEUTRAL.into(),
@@ -324,7 +325,7 @@ impl AdeApp {
     /// This command's real sub-label in the popover - reused verbatim from the pre-issue-#235
     /// `*_menu_rows` builders. [`MenuCommand::ResetZoom`]'s is the one dynamic case that isn't
     /// [`MenuCommand::NewAgentPane`] (resolved by [`Self::menu_command_row`] instead): the real
-    /// current zoom percentage. The four macOS-application-menu-only commands have no popover row
+    /// current zoom percentage. The five macOS-application-menu-only commands have no popover row
     /// to show a sub-label in at all - same "never actually reached" note as
     /// [`Self::menu_command_chip`].
     fn menu_command_sub_label(&self, cmd: MenuCommand) -> String {
@@ -356,7 +357,8 @@ impl AdeApp {
             | MenuCommand::Hide
             | MenuCommand::HideOthers
             | MenuCommand::ShowAll
-            | MenuCommand::Quit => String::new(),
+            | MenuCommand::Quit
+            | MenuCommand::QuitAndStopAllAgents => String::new(),
         }
     }
 

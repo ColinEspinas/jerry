@@ -4,6 +4,7 @@ members = [
     "crates/jerry-git",
     "crates/jerry-pty",
     "crates/jerry-lsp",
+    "crates/jerry-term",
     "crates/jerry-core",
     "crates/jerry-host",
     "crates/jerry-cli",

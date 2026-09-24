@@ -1630,4 +1630,207 @@ in production ever removes an entry from `Hosts::by_repo` once opened - there is
 app's whole lifetime), but whichever issue first needs to actually drop a `RepoHost` (issue #507's
 own detached-sessions work, or a later one) must make `RepoHost`'s `Drop` shut down its
 subscription sockets so those threads actually exit, not just leave the entry unreachable while
-its threads keep running.
+its threads keep running. **Still latent after #507:** that issue's own detached-sessions work
+(§25 below) never adds a "close this repository" caller either - a repository stays open, and its
+`RepoHost` alive, for as long as the window that opened it does, exactly as before. Whichever
+issue first needs one still owns this fix.
+
+## 25. The host owns the terminal grid; reattach is a snapshot, never a raw byte replay
+
+**Status:** Accepted, landed across three PRs on issue #507 (2026-09-24: `jerry-term` extracted;
+the snapshot mechanism; reconnect-on-launch reconciliation; quit semantics; the external DoD test).
+
+**Context:** §24's own data-plane amendment gave a session a real socket, but a client attaching
+after bytes had already been produced only ever saw a **raw byte buffer replay** (§24's own
+`PRE_ATTACH_BUFFER_CAP_BYTES`, 256 KiB, drop-oldest) - real for the narrow "attached a moment
+late" case that amendment scoped itself to, but two real problems once reattach became the point
+of the exercise rather than an edge case: replayed bytes render at whatever size the pty was *at
+the moment they were produced*, not the client's current one (a resize between detach and
+reattach leaves the replay visibly wrong until the child reacts on its own), and a buffer capped
+at 256 KiB has no real answer for "I detached hours ago, what's on screen now" - it holds recent
+bytes, not current state. Both problems are exactly what Zed's and Warp's own reattach
+implementations independently hit and abandoned raw replay over, per their own public design
+notes at the time this issue was scoped.
+
+**Decision:**
+
+- **`jerry-term`, a new gpui-free crate, is the one VT/grid engine both the app and the host
+  use.** Extracted verbatim from `crates/jerry-app/src/terminal/{grid,mouse,osc}.rs` - it never
+  depended on `gpui` even while it lived there - and re-exported wholesale by
+  `crate::terminal::{grid,mouse,osc}` so no call site elsewhere in `jerry-app` had to change.
+  `jerry-host` takes it as a real (non-dev) dependency for its own headless grid, below.
+- **Every session gets a real, headless `jerry_term::grid::TerminalGrid` on the host, fed the
+  identical bytes the data plane is.** `SessionManager::spawn`'s relay thread
+  (`crate::session::spawn_relay`) calls `grid.append_bytes(chunk)` on every `PtyOutput::Bytes`
+  item, in the same order it forwards them to the data-plane socket and the in-process
+  `SessionHandle` - the host's own copy of "what does this pty's screen actually look like right
+  now" is never behind, never ahead, of what a live client would have rendered itself.
+  `SessionManager::resize` resizes this grid alongside the real pty, so the headless grid's own
+  geometry is always the session's real, current one - not a snapshot of whatever it was sized at
+  when this client's own attach happened to run.
+- **`command/session-attach` answers `{ socket, snapshot }`, never just a socket.**
+  `SessionAttachOutcome` gained `snapshot: jerry_core::SessionSnapshot` - `rows`/`cols`, the real
+  `cursor` position (`None` when hidden), `cells` (exactly `rows * cols`, row-major) and
+  `scrollback` (real retained history above the visible screen, oldest first, capped at
+  `SNAPSHOT_SCROLLBACK_CAP_LINES` = 200 lines - bounded so a long-lived session's own history
+  never makes an attach answer unbounded). `SnapshotCell`/`SnapshotCellWidth` are `jerry-core`'s
+  own wire twins of `jerry_term::grid::GridCell`/`CellWidth`, kept in `jerry-core` rather than a
+  `jerry-term` dependency so that crate stays a pure wire-contract type with no `gpui`-adjacent
+  dependency at all (§4/§15) - `jerry-host` converts field-by-field at its own boundary
+  (`session::snapshot_from_grid`/`convert_cell`). The byte stream on the returned socket starts
+  exactly at the snapshot point - never replayed - and §24's own pre-attach buffer
+  (`PRE_ATTACH_BUFFER_CAP_BYTES`, `DataPlane`'s own `buffer` field) is gone outright, not merely
+  unused: a client attaching late now has a real, current, correctly-sized answer instead of a
+  bounded tail of history to catch up through.
+- **A snapshot's `cells` are the grid's own raw, unhighlighted content - never the live cursor's
+  inverse-video swap baked in.** `TerminalGrid::visible_rows` (the app's own live-render path)
+  swaps a cell's fg/bg when it is the cursor's current position, so the renderer never needs a
+  separate cursor glyph; `visible_rows_plain` is the identical read without that swap, and is
+  what `snapshot_from_grid` uses. Baking the swap into a wire snapshot's own stored colors would
+  double it away to nothing the moment a client's own live render (over its own seeded grid,
+  below) reached that same cell and swapped it *again* - a real bug caught before it shipped by
+  the seeding round-trip test that renders a seeded grid live and diffs it against the original.
+- **A client seeds its own grid from a snapshot by synthesizing minimal ANSI through the same VT
+  parser every other byte goes through - never a special-cased "static picture" mode.**
+  `TerminalGrid::seed_from_snapshot(cursor, scrollback, cells)` prints `scrollback` then `cells`
+  (oldest first) as real SGR-styled text through `Self::append_bytes`, letting more lines than
+  the screen holds naturally push the oldest into real retained history exactly as a live
+  program's own output would, then positions the real cursor with a real CSI sequence (or hides
+  it with real `DECTCEM` off). The result is a grid whose `Term` genuinely holds that content, so
+  any further live bytes the reattached socket delivers apply against real state - a resize, a
+  redraw, a program that overwrites part of an old line - rather than landing on an empty screen a
+  "just show this picture until the first real byte arrives" shortcut would have produced.
+  `SocketSessionAdapter` carries the attach's own snapshot (`SessionAdapter::snapshot`, `None` for
+  a freshly-spawned in-process `SessionHandle`, whose grid already starts empty and correct) and
+  `TerminalPane::seed_from_snapshot` seeds before consuming a single byte off the adapter's output
+  stream, latching `ResizeLatch`/`settled_real_size` to the snapshot's own dimensions so the
+  pane's own later real-content-box resize correction can never mistake the snapshot's real,
+  just-seeded history for placeholder-size garbage and discard it (`TerminalPane::
+  maybe_resize_pty`'s existing "first real resize discards inherited placeholder scrollback"
+  rule, which must never fire for a reattached pane at all).
+- **Reconnect-on-launch reconciles the persisted tab layout against a real `SessionsQuery`
+  answer** (decision Q21 of the plan this issue is part of), in
+  `crate::work_surface::session_reconcile` (gpui-free, `jerry-app`-internal) - one of three
+  outcomes per persisted tab: **Reattach** (its recorded `host_session_id` still answers - attach
+  in place, `Agents::spawn_reattached`, painting the real snapshot immediately), **Gone** (the id
+  was recorded but the host has no live session for it - shown already-exited with the host's own
+  last-known status, `Agents::spawn_gone` -> `TerminalPane::mark_restored_as_gone`, which
+  deliberately never emits `TerminalPaneEvent::ProcessExited`: the existing "a process that
+  finished cleanly closes its own tab" convenience is right for a live run the user watched end,
+  and wrong for a placeholder appearing already-finished the instant it's restored - emitting it
+  auto-closed the tab before this fix, a real regression the reconciliation's own end-to-end test
+  caught), or **Fallback** (no recorded id at all - the pre-existing spawn/`--resume` path,
+  unchanged). A live session under the worktree that answers to no persisted tab lands on
+  `AdeApp::detached_sessions`, surfaced by the rail's own "Detached sessions" section; opening one
+  reattaches it as a real tab (`AdeApp::open_detached_session`). `PersistedTab`/`SessionTab::
+  {Shell,Agent}` gained `host_session_id` to make any of this possible at all.
+- **Quit detaches by default; stopping every host is a separate, deliberate action.** Every
+  repository's session host is already its own process (§24) - an ordinary `cx.quit()` was
+  already correct "detach" behavior with no code change needed, since nothing in `jerry-app` ever
+  sent a live repository's host a `Shutdown` on the app's own exit. `MenuCommand::
+  QuitAndStopAllAgents`/`root::QuitAndStopAllAgents` (decision Q16) is the one path that isn't:
+  `crate::root::menu_commands::quit_and_stop_all_agents` enumerates every open window
+  (`gpui::App::windows`), calls each one's own `AdeApp::shutdown_all_repo_hosts_blocking` (a
+  plain blocking `RemoteRepoHost::dispatch` of a real `Shutdown` per connected repository host,
+  safe from any context per §16's amendment - there is no async context to await one from at this
+  call site anyway), then quits. Registered as a global `on_action` listener (no window in scope,
+  the identical reason `Quit`/`Hide`/`Hide Others`/`Show All` already are) since it has to reach
+  every open window's repositories, not just whichever one dispatched it - wired into the macOS
+  application menu, the Windows/Linux popover's own exhaustiveness check, and the command palette.
+- **Which drop disconnects and which kills, made explicit.** A plain drop of `AdeApp`, a window,
+  a `TerminalPane`, or a `SocketSessionAdapter` must only ever disconnect - close whatever control-
+  or data-plane connection that value owned - never reach into `jerry-pty`/`jerry-host` to end the
+  real process on the other side of it. `SessionAdapter::shutdown` (an explicit call, never a
+  `Drop`) is the one thing that kills, and only two callers ever make it: `Agents::close` (closing
+  a tab) and the worktree-discard flow - both real, deliberate user actions, never app/window/pane
+  teardown. `SocketSessionAdapter` had no `Drop` impl at all until this issue: closing a window
+  left its own real socket connection open forever, since nothing joined or interrupted its reader
+  thread's blocking `read` - the real, production-relevant bug this issue's own DoD test caught
+  (below). `TerminalPane`'s `Drop` only cancels its output task, `Agents` has none, and `RepoHost`/
+  `Hosts` have none either - `Connection::Remote`'s own `RemoteRepoHost::drop` only ends a worker
+  thread, a pure disconnect, matching this rule everywhere production ever constructs one.
+  `Connection::InProcess` (`#[cfg(test)]`-only, never constructed in production at all) is the one
+  deliberate exception: dropping it *does* kill, because a throwaway test host has no other real
+  process serving it and GitHub issue #530's own regression
+  (`crate::test_support::dropping_a_test_app_leaves_no_spawned_agent_process_behind`) requires
+  exactly that - a test app that owns its own in-process host must not leak the real processes it
+  spawned once the test ends. `jerry_host::Host`'s own `Drop` (which always kills, via
+  `Host::shutdown`) is correct there for the identical reason: an in-process test host has no
+  external process to detach from, only its own real children to reap.
+
+**Three real bugs this issue's own DoD test found, past the socket/session-management pieces
+already covered above:**
+
+1. **A session's real ConPTY/PTY startup handshake hangs forever with no client attached yet.**
+   Windows ConPTY sends a cursor-position query (`ESC[6n`) as part of spawning any real
+   interactive shell, and blocks its *entire* output stream until something writes back a real
+   reply (`crate::terminal::pane`'s own docs, confirmed live). `crate::terminal::pane::
+   TerminalPane`'s own output task already answers this once a client is attached, but nothing
+   answered it for the ordinary "spawned, not yet attached" gap every session has - a session
+   spawned and reattached to later (this issue's whole point) could die waiting on a query nobody
+   ever saw. Fixed in `jerry_host::data_plane::DataPlane::push`, which now reports whether a chunk
+   was actually captured (delivered live or buffered for an in-flight attach) or genuinely
+   dropped; `crate::session::spawn_relay` answers the query itself, from the host's own headless
+   grid, exactly when `push` reports a chunk dropped - the one case in which no client's own grid
+   will ever see, and so ever answer, these same bytes, so answering twice is impossible by
+   construction.
+2. **A freshly spawned agent's `host_session_id` was never persisted before a reasonably-timed
+   quit.** `AdeApp::record_worktree_session`'s synchronous call from `Agents::spawn`'s own caller
+   necessarily records `host_session_id: None` - the real id is only learned once this session's
+   own `SessionSpawn`/attach round trip resolves, asynchronously. Nothing re-persisted afterward
+   unless some *other*, unrelated tab mutation happened to trigger it first - a spawn-then-quit
+   with no other activity (the ordinary "started a shell, did nothing else, closed the window"
+   case) recorded a tab with no id to reattach by at all, so a relaunch's reconciliation always
+   fell back to a fresh spawn instead of finding the still-live session. Fixed by
+   `crate::work_surface::agents::attach_pane_to_session` re-persisting once its own attach
+   succeeds and the real id is known.
+3. **`SocketSessionAdapter` had no `Drop` impl**, covered in the bullet above - the socket a
+   detaching client leaves open never closes, so the host's own single-attach-at-a-time gate
+   (`DataPlane::attached`) never resets, and every later reattach for that session answers
+   `session-already-attached` forever. `SocketSessionAdapter::connect`'s reader thread is blocked
+   in a plain `read` on its own cloned handle, with no other way to notice the adapter itself is
+   gone; a real `UnixStream::shutdown(Shutdown::Both)` on `Self::shutdown_stream` - a *different*
+   handle to the same real connection, called from whichever thread drops the value - is what
+   actually severs it and unblocks that read, the identical call `Self::shutdown`'s own kill path
+   already made.
+
+**A real race in this issue's own DoD test, not a product bug:** `#[cfg(test)]`'s `Connection::
+InProcess` means a test app opened against a real repository always starts a throwaway, always-
+fresh in-process `jerry_host::Host` for it (`crate::host::connect_repo_host`'s own eager, though
+asynchronous, default path from `AdeApp::add_repo`) - a test that wants to *substitute* a specific
+connection instead (`AdeApp::adopt_repo_host_for_test`) is racing that default connect for the
+same repository, and losing is a real, reproducible failure: the default connect's own throwaway
+host can win, spawn the worktree's guaranteed startup shell onto *itself*, and then get replaced
+(and, per the bullet above, killed) the instant adoption's own `Hosts::by_repo` insert overwrites
+it - `crate::work_surface::session::session_restore_tests::launch_against_adopted_host`'s own docs
+cover the fix (build with no repo and `use_remembered_repo: false`, adopt, *then* open the
+repository through the adopted connection) and are the one place any future test needing the same
+shape should look first, rather than re-deriving it.
+
+**A real, load-bearing bug the async reconciliation introduced, and its fix:** making
+`restore_worktree_session` asynchronous (it needs a real `SessionsQuery` round trip) broke an
+assumption two independent callers relied on - `AdeApp::select_worktree` and `AdeApp::
+spawn_initial_shell_for_opened_repo` both call it for the same just-opened repository's worktree
+in the same synchronous continuation, and the second call's idempotency guard
+(`session_restored: HashSet<PathBuf>`) answered a fake `Task::ready(())` rather than a task that
+actually waited for the first (real) one to finish - harmless when restoration was synchronous,
+a real race once it wasn't. `spawn_initial_shell_for_opened_repo`'s own "is this worktree still
+empty" guaranteed-shell check then ran before the real reconciliation had landed a single tab,
+stacking a redundant guaranteed shell on top of whatever was about to be restored. Fixed by
+`select_worktree_maybe_restoring(index, restore: bool, ..)`: the opening continuation calls it
+with `restore: false`, so `spawn_initial_shell_for_opened_repo`'s own `restore_worktree_session`
+call is the one and only owner of that worktree's reconciliation, start to finish; every other
+`select_worktree` call site is unchanged. Caught by the pre-existing `session_restore_tests` fixtures
+once they stopped passing after the reconciliation change - not a new test, the existing regression
+coverage doing exactly its job.
+
+**Not attempted here:** `crates/jerry-host/tests/real_binary_spawn.rs`'s own
+`output_produced_while_no_client_is_attached_is_visible_in_the_snapshot_after_a_fresh_attach` -
+this issue's external-tier DoD test against the real, separate `jerry-host` binary - is written
+and reviewed but not confirmed passing in every builder's own sandbox; see that test's own commit
+message for which real-process constraint blocked verification there. A rarer, second instance of
+the double-restore race this entry's own fix above closes remains open: `select_worktree`'s
+*ordinary* (non-opening) call to `restore_worktree_session` can still race a *user's* raced click
+on the same worktree while `load_worktrees_for_opened_repo`'s own fetch is still in flight - narrower
+than the reliably-reproducing case above (it needs a real click during a real async window, not a
+deterministic double call), and not covered by a regression test.

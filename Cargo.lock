@@ -4401,7 +4401,6 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 name = "jerry-app"
 version = "0.2.0"
 dependencies = [
- "alacritty_terminal",
  "anyhow",
  "dunce",
  "env_logger",
@@ -4416,6 +4415,7 @@ dependencies = [
  "jerry-host",
  "jerry-lsp",
  "jerry-pty",
+ "jerry-term",
  "libc",
  "log",
  "notify",
@@ -4504,6 +4504,7 @@ dependencies = [
  "futures",
  "jerry-core",
  "jerry-pty",
+ "jerry-term",
  "libc",
  "log",
  "serde_json",
@@ -4545,6 +4546,16 @@ dependencies = [
  "tempfile",
  "test-support",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "jerry-term"
+version = "0.2.0"
+dependencies = [
+ "alacritty_terminal",
+ "futures",
+ "jerry-pty",
+ "test-support",
 ]
 
 [[package]]

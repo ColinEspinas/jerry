@@ -50,6 +50,7 @@ pub use request::{
 };
 pub use session::{
     ExitStatusWire, SessionAgentInfo, SessionAttach, SessionAttachOutcome, SessionId, SessionKill,
-    SessionKind, SessionRecord, SessionResize, SessionSpawn, SessionSpawnOutcome,
+    SessionKind, SessionRecord, SessionResize, SessionSnapshot, SessionSpawn, SessionSpawnOutcome,
+    SnapshotCell, SnapshotCellWidth,
 };
 pub use wire::{Message, RequestId, RpcError, PROTOCOL_VERSION};
