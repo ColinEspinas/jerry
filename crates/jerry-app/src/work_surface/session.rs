@@ -466,6 +466,49 @@ mod session_restore_tests {
         })
     }
 
+    /// Like [`launch`], but for a test that must attach `repo_path` to a specific, already-
+    /// connected [`crate::host::RepoHost`] (typically [`crate::host::RepoHost::for_test_remote`])
+    /// rather than whatever [`AdeApp::new_with_settings`] would otherwise resolve on its own.
+    ///
+    /// Built with no repo at all (`repo_path: None`, `use_remembered_repo: false`) - not just
+    /// `repo_path: None`, which alone would still resolve `repo_path` from a settings file an
+    /// earlier launch already populated (`AdeApp::new_with_settings`'s own "no CLI argument"
+    /// decision table falls back to the last-focused remembered repo) - so nothing here calls
+    /// `AdeApp::add_repo`, and so nothing starts `Self::open_repo_host`'s own default,
+    /// asynchronous connect for `repo_path`, until the explicit `open_repo_in_current_window`
+    /// call below runs against a connection this already adopted. Without this ordering, a
+    /// caller that instead calls `launch(cx, Some(repo_path), ..)` and adopts afterward is
+    /// racing that eager default connect, and losing that race is a real, reproducible failure,
+    /// not a hypothetical one: the default connect's own throwaway, in-process `jerry_host::Host`
+    /// can win, spawn the worktree's guaranteed startup shell onto *itself*, and then get
+    /// silently replaced (and, since dropping a test-only in-process `Host` shuts it down, killed,
+    /// per `docs/architecture/decisions.md` §25) the moment adoption's own `Hosts::by_repo` insert
+    /// overwrites it.
+    fn launch_against_adopted_host(
+        cx: &mut TestAppContext,
+        repo_path: PathBuf,
+        repo_host: crate::host::RepoHost,
+        settings_path: PathBuf,
+    ) -> (gpui::Entity<AdeApp>, &mut gpui::VisualTestContext) {
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            AdeApp::new_with_settings(
+                None,
+                false,
+                settings_store::Settings::default(),
+                Some(settings_path),
+                window,
+                cx,
+            )
+        });
+        app.update(cx, |app, cx| {
+            app.adopt_repo_host_for_test(repo_path.clone(), repo_host, cx);
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.open_repo_in_current_window(repo_path, window, cx);
+        });
+        (app, cx)
+    }
+
     /// The index of `path` in the live worktree list, so a test can select a worktree the same way
     /// a real rail click does.
     fn worktree_index(app: &AdeApp, path: &Path) -> usize {
@@ -1066,19 +1109,20 @@ mod session_restore_tests {
 
         const MARKER: &str = "jerry-still-running-marker";
 
-        // ---- Launch 1: attach the real shared host before this window's own automatic
-        // restore-on-open ever runs (both `launch` and `adopt_repo_host_for_test` are plain
-        // synchronous calls - nothing here has parked yet, so the adoption always wins the
-        // race against `Self::open_repo_host`'s own eager, but asynchronous, default connect).
+        // ---- Launch 1: attach the real shared host via `launch_against_adopted_host`, which
+        // adopts it before this window's own default `Self::open_repo_host` connect could ever
+        // start - see that helper's own docs for the real race this avoids.
         {
             let client = jerry_core::client::Client::connect(&socket, Duration::from_secs(5))
                 .expect("connect to the real socket");
             let repo_host = crate::host::RepoHost::for_test_remote(client, socket.clone())
                 .expect("wrap the real connection");
-            let (app, cx) = launch(cx, Some(repo_path.clone()), settings_path.clone());
-            app.update(cx, |app, cx| {
-                app.adopt_repo_host_for_test(repo_path.clone(), repo_host, cx);
-            });
+            let (app, cx) = launch_against_adopted_host(
+                cx,
+                repo_path.clone(),
+                repo_host,
+                settings_path.clone(),
+            );
             cx.run_until_parked();
 
             let id = app
@@ -1087,42 +1131,34 @@ mod session_restore_tests {
             // The real socket attach (`crate::host::attach_remote_session`) runs its own real
             // background threads - a single `run_until_parked` can return before they finish,
             // exactly like `remote_attach_tests`' own real-socket coverage - so this polls for
-            // real readiness rather than assuming one park is enough.
+            // real attach readiness rather than assuming one park is enough. Deliberately never
+            // waits for the *bare, unconfigured shell's own default prompt* to look non-empty
+            // first: whether a plain `sh`/`cmd` prints anything at all before a real command runs
+            // is shell-config-dependent (an empty `$PS1` on a minimal CI image prints nothing),
+            // and not something this test's own correctness should hinge on - `send_prompt`
+            // itself already refuses honestly (`false`) until `TerminalPane::session` is real, so
+            // retrying it directly is the precise, portable "is this genuinely attached yet" gate.
+            let mut sent = false;
             assert!(
                 wait_until(Duration::from_secs(15), || {
                     cx.run_until_parked();
-                    app.read_with(cx, |app, cx| {
-                        app.agents
-                            .iter()
-                            .find(|agent| agent.id == id)
-                            .is_some_and(|agent| {
-                                let pane = agent.pane.read(cx);
-                                pane.spawn_error().is_none()
-                                    && pane
-                                        .visible_text_lines()
-                                        .iter()
-                                        .any(|line| !line.trim().is_empty())
-                            })
-                    })
+                    if sent {
+                        return true;
+                    }
+                    sent = app.update(cx, |app, cx| {
+                        let Some(agent) = app.agents.iter().find(|agent| agent.id == id) else {
+                            return false;
+                        };
+                        let pane = agent.pane.clone();
+                        pane.update(cx, |pane, cx| {
+                            pane.send_prompt(&format!("echo {MARKER}"), cx)
+                        })
+                    });
+                    sent
                 }),
-                "the real shell must attach over the remote socket and produce its real prompt \
-                 before this test can send it anything"
+                "the real shell must attach over the remote socket and accept a real prompt \
+                 within the real timeout"
             );
-            app.update(cx, |app, cx| {
-                let pane = app
-                    .agents
-                    .iter()
-                    .find(|agent| agent.id == id)
-                    .expect("the agent just found above")
-                    .pane
-                    .clone();
-                pane.update(cx, |pane, cx| {
-                    assert!(
-                        pane.send_prompt(&format!("echo {MARKER}"), cx),
-                        "the real shell must be attached and ready to accept a real prompt"
-                    );
-                });
-            });
             assert!(
                 wait_until(Duration::from_secs(15), || {
                     cx.run_until_parked();
@@ -1142,10 +1178,21 @@ mod session_restore_tests {
                 }),
                 "the real shell must have echoed the marker back before this window closes"
             );
+
+            // Standing in for the app itself closing. GPUI only releases an entity whose last
+            // handle was dropped during `flush_effects`, which runs inside an app update -
+            // dropping `app` and letting this block end is not enough on its own
+            // (`crate::test_support::dropping_a_test_app_leaves_no_spawned_agent_process_behind`'s
+            // own identical pattern) - closing the window is what actually drops the `AdeApp`
+            // root view, and everything it owns down to this pane's own `SocketSessionAdapter`,
+            // along with it. The real host, and the real session it owns, are untouched: nothing
+            // here ever sends `Shutdown` or `command/session-kill`.
+            drop(app);
+            for window in cx.windows() {
+                let _ = window.update(cx, |_, window, _| window.remove_window());
+            }
+            cx.run_until_parked();
         }
-        // The app entity above is dropped here - standing in for the app itself closing. The
-        // real host, and the real session it owns, are untouched: nothing here ever sends
-        // `Shutdown` or `command/session-kill`.
 
         // ---- Launch 2: a fresh AdeApp, the same real host still running, a real persisted
         // layout naming that session's own `host_session_id`. ----
@@ -1153,10 +1200,8 @@ mod session_restore_tests {
             .expect("reconnect to the still-running host");
         let repo_host = crate::host::RepoHost::for_test_remote(client, socket.clone())
             .expect("wrap the real connection");
-        let (app, cx) = launch(cx, Some(repo_path.clone()), settings_path);
-        app.update(cx, |app, cx| {
-            app.adopt_repo_host_for_test(repo_path.clone(), repo_host, cx);
-        });
+        let (app, cx) =
+            launch_against_adopted_host(cx, repo_path.clone(), repo_host, settings_path);
         cx.run_until_parked();
 
         assert_eq!(

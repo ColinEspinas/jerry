@@ -244,6 +244,12 @@ pub struct SessionAttach {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionAttachOutcome {
     pub socket: PathBuf,
+    /// The session's own real process id, mirrored from [`SessionRecord::process_id`] so a
+    /// caller building a data-plane adapter (`jerry-app`'s `SocketSessionAdapter`) never needs a
+    /// separate `SessionsQuery` round trip just to resolve it - one real bug that round trip
+    /// left open: a fast-exiting child's own real exit could race past it, widening the window
+    /// before this attach's own data-plane connection ever completes.
+    pub process_id: Option<u32>,
     /// A structured rendering of the session's own headless grid at the moment of attach - what
     /// a reattaching pane paints *before* the first byte off `socket` ever arrives (§25). Never a
     /// raw byte replay (the pre-attach buffer §24 introduced is gone): a byte stream replayed

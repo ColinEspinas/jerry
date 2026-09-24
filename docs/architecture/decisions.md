@@ -1737,6 +1737,75 @@ notes at the time this issue was scoped.
   the identical reason `Quit`/`Hide`/`Hide Others`/`Show All` already are) since it has to reach
   every open window's repositories, not just whichever one dispatched it - wired into the macOS
   application menu, the Windows/Linux popover's own exhaustiveness check, and the command palette.
+- **Which drop disconnects and which kills, made explicit.** A plain drop of `AdeApp`, a window,
+  a `TerminalPane`, or a `SocketSessionAdapter` must only ever disconnect - close whatever control-
+  or data-plane connection that value owned - never reach into `jerry-pty`/`jerry-host` to end the
+  real process on the other side of it. `SessionAdapter::shutdown` (an explicit call, never a
+  `Drop`) is the one thing that kills, and only two callers ever make it: `Agents::close` (closing
+  a tab) and the worktree-discard flow - both real, deliberate user actions, never app/window/pane
+  teardown. `SocketSessionAdapter` had no `Drop` impl at all until this issue: closing a window
+  left its own real socket connection open forever, since nothing joined or interrupted its reader
+  thread's blocking `read` - the real, production-relevant bug this issue's own DoD test caught
+  (below). `TerminalPane`'s `Drop` only cancels its output task, `Agents` has none, and `RepoHost`/
+  `Hosts` have none either - `Connection::Remote`'s own `RemoteRepoHost::drop` only ends a worker
+  thread, a pure disconnect, matching this rule everywhere production ever constructs one.
+  `Connection::InProcess` (`#[cfg(test)]`-only, never constructed in production at all) is the one
+  deliberate exception: dropping it *does* kill, because a throwaway test host has no other real
+  process serving it and GitHub issue #530's own regression
+  (`crate::test_support::dropping_a_test_app_leaves_no_spawned_agent_process_behind`) requires
+  exactly that - a test app that owns its own in-process host must not leak the real processes it
+  spawned once the test ends. `jerry_host::Host`'s own `Drop` (which always kills, via
+  `Host::shutdown`) is correct there for the identical reason: an in-process test host has no
+  external process to detach from, only its own real children to reap.
+
+**Three real bugs this issue's own DoD test found, past the socket/session-management pieces
+already covered above:**
+
+1. **A session's real ConPTY/PTY startup handshake hangs forever with no client attached yet.**
+   Windows ConPTY sends a cursor-position query (`ESC[6n`) as part of spawning any real
+   interactive shell, and blocks its *entire* output stream until something writes back a real
+   reply (`crate::terminal::pane`'s own docs, confirmed live). `crate::terminal::pane::
+   TerminalPane`'s own output task already answers this once a client is attached, but nothing
+   answered it for the ordinary "spawned, not yet attached" gap every session has - a session
+   spawned and reattached to later (this issue's whole point) could die waiting on a query nobody
+   ever saw. Fixed in `jerry_host::data_plane::DataPlane::push`, which now reports whether a chunk
+   was actually captured (delivered live or buffered for an in-flight attach) or genuinely
+   dropped; `crate::session::spawn_relay` answers the query itself, from the host's own headless
+   grid, exactly when `push` reports a chunk dropped - the one case in which no client's own grid
+   will ever see, and so ever answer, these same bytes, so answering twice is impossible by
+   construction.
+2. **A freshly spawned agent's `host_session_id` was never persisted before a reasonably-timed
+   quit.** `AdeApp::record_worktree_session`'s synchronous call from `Agents::spawn`'s own caller
+   necessarily records `host_session_id: None` - the real id is only learned once this session's
+   own `SessionSpawn`/attach round trip resolves, asynchronously. Nothing re-persisted afterward
+   unless some *other*, unrelated tab mutation happened to trigger it first - a spawn-then-quit
+   with no other activity (the ordinary "started a shell, did nothing else, closed the window"
+   case) recorded a tab with no id to reattach by at all, so a relaunch's reconciliation always
+   fell back to a fresh spawn instead of finding the still-live session. Fixed by
+   `crate::work_surface::agents::attach_pane_to_session` re-persisting once its own attach
+   succeeds and the real id is known.
+3. **`SocketSessionAdapter` had no `Drop` impl**, covered in the bullet above - the socket a
+   detaching client leaves open never closes, so the host's own single-attach-at-a-time gate
+   (`DataPlane::attached`) never resets, and every later reattach for that session answers
+   `session-already-attached` forever. `SocketSessionAdapter::connect`'s reader thread is blocked
+   in a plain `read` on its own cloned handle, with no other way to notice the adapter itself is
+   gone; a real `UnixStream::shutdown(Shutdown::Both)` on `Self::shutdown_stream` - a *different*
+   handle to the same real connection, called from whichever thread drops the value - is what
+   actually severs it and unblocks that read, the identical call `Self::shutdown`'s own kill path
+   already made.
+
+**A real race in this issue's own DoD test, not a product bug:** `#[cfg(test)]`'s `Connection::
+InProcess` means a test app opened against a real repository always starts a throwaway, always-
+fresh in-process `jerry_host::Host` for it (`crate::host::connect_repo_host`'s own eager, though
+asynchronous, default path from `AdeApp::add_repo`) - a test that wants to *substitute* a specific
+connection instead (`AdeApp::adopt_repo_host_for_test`) is racing that default connect for the
+same repository, and losing is a real, reproducible failure: the default connect's own throwaway
+host can win, spawn the worktree's guaranteed startup shell onto *itself*, and then get replaced
+(and, per the bullet above, killed) the instant adoption's own `Hosts::by_repo` insert overwrites
+it - `crate::work_surface::session::session_restore_tests::launch_against_adopted_host`'s own docs
+cover the fix (build with no repo and `use_remembered_repo: false`, adopt, *then* open the
+repository through the adopted connection) and are the one place any future test needing the same
+shape should look first, rather than re-deriving it.
 
 **A real, load-bearing bug the async reconciliation introduced, and its fix:** making
 `restore_worktree_session` asynchronous (it needs a real `SessionsQuery` round trip) broke an

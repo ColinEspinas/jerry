@@ -42,11 +42,11 @@ fn menu_items(rows: &[MenuRow]) -> Vec<MenuItem> {
 pub(crate) fn native_menus() -> Vec<Menu> {
     let mut app_menu_items = menu_items(MenuCommand::app_menu_rows());
     // `app_menu_rows()`'s own order is `About, sep, Settings, sep, Hide, HideOthers, ShowAll,
-    // sep, Quit` - nine entries, indices 0-8. `ShowAll` is index 6; Services goes right after it,
-    // before the separator (currently index 7) that leads into Quit.
+    // sep, Quit, QuitAndStopAllAgents` - ten entries, indices 0-9. `ShowAll` is index 6; Services
+    // goes right after it, before the separator (currently index 7) that leads into Quit.
     debug_assert_eq!(
         app_menu_items.len(),
-        9,
+        10,
         "MenuCommand::app_menu_rows changed shape - re-check where Services belongs"
     );
     app_menu_items.insert(

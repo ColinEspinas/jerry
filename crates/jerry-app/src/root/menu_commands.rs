@@ -7,7 +7,9 @@
 //! macOS menu (`crate::title_bar::native_menu`) go through them rather than each keeping its own
 //! copy, so enablement and effect can never drift between the two surfaces.
 use super::*;
+use crate::repo_host::RemoteRepoHost;
 use crate::title_bar::menu_model::MenuCommand;
+use std::time::Duration;
 
 impl AdeApp {
     /// Whether `cmd` genuinely has something to do right now, using the exact same real
@@ -392,6 +394,13 @@ impl AdeApp {
     }
 }
 
+/// How long [`quit_and_stop_all_agents`] gives every open repository host to answer a real
+/// `Shutdown` before quitting anyway - real headroom for a normal round trip to a handful of
+/// hosts, never a reason to keep the app open for one that is genuinely stuck (an abandoned host
+/// dies with the process the instant `cx.quit()` actually runs; see
+/// [`crate::host::shutdown_repo_hosts_with_deadline`]'s own docs).
+const QUIT_AND_STOP_ALL_AGENTS_DEADLINE: Duration = Duration::from_secs(3);
+
 /// [`MenuCommand::QuitAndStopAllAgents`]'s real effect: every open window's own repository hosts
 /// get a real `Shutdown`, then the app quits - `docs/architecture/decisions.md` §25's own
 /// deliberate exception to ordinary Quit's "detach by default" (every host is a separate process,
@@ -400,15 +409,32 @@ impl AdeApp {
 /// `Context<AdeApp>` happened to be in scope when the command was picked, which is why this is
 /// also `crate::run`'s own global `on_action` listener rather than one more `handle_*_menu_command`
 /// on the window-scoped dispatch tree.
+///
+/// Collects every window's own hosts synchronously (cheap - see [`AdeApp::remote_hosts`]) but
+/// stops them and quits from inside a real `cx.spawn` task, never the action handler itself: a
+/// synchronous `shutdown_all_repo_hosts_blocking`-style call here would block the UI thread for as
+/// long as the slowest host takes to answer (worst case, every host's own dispatch timeout), which
+/// is exactly the bug this replaces.
 pub(crate) fn quit_and_stop_all_agents(cx: &mut App) {
+    let mut remotes: Vec<(PathBuf, RemoteRepoHost)> = Vec::new();
     for handle in cx.windows() {
         if let Some(window) = handle.downcast::<AdeApp>() {
-            let _ = window.update(cx, |ade_app, _window, _cx| {
-                ade_app.shutdown_all_repo_hosts_blocking();
-            });
+            if let Ok(mut this_window) = window.read_with(cx, |ade_app, _cx| ade_app.remote_hosts())
+            {
+                remotes.append(&mut this_window);
+            }
         }
     }
-    cx.quit();
+    cx.spawn(async move |cx| {
+        crate::host::shutdown_repo_hosts_with_deadline(
+            remotes,
+            QUIT_AND_STOP_ALL_AGENTS_DEADLINE,
+            cx,
+        )
+        .await;
+        cx.update(|cx| cx.quit());
+    })
+    .detach();
 }
 
 #[cfg(test)]
