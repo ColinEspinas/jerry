@@ -49,8 +49,9 @@ pub use request::{
     execute_locally, AppCommand, AppQuery, HookEvent, LocalDispatchError, Request, Shutdown,
 };
 pub use session::{
-    ExitStatusWire, SessionAgentInfo, SessionAttach, SessionAttachOutcome, SessionId, SessionKill,
-    SessionKind, SessionRecord, SessionResize, SessionSnapshot, SessionSpawn, SessionSpawnOutcome,
-    SnapshotCell, SnapshotCellWidth,
+    AttentionRaise, ExitStatusWire, SessionAgentInfo, SessionAttach, SessionAttachOutcome,
+    SessionId, SessionKill, SessionKind, SessionRecord, SessionResize, SessionSend,
+    SessionSnapshot, SessionSpawn, SessionSpawnOutcome, SessionStopPolicy, SnapshotCell,
+    SnapshotCellWidth, StopDecision,
 };
 pub use wire::{Message, RequestId, RpcError, PROTOCOL_VERSION};

@@ -18,7 +18,10 @@ use crate::queries::{
     AgentsQuery, MergeStatusQuery, RebaseStatusQuery, SessionsQuery, StatusQuery,
 };
 use crate::report::Report;
-use crate::session::{SessionAttach, SessionId, SessionKill, SessionResize, SessionSpawn};
+use crate::session::{
+    AttentionRaise, SessionAttach, SessionId, SessionKill, SessionResize, SessionSend,
+    SessionSpawn, SessionStopPolicy,
+};
 use crate::wire::{rpc_code, RpcError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -90,6 +93,9 @@ pub enum AppCommand {
     SessionAttach(SessionAttach),
     SessionResize(SessionResize),
     SessionKill(SessionKill),
+    SessionSend(SessionSend),
+    SessionStopPolicy(SessionStopPolicy),
+    AttentionRaise(AttentionRaise),
     Shutdown(Shutdown),
 }
 
@@ -107,6 +113,7 @@ pub enum AppQuery {
 /// The kebab-case names of every `AppCommand` variant, for method lookup and tool listing.
 pub const COMMAND_NAMES: &[&str] = &[
     "amend-head-message",
+    "attention-raise",
     "merge-abort",
     "merge-attempt",
     "merge-branch-into-current",
@@ -118,7 +125,9 @@ pub const COMMAND_NAMES: &[&str] = &[
     "session-attach",
     "session-kill",
     "session-resize",
+    "session-send",
     "session-spawn",
+    "session-stop-policy",
     "shutdown",
     "stage-resolved",
     "worktree-create",
@@ -176,6 +185,9 @@ macro_rules! each_command {
             AppCommand::SessionAttach($c) => $body,
             AppCommand::SessionResize($c) => $body,
             AppCommand::SessionKill($c) => $body,
+            AppCommand::SessionSend($c) => $body,
+            AppCommand::SessionStopPolicy($c) => $body,
+            AppCommand::AttentionRaise($c) => $body,
             AppCommand::Shutdown($c) => $body,
         }
     };
@@ -199,6 +211,9 @@ impl AppCommand {
             AppCommand::SessionAttach(_) => SessionAttach::NAME,
             AppCommand::SessionResize(_) => SessionResize::NAME,
             AppCommand::SessionKill(_) => SessionKill::NAME,
+            AppCommand::SessionSend(_) => SessionSend::NAME,
+            AppCommand::SessionStopPolicy(_) => SessionStopPolicy::NAME,
+            AppCommand::AttentionRaise(_) => AttentionRaise::NAME,
             AppCommand::Shutdown(_) => Shutdown::NAME,
         }
     }
@@ -256,6 +271,18 @@ impl AppCommand {
             }
             AppCommand::SessionResize(_) => "Resize a live session's pty.",
             AppCommand::SessionKill(_) => "Kill a live session's process tree.",
+            AppCommand::SessionSend(_) => {
+                "Write to another live session's stdin. Denied by default; opened per agent \
+                 through its own orchestrator grants."
+            }
+            AppCommand::SessionStopPolicy(_) => {
+                "Pre-register this orchestrator's decision for a child agent's next Stop hook - \
+                 consumed once. Denied by default; opened per agent through its own orchestrator \
+                 grants."
+            }
+            AppCommand::AttentionRaise(_) => {
+                "Wake the human working on this repository, keyed to the calling agent's own tab."
+            }
             AppCommand::Shutdown(_) => {
                 "Shut the connected Jerry host down, killing every session it still owns."
             }
@@ -281,6 +308,9 @@ impl AppCommand {
             AppCommand::SessionAttach(_) => schema_of::<SessionAttach>(),
             AppCommand::SessionResize(_) => schema_of::<SessionResize>(),
             AppCommand::SessionKill(_) => schema_of::<SessionKill>(),
+            AppCommand::SessionSend(_) => schema_of::<SessionSend>(),
+            AppCommand::SessionStopPolicy(_) => schema_of::<SessionStopPolicy>(),
+            AppCommand::AttentionRaise(_) => schema_of::<AttentionRaise>(),
             AppCommand::Shutdown(_) => schema_of::<Shutdown>(),
         }
     }
@@ -530,6 +560,7 @@ impl Request {
                     from: None,
                     agent: Some(AgentSpec::Claude),
                     prompt: Some("fix the login bug".into()),
+                    orchestrator: false,
                 })),
             ),
             (
@@ -547,6 +578,8 @@ impl Request {
                     agent: Some(crate::session::SessionAgentInfo {
                         kind: "Claude".into(),
                         agent_id: crate::AgentId::from("agent-1"),
+                        grants: Vec::new(),
+                        parent: None,
                     }),
                 })),
             ),
@@ -568,6 +601,30 @@ impl Request {
                 "request-command-session-kill",
                 Request::Command(AppCommand::SessionKill(SessionKill {
                     id: SessionId::from("session-1"),
+                })),
+            ),
+            (
+                "request-command-session-send",
+                Request::Command(AppCommand::SessionSend(crate::session::SessionSend {
+                    to: SessionId::from("session-1"),
+                    text: "y\n".into(),
+                    submit: true,
+                })),
+            ),
+            (
+                "request-command-session-stop-policy",
+                Request::Command(AppCommand::SessionStopPolicy(
+                    crate::session::SessionStopPolicy {
+                        child: crate::AgentId::from("agent-7"),
+                        decision: crate::session::StopDecision::Stop,
+                        reason: Some("still validating the migration".into()),
+                    },
+                )),
+            ),
+            (
+                "request-command-attention-raise",
+                Request::Command(AppCommand::AttentionRaise(crate::session::AttentionRaise {
+                    message: "need your input on the login flow".into(),
                 })),
             ),
             (

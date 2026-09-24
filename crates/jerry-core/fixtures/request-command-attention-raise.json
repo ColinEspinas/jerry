@@ -1,0 +1,9 @@
+{
+  "method": "command/attention-raise",
+  "params": {
+    "cwd": "/repo",
+    "params": {
+      "message": "need your input on the login flow"
+    }
+  }
+}

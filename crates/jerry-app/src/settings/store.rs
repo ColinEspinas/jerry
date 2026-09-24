@@ -36,7 +36,7 @@ pub struct Settings {
 /// Settings about the agent CLIs themselves, rather than about the Jerry UI around them - separate
 /// from [`TerminalSettings`] (which is about *shell* spawn behaviour) for the same reason that
 /// section is its own key rather than folded into [`AppearanceSettings`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentsSettings {
     /// GitHub issue #479: whether Jerry writes its managed `jerry hook <event>` entries into
@@ -48,6 +48,32 @@ pub struct AgentsSettings {
     /// spawn (`jerry hook` no-ops without Jerry's own `JERRY_AGENT_ID`/`JERRY_HOST_SOCKET`
     /// environment).
     pub cursor_hooks_enabled: bool,
+    /// `[agents.orchestrator]` in `settings.toml` - what `jerry wt new --agent <kind>
+    /// --orchestrator` grants the agent it spawns (`docs/architecture/decisions.md` §28).
+    pub orchestrator: OrchestratorSettings,
+}
+
+/// An orchestrator's own grants (`docs/architecture/decisions.md` §28): wire method names beyond
+/// what its `Invocability` alone allows - `jerry-host`'s dispatcher consults exactly these
+/// (`SessionAgentInfo::grants`) for an agent caller. Its own section, not folded into
+/// [`AgentsSettings`] directly, so a future orchestrator-only setting has somewhere to go without
+/// growing that struct's own flat field list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OrchestratorSettings {
+    pub grants: Vec<String>,
+}
+
+impl Default for OrchestratorSettings {
+    /// `command/session-send` alone: real control over another agent's stdin, the one grant
+    /// `jerry wt new --orchestrator` needs to be useful with no further `settings.toml` editing.
+    /// `command/session-stop-policy` is deliberately not included by default - pre-empting
+    /// another agent's own `Stop` is a stronger claim than sending it a message, and stays opt-in.
+    fn default() -> Self {
+        Self {
+            grants: vec!["command/session-send".to_owned()],
+        }
+    }
 }
 
 /// The integrated terminal's own behavioural settings (GitHub issue #213: "Allow to select
@@ -1603,6 +1629,43 @@ mod tests {
         std::fs::write(&path, "[terminal]\nshell = \"fish\"\n")
             .expect("write a file with no agents section");
         assert!(!Settings::load_or_init_at(&path).agents.cursor_hooks_enabled);
+    }
+
+    #[test]
+    fn orchestrator_grants_default_to_session_send_and_round_trip_through_a_real_file() {
+        // `docs/architecture/decisions.md` §28: `jerry wt new --orchestrator` must be useful with
+        // no `settings.toml` editing at all.
+        assert_eq!(
+            Settings::default().agents.orchestrator.grants,
+            vec!["command/session-send".to_owned()]
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        let mut configured = Settings::default();
+        configured.agents.orchestrator.grants = vec![
+            "command/session-send".into(),
+            "command/session-stop-policy".into(),
+        ];
+        configured.save_at(&path).expect("write configured");
+        assert_eq!(
+            Settings::load_or_init_at(&path).agents.orchestrator.grants,
+            vec![
+                "command/session-send".to_owned(),
+                "command/session-stop-policy".to_owned()
+            ]
+        );
+
+        // A hand-edited file with no `[agents.orchestrator]` section at all still loads, with the
+        // real default grant rather than an empty list.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, "[terminal]\nshell = \"fish\"\n")
+            .expect("write a file with no agents section");
+        assert_eq!(
+            Settings::load_or_init_at(&path).agents.orchestrator.grants,
+            vec!["command/session-send".to_owned()]
+        );
     }
 
     #[test]

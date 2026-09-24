@@ -34,7 +34,7 @@ differently:
 Prints the worktree, repository, caller identity (you, as an agent, or a human), and whether a
 Jerry is reachable. Cheap; safe to run any time you're unsure where you are.
 
-### `jerry wt new <branch> [--from <ref>] [--agent <kind>] [prompt]`
+### `jerry wt new <branch> [--from <ref>] [--agent <kind>] [--orchestrator] [prompt]`
 
 Creates a new git worktree on a fresh branch, as a sibling of the main checkout. Prints the new
 worktree's path on success.
@@ -42,6 +42,9 @@ worktree's path on success.
 - `--from <ref>`: the start point for `<branch>` (defaults to `HEAD`).
 - `--agent <kind>`: also asks Jerry to start an agent CLI in the new worktree once it's created.
   `<kind>` is one of `claude`, `codex`, `cursor` (case-insensitive).
+- `--orchestrator`: grants the spawned agent orchestrator policy - real control over sessions it
+  spawns, through `jerry send`/`jerry hook`'s `Stop` decision (see "Orchestration" below). Only
+  meaningful with `--agent`.
 - `[prompt]`: an optional initial message handed to the spawned agent. Only meaningful with
   `--agent`.
 
@@ -58,6 +61,36 @@ created, but exits 4 with a note on stderr that no agent was spawned.
 Lists every agent Jerry is currently supervising, one per line as `<id>\t<kind>\t<worktree>`
 (or a JSON array with `--json`). Requires a running Jerry (exit 4 without one). Empty output with
 exit 0 means Jerry is running but supervising nothing right now.
+
+### `jerry attention <message>`
+
+Wakes the human: raises the same signal an agent CLI's own desktop-notification escape sequence
+would, on your own tab specifically. Use it when you're genuinely blocked on a human decision, not
+for routine progress updates.
+
+### `jerry send --to <session-id> [--no-submit] <text>`
+
+Writes `<text>` to another live session's stdin - the trailing Enter is sent unless `--no-submit`
+is given. Refused (exit 3) unless the caller is an orchestrator: an agent spawned with
+`jerry wt new --agent <kind> --orchestrator`, which grants exactly this. Find `<session-id>` with
+`jerry sessions`.
+
+## Orchestration
+
+An agent spawned with `--orchestrator` (`jerry wt new --agent <kind> --orchestrator`) may act on
+sessions it spawned, beyond what an ordinary agent can:
+
+- `jerry send` (above) - drive another session's input directly.
+- Pre-empt a child's own `Stop` hook: register `command/session-stop-policy` (via `jerry mcp`;
+  there is no dedicated CLI verb for this one) naming the child's own agent id and a decision -
+  the child's *next* `Stop` answers with it, once, then reverts to letting the child stop
+  normally. Use this to keep a child working past a turn boundary it would otherwise stop at,
+  e.g. because you've sent it more to do via `jerry send` and it hasn't seen it yet.
+
+What grants an agent has is configured in Jerry's own `settings.toml`
+(`[agents.orchestrator]`, `grants = ["command/session-send", ...]`) - `jerry mcp`'s `tools/list`
+only ever shows tools this exact caller may invoke, orchestrator grants included, so check there
+rather than assuming.
 
 ### `jerry merge [--dry-run | --continue | --abort]`
 
