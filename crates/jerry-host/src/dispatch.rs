@@ -11,8 +11,9 @@ use crate::session::{SessionAttachError, SessionError};
 use crate::Inner;
 use jerry_core::wire::rpc_code;
 use jerry_core::{
-    execute_locally, permits, AppCommand, AppQuery, Call, Caller, Ctx, Error, LocalDispatchError,
-    Message, Report, Request, RpcError, SessionAttachOutcome, SessionSpawnOutcome,
+    execute_locally, permits, AgentId, AppCommand, AppQuery, Call, Caller, Ctx, Error, HookEvent,
+    LocalDispatchError, Message, Report, Request, RpcError, SessionAttachOutcome,
+    SessionSpawnOutcome, StopDecision,
 };
 use serde_json::Value;
 use std::fs;
@@ -20,7 +21,7 @@ use std::path::Path;
 
 pub(crate) fn handle(inner: &Inner, call: Call) -> Result<Value, RpcError> {
     let caller = classify(inner, &call)?;
-    if !permits(&caller, call.request.invocability()) {
+    if !permits(&caller, call.request.invocability()) && !granted(inner, &caller, &call) {
         return Err(RpcError::new(
             rpc_code::FORBIDDEN,
             format!("{} is not invocable by an agent", call.method()),
@@ -46,6 +47,61 @@ pub(crate) fn handle(inner: &Inner, call: Call) -> Result<Value, RpcError> {
                     "payload": event.payload,
                 }),
             });
+            let outcome = if event.event == "Stop" {
+                stop_hook_outcome(inner, id, event)
+            } else {
+                Value::Null
+            };
+            to_value(Report::Ok { outcome })
+        }
+        Request::Command(AppCommand::AttentionRaise(command)) => {
+            let Caller::Agent { id } = &caller else {
+                return Err(RpcError::new(
+                    rpc_code::FORBIDDEN,
+                    "attention needs an agent identity",
+                ));
+            };
+            let session_id = inner.sessions().session_id_for_agent(id);
+            inner.fanout().broadcast(Message::Notification {
+                method: "event/attention".into(),
+                params: serde_json::json!({
+                    "session_id": session_id,
+                    "agent_id": id,
+                    "message": command.message,
+                }),
+            });
+            to_value(Report::Ok {
+                outcome: Value::Null,
+            })
+        }
+        Request::Command(AppCommand::SessionSend(command)) => {
+            if let Caller::Agent { id } = &caller {
+                if inner.sessions().session_id_for_agent(id).as_ref() == Some(&command.to) {
+                    return to_value(Report::Denied {
+                        code: "session-send-self".into(),
+                        reason: "an agent may not send to its own session".into(),
+                    });
+                }
+            }
+            let mut data = command.text.clone().into_bytes();
+            if command.submit {
+                data.extend_from_slice(b"\r");
+            }
+            to_value(match inner.sessions().write_input(&command.to, &data) {
+                Ok(()) => Report::Ok {
+                    outcome: Value::Null,
+                },
+                Err(error) => Report::Error {
+                    error: session_error_to_wire(error),
+                },
+            })
+        }
+        Request::Command(AppCommand::SessionStopPolicy(command)) => {
+            inner.register_stop_policy(
+                command.child.clone(),
+                command.decision,
+                command.reason.clone(),
+            );
             to_value(Report::Ok {
                 outcome: Value::Null,
             })
@@ -222,8 +278,49 @@ fn publish_worktree_created(
             "agent": command.agent,
             "prompt": command.prompt,
             "requested_by": requested_by,
+            "orchestrator": command.orchestrator,
         }),
     });
+}
+
+/// An agent caller's own `SessionAgentInfo::grants` can open a method its `Invocability` alone
+/// would refuse (orchestrator policy, `docs/architecture/decisions.md` §26) - a human is already
+/// permitted everything by `permits` itself, so this is only ever worth consulting for
+/// `Caller::Agent`.
+fn granted(inner: &Inner, caller: &Caller, call: &Call) -> bool {
+    let Caller::Agent { id } = caller else {
+        return false;
+    };
+    let method = call.method().to_string();
+    inner.sessions().grants_for_agent(id).contains(&method)
+}
+
+/// A `Stop` hook's own reply outcome (`docs/architecture/decisions.md` §26): when `child` was
+/// spawned with a known orchestrator (`SessionAgentInfo::parent`), forwards `event/child-stopped`
+/// to it and answers whatever decision that orchestrator pre-registered
+/// (`SessionStopPolicy`, consumed exactly once) - `"continue"` if none was, and always
+/// `"continue"` for a child with no orchestrator at all (nothing registered a policy, and nothing
+/// to forward to).
+fn stop_hook_outcome(inner: &Inner, child: &AgentId, event: &HookEvent) -> Value {
+    let Some(_parent) = inner.sessions().parent_of_agent(child) else {
+        return serde_json::json!({ "decision": "continue" });
+    };
+    let hook_reason = event
+        .payload
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    inner.fanout().broadcast(Message::Notification {
+        method: "event/child-stopped".into(),
+        params: serde_json::json!({ "child": child, "reason": hook_reason }),
+    });
+    match inner.take_stop_policy(child) {
+        Some((StopDecision::Stop, policy_reason)) => serde_json::json!({
+            "decision": "stop",
+            "reason": policy_reason.or(hook_reason),
+        }),
+        _ => serde_json::json!({ "decision": "continue" }),
+    }
 }
 
 /// Env-injected identity makes an `Agent`, and only an identity this host handed out counts.

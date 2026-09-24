@@ -389,7 +389,12 @@ impl SessionManager {
             id: id.clone(),
             kind: SessionKind::Pty,
             worktree,
-            agent: Some(SessionAgentInfo { kind, agent_id }),
+            agent: Some(SessionAgentInfo {
+                kind,
+                agent_id,
+                grants: Vec::new(),
+                parent: None,
+            }),
             started_at: unix_now(),
             exit: None,
             process_id: None,
@@ -463,6 +468,74 @@ impl SessionManager {
                     .as_ref()
                     .is_some_and(|agent| &agent.agent_id == agent_id)
         })
+    }
+
+    /// The live session id `agent_id` is currently spawned as, if any - the real counterpart to
+    /// [`Self::worktree_of_agent`], used to resolve an `AttentionRaise`/`SessionSend` caller's own
+    /// session (`docs/architecture/decisions.md` §26). Same "prefer a still-live entry" rule as
+    /// that method.
+    pub(crate) fn session_id_for_agent(&self, agent_id: &AgentId) -> Option<SessionId> {
+        let entries = lock(&self.entries);
+        let matches = || {
+            entries.values().filter(|entry| {
+                entry
+                    .record
+                    .agent
+                    .as_ref()
+                    .is_some_and(|agent| &agent.agent_id == agent_id)
+            })
+        };
+        matches()
+            .find(|entry| entry.record.exit.is_none())
+            .or_else(|| matches().next())
+            .map(|entry| entry.record.id.clone())
+    }
+
+    /// `SessionAgentInfo::grants` for `agent_id`'s own live session, empty for none/not found -
+    /// what the dispatcher's `permits` check consults for an agent caller whose own
+    /// `Invocability::Denied` would otherwise refuse a call (`docs/architecture/decisions.md`
+    /// §26).
+    pub(crate) fn grants_for_agent(&self, agent_id: &AgentId) -> Vec<String> {
+        lock(&self.entries)
+            .values()
+            .filter(|entry| entry.record.exit.is_none())
+            .find_map(|entry| {
+                entry
+                    .record
+                    .agent
+                    .as_ref()
+                    .filter(|agent| &agent.agent_id == agent_id)
+                    .map(|agent| agent.grants.clone())
+            })
+            .unwrap_or_default()
+    }
+
+    /// `SessionAgentInfo::parent` for `agent_id`'s own live session - the orchestrator a `Stop`
+    /// hook from it is forwarded to, if any (`docs/architecture/decisions.md` §26).
+    pub(crate) fn parent_of_agent(&self, agent_id: &AgentId) -> Option<AgentId> {
+        lock(&self.entries)
+            .values()
+            .filter(|entry| entry.record.exit.is_none())
+            .find_map(|entry| {
+                entry
+                    .record
+                    .agent
+                    .as_ref()
+                    .filter(|agent| &agent.agent_id == agent_id)
+                    .and_then(|agent| agent.parent.clone())
+            })
+    }
+
+    /// Writes to a live session's real pty input - `SessionSend`'s own execution
+    /// (`docs/architecture/decisions.md` §26). `NotOwned` for an `AgentTable`-compatibility
+    /// registration or an already-exited session (both have no process to write to), exactly like
+    /// [`Self::resize`]/[`Self::kill`].
+    pub fn write_input(&self, id: &SessionId, data: &[u8]) -> Result<(), SessionError> {
+        self.process_for(id)?
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .write_input(data)
+            .map_err(SessionError::from)
     }
 
     pub(crate) fn agent_count(&self) -> usize {
@@ -662,6 +735,17 @@ mod session_manager_tests {
         }
     }
 
+    /// Stays alive and lets whatever is written to the pty come back out of it - `cat` on unix,
+    /// and on Windows the shell itself, since ConPTY does the echoing rather than the child
+    /// (mirrors `jerry_pty`'s own `stdin_echoing_command` test helper).
+    fn stdin_echoing_command() -> SpawnOptions {
+        if cfg!(windows) {
+            SpawnOptions::new("cmd.exe")
+        } else {
+            SpawnOptions::new("cat")
+        }
+    }
+
     /// ConPTY's startup Device Status Report query: it withholds all child output until
     /// something answers it. `crates/jerry-app`'s real pane answers this from its own
     /// `alacritty_terminal`-backed grid; this table has none, so a test holding a bare
@@ -763,6 +847,92 @@ mod session_manager_tests {
                 .is_some()),
             "the manager's own record must reflect the observed exit"
         );
+    }
+
+    #[test]
+    fn session_id_grants_and_parent_are_resolved_from_the_spawning_agents_own_live_session() {
+        use jerry_core::{AgentId, SessionAgentInfo};
+
+        let manager = SessionManager::new(Fanout::default(), crate::default_sockets_dir());
+        let agent_id = AgentId::from("agent-orchestrator");
+        let (id, _handle) = manager
+            .spawn(
+                PathBuf::from("/repo"),
+                Some(SessionAgentInfo {
+                    kind: "Claude".into(),
+                    agent_id: agent_id.clone(),
+                    grants: vec!["command/session-send".into()],
+                    parent: Some(AgentId::from("agent-parent")),
+                }),
+                shell_options("echo hello"),
+            )
+            .expect("spawn");
+
+        assert_eq!(manager.session_id_for_agent(&agent_id), Some(id));
+        assert_eq!(
+            manager.grants_for_agent(&agent_id),
+            vec!["command/session-send".to_owned()]
+        );
+        assert_eq!(
+            manager.parent_of_agent(&agent_id),
+            Some(AgentId::from("agent-parent"))
+        );
+
+        let stranger = AgentId::from("nobody-spawned-this");
+        assert_eq!(manager.session_id_for_agent(&stranger), None);
+        assert!(manager.grants_for_agent(&stranger).is_empty());
+        assert_eq!(manager.parent_of_agent(&stranger), None);
+    }
+
+    #[test]
+    fn write_input_reaches_the_real_process_and_an_unknown_target_is_refused() {
+        let manager = SessionManager::new(Fanout::default(), crate::default_sockets_dir());
+        let (id, handle) = manager
+            .spawn(PathBuf::from("/repo"), None, stdin_echoing_command())
+            .expect("spawn");
+        let mut output = handle.take_output().expect("output stream");
+
+        manager
+            .write_input(&id, b"echo-me-back\r\n")
+            .expect("write to a real, live session");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut seen = Vec::new();
+        let mut answered = false;
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the write must reach the real process and come back out - either the child's \
+                 own echo (unix `cat`) or ConPTY's own local echo (Windows `cmd.exe`); saw {:?}",
+                String::from_utf8_lossy(&seen)
+            );
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match recv_timeout(&mut output, remaining) {
+                Some(PtyOutput::Bytes(chunk)) => {
+                    answer_cursor_position_query(&handle, &chunk, &mut answered);
+                    seen.extend_from_slice(&chunk);
+                    if String::from_utf8_lossy(&seen).contains("echo-me-back") {
+                        break;
+                    }
+                }
+                Some(PtyOutput::Exited(status)) => {
+                    panic!("the still-alive echoing session exited unexpectedly: {status:?}")
+                }
+                None => panic!(
+                    "the output stream produced nothing further: {:?}",
+                    String::from_utf8_lossy(&seen)
+                ),
+            }
+        }
+        manager
+            .kill(&id)
+            .expect("kill the still-alive echoing session so this test does not leak it");
+
+        let unknown = jerry_core::SessionId::from("no-such-session");
+        assert!(matches!(
+            manager.write_input(&unknown, b"x"),
+            Err(super::SessionError::NotFound(_))
+        ));
     }
 
     /// The real CI regression behind PR #538: every other test in this module reaches

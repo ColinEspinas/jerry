@@ -17,8 +17,9 @@ pub use session::{SessionError, SessionHandle, SessionManager, SessionSpawnError
 use futures::channel::{mpsc, oneshot};
 use jerry_core::client::Stream;
 use jerry_core::wire::rpc_code;
-use jerry_core::{AgentId, Call, Message, Report, RpcError, SessionId};
+use jerry_core::{AgentId, Call, Message, Report, RpcError, SessionId, StopDecision};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::net::Shutdown;
@@ -140,6 +141,11 @@ pub(crate) struct Inner {
     /// (`HostRuntime::in_process`/test hosts never start one): the bounded channel just buffers
     /// the one wake with nothing reading it.
     shutdown_tx: std_mpsc::SyncSender<()>,
+    /// Pending `SessionStopPolicy` decisions, keyed by the child agent id the *next* `Stop` hook
+    /// from them should honour (`docs/architecture/decisions.md` §26) - consumed once
+    /// ([`Self::take_stop_policy`]). Registrations are rare (one per orchestrator-managed stop),
+    /// never a hot path, so a plain mutex-guarded map is enough.
+    stop_policies: Mutex<HashMap<AgentId, (StopDecision, Option<String>)>>,
 }
 
 impl Inner {
@@ -192,6 +198,26 @@ impl Inner {
 
     pub(crate) fn track_connection(&self, stream: Stream) {
         lock(&self.connections).push(stream);
+    }
+
+    /// `SessionStopPolicy`'s own write side (`docs/architecture/decisions.md` §26): registers, or
+    /// replaces, the decision `child`'s next `Stop` hook should answer with.
+    pub(crate) fn register_stop_policy(
+        &self,
+        child: AgentId,
+        decision: StopDecision,
+        reason: Option<String>,
+    ) {
+        lock(&self.stop_policies).insert(child, (decision, reason));
+    }
+
+    /// Consumes and returns the pending policy for `child`, if any - a registered policy applies
+    /// to exactly one `Stop` (`docs/architecture/decisions.md` §26).
+    pub(crate) fn take_stop_policy(
+        &self,
+        child: &AgentId,
+    ) -> Option<(StopDecision, Option<String>)> {
+        lock(&self.stop_policies).remove(child)
     }
 
     /// Closes every live connection's socket, which ends its reader and, through the fanout,
@@ -276,6 +302,7 @@ impl Host {
             connections: Mutex::new(Vec::new()),
             shutting_down: AtomicBool::new(false),
             shutdown_tx,
+            stop_policies: Mutex::new(HashMap::new()),
         });
         let worker = Arc::clone(&inner);
         let dispatch: DispatchFuture = Box::pin(async move {
@@ -639,6 +666,8 @@ mod host_dispatch_tests {
             agent: Some(jerry_core::SessionAgentInfo {
                 kind: "Claude".into(),
                 agent_id,
+                grants: Vec::new(),
+                parent: None,
             }),
         }))
     }
@@ -701,6 +730,8 @@ mod host_dispatch_tests {
             agent: Some(jerry_core::SessionAgentInfo {
                 kind: "Claude".into(),
                 agent_id: id.clone(),
+                grants: Vec::new(),
+                parent: None,
             }),
         };
         let spawned = block_on(client.request(Call::human(
@@ -765,6 +796,8 @@ mod host_dispatch_tests {
             agent: Some(jerry_core::SessionAgentInfo {
                 kind: "Claude".into(),
                 agent_id: id.clone(),
+                grants: Vec::new(),
+                parent: None,
             }),
         };
         let spawned = block_on(client.request(Call::human(
@@ -891,6 +924,7 @@ mod host_dispatch_tests {
             from: None,
             agent: Some(jerry_core::AgentSpec::Claude),
             prompt: Some("do the thing".into()),
+            orchestrator: true,
         }));
         let report =
             block_on(client.request(Call::human(repo.path(), create))).expect("dispatched");
@@ -911,6 +945,7 @@ mod host_dispatch_tests {
                 assert_eq!(params["path"], serde_json::json!(path));
                 assert_eq!(params["agent"], serde_json::json!("claude"));
                 assert_eq!(params["prompt"], serde_json::json!("do the thing"));
+                assert_eq!(params["orchestrator"], serde_json::json!(true));
                 assert_eq!(
                     params["requested_by"],
                     serde_json::json!({ "kind": "human" })
@@ -937,6 +972,7 @@ mod host_dispatch_tests {
                 from: None,
                 agent: None,
                 prompt: None,
+                orchestrator: false,
             }))
         };
         let first = block_on(client.request(Call::human(repo.path(), create()))).expect("first");
@@ -955,6 +991,57 @@ mod host_dispatch_tests {
             "a denied command must publish nothing"
         );
 
+        let _ = std::fs::remove_dir_all(Path::new(&path).parent().expect("parent"));
+        host.shutdown_and_join();
+    }
+
+    /// `event/worktree-created`'s own `requested_by` names a real agent caller, not just
+    /// `{"kind": "human"}` - the data `jerry-app`'s own `work_surface::worktree_created` reads to
+    /// record the spawned agent's `parent` (`docs/architecture/decisions.md` §26), so a child
+    /// agent's later `Stop` hook has somewhere real to forward to.
+    #[test]
+    fn a_worktree_create_requested_by_an_agent_names_that_agent_in_the_notification() {
+        let repo = seed_repo();
+        let host = Host::start().expect("host");
+        let client = host.client();
+        let requester = AgentId::from("agent-requester");
+        host.agents().register(
+            requester.clone(),
+            repo.path().to_path_buf(),
+            "Claude".into(),
+        );
+        let mut events = client.subscribe();
+
+        let create = Request::Command(AppCommand::WorktreeCreate(WorktreeCreate {
+            branch: "feature-agent-requested".into(),
+            from: None,
+            agent: Some(jerry_core::AgentSpec::Claude),
+            prompt: None,
+            orchestrator: true,
+        }));
+        let report = block_on(client.request(Call::agent(repo.path(), requester, create)))
+            .expect("dispatched");
+        assert!(report.is_ok(), "{report:?}");
+        let path = outcome_path(&report, "path");
+
+        let mut received = None;
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                received = events.try_recv().ok();
+                received.is_some()
+            }),
+            "one notification arrives"
+        );
+        match received.expect("received") {
+            Message::Notification { method, params } => {
+                assert_eq!(method, "event/worktree-created");
+                assert_eq!(
+                    params["requested_by"],
+                    serde_json::json!({ "kind": "agent", "id": "agent-requester" })
+                );
+            }
+            other => panic!("expected a notification, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(Path::new(&path).parent().expect("parent"));
         host.shutdown_and_join();
     }
@@ -1001,6 +1088,325 @@ mod host_dispatch_tests {
         host.shutdown_and_join();
         let err = block_on(client.call(Call::human(repo.path(), status()))).expect_err("down");
         assert_eq!(err.code, rpc_code::SHUTTING_DOWN);
+        host.shutdown_and_join();
+    }
+
+    /// A long-running (never exits on its own) real session - the shared shape
+    /// `a_second_spawn_reusing_a_live_agent_id_is_denied`/`agents_query_stops_listing_...` already
+    /// used inline; pulled out here so the orchestrator-policy tests below can spawn several.
+    fn long_running_spawn(agent: Option<jerry_core::SessionAgentInfo>) -> jerry_core::SessionSpawn {
+        let sleep = if cfg!(windows) {
+            "ping -n 30 127.0.0.1 >NUL"
+        } else {
+            "sleep 30"
+        };
+        jerry_core::SessionSpawn {
+            program: if cfg!(windows) { "cmd" } else { "sh" }.into(),
+            args: if cfg!(windows) {
+                vec!["/c".into(), sleep.into()]
+            } else {
+                vec!["-c".into(), sleep.into()]
+            },
+            env: Vec::new(),
+            rows: 24,
+            cols: 80,
+            agent,
+        }
+    }
+
+    fn spawn_session(
+        client: &super::LocalClient,
+        repo: &Path,
+        agent: Option<jerry_core::SessionAgentInfo>,
+    ) -> jerry_core::SessionId {
+        let report = block_on(client.request(Call::human(
+            repo.to_path_buf(),
+            Request::Command(AppCommand::SessionSpawn(long_running_spawn(agent))),
+        )))
+        .expect("spawn dispatched");
+        jerry_core::SessionId::from(outcome_path(&report, "id"))
+    }
+
+    /// `AttentionRaise` (`docs/architecture/decisions.md` §26): `Invocability::Allowed`, but only
+    /// meaningful for an agent caller - a human has no session of their own for the host to key
+    /// the event to, and the dispatcher refuses it the same way it refuses an anonymous `Hook`.
+    #[test]
+    fn attention_raise_needs_an_agent_identity_and_publishes_a_real_event() {
+        let repo = seed_empty_repo();
+        let host = Host::start().expect("host");
+        let client = host.client();
+        let id = AgentId::from("agent-attention");
+        host.agents()
+            .register(id.clone(), repo.path().to_path_buf(), "Claude".into());
+        let mut events = client.subscribe();
+
+        let anonymous = block_on(client.call(Call::human(
+            repo.path(),
+            Request::Command(AppCommand::AttentionRaise(jerry_core::AttentionRaise {
+                message: "no agent behind this call".into(),
+            })),
+        )))
+        .expect_err("a human has no session to key the event to");
+        assert_eq!(anonymous.code, rpc_code::FORBIDDEN);
+
+        let report = block_on(client.request(Call::agent(
+            repo.path(),
+            id.clone(),
+            Request::Command(AppCommand::AttentionRaise(jerry_core::AttentionRaise {
+                message: "need your input on the login flow".into(),
+            })),
+        )))
+        .expect("dispatched");
+        assert!(report.is_ok(), "{report:?}");
+
+        let mut received = None;
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                received = events.try_recv().ok();
+                received.is_some()
+            }),
+            "one notification arrives"
+        );
+        match received.expect("received") {
+            Message::Notification { method, params } => {
+                assert_eq!(method, "event/attention");
+                assert_eq!(params["agent_id"], serde_json::json!("agent-attention"));
+                assert_eq!(
+                    params["message"],
+                    serde_json::json!("need your input on the login flow")
+                );
+                assert!(
+                    params["session_id"].is_string(),
+                    "a registered agent has a session id to key the event to: {params}"
+                );
+            }
+            other => panic!("expected a notification, got {other:?}"),
+        }
+        host.shutdown_and_join();
+    }
+
+    /// `SessionSend` (`docs/architecture/decisions.md` §26): `Invocability::Denied` by default,
+    /// opened per agent through `SessionAgentInfo::grants`; refuses a caller sending to its own
+    /// session, and a dead/unknown target is a real error, not a silent no-op.
+    #[test]
+    fn session_send_is_gated_by_grants_and_refuses_self_and_unknown_targets() {
+        let repo = seed_empty_repo();
+        let host = Host::start().expect("host");
+        let client = host.client();
+
+        let target = spawn_session(&client, repo.path(), None);
+
+        let ordinary = AgentId::from("agent-ordinary");
+        spawn_session(
+            &client,
+            repo.path(),
+            Some(jerry_core::SessionAgentInfo {
+                kind: "Claude".into(),
+                agent_id: ordinary.clone(),
+                grants: Vec::new(),
+                parent: None,
+            }),
+        );
+        let denied = block_on(client.call(Call::agent(
+            repo.path(),
+            ordinary,
+            Request::Command(AppCommand::SessionSend(jerry_core::SessionSend {
+                to: target.clone(),
+                text: "hi".into(),
+                submit: true,
+            })),
+        )))
+        .expect_err("no grant, denied");
+        assert_eq!(denied.code, rpc_code::FORBIDDEN);
+
+        let orchestrator = AgentId::from("agent-orchestrator");
+        let orchestrator_session = spawn_session(
+            &client,
+            repo.path(),
+            Some(jerry_core::SessionAgentInfo {
+                kind: "Claude".into(),
+                agent_id: orchestrator.clone(),
+                grants: vec!["command/session-send".into()],
+                parent: None,
+            }),
+        );
+        let ok = block_on(client.request(Call::agent(
+            repo.path(),
+            orchestrator.clone(),
+            Request::Command(AppCommand::SessionSend(jerry_core::SessionSend {
+                to: target.clone(),
+                text: "hi".into(),
+                submit: true,
+            })),
+        )))
+        .expect("granted send dispatched");
+        assert!(ok.is_ok(), "{ok:?}");
+
+        let to_self = block_on(client.request(Call::agent(
+            repo.path(),
+            orchestrator.clone(),
+            Request::Command(AppCommand::SessionSend(jerry_core::SessionSend {
+                to: orchestrator_session.clone(),
+                text: "hi".into(),
+                submit: true,
+            })),
+        )))
+        .expect("dispatched, even though refused");
+        match to_self {
+            Report::Denied { code, .. } => assert_eq!(code, "session-send-self"),
+            other => panic!("expected denied, got {other:?}"),
+        }
+
+        let dead = jerry_core::SessionId::from("no-such-session");
+        let to_dead = block_on(client.request(Call::agent(
+            repo.path(),
+            orchestrator,
+            Request::Command(AppCommand::SessionSend(jerry_core::SessionSend {
+                to: dead,
+                text: "hi".into(),
+                submit: true,
+            })),
+        )))
+        .expect("dispatched");
+        assert!(
+            matches!(to_dead, Report::Error { .. }),
+            "expected error, got {to_dead:?}"
+        );
+
+        for id in [target, orchestrator_session] {
+            let _ = block_on(client.request(Call::human(
+                repo.path(),
+                Request::Command(AppCommand::SessionKill(jerry_core::SessionKill { id })),
+            )));
+        }
+        host.shutdown_and_join();
+    }
+
+    /// A `Stop` hook from a child with no registered orchestrator, or no registered policy,
+    /// answers `continue`; a `SessionStopPolicy` registered for a child answers `stop` with its
+    /// own reason exactly once, then reverts to `continue` - and `event/child-stopped` is
+    /// published only for a child with a known parent (`docs/architecture/decisions.md` §26).
+    #[test]
+    fn a_stop_hooks_reply_honours_a_registered_policy_exactly_once() {
+        let repo = seed_empty_repo();
+        let host = Host::start().expect("host");
+        let client = host.client();
+
+        let parent = AgentId::from("agent-parent");
+        let orphan = AgentId::from("agent-orphan");
+        spawn_session(
+            &client,
+            repo.path(),
+            Some(jerry_core::SessionAgentInfo {
+                kind: "Claude".into(),
+                agent_id: orphan.clone(),
+                grants: Vec::new(),
+                parent: None,
+            }),
+        );
+        let child = AgentId::from("agent-child");
+        spawn_session(
+            &client,
+            repo.path(),
+            Some(jerry_core::SessionAgentInfo {
+                kind: "Claude".into(),
+                agent_id: child.clone(),
+                grants: Vec::new(),
+                parent: Some(parent.clone()),
+            }),
+        );
+        let mut events = client.subscribe();
+
+        let stop_hook = |reason: &str| {
+            Request::Hook(HookEvent {
+                event: "Stop".into(),
+                payload: serde_json::json!({ "reason": reason }),
+            })
+        };
+
+        // No parent at all: always `continue`, and nothing is forwarded.
+        let orphan_report =
+            block_on(client.request(Call::agent(repo.path(), orphan, stop_hook("turn ended"))))
+                .expect("dispatched");
+        match orphan_report {
+            Report::Ok { outcome } => {
+                assert_eq!(outcome["decision"], serde_json::json!("continue"))
+            }
+            other => panic!("expected ok, got {other:?}"),
+        }
+
+        // A known parent, no policy registered yet: `continue`, but forwarded.
+        let first = block_on(client.request(Call::agent(
+            repo.path(),
+            child.clone(),
+            stop_hook("turn ended"),
+        )))
+        .expect("dispatched");
+        match first {
+            Report::Ok { outcome } => {
+                assert_eq!(outcome["decision"], serde_json::json!("continue"))
+            }
+            other => panic!("expected ok, got {other:?}"),
+        }
+        let mut child_stopped = None;
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                while let Ok(message) = events.try_recv() {
+                    if let Message::Notification { method, params } = message {
+                        if method == "event/child-stopped" {
+                            child_stopped = Some(params);
+                        }
+                    }
+                }
+                child_stopped.is_some()
+            }),
+            "event/child-stopped must be published for a child with a known parent"
+        );
+        let params = child_stopped.expect("checked above");
+        assert_eq!(params["child"], serde_json::json!("agent-child"));
+        assert_eq!(params["reason"], serde_json::json!("turn ended"));
+
+        // The parent pre-registers a `stop` decision for the child's *next* `Stop`.
+        let registered = block_on(client.request(Call::human(
+            repo.path(),
+            Request::Command(AppCommand::SessionStopPolicy(
+                jerry_core::SessionStopPolicy {
+                    child: child.clone(),
+                    decision: jerry_core::StopDecision::Stop,
+                    reason: Some("still validating the migration".into()),
+                },
+            )),
+        )))
+        .expect("policy registered");
+        assert!(registered.is_ok(), "{registered:?}");
+
+        let second = block_on(client.request(Call::agent(
+            repo.path(),
+            child.clone(),
+            stop_hook("turn ended again"),
+        )))
+        .expect("dispatched");
+        match second {
+            Report::Ok { outcome } => {
+                assert_eq!(outcome["decision"], serde_json::json!("stop"));
+                assert_eq!(
+                    outcome["reason"],
+                    serde_json::json!("still validating the migration")
+                );
+            }
+            other => panic!("expected ok, got {other:?}"),
+        }
+
+        // Consumed - the next `Stop` reverts to `continue`.
+        let third =
+            block_on(client.request(Call::agent(repo.path(), child, stop_hook("turn ended"))))
+                .expect("dispatched");
+        match third {
+            Report::Ok { outcome } => {
+                assert_eq!(outcome["decision"], serde_json::json!("continue"))
+            }
+            other => panic!("expected ok, got {other:?}"),
+        }
         host.shutdown_and_join();
     }
 }

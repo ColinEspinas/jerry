@@ -37,6 +37,12 @@ pub enum Command {
     Agents,
     /// List every PTY session Jerry is currently tracking, agents and plain terminal tabs alike.
     Sessions,
+    /// Wake the human: `Invocability::Allowed`, meant for an agent to call on itself.
+    Attention(AttentionArgs),
+    /// Write to another live session's stdin over the control plane. `Invocability::Denied` by
+    /// default - opened per agent through its own orchestrator grants
+    /// (`docs/architecture/decisions.md` §26).
+    Send(SendArgs),
     /// Start or stop the Jerry host for this repository directly - for headless use, without
     /// `jerry-app` running (`docs/architecture/decisions.md` §24). Agents never reach this:
     /// `Shutdown`'s own `Invocability::Denied` refuses it, and nothing spawns a host on an
@@ -122,8 +128,34 @@ pub struct WtNewArgs {
     #[arg(long, value_name = "KIND")]
     pub agent: Option<String>,
 
+    /// Grants the spawned agent orchestrator policy - real control over other agents' sessions
+    /// (`jerry send`), gated by `[agents.orchestrator]` grants in Jerry's own settings. Only
+    /// meaningful with `--agent`.
+    #[arg(long)]
+    pub orchestrator: bool,
+
     /// An initial message for the spawned agent. Only meaningful with `--agent`.
     pub prompt: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct AttentionArgs {
+    /// What to tell the human.
+    pub message: String,
+}
+
+#[derive(Debug, Args)]
+pub struct SendArgs {
+    /// The session to write to.
+    #[arg(long, value_name = "SESSION_ID")]
+    pub to: String,
+
+    /// Leave `text` sitting unentered - don't send the trailing Enter.
+    #[arg(long)]
+    pub no_submit: bool,
+
+    /// The text to write.
+    pub text: String,
 }
 
 #[derive(Debug, Args)]

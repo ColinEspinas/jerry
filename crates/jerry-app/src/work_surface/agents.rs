@@ -435,6 +435,8 @@ impl Agents {
             shell_override,
             hooks,
             Vec::new(),
+            Vec::new(),
+            None,
             window,
             cx,
         )
@@ -472,6 +474,8 @@ impl Agents {
             shell_override,
             hooks,
             leading_args,
+            Vec::new(),
+            None,
             window,
             cx,
         );
@@ -485,7 +489,9 @@ impl Agents {
     /// `claude`/`codex`'s real "start with this initial message" convention, the same one a
     /// human types at the end of the command line. For `event/worktree-created`'s own agent
     /// spawn (`docs/architecture/decisions.md` §21), where the prompt travels on the wire rather
-    /// than being typed.
+    /// than being typed - and, per that same event, `grants`/`parent` for a spawn requested with
+    /// `--orchestrator` (`docs/architecture/decisions.md` §26): empty/`None` for an ordinary
+    /// spawn, exactly [`Self::spawn`]'s own contract.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_with_prompt(
         &mut self,
@@ -494,7 +500,9 @@ impl Agents {
         terminal_font_size_px: f32,
         shell_override: Option<&str>,
         hooks: Option<&crate::hooks::HookInjection>,
-        prompt: String,
+        prompt: Option<String>,
+        grants: Vec<String>,
+        parent: Option<jerry_core::AgentId>,
         window: &mut Window,
         cx: &mut Context<AdeApp>,
     ) -> AgentId {
@@ -504,7 +512,9 @@ impl Agents {
             terminal_font_size_px,
             shell_override,
             hooks,
-            vec![prompt],
+            prompt.into_iter().collect(),
+            grants,
+            parent,
             window,
             cx,
         )
@@ -611,6 +621,8 @@ impl Agents {
         shell_override: Option<&str>,
         hooks: Option<&crate::hooks::HookInjection>,
         mut leading_args: Vec<String>,
+        grants: Vec<String>,
+        parent: Option<jerry_core::AgentId>,
         window: &mut Window,
         cx: &mut Context<AdeApp>,
     ) -> AgentId {
@@ -630,7 +642,17 @@ impl Agents {
                 spec.spawn_override = Some(override_command.clone());
             }
         }
-        self.spawn_resolved(id, kind, cwd, terminal_font_size_px, spec, window, cx)
+        self.spawn_resolved(
+            id,
+            kind,
+            cwd,
+            terminal_font_size_px,
+            spec,
+            grants,
+            parent,
+            window,
+            cx,
+        )
     }
 
     /// Test-only: [`Self::spawn_inner`], but with an explicit [`TerminalSpec`] rather than one
@@ -654,7 +676,17 @@ impl Agents {
     ) -> AgentId {
         let id = self.next_id;
         self.next_id += 1;
-        self.spawn_resolved(id, kind, cwd, terminal_font_size_px, spec, window, cx)
+        self.spawn_resolved(
+            id,
+            kind,
+            cwd,
+            terminal_font_size_px,
+            spec,
+            Vec::new(),
+            None,
+            window,
+            cx,
+        )
     }
 
     /// The shared tail of [`Self::spawn_inner`] and (in tests)
@@ -669,6 +701,8 @@ impl Agents {
         cwd: PathBuf,
         terminal_font_size_px: f32,
         spec: TerminalSpec,
+        grants: Vec<String>,
+        parent: Option<jerry_core::AgentId>,
         window: &mut Window,
         cx: &mut Context<AdeApp>,
     ) -> AgentId {
@@ -724,6 +758,8 @@ impl Agents {
             ProcessKind::Agent(agent_kind) => Some(jerry_core::SessionAgentInfo {
                 kind: agent_kind.label().to_owned(),
                 agent_id: host_agent_id(id),
+                grants,
+                parent,
             }),
             ProcessKind::Shell => None,
         };

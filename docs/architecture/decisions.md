@@ -1765,3 +1765,97 @@ the double-restore race this entry's own fix above closes remains open: `select_
 on the same worktree while `load_worktrees_for_opened_repo`'s own fetch is still in flight - narrower
 than the reliably-reproducing case above (it needs a real click during a real async window, not a
 deterministic double call), and not covered by a regression test.
+
+## 26. Orchestrator policy: `jerry attention`, `jerry send`, per-agent grants, the `Stop` decision
+
+**Status:** Accepted (2026-09-24, issue #508). The host-side mechanism is real and tested end to
+end; the CLI's own emission of a `Stop` hook's `"stop"` decision into the format the spawning
+agent CLI expects on stdout is not - see the third bullet below.
+
+**Context:** By the time #443 (worktree supervision) and #507 (reattach) landed, an agent could
+already spawn another agent (`WorktreeCreate`, §21) but had no way to *act* on what it spawned:
+no way to wake the human, no way to write into a child's own session, and no way to influence
+whether a child's own `Stop` hook actually stops it. This issue makes those three things real,
+each gated the same way: `Invocability` alone for the first (anyone may wake the human), and a
+new per-session grants list for the second and third (only an agent explicitly trusted with it).
+
+**Decision:**
+
+- **`AttentionRaise { message }`** (`jerry attention <message>`) is `Locality::Session`,
+  `Invocability::Allowed`, but only an agent caller can use it meaningfully - the host resolves
+  *whose* session to key the event to from the caller's own identity
+  (`SessionManager::session_id_for_agent`), so a human call (no session of its own) is refused the
+  same way an anonymous `Hook` already is. Never actually executed through `Command::execute` -
+  `jerry-host`'s dispatcher special-cases it, exactly like every other Session-locality request
+  (§15's own pattern). Publishes `event/attention { session_id, agent_id, message }` on the
+  existing fanout; `jerry-app`'s new `work_surface::attention` subscriber resolves `session_id` to
+  a pane (`Agents::pane_for_host_session`, already built for `session_exited`) and calls the new
+  `TerminalPane::raise_attention_ping` - the *same* latch an OSC 9/777 desktop notification sets
+  (`attention_ping_at`), so the rail's existing `attention_pinged` read lights up with no new UI
+  surface. There is no separate OS-level desktop notification anywhere in this codebase to raise
+  alongside it - checked, not assumed.
+- **`SessionSend { to, text, submit }`** (`jerry send --to <session-id> [--no-submit] <text>`) is
+  `Locality::Session`, `Invocability::Denied` by default - opened per agent through the new
+  `SessionAgentInfo::grants: Vec<String>` field (wire method names, e.g.
+  `"command/session-send"`), consulted by a new `dispatch::granted` check that runs only when the
+  blanket `permits` check already refused an agent caller. `jerry-host`'s dispatcher refuses a
+  caller sending to its own session (`session-send-self`) and answers a real, typed error for a
+  dead or unknown target (`SessionManager::write_input`, the same `NotFound`/`NotOwned` shape
+  `resize`/`kill` already use) - never a silent no-op either way.
+- **Per-agent invocability is `SessionAgentInfo::grants`, set once at spawn time.**
+  `SessionSpawn::agent` already associates a session with its agent identity atomically (§24); a
+  `grants` field on the same struct means there is never a window where a session exists without
+  its own grants already in force. `jerry-app` computes real values for it only for a
+  `WorktreeCreate`-driven spawn made with the new `orchestrator: bool` field
+  (`jerry wt new --agent <kind> --orchestrator`): `Settings.agents.orchestrator.grants`
+  (`[agents.orchestrator]` in `settings.toml`, defaulting to `["command/session-send"]` so
+  `--orchestrator` alone is useful with no file editing) flows through `event/worktree-created`'s
+  own `orchestrator` field into `Agents::spawn_with_prompt`'s two new trailing parameters
+  (`grants`, `parent`) - the only public spawn entry point this issue widened, since it already
+  had exactly one call site (`work_surface::worktree_created`); `Agents::spawn`/`spawn_resume`
+  pass `Vec::new()`/`None` through the same widened `spawn_inner`/`spawn_resolved` internals
+  unchanged. `jerry mcp`'s `tools/list` reflects real grants, not just `Invocability`:
+  `mcp::granted_tool_names` asks a real `SessionsQuery` for the caller's own live session (never
+  trusting what the caller claims about itself - the same host-authoritative check `tools/call`
+  already makes at call time), reads its `agent.grants`, and maps each wire method to its tool
+  name (`jerry_core::tool_name`) to widen the `permits`-based filter §22 already had.
+- **The `Stop` decision.** `SessionAgentInfo` also gained `parent: Option<AgentId>` - who asked
+  `WorktreeCreate` for this session, read straight from `event/worktree-created`'s own
+  `requested_by` field (already carried the caller; nothing new to plumb on the wire) by
+  `work_surface::worktree_created`, and threaded through the same `spawn_with_prompt` parameters
+  as `grants`. A new `SessionStopPolicy { child, decision: Stop | Continue, reason }` Command
+  (`Locality::Session`, `Invocability::Denied`, opened through `"command/session-stop-policy"` the
+  same way `SessionSend` is - no dedicated CLI verb, reachable via `jerry mcp` or direct dispatch)
+  registers, in a plain `Mutex<HashMap<AgentId, (StopDecision, Option<String>)>>` on `Inner`, the
+  decision `child`'s *next* `Stop` should answer with - consumed exactly once
+  (`Inner::take_stop_policy`). `jerry-host`'s `Hook` dispatch arm, for a `Stop` event specifically,
+  looks up the caller's own `parent`; with one, it publishes `event/child-stopped { child, reason
+  }` (`reason` from the hook's own payload) and answers `{"decision": "stop", "reason": ...}` if a
+  policy was pending, `{"decision": "continue"}` otherwise - a child with no parent at all always
+  gets `"continue"`, and nothing is forwarded (there is no orchestrator to forward to). This is
+  the part of #496's reserved transport this issue actually spends: the `hook` request already had
+  room for a real reply, unused until now.
+
+  **Not done: the CLI's own emission of `"stop"` into the spawning agent's expected format.**
+  `jerry hook`'s existing "always exit 0, print nothing to stdout" contract is unconditionally
+  correct for `"continue"` (every event before this issue, and a `Stop` with no policy). For a
+  real `"stop"`, four separate fetches of `code.claude.com/docs/en/hooks.md` (via `WebFetch`, from
+  this exact machine) each truncated before reaching the JSON-Output subsection specific to
+  `Stop`/`SubagentStop` - the page does confirm `hookSpecificOutput` as an event-specific decision
+  object and `permissionDecision` (`"allow"`/`"deny"`) as the field for *tool-related* events, but
+  never confirmed whether `Stop` uses that same shape or a different top-level field. Per
+  CLAUDE.md's "don't guess an API signature" rule, `jerry_cli::emit_stop_decision` is a real
+  `todo!("unverified: ...")` rather than a guessed field name that would fail silently the moment
+  it actually mattered. The host-side mechanism above needs nothing from this to be real and
+  tested; only Jerry's own decision reaching the agent CLI's stop-blocking mechanism is open.
+
+**Consequences:** `crates/jerry-host/src/session.rs` gained `session_id_for_agent`,
+`grants_for_agent`, `parent_of_agent`, and `write_input` (mirroring `resize`/`kill`'s own
+`NotFound`/`NotOwned` shape) on `SessionManager`. `crates/jerry-app/src/host.rs` grew a fourth
+per-repository event subscription (`worktree_created`/`session_exited`/`event/hook`/
+`event/attention`, at both its real call sites) - the same "one subscription per event name,
+each filtering for its own" shape §19's hook subscription already established, not a new pattern.
+`RepoHost::dispatch` itself still only ever sends `Call::human` (unchanged, and still the reason
+an app-level test proving `event/attention` reaches a real pane dispatches through the newly
+`pub(crate)` `AdeApp::host_client_for` test accessor directly, as the spawned agent's own
+identity, rather than through `AdeApp::dispatch`).

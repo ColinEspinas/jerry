@@ -1236,6 +1236,17 @@ impl TerminalPane {
         self.attention_ping_at.is_some()
     }
 
+    /// Latches the same attention signal an OSC 9/777 desktop notification does, but raised by
+    /// `command/attention-raise` (`docs/architecture/decisions.md` §26) rather than parsed from
+    /// this pane's own byte stream - what `crate::work_surface::attention`'s `event/attention`
+    /// consumer calls once it has resolved which pane the host keyed the event to. Answered the
+    /// same way a real OSC ping is: the human typing into this pane, or a new process taking it
+    /// over (see [`Self::clear_attention_ping`]).
+    pub(crate) fn raise_attention_ping(&mut self, cx: &mut Context<Self>) {
+        self.attention_ping_at = Some(Instant::now());
+        cx.notify();
+    }
+
     /// The most recent OSC 9;4 progress report from this pane's process, if it speaks that
     /// protocol - see [`crate::terminal::osc::Progress`].
     pub fn progress(&self) -> Option<Progress> {

@@ -6,8 +6,11 @@
 use crate::exit;
 use crate::Session;
 use jerry_core::wire::{read_line_frame, rpc_code, write_line_frame, FrameError};
-use jerry_core::{permits, Caller, Message, Method, Report, Request, RequestId, RpcError};
+use jerry_core::{
+    permits, tool_name, AppQuery, Caller, Message, Method, Report, Request, RequestId, RpcError,
+};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::io::{BufReader, Read, Write};
 
 /// The legacy `initialize`-handshake protocol version this server speaks - see why, over the
@@ -94,7 +97,7 @@ fn handle(
     match method {
         "initialize" => Ok(initialize_result()),
         "ping" => Ok(serde_json::json!({})),
-        "tools/list" => Ok(tools_list_result(caller)),
+        "tools/list" => Ok(tools_list_result(session, caller, err)),
         "tools/call" => call_tool(session, caller, params, err),
         other => Err(RpcError::new(
             rpc_code::METHOD_NOT_FOUND,
@@ -113,11 +116,17 @@ fn initialize_result() -> Value {
 
 /// Only the tools this caller's `Invocability` allows - an agent sees `Allowed` variants only, a
 /// human caller (no `JERRY_AGENT_ID` in its environment) sees everything, mirroring the socket's
-/// own `permits` rule.
-fn tools_list_result(caller: &Caller) -> Value {
+/// own `permits` rule - plus, per `docs/architecture/decisions.md` §26, whatever an orchestrator's
+/// own grants open beyond that, exactly as they open the underlying method on the socket
+/// (`jerry_host::dispatch::granted`): `tools/list` reflects the same authority `tools/call` would
+/// actually honor, rather than listing a tool a grant makes callable but hiding it anyway.
+fn tools_list_result(session: &mut Session, caller: &Caller, err: &mut dyn Write) -> Value {
+    let granted_tool_names = granted_tool_names(session, caller, err);
     let tools: Vec<Value> = jerry_core::all_tools()
         .into_iter()
-        .filter(|tool| permits(caller, tool.invocability))
+        .filter(|tool| {
+            permits(caller, tool.invocability) || granted_tool_names.contains(&tool.name)
+        })
         .map(|tool| {
             serde_json::json!({
                 "name": tool.name,
@@ -127,6 +136,39 @@ fn tools_list_result(caller: &Caller) -> Value {
         })
         .collect();
     serde_json::json!({ "tools": tools })
+}
+
+/// The tool names this exact caller's own `SessionAgentInfo::grants` opens - empty for a human
+/// (already permitted everything by `permits`) or an agent with no live session the host can
+/// resolve grants from (standalone, or a registration with none). Asks a real `SessionsQuery`
+/// rather than trusting anything the caller claims about itself - the same host-authoritative
+/// check `tools/call` already makes at call time.
+fn granted_tool_names(
+    session: &mut Session,
+    caller: &Caller,
+    err: &mut dyn Write,
+) -> HashSet<String> {
+    let Caller::Agent { id } = caller else {
+        return HashSet::new();
+    };
+    let Ok(Report::Ok { outcome }) =
+        session.call(Request::Query(AppQuery::Sessions(Default::default())), err)
+    else {
+        return HashSet::new();
+    };
+    let Some(entries) = outcome.as_array() else {
+        return HashSet::new();
+    };
+    entries
+        .iter()
+        .find(|entry| entry["agent"]["agent_id"].as_str() == Some(id.0.as_str()))
+        .and_then(|entry| entry["agent"]["grants"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter_map(Method::parse)
+        .map(|method| tool_name(&method))
+        .collect()
 }
 
 /// `name`/`arguments` are the client's mistake when malformed - a real JSON-RPC error, like any
@@ -432,6 +474,77 @@ mod mcp_server_tests {
             .iter()
             .any(|t| t["name"] == serde_json::json!("command_worktree-create")));
         assert!(agent_tools.len() < human_tools.len());
+    }
+
+    /// `docs/architecture/decisions.md` §26: an orchestrator's own `SessionAgentInfo::grants`
+    /// widens its `tools/list` beyond `Invocability` alone - `command_session-send` is `Denied`
+    /// by default (an ordinary agent never sees it, proven by the test above), but a real,
+    /// granted orchestrator session does.
+    #[test]
+    fn tools_list_reflects_a_real_grant_beyond_invocability() {
+        let repo = seed_empty_repo();
+        let runtime = tempfile::TempDir::new().expect("runtime");
+        let base_env = env(&[(runtime_env_key(), runtime.path())]);
+        let registry_dir =
+            jerry_core::registry::runtime_dir_for(Os::host(), &base_env).expect("runtime dir");
+        let registry = Registry::open(registry_dir).expect("registry");
+        let instance = registry.allocate().expect("instance");
+        let host = jerry_host::Host::start().expect("host");
+        host.listen(&instance.socket).expect("listen");
+        let common = jerry_core::Ctx::from_cwd(repo.path(), jerry_core::Caller::Human)
+            .expect("a repo")
+            .repo_path;
+        registry.publish(&instance, &[common]).expect("publish");
+
+        let sleep = if cfg!(windows) {
+            "ping -n 30 127.0.0.1 >NUL"
+        } else {
+            "sleep 30"
+        };
+        let orchestrator_spawn = jerry_core::Request::Command(
+            jerry_core::AppCommand::SessionSpawn(jerry_core::SessionSpawn {
+                program: if cfg!(windows) { "cmd" } else { "sh" }.into(),
+                args: if cfg!(windows) {
+                    vec!["/c".into(), sleep.into()]
+                } else {
+                    vec!["-c".into(), sleep.into()]
+                },
+                env: Vec::new(),
+                rows: 24,
+                cols: 80,
+                agent: Some(jerry_core::SessionAgentInfo {
+                    kind: "Claude".into(),
+                    agent_id: jerry_core::AgentId::from("agent-orchestrator"),
+                    grants: vec!["command/session-send".into()],
+                    parent: None,
+                }),
+            }),
+        );
+        let spawned = futures::executor::block_on(
+            host.client()
+                .request(jerry_core::Call::human(repo.path(), orchestrator_spawn)),
+        )
+        .expect("orchestrator spawn dispatched");
+        assert!(spawned.is_ok(), "{spawned:?}");
+
+        let orchestrator_agent = PathBuf::from("agent-orchestrator");
+        let orchestrator_env = env(&[
+            (runtime_env_key(), runtime.path()),
+            (crate::AGENT_ENV, &orchestrator_agent),
+        ]);
+        let list = request(1, "tools/list", serde_json::json!({}));
+        let (code, responses, err) = run_mcp(&orchestrator_env, repo.path(), &[list]);
+        assert_eq!(code, 0, "{err}");
+        let tools = responses[0]["result"]["tools"].as_array().expect("tools");
+        assert!(
+            tools
+                .iter()
+                .any(|t| t["name"] == serde_json::json!("command_session-send")),
+            "a granted orchestrator must see the tool its grant opens: {tools:?}"
+        );
+
+        host.shutdown_and_join();
+        registry.remove(&instance).expect("remove");
     }
 
     #[test]

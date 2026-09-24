@@ -4,9 +4,9 @@
 //! (`#[cfg(test)]`-only). `AdeApp::dispatch` resolves a request's `cwd` to its repository's
 //! common `.git` directory (cached) and routes through that repository's own connection - never
 //! a single connection shared across every open repository. Each connection also carries its own
-//! `worktree_created`/`session_exited`/`event/hook` subscriptions, feeding the same app-wide
-//! handlers regardless of which repository an event came from - see `ensure_repo_host_connected`
-//! for both.
+//! `worktree_created`/`session_exited`/`event/hook`/`event/attention` subscriptions, feeding the
+//! same app-wide handlers regardless of which repository an event came from - see
+//! `ensure_repo_host_connected` for both.
 
 use crate::repo_host::RemoteRepoHost;
 use crate::root::AdeApp;
@@ -360,10 +360,10 @@ async fn ensure_repo_host_connected(
 
     let mut repo_host = connect_repo_host(common_dir.clone(), cx).await;
 
-    // Three dedicated event subscriptions - `worktree_created`/`session_exited`/`event/hook` each
-    // filter for their own `event/*` name - opened off the UI thread for a real socket connection
-    // (blocking connect + handshake), or synchronously for the in-process fanout tap
-    // (`LocalClient::subscribe`, never blocking).
+    // Four dedicated event subscriptions - `worktree_created`/`session_exited`/`event/hook`/
+    // `event/attention` each filter for their own `event/*` name - opened off the UI thread for a
+    // real socket connection (blocking connect + handshake), or synchronously for the in-process
+    // fanout tap (`LocalClient::subscribe`, never blocking).
     let events = match &repo_host.connection {
         Some(Connection::Remote(_)) => {
             let socket = repo_host.socket.clone();
@@ -373,9 +373,13 @@ async fn ensure_repo_host_connected(
                     crate::repo_host::subscribe_remote(&socket),
                     crate::repo_host::subscribe_remote(&socket),
                     crate::repo_host::subscribe_remote(&socket),
+                    crate::repo_host::subscribe_remote(&socket),
                 ) {
-                    (Ok(a), Ok(b), Ok(c)) => Some((a, b, c)),
-                    (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+                    (Ok(a), Ok(b), Ok(c), Ok(d)) => Some((a, b, c, d)),
+                    (Err(error), ..)
+                    | (_, Err(error), ..)
+                    | (_, _, Err(error), _)
+                    | (_, _, _, Err(error)) => {
                         log::warn!(
                             "jerry-app: could not subscribe to this repository's own events: \
                              {error}"
@@ -387,14 +391,23 @@ async fn ensure_repo_host_connected(
             .await
         }
         #[cfg(test)]
-        Some(Connection::InProcess { client, .. }) => {
-            Some((client.subscribe(), client.subscribe(), client.subscribe()))
-        }
+        Some(Connection::InProcess { client, .. }) => Some((
+            client.subscribe(),
+            client.subscribe(),
+            client.subscribe(),
+            client.subscribe(),
+        )),
         None => None,
     };
 
     let _ = this.update(cx, |this, cx| {
-        if let Some((worktree_created_events, session_exited_events, hook_events)) = events {
+        if let Some((
+            worktree_created_events,
+            session_exited_events,
+            hook_events,
+            attention_events,
+        )) = events
+        {
             repo_host
                 ._events
                 .push(crate::work_surface::worktree_created::spawn_consumer(
@@ -410,6 +423,12 @@ async fn ensure_repo_host_connected(
             repo_host
                 ._events
                 .push(crate::hooks::spawn_consumer(hook_events, cx));
+            repo_host
+                ._events
+                .push(crate::work_surface::attention::spawn_consumer(
+                    attention_events,
+                    cx,
+                ));
         }
         this.hosts.by_repo.insert(common_dir.clone(), repo_host);
     });
@@ -486,8 +505,11 @@ impl AdeApp {
 
     /// The `#[cfg(test)]` in-process half of [`Self::control_plane_for`] - real only for a
     /// `#[cfg(test)]` in-process repository, matching [`Self::sessions_for`]'s own reasoning.
+    /// `pub(crate)`, not private: other test modules (`work_surface::attention`'s own) dispatch
+    /// directly through it as a real agent identity, which `Self::dispatch` itself never does -
+    /// see that method's own docs.
     #[cfg(test)]
-    fn host_client_for(&self, cwd: &Path) -> Option<jerry_host::LocalClient> {
+    pub(crate) fn host_client_for(&self, cwd: &Path) -> Option<jerry_host::LocalClient> {
         let common_dir = self.hosts.common_dir_for(cwd)?;
         if let Some(Connection::InProcess { client, .. }) =
             &self.hosts.repo_host_for(common_dir)?.connection
@@ -726,17 +748,23 @@ fn wire_test_repo_host_events(repo_host: &mut RepoHost, cx: &mut Context<AdeApp>
                 crate::repo_host::subscribe_remote(&socket),
                 crate::repo_host::subscribe_remote(&socket),
                 crate::repo_host::subscribe_remote(&socket),
+                crate::repo_host::subscribe_remote(&socket),
             ) {
-                (Ok(a), Ok(b), Ok(c)) => Some((a, b, c)),
+                (Ok(a), Ok(b), Ok(c), Ok(d)) => Some((a, b, c, d)),
                 _ => None,
             }
         }),
-        Some(Connection::InProcess { client, .. }) => {
-            Some((client.subscribe(), client.subscribe(), client.subscribe()))
-        }
+        Some(Connection::InProcess { client, .. }) => Some((
+            client.subscribe(),
+            client.subscribe(),
+            client.subscribe(),
+            client.subscribe(),
+        )),
         None => None,
     };
-    if let Some((worktree_created_events, session_exited_events, hook_events)) = events {
+    if let Some((worktree_created_events, session_exited_events, hook_events, attention_events)) =
+        events
+    {
         repo_host
             ._events
             .push(crate::work_surface::worktree_created::spawn_consumer(
@@ -752,6 +780,12 @@ fn wire_test_repo_host_events(repo_host: &mut RepoHost, cx: &mut Context<AdeApp>
         repo_host
             ._events
             .push(crate::hooks::spawn_consumer(hook_events, cx));
+        repo_host
+            ._events
+            .push(crate::work_surface::attention::spawn_consumer(
+                attention_events,
+                cx,
+            ));
     }
 }
 

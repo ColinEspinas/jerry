@@ -67,6 +67,21 @@ impl AdeApp {
             .and_then(Value::as_str)
             .filter(|prompt| !prompt.is_empty())
             .map(str::to_owned);
+        let orchestrator = params
+            .get("orchestrator")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        // Who a `--orchestrator` child's `Stop` hook is forwarded to (`docs/architecture/
+        // decisions.md` §26) - `None` for a plain human `jerry wt new`, or when `requested_by`
+        // itself fails to parse (never trusted blindly; a malformed payload just means no parent).
+        let parent = params
+            .get("requested_by")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<jerry_core::Caller>(value).ok())
+            .and_then(|caller| match caller {
+                jerry_core::Caller::Agent { id } => Some(id),
+                jerry_core::Caller::Human => None,
+            });
 
         let repo_roots: Vec<PathBuf> = self.repos.iter().map(|repo| repo.path.clone()).collect();
         let task = cx.spawn_in(window, async move |this, cx| {
@@ -113,6 +128,8 @@ impl AdeApp {
                         agent_kind,
                         path.clone(),
                         prompt.clone(),
+                        orchestrator,
+                        parent.clone(),
                         window,
                         cx,
                     );
@@ -124,40 +141,42 @@ impl AdeApp {
     }
 
     /// The agent-spawn half of [`Self::handle_worktree_created`]: spawns `agent_kind` into
-    /// `cwd`, exactly as a human's "New agent here" click would (`Agents::spawn`), or with
-    /// `prompt` as its leading argument (`Agents::spawn_with_prompt`) when one was given.
+    /// `cwd`, with `prompt` as its leading argument when one was given (`Agents::
+    /// spawn_with_prompt`, a no-op prefix when `prompt` is `None` - exactly [`Agents::spawn`]'s
+    /// own behavior). `orchestrator` (`--orchestrator` on `jerry wt new`) grants the spawned
+    /// agent `Settings.agents.orchestrator.grants`, and `parent` records who asked for it, so a
+    /// later `Stop` from this agent forwards to them (`docs/architecture/decisions.md` §26).
+    #[allow(clippy::too_many_arguments)]
     fn spawn_created_worktree_agent(
         &mut self,
         agent_kind: AgentKind,
         cwd: PathBuf,
         prompt: Option<String>,
+        orchestrator: bool,
+        parent: Option<jerry_core::AgentId>,
         window: &mut gpui::Window,
         cx: &mut Context<Self>,
     ) {
         let font_size = self.settings.appearance.terminal_font_size;
         let shell_override = self.settings.terminal.shell_override().map(str::to_owned);
         let hook_injection = self.hook_injection_for(ProcessKind::Agent(agent_kind), &cwd);
-        let id = match prompt {
-            Some(prompt) => self.agents.spawn_with_prompt(
-                agent_kind,
-                cwd,
-                font_size,
-                shell_override.as_deref(),
-                hook_injection.as_ref(),
-                prompt,
-                window,
-                cx,
-            ),
-            None => self.agents.spawn(
-                ProcessKind::Agent(agent_kind),
-                cwd,
-                font_size,
-                shell_override.as_deref(),
-                hook_injection.as_ref(),
-                window,
-                cx,
-            ),
+        let grants = if orchestrator {
+            self.settings.agents.orchestrator.grants.clone()
+        } else {
+            Vec::new()
         };
+        let id = self.agents.spawn_with_prompt(
+            agent_kind,
+            cwd,
+            font_size,
+            shell_override.as_deref(),
+            hook_injection.as_ref(),
+            prompt,
+            grants,
+            parent,
+            window,
+            cx,
+        );
         self.after_agent_spawn(id, window, cx);
     }
 }
@@ -186,6 +205,7 @@ mod tests {
                         from: None,
                         agent: Some(AgentSpec::Claude),
                         prompt: Some("fix the bug".into()),
+                        orchestrator: false,
                     })),
                     cx,
                 )

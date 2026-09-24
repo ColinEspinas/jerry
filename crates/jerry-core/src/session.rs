@@ -49,6 +49,17 @@ pub enum SessionKind {
 pub struct SessionAgentInfo {
     pub kind: String,
     pub agent_id: AgentId,
+    /// Wire method names (e.g. `"command/session-send"`) this agent may call beyond what its own
+    /// `Invocability` alone allows - `jerry-host`'s dispatcher consults this for an agent caller
+    /// whose `Invocability::Denied` would otherwise refuse the call (orchestrator policy,
+    /// `docs/architecture/decisions.md` §26). Empty for an ordinary, non-orchestrator agent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grants: Vec<String>,
+    /// The agent id that asked `WorktreeCreate` to spawn this session, if any - who a `Stop`
+    /// hook from this agent is forwarded to as `event/child-stopped`
+    /// (`docs/architecture/decisions.md` §26). `None` for a session a human spawned directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<AgentId>,
 }
 
 /// [`jerry_pty::ExitStatus`], mirrored onto the wire rather than derived directly on it - this
@@ -309,6 +320,147 @@ impl Command for SessionAttach {
     }
 }
 
+/// Wakes the human working on this repository (`docs/architecture/decisions.md` §26): the host
+/// records it against the calling agent's own live session and publishes `event/attention
+/// { session_id, agent_id, message }`, so the app can raise the same attention signal it already
+/// shows for an OSC 9/777 ping, keyed to that agent's own tab. `Locality::Session` (meaningless
+/// without a live session to record it against), `Invocability::Allowed` - this exists for an
+/// agent to call. Never actually executed through [`Command::execute`] below -
+/// `jerry-host`'s dispatcher special-cases it, since only it can resolve the caller's own agent
+/// identity to a live session id (see [`SessionSpawn`]'s own docs for why this shape recurs).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AttentionRaise {
+    pub message: String,
+}
+
+impl Command for AttentionRaise {
+    type Outcome = ();
+    const NAME: &'static str = "attention-raise";
+
+    fn invocability(&self) -> Invocability {
+        Invocability::Allowed
+    }
+
+    fn locality(&self) -> Locality {
+        Locality::Session
+    }
+
+    /// Never reached - see the type's own docs.
+    fn validate(&self, _ctx: &Ctx) -> Result<(), Denied> {
+        Ok(())
+    }
+
+    /// Never reached - see the type's own docs.
+    fn execute(self, _ctx: &Ctx) -> Result<(), Error> {
+        Err(Error::new(
+            "needs-host",
+            "the session table lives on the session host, not in this process",
+        ))
+    }
+}
+
+fn default_submit() -> bool {
+    true
+}
+
+/// Writes to another live session's stdin over the control plane (`docs/architecture/decisions.md`
+/// §26): `text`, plus a trailing Enter when `submit` (the default - `--no-submit` on the CLI
+/// leaves the text sitting unentered, e.g. to let a human finish it by hand). `Locality::Session`,
+/// `Invocability::Denied` by default - opened per agent through `SessionAgentInfo::grants`
+/// (`"command/session-send"`), never a blanket `Allowed`, since this is one live session directly
+/// driving another's input. Never actually executed through [`Command::execute`] below -
+/// `jerry-host`'s dispatcher special-cases it: refusing a caller sending to its own session and
+/// checking the target is a real, live session both need the session table this trait impl has no
+/// access to (see [`SessionSpawn`]'s own docs).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SessionSend {
+    pub to: SessionId,
+    pub text: String,
+    #[serde(default = "default_submit")]
+    pub submit: bool,
+}
+
+impl Command for SessionSend {
+    type Outcome = ();
+    const NAME: &'static str = "session-send";
+
+    fn invocability(&self) -> Invocability {
+        Invocability::Denied
+    }
+
+    fn locality(&self) -> Locality {
+        Locality::Session
+    }
+
+    /// Never reached - see the type's own docs.
+    fn validate(&self, _ctx: &Ctx) -> Result<(), Denied> {
+        Ok(())
+    }
+
+    /// Never reached - see the type's own docs.
+    fn execute(self, _ctx: &Ctx) -> Result<(), Error> {
+        Err(Error::new(
+            "needs-host",
+            "the session table lives on the session host, not in this process",
+        ))
+    }
+}
+
+/// Whether a child's *next* `Stop` hook should be blocked (kept going) or let through -
+/// [`SessionStopPolicy`]'s own decision, and the `hook` reply's own outcome for a `Stop` event
+/// once one is registered (`docs/architecture/decisions.md` §26).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum StopDecision {
+    Stop,
+    Continue,
+}
+
+/// Pre-registers this orchestrator's own decision for the *next* `Stop` hook `child` fires
+/// (`docs/architecture/decisions.md` §26) - consumed exactly once, so a policy left registered
+/// after the `Stop` it was meant for does not also apply to the one after that.
+/// `Locality::Session`, `Invocability::Denied` by default - opened per agent through
+/// `SessionAgentInfo::grants` (`"command/session-stop-policy"`), the same as [`SessionSend`].
+/// Never actually executed through [`Command::execute`] below - `jerry-host`'s dispatcher
+/// special-cases it, storing the policy directly rather than through the session table this trait
+/// impl has no access to (see [`SessionSpawn`]'s own docs).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SessionStopPolicy {
+    /// The agent id whose next `Stop` this decision applies to - not a [`SessionId`], since the
+    /// forwarding this answers (`event/child-stopped`) is keyed by agent identity, the same way
+    /// `SessionAgentInfo::parent` records it.
+    pub child: AgentId,
+    pub decision: StopDecision,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl Command for SessionStopPolicy {
+    type Outcome = ();
+    const NAME: &'static str = "session-stop-policy";
+
+    fn invocability(&self) -> Invocability {
+        Invocability::Denied
+    }
+
+    fn locality(&self) -> Locality {
+        Locality::Session
+    }
+
+    /// Never reached - see the type's own docs.
+    fn validate(&self, _ctx: &Ctx) -> Result<(), Denied> {
+        Ok(())
+    }
+
+    /// Never reached - see the type's own docs.
+    fn execute(self, _ctx: &Ctx) -> Result<(), Error> {
+        Err(Error::new(
+            "needs-host",
+            "the session table lives on the session host, not in this process",
+        ))
+    }
+}
+
 #[cfg(test)]
 mod session_id_tests {
     use super::SessionId;
@@ -317,5 +469,96 @@ mod session_id_tests {
     fn a_session_id_displays_as_its_own_bare_string() {
         assert_eq!(SessionId::from("session-3").to_string(), "session-3");
         assert_eq!(SessionId::from("session-3".to_owned()).0, "session-3");
+    }
+}
+
+#[cfg(test)]
+mod orchestrator_policy_tests {
+    use super::{
+        AttentionRaise, SessionAgentInfo, SessionId, SessionSend, SessionStopPolicy, StopDecision,
+    };
+    use crate::command::{Command, Invocability, Locality};
+    use crate::ctx::AgentId;
+
+    #[test]
+    fn attention_raise_is_session_locality_and_allowed_to_agents() {
+        let command = AttentionRaise {
+            message: "hi".into(),
+        };
+        assert_eq!(command.invocability(), Invocability::Allowed);
+        assert_eq!(command.locality(), Locality::Session);
+    }
+
+    #[test]
+    fn session_send_and_session_stop_policy_are_denied_by_default() {
+        let send = SessionSend {
+            to: SessionId::from("session-1"),
+            text: "y".into(),
+            submit: true,
+        };
+        assert_eq!(send.invocability(), Invocability::Denied);
+        assert_eq!(send.locality(), Locality::Session);
+
+        let policy = SessionStopPolicy {
+            child: AgentId::from("agent-1"),
+            decision: StopDecision::Stop,
+            reason: None,
+        };
+        assert_eq!(policy.invocability(), Invocability::Denied);
+        assert_eq!(policy.locality(), Locality::Session);
+    }
+
+    /// `submit` defaults to `true` when omitted - a hand-typed `{"to": ..., "text": ...}` (no
+    /// `submit` key at all) still sends the trailing Enter, matching the CLI's own default.
+    #[test]
+    fn session_send_submit_defaults_to_true() {
+        let decoded: SessionSend =
+            serde_json::from_value(serde_json::json!({ "to": "session-1", "text": "y" }))
+                .expect("decodes with submit omitted");
+        assert!(decoded.submit);
+    }
+
+    /// Empty `grants`/absent `parent` are omitted from the wire entirely - an ordinary agent's
+    /// `SessionAgentInfo` serializes exactly as it did before this issue, and a payload with
+    /// neither key still decodes.
+    #[test]
+    fn an_ordinary_agents_grants_and_parent_are_invisible_on_the_wire() {
+        let ordinary = SessionAgentInfo {
+            kind: "Claude".into(),
+            agent_id: AgentId::from("agent-1"),
+            grants: Vec::new(),
+            parent: None,
+        };
+        let value = serde_json::to_value(&ordinary).expect("serializes");
+        assert_eq!(
+            value,
+            serde_json::json!({ "kind": "Claude", "agent_id": "agent-1" })
+        );
+        let decoded: SessionAgentInfo =
+            serde_json::from_value(serde_json::json!({ "kind": "Claude", "agent_id": "agent-1" }))
+                .expect("decodes with neither key present");
+        assert_eq!(decoded, ordinary);
+    }
+
+    #[test]
+    fn an_orchestrators_grants_and_parent_round_trip() {
+        let orchestrator = SessionAgentInfo {
+            kind: "Claude".into(),
+            agent_id: AgentId::from("agent-2"),
+            grants: vec!["command/session-send".into()],
+            parent: Some(AgentId::from("agent-1")),
+        };
+        let value = serde_json::to_value(&orchestrator).expect("serializes");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "kind": "Claude",
+                "agent_id": "agent-2",
+                "grants": ["command/session-send"],
+                "parent": "agent-1",
+            })
+        );
+        let decoded: SessionAgentInfo = serde_json::from_value(value).expect("decodes");
+        assert_eq!(decoded, orchestrator);
     }
 }

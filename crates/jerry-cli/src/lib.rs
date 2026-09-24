@@ -15,8 +15,8 @@ pub(crate) mod mcp;
 pub mod transport;
 
 use crate::cli::{
-    Cli, Command, GitEditorArgs, GitSequenceEditorArgs, HookArgs, HostAction, MergeArgs, WtAction,
-    WtNewArgs,
+    AttentionArgs, Cli, Command, GitEditorArgs, GitSequenceEditorArgs, HookArgs, HostAction,
+    MergeArgs, SendArgs, WtAction, WtNewArgs,
 };
 use crate::transport::{ChooseError, Transport};
 use clap::Parser;
@@ -25,11 +25,12 @@ use jerry_core::host_spawn::{self, SpawnOrConnectError};
 use jerry_core::registry::{runtime_dir_for, Os, Registry};
 use jerry_core::wire::rpc_code;
 use jerry_core::{
-    execute_locally, AgentId, AgentSpec, AppCommand, AppQuery, Call, Caller, ConflictKind, Ctx,
-    HookEvent, LocalDispatchError, MergeAbort, MergeAttempt, MergeAttemptOutcome, MergeComplete,
-    MergeStatusOutcome, MergeStatusQuery, Report, Request, RpcError, Shutdown, StageResolved,
-    WorktreeCreate,
+    execute_locally, AgentId, AgentSpec, AppCommand, AppQuery, AttentionRaise, Call, Caller,
+    ConflictKind, Ctx, HookEvent, LocalDispatchError, MergeAbort, MergeAttempt,
+    MergeAttemptOutcome, MergeComplete, MergeStatusOutcome, MergeStatusQuery, Report, Request,
+    RpcError, SessionId, SessionSend, Shutdown, StageResolved, WorktreeCreate,
 };
+use serde_json::Value;
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -158,11 +159,13 @@ pub fn run(
         },
         Command::Agents => agents(&mut session, cli.json, out, err),
         Command::Sessions => sessions(&mut session, cli.json, out, err),
+        Command::Attention(args) => attention(&mut session, args, cli.json, out, err),
+        Command::Send(args) => send(&mut session, args, cli.json, out, err),
         Command::Host(args) => match args.action {
             HostAction::Start => host_start(env, &session, out, err),
             HostAction::Stop => host_stop(&mut session, out, err),
         },
-        Command::Hook(args) => hook(&mut session, args, stdin, err),
+        Command::Hook(args) => hook(&mut session, args, stdin, out, err),
         Command::Mcp => mcp::run(&mut session, &caller, stdin, out, err),
         // Already handled and returned above, before any `Ctx`/transport existed to build a
         // `Session` from.
@@ -274,14 +277,21 @@ fn unreachable_standalone() -> Result<Client, ClientError> {
 /// Forwards one hook event, verbatim from `stdin`, as a `hook` request - decision Q10 and
 /// `docs/architecture/decisions.md` §19. Always exits 0, within a bounded time
 /// ([`MAX_HOOK_PAYLOAD_BYTES`] bytes, [`HOOK_STDIN_DEADLINE`] wall-clock for the read;
-/// [`HOOK_CALL_TIMEOUT`] for the RPC once a payload is in hand), and never writes to stdout: a
-/// hook that blocked or failed the agent's own tool call would be strictly worse than one that
-/// silently did nothing, so every failure here - a read that never finishes, invalid JSON, no
-/// host reachable, a refusal - is a diagnostic on stderr and nothing more.
+/// [`HOOK_CALL_TIMEOUT`] for the RPC once a payload is in hand): a hook that blocked or failed the
+/// agent's own tool call would be strictly worse than one that silently did nothing, so every
+/// failure here - a read that never finishes, invalid JSON, no host reachable, a refusal - is a
+/// diagnostic on stderr and nothing more.
+///
+/// For a `Stop` event specifically, the reply may carry a real `{"decision": "stop"|"continue"}`
+/// outcome - an orchestrator's pre-registered `SessionStopPolicy` (`docs/architecture/
+/// decisions.md` §26). `"continue"` (the default, and every non-`Stop` event) prints nothing on
+/// stdout, exactly as before. `"stop"` is real, host-side policy with nowhere left to go: see
+/// [`emit_stop_decision`]'s own docs for why its stdout emission is not implemented yet.
 fn hook(
     session: &mut Session,
     args: &HookArgs,
     stdin: Box<dyn Read + Send>,
+    out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> u8 {
     let Some(raw) = read_hook_stdin(stdin, MAX_HOOK_PAYLOAD_BYTES, HOOK_STDIN_DEADLINE) else {
@@ -301,10 +311,28 @@ fn hook(
         event: args.event.clone(),
         payload,
     });
-    // The `Report`, if any, carries nothing an agent's tool call needs to see; `session.call`
-    // has already written any diagnostic to `err`.
-    let _ = session.call(request, err);
+    let report = session.call(request, err);
+    if args.event == "Stop" {
+        if let Ok(Report::Ok { outcome }) = &report {
+            if outcome.get("decision").and_then(Value::as_str) == Some("stop") {
+                let reason = outcome
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                emit_stop_decision(&reason, out);
+            }
+        }
+    }
     exit::DONE
+}
+
+/// Prints the real, host-decided `Stop` refusal in whatever JSON the spawning agent CLI expects
+/// on stdout to actually block the stop. Unverified against the real contract - see
+/// `docs/architecture/decisions.md` §26 for what was checked and why it stayed a gap rather than
+/// a guess (CLAUDE.md's "don't guess an API signature" rule). `reason` is already resolved.
+fn emit_stop_decision(reason: &str, _out: &mut dyn Write) {
+    todo!("unverified: Claude Code's exact Stop-hook JSON-on-stdout contract - reason={reason:?}")
 }
 
 /// Reads `stdin` up to `cap` bytes (a longer payload is silently truncated, never an error - a
@@ -692,6 +720,7 @@ fn wt_new(
             from: args.from.clone(),
             agent,
             prompt: args.prompt.clone(),
+            orchestrator: args.orchestrator,
         })),
         err,
     ) {
@@ -779,6 +808,71 @@ fn sessions(session: &mut Session, json: bool, out: &mut dyn Write, err: &mut dy
                 let worktree = entry["worktree"].as_str().unwrap_or("?");
                 let _ = writeln!(out, "{id}\t{kind}\t{agent}\t{worktree}");
             }
+        }
+        other => explain(other, err),
+    }
+    exit::for_report(&report)
+}
+
+/// `jerry attention <message>`: wakes the human. `Invocability::Allowed` - meant for an agent to
+/// call on itself, so the host can resolve *which* session to key the attention signal to
+/// (`docs/architecture/decisions.md` §26); a human running this has no session of their own for
+/// the host to record it against, and gets back whatever refusal the host itself answers with.
+fn attention(
+    session: &mut Session,
+    args: &AttentionArgs,
+    json: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> u8 {
+    let report = match session.call(
+        Request::Command(AppCommand::AttentionRaise(AttentionRaise {
+            message: args.message.clone(),
+        })),
+        err,
+    ) {
+        Ok(report) => report,
+        Err(code) => return code,
+    };
+    if json {
+        return emit_json(&report, out);
+    }
+    match &report {
+        Report::Ok { .. } => {
+            let _ = writeln!(out, "jerry: attention raised");
+        }
+        other => explain(other, err),
+    }
+    exit::for_report(&report)
+}
+
+/// `jerry send --to <session-id> [--no-submit] <text>`: writes to another live session's stdin
+/// over the control plane. `Invocability::Denied` by default - see `SessionSend`'s own docs for
+/// how an orchestrator's grants open it.
+fn send(
+    session: &mut Session,
+    args: &SendArgs,
+    json: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> u8 {
+    let report = match session.call(
+        Request::Command(AppCommand::SessionSend(SessionSend {
+            to: SessionId::from(args.to.clone()),
+            text: args.text.clone(),
+            submit: !args.no_submit,
+        })),
+        err,
+    ) {
+        Ok(report) => report,
+        Err(code) => return code,
+    };
+    if json {
+        return emit_json(&report, out);
+    }
+    match &report {
+        Report::Ok { .. } => {
+            let _ = writeln!(out, "jerry: sent");
         }
         other => explain(other, err),
     }
@@ -1451,6 +1545,62 @@ mod run_tests {
         registry.remove(&instance).expect("remove");
     }
 
+    /// `--orchestrator` (`docs/architecture/decisions.md` §26) reaches the wire as
+    /// `WorktreeCreate.orchestrator`, carried into `event/worktree-created` for the app to act on.
+    #[test]
+    fn wt_new_orchestrator_flag_reaches_the_worktree_created_notification() {
+        let repo = seed_repo();
+        let runtime = tempfile::TempDir::new().expect("runtime");
+        let env = env(&[(runtime_env_key(), runtime.path())]);
+        let registry_dir =
+            jerry_core::registry::runtime_dir_for(Os::host(), &env).expect("runtime dir");
+        let registry = Registry::open(registry_dir).expect("registry");
+        let instance = registry.allocate().expect("instance");
+        let host = jerry_host::Host::start().expect("host");
+        host.listen(&instance.socket).expect("listen");
+        let common = jerry_core::Ctx::from_cwd(repo.path(), jerry_core::Caller::Human)
+            .expect("a repo")
+            .repo_path;
+        registry.publish(&instance, &[common]).expect("publish");
+        let mut events = host.client().subscribe();
+
+        let (code, out, err) = invoke(
+            &[
+                "wt",
+                "new",
+                "feature-orchestrator",
+                "--agent",
+                "claude",
+                "--orchestrator",
+            ],
+            &env,
+            repo.path(),
+        );
+        assert_eq!(code, 0, "stderr: {err}");
+        let path = out.trim();
+        assert!(Path::new(path).is_dir(), "{path}");
+
+        let mut received = None;
+        assert!(
+            test_support::wait_until(Duration::from_secs(5), || {
+                received = events.try_recv().ok();
+                received.is_some()
+            }),
+            "a worktree-created notification arrives"
+        );
+        match received.expect("received") {
+            jerry_core::Message::Notification { method, params } => {
+                assert_eq!(method, "event/worktree-created");
+                assert_eq!(params["orchestrator"], serde_json::json!(true));
+            }
+            other => panic!("expected a notification, got {other:?}"),
+        }
+
+        cleanup_sibling(path);
+        host.shutdown_and_join();
+        registry.remove(&instance).expect("remove");
+    }
+
     #[test]
     fn agents_prints_nothing_and_exits_zero_when_the_host_has_none() {
         let repo = seed_empty_repo();
@@ -1586,6 +1736,185 @@ mod run_tests {
         let (code, out, err) = invoke(&["sessions"], &env, repo.path());
         assert_eq!(code, 4, "{err}");
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn attention_needs_a_running_jerry_standalone() {
+        let repo = seed_empty_repo();
+        let runtime = tempfile::TempDir::new().expect("runtime");
+        let env = env(&[(runtime_env_key(), runtime.path())]);
+        let (code, out, err) = invoke(&["attention", "hello"], &env, repo.path());
+        assert_eq!(code, 4, "{err}");
+        assert!(out.is_empty());
+    }
+
+    /// `jerry attention <message>`, dispatched as a real agent the host recognizes, reaches a
+    /// real published Jerry and publishes a real `event/attention` (`docs/architecture/
+    /// decisions.md` §26).
+    #[test]
+    fn attention_reaches_a_running_jerry_and_publishes_a_real_event() {
+        let repo = seed_empty_repo();
+        let runtime = tempfile::TempDir::new().expect("runtime");
+        let base_env = env(&[(runtime_env_key(), runtime.path())]);
+        let registry_dir =
+            jerry_core::registry::runtime_dir_for(Os::host(), &base_env).expect("runtime dir");
+        let registry = Registry::open(registry_dir).expect("registry");
+        let instance = registry.allocate().expect("instance");
+        let host = jerry_host::Host::start().expect("host");
+        host.listen(&instance.socket).expect("listen");
+        let common = jerry_core::Ctx::from_cwd(repo.path(), jerry_core::Caller::Human)
+            .expect("a repo")
+            .repo_path;
+        registry.publish(&instance, &[common]).expect("publish");
+        host.agents().register(
+            jerry_core::AgentId::from("agent-1"),
+            repo.path().to_path_buf(),
+            "Claude".into(),
+        );
+        let mut events = host.client().subscribe();
+
+        let agent = PathBuf::from("agent-1");
+        let agent_env = env(&[(runtime_env_key(), runtime.path()), (AGENT_ENV, &agent)]);
+        let (code, out, err) = invoke(&["attention", "need your input"], &agent_env, repo.path());
+        assert_eq!(code, 0, "stderr: {err}");
+        assert!(out.contains("attention raised"), "{out}");
+
+        let mut received = None;
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                received = events.try_recv().ok();
+                received.is_some()
+            }),
+            "one notification arrives"
+        );
+        match received.expect("received") {
+            jerry_core::Message::Notification { method, params } => {
+                assert_eq!(method, "event/attention");
+                assert_eq!(params["agent_id"], serde_json::json!("agent-1"));
+                assert_eq!(params["message"], serde_json::json!("need your input"));
+            }
+            other => panic!("expected a notification, got {other:?}"),
+        }
+        host.shutdown_and_join();
+        registry.remove(&instance).expect("remove");
+    }
+
+    #[test]
+    fn send_needs_a_running_jerry_standalone() {
+        let repo = seed_empty_repo();
+        let runtime = tempfile::TempDir::new().expect("runtime");
+        let env = env(&[(runtime_env_key(), runtime.path())]);
+        let (code, out, err) = invoke(&["send", "--to", "session-1", "hi"], &env, repo.path());
+        assert_eq!(code, 4, "{err}");
+        assert!(out.is_empty());
+    }
+
+    /// `jerry send --to <session-id> <text>` (`docs/architecture/decisions.md` §26): denied for
+    /// an ordinary agent with no `command/session-send` grant, and a granted orchestrator's send
+    /// really reaches the target's real process.
+    #[test]
+    fn send_is_denied_without_a_grant_and_reaches_the_target_with_one() {
+        let repo = seed_empty_repo();
+        let runtime = tempfile::TempDir::new().expect("runtime");
+        let base_env = env(&[(runtime_env_key(), runtime.path())]);
+        let registry_dir =
+            jerry_core::registry::runtime_dir_for(Os::host(), &base_env).expect("runtime dir");
+        let registry = Registry::open(registry_dir).expect("registry");
+        let instance = registry.allocate().expect("instance");
+        let host = jerry_host::Host::start().expect("host");
+        host.listen(&instance.socket).expect("listen");
+        let common = jerry_core::Ctx::from_cwd(repo.path(), jerry_core::Caller::Human)
+            .expect("a repo")
+            .repo_path;
+        registry.publish(&instance, &[common]).expect("publish");
+
+        let sleep = if cfg!(windows) {
+            "ping -n 30 127.0.0.1 >NUL"
+        } else {
+            "sleep 30"
+        };
+        let target_spawn = jerry_core::Request::Command(jerry_core::AppCommand::SessionSpawn(
+            jerry_core::SessionSpawn {
+                program: if cfg!(windows) { "cmd" } else { "sh" }.into(),
+                args: if cfg!(windows) {
+                    vec!["/c".into(), sleep.into()]
+                } else {
+                    vec!["-c".into(), sleep.into()]
+                },
+                env: Vec::new(),
+                rows: 24,
+                cols: 80,
+                agent: None,
+            },
+        ));
+        let report = futures::executor::block_on(
+            host.client()
+                .request(jerry_core::Call::human(repo.path(), target_spawn)),
+        )
+        .expect("target spawn dispatched");
+        let jerry_core::Report::Ok { outcome } = report else {
+            panic!("expected ok, got {report:?}")
+        };
+        let target_id = outcome["id"].as_str().expect("id").to_owned();
+
+        host.agents().register(
+            jerry_core::AgentId::from("agent-ordinary"),
+            repo.path().to_path_buf(),
+            "Claude".into(),
+        );
+        let ordinary_agent = PathBuf::from("agent-ordinary");
+        let ordinary_env = env(&[
+            (runtime_env_key(), runtime.path()),
+            (AGENT_ENV, &ordinary_agent),
+        ]);
+        let (code, out, err) = invoke(
+            &["send", "--to", &target_id, "hi"],
+            &ordinary_env,
+            repo.path(),
+        );
+        assert_eq!(code, 3, "stdout: {out}, stderr: {err}");
+
+        let orchestrator_spawn = jerry_core::Request::Command(
+            jerry_core::AppCommand::SessionSpawn(jerry_core::SessionSpawn {
+                program: if cfg!(windows) { "cmd" } else { "sh" }.into(),
+                args: if cfg!(windows) {
+                    vec!["/c".into(), sleep.into()]
+                } else {
+                    vec!["-c".into(), sleep.into()]
+                },
+                env: Vec::new(),
+                rows: 24,
+                cols: 80,
+                agent: Some(jerry_core::SessionAgentInfo {
+                    kind: "Claude".into(),
+                    agent_id: jerry_core::AgentId::from("agent-orchestrator"),
+                    grants: vec!["command/session-send".into()],
+                    parent: None,
+                }),
+            }),
+        );
+        let report = futures::executor::block_on(
+            host.client()
+                .request(jerry_core::Call::human(repo.path(), orchestrator_spawn)),
+        )
+        .expect("orchestrator spawn dispatched");
+        assert!(report.is_ok(), "{report:?}");
+
+        let orchestrator_agent = PathBuf::from("agent-orchestrator");
+        let orchestrator_env = env(&[
+            (runtime_env_key(), runtime.path()),
+            (AGENT_ENV, &orchestrator_agent),
+        ]);
+        let (code, out, err) = invoke(
+            &["send", "--to", &target_id, "hi"],
+            &orchestrator_env,
+            repo.path(),
+        );
+        assert_eq!(code, 0, "stdout: {out}, stderr: {err}");
+        assert!(out.contains("sent"), "{out}");
+
+        host.shutdown_and_join();
+        registry.remove(&instance).expect("remove");
     }
 
     #[test]
