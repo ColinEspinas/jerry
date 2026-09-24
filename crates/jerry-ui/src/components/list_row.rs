@@ -20,10 +20,25 @@ pub enum ListRowDirection {
     Col,
 }
 
+/// How this row fills its parent's width - the two real shapes `rail/render.rs`'s migrated rows
+/// need, not an exhaustive layout API. `.w_full()` only means "100% of the parent's own width",
+/// which is correct for a row that *is* the flex item (a virtualized list's own row) but wrong
+/// for one that is a flex *sibling* of other content (a connector rule beside it) - there,
+/// `.flex_1()` (grow to fill whatever space siblings leave) plus `.min_w_0()` (let it shrink
+/// below its content's intrinsic width, so a child's own `.truncate()` still works) is the real
+/// shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListRowWidth {
+    Full,
+    Flex1,
+}
+
 #[derive(IntoElement)]
 pub struct ListRow {
     id: ElementId,
     direction: ListRowDirection,
+    width: ListRowWidth,
+    items_center: bool,
     selected: bool,
     edge_color: Option<Hsla>,
     selected_bg: Option<Hsla>,
@@ -46,6 +61,8 @@ impl ListRow {
         ListRow {
             id: id.into(),
             direction: ListRowDirection::Row,
+            width: ListRowWidth::Full,
+            items_center: false,
             selected: false,
             edge_color: None,
             selected_bg: None,
@@ -66,6 +83,19 @@ impl ListRow {
 
     pub fn direction(mut self, direction: ListRowDirection) -> Self {
         self.direction = direction;
+        self
+    }
+
+    pub fn width(mut self, width: ListRowWidth) -> Self {
+        self.width = width;
+        self
+    }
+
+    /// Cross-axis centering - `false` (unset) is correct for [`ListRowDirection::Col`] (each
+    /// line should stretch, not centre horizontally); a [`ListRowDirection::Row`] shell usually
+    /// wants it set, so its children line up on the row's own vertical centre.
+    pub fn items_center(mut self) -> Self {
+        self.items_center = true;
         self
     }
 
@@ -177,12 +207,18 @@ impl RenderOnce for ListRow {
                 None => format!("{id_for_default_selector:?}"),
             })
             .cursor_pointer()
-            .w_full()
             .flex()
             .border_l(px(2.0));
+        element = match self.width {
+            ListRowWidth::Full => element.w_full(),
+            ListRowWidth::Flex1 => element.flex_1().min_w_0(),
+        };
 
         if self.direction == ListRowDirection::Col {
             element = element.flex_col();
+        }
+        if self.items_center {
+            element = element.items_center();
         }
         if let Some(height) = self.height {
             element = element.h(height);

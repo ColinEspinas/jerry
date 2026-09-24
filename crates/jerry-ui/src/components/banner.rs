@@ -50,6 +50,7 @@ pub struct Banner {
     message: SharedString,
     theme: Theme,
     font_family: Option<SharedString>,
+    border_color: Option<Hsla>,
     action: Option<AnyElement>,
     debug_selector: Option<Box<dyn FnOnce() -> String>>,
 }
@@ -68,6 +69,7 @@ impl Banner {
             message: message.into(),
             theme,
             font_family: None,
+            border_color: None,
             action: None,
             debug_selector: None,
         }
@@ -80,6 +82,14 @@ impl Banner {
 
     pub fn font_family(mut self, family: impl Into<SharedString>) -> Self {
         self.font_family = Some(family.into());
+        self
+    }
+
+    /// Overrides [`BannerShape::Strip`]'s default border colour (`theme.colors.border`) - a
+    /// migrated call site with its own, more specific divider token passes it here rather than
+    /// losing fidelity to the generic default.
+    pub fn border_color(mut self, color: Hsla) -> Self {
+        self.border_color = Some(color);
         self
     }
 
@@ -118,13 +128,15 @@ impl RenderOnce for Banner {
             .text_size(px(10.0))
             .text_color(fg);
 
+        let border_color = self.border_color.unwrap_or(match self.shape {
+            BannerShape::Card => fg,
+            BannerShape::Strip => self.theme.colors.border,
+        });
         element = match self.shape {
-            BannerShape::Card => element
-                .rounded(self.theme.radius.lg)
-                .border_1()
-                .border_color(fg),
-            BannerShape::Strip => element.border_b_1().border_color(self.theme.colors.border),
-        };
+            BannerShape::Card => element.rounded(self.theme.radius.lg).border_1(),
+            BannerShape::Strip => element.border_b_1(),
+        }
+        .border_color(border_color);
         if let Some(family) = self.font_family {
             element = element.font(font(family));
         }

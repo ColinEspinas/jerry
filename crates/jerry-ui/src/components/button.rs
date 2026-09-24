@@ -5,8 +5,9 @@
 //! component - see `docs/architecture/decisions.md` §27.
 
 use gpui::{
-    div, px, AnyElement, App, ClickEvent, ElementId, FontWeight, InteractiveElement, IntoElement,
-    ParentElement, RenderOnce, SharedString, StatefulInteractiveElement, Styled, Window,
+    div, px, AnyElement, App, ClickEvent, ElementId, FontWeight, Hsla, InteractiveElement,
+    IntoElement, ParentElement, RenderOnce, SharedString, StatefulInteractiveElement, Styled,
+    Window,
 };
 
 use crate::handlers::ClickHandler;
@@ -58,6 +59,10 @@ pub struct Button {
     theme: Theme,
     disabled: bool,
     icon: Option<AnyElement>,
+    text_color: Option<Hsla>,
+    border_color: Option<Hsla>,
+    hover_bg: Option<Hsla>,
+    font_family: Option<SharedString>,
     debug_selector: Option<Box<dyn FnOnce() -> String>>,
     on_click: Option<ClickHandler>,
 }
@@ -71,6 +76,10 @@ impl Button {
             theme,
             disabled: false,
             icon: None,
+            text_color: None,
+            border_color: None,
+            hover_bg: None,
+            font_family: None,
             debug_selector: None,
             on_click: None,
         }
@@ -99,6 +108,34 @@ impl Button {
         self
     }
 
+    /// Overrides the variant's own resting text colour - a migrated call site with its own
+    /// status-tinted button (e.g. a fail-red "Restart sessions" action) passes it here rather
+    /// than losing that tint to the generic variant default.
+    pub fn text_color(mut self, color: Hsla) -> Self {
+        self.text_color = Some(color);
+        self
+    }
+
+    /// Overrides the [`ButtonVariant::Secondary`] border colour - see [`Self::text_color`].
+    pub fn border_color(mut self, color: Hsla) -> Self {
+        self.border_color = Some(color);
+        self
+    }
+
+    /// Overrides the hover background - see [`Self::text_color`].
+    pub fn hover_bg(mut self, color: Hsla) -> Self {
+        self.hover_bg = Some(color);
+        self
+    }
+
+    /// Sets the label's font family - this crate owns no font asset of its own, only `gpui::
+    /// font`'s plain family-name constructor, matching [`crate::components::Banner::
+    /// font_family`].
+    pub fn font_family(mut self, family: impl Into<SharedString>) -> Self {
+        self.font_family = Some(family.into());
+        self
+    }
+
     /// Overrides the default `{id:?}`-derived `debug_selector` - a migrated call site passes its
     /// existing lookup string here so a test written against it keeps working unchanged.
     pub fn debug_selector(mut self, f: impl FnOnce() -> String + 'static) -> Self {
@@ -117,7 +154,16 @@ impl Button {
 
 impl RenderOnce for Button {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        let style = self.variant.state_style(&self.theme);
+        let mut style = self.variant.state_style(&self.theme);
+        if let Some(text) = self.text_color {
+            style.rest.text = Some(text);
+        }
+        if let Some(border) = self.border_color {
+            style.rest.border = Some(border);
+        }
+        if let Some(hover_bg) = self.hover_bg {
+            style.hover = Some(style.hover.unwrap_or_default().bg(hover_bg));
+        }
         let state = ElementState {
             disabled: self.disabled,
             ..Default::default()
@@ -142,6 +188,9 @@ impl RenderOnce for Button {
             .font_weight(FontWeight::MEDIUM)
             .text_size(px(10.5));
         element = style.apply(element, state);
+        if let Some(family) = self.font_family {
+            element = element.font(gpui::font(family));
+        }
 
         if self.disabled {
             element = element.cursor_default();

@@ -16,7 +16,8 @@ pub mod state_style;
 pub mod theme;
 
 pub use components::{
-    Badge, BadgeTone, Banner, BannerVariant, Button, ButtonVariant, Divider, IconButton, ListRow,
+    Badge, BadgeTone, Banner, BannerShape, BannerVariant, Button, ButtonVariant, Divider,
+    DividerOrientation, IconButton, ListRow, ListRowDirection, ListRowWidth,
 };
 pub use state_style::{ElementState, StateStyle, StyleSet};
 pub use theme::Theme;

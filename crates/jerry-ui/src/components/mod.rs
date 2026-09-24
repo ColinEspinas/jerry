@@ -12,8 +12,8 @@ mod icon_button;
 mod list_row;
 
 pub use badge::{Badge, BadgeTone};
-pub use banner::{Banner, BannerVariant};
+pub use banner::{Banner, BannerShape, BannerVariant};
 pub use button::{Button, ButtonVariant};
-pub use divider::Divider;
+pub use divider::{Divider, DividerOrientation};
 pub use icon_button::IconButton;
-pub use list_row::ListRow;
+pub use list_row::{ListRow, ListRowDirection, ListRowWidth};
