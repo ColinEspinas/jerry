@@ -2986,6 +2986,12 @@ mod pty_pane_fixtures {
         spec: &TerminalSpec,
         cx: &mut Context<TerminalPane>,
     ) {
+        // Unlike `test_support::open_test_app_with_settings`, this fixture builds no `AdeApp` -
+        // it is the one place this crate spawns a real session without going through that path,
+        // so it needs its own adoption call (GitHub issue #534).
+        #[cfg(windows)]
+        crate::job_object::adopt_this_process();
+
         let (host, dispatch) = jerry_host::Host::start_detached(jerry_host::default_sockets_dir());
         cx.background_executor().spawn(dispatch).detach();
         let mut options = jerry_pty::SpawnOptions::new(spec.program.clone())
