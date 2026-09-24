@@ -669,6 +669,109 @@ mod host_dispatch_tests {
         host.shutdown_and_join();
     }
 
+    /// `AgentsQuery` stops listing an agent the moment its real session exits - no separate
+    /// "forget" call needed, unlike the retired synthetic-registration mechanism this replaces -
+    /// and the same agent id becomes spawnable again immediately afterwards, exactly because
+    /// `SessionManager::agent_is_live`/`agent_entries` both key off `record.exit`, not a second,
+    /// independent removal step that could race or be forgotten. A real `SessionKill`, not a
+    /// natural exit, drives the process's end: an idle real shell on Windows never produces its
+    /// own exit at all without something answering ConPTY's own startup query first (see
+    /// `session::session_manager_tests::answer_cursor_position_query`'s own docs), which this
+    /// test - checking only `AgentsQuery`, never draining the session's own output - never does.
+    #[test]
+    fn agents_query_stops_listing_an_agent_the_moment_its_real_session_exits() {
+        let repo = seed_empty_repo();
+        let host = Host::start().expect("host");
+        let client = host.client();
+        let id = AgentId::from("agent-exit-1");
+
+        // A real, still-running session at the moment of the kill below - `spawn_command`'s own
+        // quick `echo hi` could have already exited on its own by then, racing the kill dispatch
+        // into a `NotOwned` error instead of a clean, real kill.
+        let sleep = if cfg!(windows) {
+            "ping -n 30 127.0.0.1 >NUL"
+        } else {
+            "sleep 30"
+        };
+        let long_running = jerry_core::SessionSpawn {
+            program: if cfg!(windows) { "cmd" } else { "sh" }.into(),
+            args: if cfg!(windows) {
+                vec!["/c".into(), sleep.into()]
+            } else {
+                vec!["-c".into(), sleep.into()]
+            },
+            env: Vec::new(),
+            rows: 24,
+            cols: 80,
+            agent: Some(jerry_core::SessionAgentInfo {
+                kind: "Claude".into(),
+                agent_id: id.clone(),
+            }),
+        };
+        let spawned = block_on(client.request(Call::human(
+            repo.path(),
+            Request::Command(AppCommand::SessionSpawn(long_running)),
+        )))
+        .expect("spawn dispatched");
+        let Report::Ok { outcome } = spawned else {
+            panic!("expected ok, got {spawned:?}")
+        };
+        let session_id =
+            jerry_core::SessionId::from(outcome["id"].as_str().expect("id string").to_owned());
+
+        let listed = block_on(client.request(Call::human(repo.path(), status_agents_query())))
+            .expect("agents query");
+        let Report::Ok { outcome } = listed else {
+            panic!("expected ok, got {listed:?}")
+        };
+        assert_eq!(
+            outcome
+                .as_array()
+                .expect("array")
+                .iter()
+                .filter(|entry| entry["id"] == "agent-exit-1")
+                .count(),
+            1,
+            "the live agent must be listed: {outcome:?}"
+        );
+
+        let kill = Request::Command(AppCommand::SessionKill(jerry_core::SessionKill {
+            id: session_id,
+        }));
+        let killed =
+            block_on(client.request(Call::human(repo.path(), kill))).expect("kill dispatched");
+        assert!(killed.is_ok(), "{killed:?}");
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                let listed =
+                    block_on(client.request(Call::human(repo.path(), status_agents_query())))
+                        .expect("agents query");
+                let Report::Ok { outcome } = listed else {
+                    return false;
+                };
+                outcome
+                    .as_array()
+                    .is_some_and(|entries| !entries.iter().any(|e| e["id"] == "agent-exit-1"))
+            }),
+            "AgentsQuery must stop listing the agent once its real process exits"
+        );
+
+        // The same id is immediately spawnable again - a dead session's own stale record must
+        // never keep denying it as "already live".
+        let reused = block_on(client.request(Call::human(repo.path(), spawn_command(id))))
+            .expect("second spawn dispatched");
+        assert!(
+            reused.is_ok(),
+            "a dead agent's id must be reusable, got {reused:?}"
+        );
+        host.shutdown_and_join();
+    }
+
+    fn status_agents_query() -> Request {
+        Request::Query(AppQuery::Agents(Default::default()))
+    }
+
     #[test]
     fn a_hook_event_is_fanned_out_to_every_subscriber() {
         let repo = seed_empty_repo();

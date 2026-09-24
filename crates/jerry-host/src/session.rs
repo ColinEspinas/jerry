@@ -426,9 +426,15 @@ impl SessionManager {
             .count()
     }
 
+    /// Every still-live agent (`record.exit.is_none()`) this host is tracking, for `AgentsQuery` -
+    /// unlike [`Self::list`] (`SessionsQuery`'s own answer), which still reports an exited
+    /// session's record once. An exited real session's own `agent` association is never cleared,
+    /// only its liveness - `SessionSpawn::agent`'s own doc comment covers why an agent id becomes
+    /// reusable again the moment this stops counting it as live.
     pub(crate) fn agent_entries(&self) -> Vec<(AgentId, PathBuf, String)> {
         lock(&self.entries)
             .values()
+            .filter(|entry| entry.record.exit.is_none())
             .filter_map(|entry| {
                 let agent = entry.record.agent.as_ref()?;
                 Some((
