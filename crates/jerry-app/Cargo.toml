@@ -32,6 +32,8 @@ jerry-host = { path = "../jerry-host" }
 # decisions.md §25) - shared with `jerry-host`'s own headless per-session grid rather than
 # duplicated, since it never depended on `gpui` even while it lived in this crate.
 jerry-term = { path = "../jerry-term" }
+# Jerry's design-system crate (decisions.md §27) - theming tokens and reusable components.
+jerry-ui = { path = "../jerry-ui" }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 # `crate::terminal::pane`'s poll-free output loop awaits `jerry_pty::PtyOutput` directly

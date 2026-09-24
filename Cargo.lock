@@ -4416,6 +4416,7 @@ dependencies = [
  "jerry-lsp",
  "jerry-pty",
  "jerry-term",
+ "jerry-ui",
  "libc",
  "log",
  "notify",
@@ -4556,6 +4557,16 @@ dependencies = [
  "futures",
  "jerry-pty",
  "test-support",
+]
+
+[[package]]
+name = "jerry-ui"
+version = "0.2.0"
+dependencies = [
+ "gpui",
+ "serde",
+ "thiserror 1.0.69",
+ "toml 0.8.23",
 ]
 
 [[package]]

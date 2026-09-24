@@ -153,6 +153,24 @@ call into `jerry-git` directly (109 times in `graph_view/render.rs` alone) and o
 `git` itself (`sidebar/render.rs:6534`) instead of going through a Command. Fixing this is tracked
 work, not done in this pass.
 
+## `jerry-ui`
+
+**Scope.** Jerry's design-system crate (decisions.md §27): the semantic theming tier (`Theme`,
+non-colour scales, `StateStyle`) and a small set of reusable `RenderOnce` components (`Button`,
+`IconButton`, `Banner`, `ListRow`, `Badge`, `Divider`). The second, and only other, crate in this
+workspace allowed to depend on `gpui`.
+
+**Owns.** Its own token schema (`crate::schema::ThemeSchema`) for validating a user theme file into
+a `Theme`. Every component takes a `Theme` by value from its caller and paints a real
+`debug_selector` for `VisualTestContext::debug_bounds` - no global theme state, no styling decision
+baked in that a caller can't override.
+
+**Does not own.** Any `jerry-app` state, settings, or file I/O; any of the other core crates
+(`jerry-git`/`jerry-pty`/`jerry-lsp`/`jerry-core`/`jerry-host`) - `jerry-app` constructs a `Theme`
+from its own resolved palette and passes it in, rather than this crate reaching outward for one.
+Behaviour gpui-kit does well (focus ring, keyboard activation) is borrowed as a documented pattern,
+never as a dependency; no `gpui-component`/gpui-kit code is vendored here today.
+
 ## `jerry-cli`
 
 **Scope.** The `jerry` command: what agents and humans type. Deliberately shallow. `clap` builds a
