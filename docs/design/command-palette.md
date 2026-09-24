@@ -1,6 +1,6 @@
 # Command palette
 
-- **Code:** `crates/app/src/palette/`
+- **Code:** `crates/jerry-app/src/palette/`
 - **Tokens:** `theme::palette`, `theme::{band::PALETTE_*, zone::PALETTE_WIDTH, shadow::PALETTE}`
 
 ## What it's for

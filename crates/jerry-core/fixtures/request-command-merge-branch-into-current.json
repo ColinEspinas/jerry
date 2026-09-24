@@ -1,0 +1,7 @@
+{
+  "method": "command/merge-branch-into-current",
+  "params": {
+    "cwd": "/repo",
+    "params": { "source_branch": "feature/login" }
+  }
+}

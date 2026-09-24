@@ -19,7 +19,7 @@ rather than looping on garbage images and drawing conclusions from them.
 
 ## The loop
 
-1. **Launch.** `cargo run -p app <repo-path>` in the background. Use the debug profile for
+1. **Launch.** `cargo run -p jerry-app <repo-path>` in the background. Use the debug profile for
    layout/visual iteration — it compiles far faster than `--release`, and layout correctness
    doesn't depend on optimization level. Switch to `--release` only when the thing being checked is
    about feel (animation smoothness, frame timing) or performance.
@@ -39,7 +39,7 @@ rather than looping on garbage images and drawing conclusions from them.
 4. **Look at it.** Read the PNG back directly — it renders as an image, not a file listing.
 
 5. **Compare against an oracle, not impression.** `docs/design/` carries the rules and invariants
-   for each surface, and `crates/app/src/theme.rs` carries the exact values behind the tokens those
+   for each surface, and `crates/jerry-app/src/theme.rs` carries the exact values behind the tokens those
    pages name — a page says "the status pill's background is `theme::status::*_BG`", the token says
    what that is. If the task is a bug fix rather than a new UI, the issue's acceptance criteria is
    the oracle instead. Either way, name

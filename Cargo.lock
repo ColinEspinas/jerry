@@ -287,57 +287,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
-name = "app"
-version = "0.2.0"
-dependencies = [
- "alacritty_terminal",
- "anyhow",
- "dunce",
- "env_logger",
- "gpui",
- "gpui_platform",
- "image",
- "imara-diff",
- "libc",
- "log",
- "lsp-core",
- "notify",
- "pty-core",
- "rand 0.9.5",
- "rayon",
- "regex",
- "reqwest",
- "rodio",
- "self_update",
- "serde",
- "serde_json",
- "sha2",
- "streaming-iterator",
- "tempfile",
- "test-support",
- "toml 0.8.23",
- "tree-sitter",
- "tree-sitter-c",
- "tree-sitter-css",
- "tree-sitter-go",
- "tree-sitter-highlight",
- "tree-sitter-html",
- "tree-sitter-javascript",
- "tree-sitter-json",
- "tree-sitter-md",
- "tree-sitter-python",
- "tree-sitter-rust",
- "tree-sitter-toml-ng",
- "tree-sitter-typescript",
- "tree-sitter-yaml",
- "ttf-parser",
- "unicode-segmentation",
- "windows-sys 0.61.2",
- "winresource",
- "wt-core",
-]
-
-[[package]]
 name = "ar_archive_writer"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1121,6 +1070,47 @@ dependencies = [
  "libc",
  "libloading",
 ]
+
+[[package]]
+name = "clap"
+version = "4.6.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa8876b300ab35ba921adea3dfd70157a46249b33f95c9084ae5709785478946"
+dependencies = [
+ "clap_builder",
+ "clap_derive",
+]
+
+[[package]]
+name = "clap_builder"
+version = "4.6.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec0797fb7aeb1406c84efac526901f7ec3ead2124f946b494e72879d4b54704d"
+dependencies = [
+ "anstream",
+ "anstyle",
+ "clap_lex",
+ "strsim",
+ "terminal_size",
+]
+
+[[package]]
+name = "clap_derive"
+version = "4.6.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9c751b79415d4e559e3d1fcf128e09e720eb673a06d26cf6f392d37d75b66e0"
+dependencies = [
+ "heck 0.5.0",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.3",
+]
+
+[[package]]
+name = "clap_lex"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "clru"
@@ -4408,6 +4398,178 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "jerry-app"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "dunce",
+ "env_logger",
+ "futures",
+ "gpui",
+ "gpui_platform",
+ "image",
+ "imara-diff",
+ "jerry-cli",
+ "jerry-core",
+ "jerry-git",
+ "jerry-host",
+ "jerry-lsp",
+ "jerry-pty",
+ "jerry-term",
+ "jerry-ui",
+ "libc",
+ "log",
+ "notify",
+ "rand 0.9.5",
+ "rayon",
+ "regex",
+ "reqwest",
+ "rodio",
+ "self_update",
+ "serde",
+ "serde_json",
+ "sha2",
+ "streaming-iterator",
+ "tempfile",
+ "test-support",
+ "thiserror 1.0.69",
+ "toml 0.8.23",
+ "tree-sitter",
+ "tree-sitter-c",
+ "tree-sitter-css",
+ "tree-sitter-go",
+ "tree-sitter-highlight",
+ "tree-sitter-html",
+ "tree-sitter-javascript",
+ "tree-sitter-json",
+ "tree-sitter-md",
+ "tree-sitter-python",
+ "tree-sitter-rust",
+ "tree-sitter-toml-ng",
+ "tree-sitter-typescript",
+ "tree-sitter-yaml",
+ "ttf-parser",
+ "unicode-segmentation",
+ "windows-sys 0.61.2",
+ "winresource",
+]
+
+[[package]]
+name = "jerry-cli"
+version = "0.2.0"
+dependencies = [
+ "clap",
+ "futures",
+ "jerry-core",
+ "jerry-git",
+ "jerry-host",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "test-support",
+]
+
+[[package]]
+name = "jerry-core"
+version = "0.2.0"
+dependencies = [
+ "jerry-git",
+ "jerry-pty",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "test-support",
+ "thiserror 1.0.69",
+ "uds_windows",
+]
+
+[[package]]
+name = "jerry-git"
+version = "0.2.0"
+dependencies = [
+ "gix",
+ "jerry-pty",
+ "sha2",
+ "tempfile",
+ "test-support",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "jerry-host"
+version = "0.2.0"
+dependencies = [
+ "clap",
+ "env_logger",
+ "futures",
+ "jerry-core",
+ "jerry-pty",
+ "jerry-term",
+ "libc",
+ "log",
+ "serde_json",
+ "tempfile",
+ "test-support",
+ "thiserror 1.0.69",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "jerry-lsp"
+version = "0.2.0"
+dependencies = [
+ "dunce",
+ "jerry-pty",
+ "libc",
+ "log",
+ "lsp-types",
+ "nix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "test-support",
+ "thiserror 1.0.69",
+ "url",
+]
+
+[[package]]
+name = "jerry-pty"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "filedescriptor",
+ "futures",
+ "libc",
+ "log",
+ "nix",
+ "portable-pty",
+ "tempfile",
+ "test-support",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "jerry-term"
+version = "0.2.0"
+dependencies = [
+ "alacritty_terminal",
+ "futures",
+ "jerry-pty",
+ "test-support",
+]
+
+[[package]]
+name = "jerry-ui"
+version = "0.2.0"
+dependencies = [
+ "gpui",
+ "serde",
+ "thiserror 1.0.69",
+ "toml 0.8.23",
+]
+
+[[package]]
 name = "jiff"
 version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4774,24 +4936,6 @@ name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
-
-[[package]]
-name = "lsp-core"
-version = "0.2.0"
-dependencies = [
- "dunce",
- "libc",
- "log",
- "lsp-types",
- "nix",
- "pty-core",
- "serde",
- "serde_json",
- "tempfile",
- "test-support",
- "thiserror 1.0.69",
- "url",
-]
 
 [[package]]
 name = "lsp-types"
@@ -6146,21 +6290,6 @@ checksum = "645dbe486e346d9b5de3ef16ede18c26e6c70ad97418f4874b8b1889d6e761ea"
 dependencies = [
  "ar_archive_writer",
  "cc",
-]
-
-[[package]]
-name = "pty-core"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "filedescriptor",
- "libc",
- "log",
- "nix",
- "portable-pty",
- "tempfile",
- "test-support",
- "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -7553,6 +7682,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "strsim"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
+
+[[package]]
 name = "strum"
 version = "0.27.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7938,10 +8073,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "terminal_size"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
+dependencies = [
+ "rustix 1.1.4",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "test-support"
 version = "0.2.0"
 dependencies = [
  "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9907,18 +10053,6 @@ name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
-
-[[package]]
-name = "wt-core"
-version = "0.2.0"
-dependencies = [
- "gix",
- "pty-core",
- "sha2",
- "tempfile",
- "test-support",
- "thiserror 1.0.69",
-]
 
 [[package]]
 name = "x11"

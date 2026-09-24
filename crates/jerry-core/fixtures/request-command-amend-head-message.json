@@ -1,0 +1,7 @@
+{
+  "method": "command/amend-head-message",
+  "params": {
+    "cwd": "/repo",
+    "params": { "message": "a real new message" }
+  }
+}

@@ -8,8 +8,8 @@ what the code draws and why.
 ## The one rule that keeps this current
 
 **These documents never reprint a value.** No hex codes, no pixel literals, no font sizes. Every
-value in Jerry's UI already lives in `crates/app/src/theme.rs` as a named
-[`ColorToken`](../../crates/app/src/theme.rs) or a `Pixels` constant, with its own doc comment, and
+value in Jerry's UI already lives in `crates/jerry-app/src/theme.rs` as a named
+[`ColorToken`](../../crates/jerry-app/src/theme.rs) or a `Pixels` constant, with its own doc comment, and
 `theme.rs` is what the themes in `assets/themes/` and [`docs/themes.md`](../themes.md) are generated
 against. These docs name the token; the token carries the number.
 
@@ -43,7 +43,7 @@ Every surface doc uses one skeleton, so the set reads as a single document:
 ```markdown
 # Session rail
 
-- **Code:** `crates/app/src/rail/`
+- **Code:** `crates/jerry-app/src/rail/`
 - **Tokens:** `theme::{status, rail}`
 
 ## What it's for       — one paragraph, the job this surface does

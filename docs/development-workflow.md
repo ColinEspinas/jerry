@@ -76,7 +76,7 @@ own. To cut a release:
 The same rule applies to the changelog: `CHANGELOG.md` updates and any other release-adjacent
 commit go through a branch and a PR too, same as any other change to the repo.
 
-This tag/version equality is what the in-app updater (`crates/app/src/updater/`) actually depends
+This tag/version equality is what the in-app updater (`crates/jerry-app/src/updater/`) actually depends
 on — it compares `env!("CARGO_PKG_VERSION")` against the latest release tag, so any drift between
 the two silently breaks update detection (GitHub issue #317).
 

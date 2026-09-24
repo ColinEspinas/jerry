@@ -9,9 +9,11 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 readonly APP_NAME="Jerry"
-readonly BIN_NAME="app"
-readonly EXECUTABLE_NAME="jerry"
-readonly RESOURCES_DIR="crates/app/resources/macos"
+readonly BIN_NAME="jerry-app"
+readonly EXECUTABLE_NAME="jerry-app"
+readonly CLI_NAME="jerry"
+readonly HOST_NAME="jerry-host"
+readonly RESOURCES_DIR="crates/jerry-app/resources/macos"
 readonly DIST_DIR="dist"
 readonly APP_BUNDLE="${DIST_DIR}/${APP_NAME}.app"
 readonly DMG_PATH="${DIST_DIR}/${APP_NAME}-macos.dmg"
@@ -26,20 +28,31 @@ if [[ -z "$VERSION" ]]; then
 fi
 echo "==> Bundling ${APP_NAME} ${VERSION}"
 
-# CI already runs `cargo build --release -p app` as its own step; SKIP_BUILD lets it hand this
-# script an already-built binary instead of paying for a second build.
+# CI already runs `cargo build --release -p jerry-app -p jerry-cli -p jerry-host` as its own
+# step; SKIP_BUILD lets it hand this script already-built binaries instead of paying for a
+# second build.
 readonly RELEASE_BIN="target/release/${BIN_NAME}"
+readonly RELEASE_CLI="target/release/${CLI_NAME}"
+readonly RELEASE_HOST="target/release/${HOST_NAME}"
 if [[ -n "${SKIP_BUILD:-}" ]]; then
     echo "==> SKIP_BUILD set - expecting ${RELEASE_BIN} to already exist"
 elif [[ -f "$RELEASE_BIN" ]]; then
     echo "==> ${RELEASE_BIN} already exists - reusing it"
 else
     echo "==> Building ${RELEASE_BIN}"
-    cargo build --release -p app
+    cargo build --release -p jerry-app -p jerry-cli -p jerry-host
 fi
 
 if [[ ! -f "$RELEASE_BIN" ]]; then
     echo "error: ${RELEASE_BIN} not found" >&2
+    exit 1
+fi
+if [[ ! -f "$RELEASE_CLI" ]]; then
+    echo "error: ${RELEASE_CLI} not found" >&2
+    exit 1
+fi
+if [[ ! -f "$RELEASE_HOST" ]]; then
+    echo "error: ${RELEASE_HOST} not found" >&2
     exit 1
 fi
 
@@ -49,6 +62,12 @@ mkdir -p "${APP_BUNDLE}/Contents/MacOS" "${APP_BUNDLE}/Contents/Resources"
 
 cp "$RELEASE_BIN" "${APP_BUNDLE}/Contents/MacOS/${EXECUTABLE_NAME}"
 chmod +x "${APP_BUNDLE}/Contents/MacOS/${EXECUTABLE_NAME}"
+# The `jerry`/`jerry-host` commands ship beside the app so `jerry-app` finds them as siblings
+# (decisions §17/§24).
+cp "$RELEASE_CLI" "${APP_BUNDLE}/Contents/MacOS/${CLI_NAME}"
+chmod +x "${APP_BUNDLE}/Contents/MacOS/${CLI_NAME}"
+cp "$RELEASE_HOST" "${APP_BUNDLE}/Contents/MacOS/${HOST_NAME}"
+chmod +x "${APP_BUNDLE}/Contents/MacOS/${HOST_NAME}"
 
 cp "${RESOURCES_DIR}/Jerry.icns" "${APP_BUNDLE}/Contents/Resources/Jerry.icns"
 

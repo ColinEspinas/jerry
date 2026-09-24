@@ -1,0 +1,7 @@
+{
+  "method": "event/subscribe",
+  "params": {
+    "cwd": "/repo",
+    "params": null
+  }
+}

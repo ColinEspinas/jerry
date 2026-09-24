@@ -1,0 +1,7 @@
+{
+  "method": "validate/merge-attempt",
+  "params": {
+    "cwd": "/repo",
+    "params": {}
+  }
+}

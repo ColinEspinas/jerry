@@ -44,20 +44,20 @@ glob_baseline=$(jq -r '.glob_imports_app_src' "$BASELINE_FILE")
 adapter_baseline=$(jq -r '.render_adapter_calls' "$BASELINE_FILE")
 handoff_baseline=$(jq -r '.design_handoff_citations' "$BASELINE_FILE")
 
-glob_current=$(grep -rE "use super::\*;" crates/app/src 2>/dev/null | wc -l | tr -d ' ')
-adapter_current=$(grep -rE "wt_core::|pty_core::|lsp_core::|process::Command::new" crates/app/src --include='render.rs' 2>/dev/null | wc -l | tr -d ' ')
+glob_current=$(grep -rE "use super::\*;" crates/jerry-app/src 2>/dev/null | wc -l | tr -d ' ')
+adapter_current=$(grep -rE "jerry_git::|jerry_pty::|jerry_lsp::|process::Command::new" crates/jerry-app/src --include='render.rs' 2>/dev/null | wc -l | tr -d ' ')
 handoff_current=$(grep -rE "design_handoff|Jerry\.dc\.html|STAGE-A-CHANGELOG|REVISION-2026|AUDIT-2026" crates 2>/dev/null | wc -l | tr -d ' ')
 
 fail=0
 
 if [ "$glob_current" -gt "$glob_baseline" ]; then
-  echo "check-conventions: FAIL - 'use super::*;' occurrences in crates/app/src rose from $glob_baseline to $glob_current." >&2
+  echo "check-conventions: FAIL - 'use super::*;' occurrences in crates/jerry-app/src rose from $glob_baseline to $glob_current." >&2
   echo "  New glob imports make layering violations unlintable (docs/architecture/decisions.md, entry 3). Use explicit imports instead." >&2
   fail=1
 fi
 
 if [ "$adapter_current" -gt "$adapter_baseline" ]; then
-  echo "check-conventions: FAIL - wt_core::/pty_core::/lsp_core::/process::Command::new calls in render.rs files rose from $adapter_baseline to $adapter_current." >&2
+  echo "check-conventions: FAIL - jerry_git::/jerry_pty::/jerry_lsp::/process::Command::new calls in render.rs files rose from $adapter_baseline to $adapter_current." >&2
   echo "  Render code dispatches a Command/Query instead of calling an adapter directly (docs/architecture/decisions.md, entry 3)." >&2
   fail=1
 fi

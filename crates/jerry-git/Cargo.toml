@@ -1,0 +1,44 @@
+[package]
+name = "jerry-git"
+version = { workspace = true }
+edition = { workspace = true }
+publish = { workspace = true }
+license = { workspace = true }
+description = "Git worktree management (enumerate/create/remove) for the ade agent development environment"
+
+[lints]
+workspace = true
+
+[dependencies]
+gix = { version = "0.68" }
+thiserror = { workspace = true }
+# Used at runtime (not just in tests) by `diff::prepare_shadow_index` to build a throwaway
+# copy of the real index for `git diff`'s untracked-file handling - see that function's docs.
+tempfile = "3"
+# Sole use: `new_std_command`, the workspace's one constructor for non-PTY child processes,
+# which suppresses the per-spawn console window on Windows GUI-subsystem release builds
+# (GitHub issue #465). The constructor must live in exactly one place, and jerry-pty owns
+# process spawning (docs/architecture/crates.md) - the portable-pty it drags along is already
+# in this workspace's build graph either way.
+jerry-pty = { path = "../jerry-pty" }
+# Fixed-length, collision-free ref-name components for `review::baseline_ref_name`. Raw hex
+# encoding of the key doubled its length and pushed real, ordinary worktree paths past the
+# filesystem's 255-byte `NAME_MAX` for a loose ref's filename, which failed baseline capture
+# outright. Already present in this workspace's lockfile via other dependencies, so this adds no
+# new crate to the build graph.
+sha2 = "0.10"
+
+[[bin]]
+# A minimal, real executable standing in for `jerry git-sequence-editor`/`jerry git-editor` in
+# this crate's own tests, so `start_interactive_rebase`'s `GIT_SEQUENCE_EDITOR`/`GIT_EDITOR` spawn
+# a genuinely separate, genuinely executable process - not a mock. `CARGO_BIN_EXE_<name>` is
+# reliable for a `[[bin]]` of the *same* package (unlike a dev-dependency's bin target across a
+# cycle back through `jerry-core`/`jerry-cli`, which this crate's own tests found Cargo does not
+# reliably build before running a `--lib` test). See `src/bin/test_git_editor.rs`.
+name = "jerry_git_test_editor"
+path = "src/bin/test_git_editor.rs"
+
+[dev-dependencies]
+# Shared fixtures (real seeded repositories, argv-only `git`) - see `docs/testing.md`. Usable
+# here precisely because it carries no `gpui` (docs/architecture/decisions.md §1).
+test-support = { path = "../test-support" }

@@ -1,0 +1,7 @@
+{
+  "method": "query/merge-status",
+  "params": {
+    "cwd": "/repo",
+    "params": {}
+  }
+}

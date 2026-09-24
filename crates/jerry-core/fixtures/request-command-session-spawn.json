@@ -1,0 +1,17 @@
+{
+  "method": "command/session-spawn",
+  "params": {
+    "cwd": "/repo",
+    "params": {
+      "program": "bash",
+      "args": [],
+      "env": [],
+      "rows": 24,
+      "cols": 80,
+      "agent": {
+        "kind": "Claude",
+        "agent_id": "agent-1"
+      }
+    }
+  }
+}

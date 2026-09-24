@@ -19,7 +19,7 @@ first. Implementing against an unscoped issue is how a fix ends up solving the w
    `feat/295-agent-pane-action-bar`). One convention, matching the conventional-commit prefixes
    already used in this repo's history.
 
-2. **Write the failing test first.** This isn't a formality — `crates/app` already has real
+2. **Write the failing test first.** This isn't a formality — `crates/jerry-app` already has real
    test-writing conventions worth matching: `#[gpui::test]` + `TestAppContext`/`VisualTestContext`
    for anything touching `Render`/`Entity`, a test module named for the concern
    (`mod change_row_selection_tests`, not `mod tests`), fixtures under a sibling `testdata/`

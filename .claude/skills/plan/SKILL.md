@@ -24,7 +24,7 @@ before any code exists to be attached to the wrong fix.
 
 2. **Read the actual code the issue touches**, not just enough to guess. If the issue names a
    symptom ("terminal scrollback doesn't work"), find the module responsible
-   (`crates/app/src/terminal/`) and read enough of it to know whether the fix is local or touches
+   (`crates/jerry-app/src/terminal/`) and read enough of it to know whether the fix is local or touches
    a boundary this project cares about — see `CLAUDE.md`'s architecture section: does this cross
    from render code into an adapter? Does it touch a core crate that must stay `gpui`-free?
 

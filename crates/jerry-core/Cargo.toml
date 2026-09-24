@@ -1,0 +1,34 @@
+[package]
+name = "jerry-core"
+version = { workspace = true }
+edition = { workspace = true }
+publish = { workspace = true }
+license = { workspace = true }
+description = "The contract every Jerry client and host share: Command/Query traits, the JSON-RPC 2.0 frame codec, stable error codes, the per-repo host registry, and a blocking client"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Git-locality Commands and Queries execute here, so standalone `jerry-cli` can run them
+# without linking any host or PTY machinery (decisions.md §15).
+jerry-git = { path = "../jerry-git" }
+# `crate::host_spawn`: the one spawn-or-connect implementation `jerry-app`'s `HostRuntime` and
+# `jerry host start` both call, so the real `CREATE_BREAKAWAY_FROM_JOB`/process-group FFI (§14)
+# is written once (docs/architecture/decisions.md §24).
+jerry-pty = { path = "../jerry-pty" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Derives the `tools/list` `inputSchema` for `jerry mcp` (decisions.md §22) from the same
+# Command/Query input structs the wire already (de)serializes.
+schemars = { workspace = true }
+
+# AF_UNIX on Windows 10 1803+. Pinned to the exact version already resolved in Cargo.lock
+# (pulled by `zbus` via gpui), so this adds no new version surface.
+[target.'cfg(windows)'.dependencies]
+uds_windows = "=1.2.1"
+
+[dev-dependencies]
+tempfile = "3"
+test-support = { path = "../test-support" }
