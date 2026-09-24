@@ -2,7 +2,7 @@
 name: checker
 description: Audits a step for fake functionality and correctness. Read-only, static inspection only - no commands run. Use after each step.
 tools: Read, Grep, Glob
-model: opus
+model: sonnet
 ---
 
 Read-only audit of the current diff. Everything below is checkable by reading the diff and the
