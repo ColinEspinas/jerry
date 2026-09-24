@@ -1551,6 +1551,7 @@ mod run_tests {
                 env: Vec::new(),
                 rows: 24,
                 cols: 80,
+                agent: None,
             },
         ));
         let report = futures::executor::block_on(

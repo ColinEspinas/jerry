@@ -20,7 +20,9 @@ use gpui::{
     ScrollWheelEvent, Size, Task, Window,
 };
 use jerry_core::{AppCommand, Call, Report, Request, SessionResize};
-use jerry_host::{LocalClient, SessionHandle};
+#[cfg(test)]
+use jerry_host::LocalClient;
+use jerry_host::SessionHandle;
 use jerry_pty::{ExitStatus, PtyError, PtyOutput};
 
 use crate::root::scrollbar::{self, ScrollableHandle};
@@ -636,15 +638,40 @@ impl SessionAdapter for SessionHandle {
     }
 }
 
+/// The one thing a [`TerminalPane`] still asks the control plane for directly: dispatching
+/// `SessionResize` (decisions.md §23 - resize never travels on the data plane, so it has no path
+/// through a [`SessionAdapter`] the way bytes and kill do). Handed to the pane at attach time
+/// (`TerminalPane::attach_session`), backed by whichever connection kind actually serves the
+/// session's own repository (`crate::host::AdeApp::control_plane_for`) - a real
+/// `RemoteRepoHost` in production, a plain blocking call to its own dedicated worker thread, safe
+/// from any context (§16's amendment); the in-process `LocalClient` in tests, a real `.await`,
+/// never a `block_on`, which is equally safe to run from inside a background task for the
+/// identical reason.
+#[derive(Clone)]
+pub(crate) enum ControlPlane {
+    Remote(crate::repo_host::RemoteRepoHost),
+    #[cfg(test)]
+    InProcess(LocalClient),
+}
+
+impl ControlPlane {
+    async fn dispatch(&self, call: Call) -> Result<Report, jerry_core::RpcError> {
+        match self {
+            ControlPlane::Remote(remote) => remote.dispatch(call),
+            #[cfg(test)]
+            ControlPlane::InProcess(client) => client.request(call).await,
+        }
+    }
+}
+
 pub struct TerminalPane {
     spec: TerminalSpec,
     grid: TerminalGrid,
     session: Option<Arc<dyn SessionAdapter>>,
-    /// The host's own dispatch client, for the one thing this pane still asks the control plane
-    /// for directly: `SessionResize` (decisions.md §23 - resize never travels on the data plane).
-    /// `None` for a session with no real host behind it (a scripted test session) or before one
-    /// has ever attached.
-    host_client: Option<LocalClient>,
+    /// This pane's own [`ControlPlane`] handle, for [`Self::resize_to`]'s own `SessionResize`
+    /// dispatch. `None` for a session with no real host behind it (a scripted test session) or
+    /// before one has ever attached.
+    control_plane: Option<ControlPlane>,
     /// Test-only: the throwaway `jerry_host::Host` a real-pty test fixture
     /// (`pty_pane_fixtures::attach_real_session_for_test`) spawned this pane's session through,
     /// kept alive here rather than dropped at the end of that function. `Host::shutdown` (via
@@ -808,7 +835,7 @@ impl TerminalPane {
             spec,
             grid: TerminalGrid::new(TERMINAL_ROWS, TERMINAL_COLS),
             session: None,
-            host_client: None,
+            control_plane: None,
             #[cfg(test)]
             _test_host: None,
             spawn_error: None,
@@ -835,12 +862,40 @@ impl TerminalPane {
         }
     }
 
+    /// Marks this pane exited from a real `event/session-exited` control-plane notification
+    /// (`crate::work_surface::session_exited`) rather than the data plane's own `PtyOutput::
+    /// Exited` item - the only way a socket-attached (production) session's real exit is ever
+    /// observed, since `SocketSessionAdapter` synthesizes no exit signal of its own
+    /// (`docs/architecture/decisions.md` §25). Mirrors that data-plane handling exactly, so a
+    /// pane behaves identically regardless of which one told it; a no-op if this pane already
+    /// recorded its own exit (the data plane's own `PtyOutput::Exited`, for an in-process
+    /// session, arrives too - never double-report the same exit).
+    pub(crate) fn mark_exited_from_event(
+        &mut self,
+        status: &jerry_core::ExitStatusWire,
+        cx: &mut Context<Self>,
+    ) {
+        if self.exit_status.is_some() {
+            return;
+        }
+        let status = match &status.signal {
+            Some(signal) => ExitStatus::with_signal(signal),
+            None => ExitStatus::with_exit_code(status.code),
+        };
+        let clean = status.success();
+        self.exit_status = Some(status);
+        self.session = None;
+        self.grid.mark_ended();
+        cx.emit(TerminalPaneEvent::ProcessExited { clean });
+        cx.notify();
+    }
+
     /// Attaches this pane to a live (or scripted) session and starts the "wait for the next
     /// item, update the grid, or record exit" loop against its output stream - what
     /// `Self::new` used to do itself, against a `jerry_pty::PtySession` it spawned directly,
-    /// before the host owned every session (decisions.md §23). `client` is the host's dispatch
-    /// handle for `Self::resize_to`'s own `SessionResize` calls; `None` for a session with no
-    /// real host behind it.
+    /// before the host owned every session (decisions.md §23). `control_plane` is
+    /// `Self::resize_to`'s own `SessionResize` handle; `None` for a session with no real host
+    /// behind it.
     ///
     /// A `None` from `session.take_output()` is a real error, not a silent no-op: a session's
     /// stream is claimed exactly once, so seeing it already gone here means something upstream
@@ -848,7 +903,7 @@ impl TerminalPane {
     pub(crate) fn attach_session(
         &mut self,
         session: Arc<dyn SessionAdapter>,
-        client: Option<LocalClient>,
+        control_plane: Option<ControlPlane>,
         cx: &mut Context<Self>,
     ) {
         let Some(mut output) = session.take_output() else {
@@ -859,7 +914,7 @@ impl TerminalPane {
             return;
         };
         self.session = Some(session);
-        self.host_client = client;
+        self.control_plane = control_plane;
         if self.doomed {
             // This pane's own worktree-discard flow (`crate::worktree_history::flow`) is
             // already polling `Self::take_session_for_teardown` for exactly this case - a
@@ -1709,13 +1764,13 @@ impl TerminalPane {
         self.font_size_px
     }
 
-    /// Test-only seam: this pane's own host dispatch client, for a test that wants to prove the
-    /// host `Self::resize_to`'s own `SessionResize` dispatch went through is still genuinely
+    /// Test-only seam: this pane's own [`ControlPlane`] handle, for a test that wants to prove
+    /// the host `Self::resize_to`'s own `SessionResize` dispatch went through is still genuinely
     /// reachable, not merely that `Self::resize_latch` was latched optimistically - see
     /// `scrollback_pane_tests::a_settled_pane_can_still_reach_its_host_through_the_same_client_a_resize_used`.
     #[cfg(test)]
-    pub(crate) fn host_client_for_test(&self) -> Option<LocalClient> {
-        self.host_client.clone()
+    pub(crate) fn control_plane_for_test(&self) -> Option<ControlPlane> {
+        self.control_plane.clone()
     }
 
     /// Test-only seam: the real [`TerminalSpec`] this pane was constructed with - lets a test
@@ -1927,7 +1982,8 @@ impl TerminalPane {
         }
 
         if actions.resize_session {
-            let (Some(session), Some(client)) = (&self.session, self.host_client.clone()) else {
+            let (Some(session), Some(control_plane)) = (&self.session, self.control_plane.clone())
+            else {
                 return;
             };
             let id = session.id().clone();
@@ -1936,7 +1992,7 @@ impl TerminalPane {
             cx.background_spawn(async move {
                 let request =
                     Request::Command(AppCommand::SessionResize(SessionResize { id, rows, cols }));
-                match client.request(Call::human(cwd, request)).await {
+                match control_plane.dispatch(Call::human(cwd, request)).await {
                     Ok(Report::Ok { .. }) => {}
                     Ok(other) => log::warn!("failed to resize pty session: {other:?}"),
                     Err(err) => log::warn!("failed to resize pty session: {}", err.message),
@@ -2770,7 +2826,9 @@ impl Render for TerminalPane {
 /// room to run, with `run_until_parked` on each check picking up whatever it produced meanwhile.
 #[cfg(test)]
 mod pty_pane_fixtures {
-    use super::{TerminalPane, TerminalSpec, ROW_FONT_SIZE_PX, TERMINAL_COLS, TERMINAL_ROWS};
+    use super::{
+        ControlPlane, TerminalPane, TerminalSpec, ROW_FONT_SIZE_PX, TERMINAL_COLS, TERMINAL_ROWS,
+    };
     use gpui::{AppContext, Context, Entity, TestAppContext};
     use std::time::Duration;
 
@@ -2830,7 +2888,9 @@ mod pty_pane_fixtures {
             options = options.env(key, value);
         }
         match host.sessions().spawn(spec.cwd.clone(), None, options) {
-            Ok((_id, handle)) => pane.attach_session(handle, Some(host.client()), cx),
+            Ok((_id, handle)) => {
+                pane.attach_session(handle, Some(ControlPlane::InProcess(host.client())), cx)
+            }
             Err(err) => pane.mark_spawn_failed(
                 format!("failed to start {}: {err}", spec.program.display()),
                 cx,
@@ -2990,6 +3050,146 @@ mod pty_pane_fixtures {
             pane
         });
         (pane, tx)
+    }
+}
+
+/// `ControlPlane::Remote`'s own regression coverage - decisions.md §24's "resize of a
+/// socket-attached pane must not be a no-op" fix, closing the gap `pty_pane_fixtures`'s own
+/// `Connection::InProcess`-shaped `LocalClient` never exercised.
+#[cfg(test)]
+mod control_plane_resize_tests {
+    use super::{ControlPlane, TerminalPane, TerminalSpec, ROW_FONT_SIZE_PX};
+    use crate::repo_host::RemoteRepoHost;
+    use crate::terminal::socket_adapter::SocketSessionAdapter;
+    use gpui::{AppContext as _, TestAppContext};
+    use jerry_core::{
+        AppCommand, AppQuery, Call, Report, Request, SessionAttach, SessionId, SessionKill,
+        SessionRecord, SessionSpawn, SessionsQuery,
+    };
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use test_support::wait_until;
+
+    /// A real, separate `jerry-host` process shape (a real socket, never an in-process stand-in)
+    /// spawns a real, idling shell, attaches a real `SocketSessionAdapter` to it exactly as
+    /// `crate::host::attach_remote_session` would, resizes the pane through its
+    /// `ControlPlane::Remote` handle, and confirms a real `SessionResize` reached the host by
+    /// reading it straight back off a fresh `SessionsQuery` - the one thing an out-of-process
+    /// pane has no in-process `PtySession` to read back from directly. Before this fix,
+    /// `TerminalPane::resize_to` had no `ControlPlane` for this connection kind at all, so this
+    /// would have been a silent no-op.
+    #[gpui::test]
+    fn a_socket_attached_panes_resize_reaches_the_real_host(cx: &mut TestAppContext) {
+        let host = jerry_host::Host::start().expect("host");
+        let socket_dir = jerry_core::registry::runtime_dir().expect("runtime dir");
+        let socket = socket_dir.join(format!(
+            "cr-{:x}-{:08x}.sock",
+            std::process::id(),
+            jerry_core::registry::fresh_u32()
+        ));
+        host.listen(&socket).expect("listen");
+        let client = jerry_core::client::Client::connect(&socket, Duration::from_secs(5))
+            .expect("connect to the real socket");
+        let remote = RemoteRepoHost::new(client).expect("worker thread");
+
+        let cwd = std::env::temp_dir();
+        #[cfg(windows)]
+        let (program, args) = (PathBuf::from("cmd"), Vec::new());
+        #[cfg(not(windows))]
+        let (program, args) = (PathBuf::from("sh"), Vec::new());
+        let spawn_report = remote
+            .dispatch(Call::human(
+                cwd.clone(),
+                Request::Command(AppCommand::SessionSpawn(SessionSpawn {
+                    program,
+                    args,
+                    env: Vec::new(),
+                    rows: 24,
+                    cols: 80,
+                    agent: None,
+                })),
+            ))
+            .expect("the real host accepts a real spawn");
+        let Report::Ok { outcome } = spawn_report else {
+            panic!("expected ok, got {spawn_report:?}")
+        };
+        let session_id = SessionId(
+            outcome["id"]
+                .as_str()
+                .expect("the outcome carries a real session id")
+                .to_owned(),
+        );
+
+        let attach_report = remote
+            .dispatch(Call::human(
+                cwd.clone(),
+                Request::Command(AppCommand::SessionAttach(SessionAttach {
+                    id: session_id.clone(),
+                })),
+            ))
+            .expect("attach must succeed against a session with no client yet");
+        let Report::Ok { outcome } = attach_report else {
+            panic!("expected ok, got {attach_report:?}")
+        };
+        let data_socket = PathBuf::from(
+            outcome["socket"]
+                .as_str()
+                .expect("the outcome carries a real socket path"),
+        );
+
+        let kill_id = session_id.clone();
+        let kill_cwd = cwd.clone();
+        let kill_remote = remote.clone();
+        let adapter =
+            SocketSessionAdapter::connect(&data_socket, session_id.clone(), None, move || {
+                match kill_remote.dispatch(Call::human(
+                    kill_cwd.clone(),
+                    Request::Command(AppCommand::SessionKill(SessionKill {
+                        id: kill_id.clone(),
+                    })),
+                )) {
+                    Ok(Report::Ok { .. }) => Ok(()),
+                    Ok(other) => Err(format!("{other:?}")),
+                    Err(error) => Err(error.message),
+                }
+            })
+            .expect("connect to the real data plane");
+
+        let spec = TerminalSpec::command(PathBuf::from("sh"), Vec::new(), cwd.clone());
+        let pane = cx.new(|cx| TerminalPane::new(spec, ROW_FONT_SIZE_PX, cx));
+        pane.update(cx, |pane, cx| {
+            pane.attach_session(
+                Arc::new(adapter),
+                Some(ControlPlane::Remote(remote.clone())),
+                cx,
+            );
+            pane.resize_to(30, 100, cx);
+        });
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                cx.run_until_parked();
+                let sessions_report = remote
+                    .dispatch(Call::human(
+                        cwd.clone(),
+                        Request::Query(AppQuery::Sessions(SessionsQuery::default())),
+                    ))
+                    .expect("sessions query");
+                let Report::Ok { outcome } = sessions_report else {
+                    return false;
+                };
+                let records: Vec<SessionRecord> =
+                    serde_json::from_value(outcome).expect("a real list of session records");
+                records.iter().any(|record| {
+                    record.id == session_id && record.rows == 30 && record.cols == 100
+                })
+            }),
+            "a socket-attached pane's own resize must reach the real host as a real \
+             SessionResize, observable back through SessionsQuery"
+        );
+
+        host.shutdown_and_join();
     }
 }
 
@@ -3418,10 +3618,10 @@ mod process_exit_event_tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use gpui::TestAppContext;
+    use gpui::{AppContext as _, TestAppContext};
 
     use super::pty_pane_fixtures::{pump_until, release, spawn_pane};
-    use super::TerminalPaneEvent;
+    use super::{TerminalPaneEvent, TerminalSpec, ROW_FONT_SIZE_PX};
 
     /// A real child process that does nothing but exit with `code`, spelled for this platform's
     /// own always-present interpreter - `cmd.exe` ships with every Windows install, `/bin/sh`
@@ -3484,6 +3684,35 @@ mod process_exit_event_tests {
         );
 
         release(cx, pane);
+    }
+
+    /// The deterministic counterpart of the two real-process tests above, for the race
+    /// `crate::work_surface::agents::Agents::set_host_session_id`'s own docs describe: a
+    /// socket-attached (production) session's real `event/session-exited` notification can
+    /// arrive - and, on Linux, be applied - before `Agents::spawn_resolved` ever calls
+    /// `Self::attach_session` at all, since that adapter synthesizes no exit signal of its own on
+    /// the data plane. A pane that never attached anything must still report the exit correctly
+    /// once `Self::mark_exited_from_event` delivers it.
+    #[gpui::test]
+    fn an_exit_event_arriving_before_any_attach_still_marks_the_pane_exited(
+        cx: &mut TestAppContext,
+    ) {
+        let spec = TerminalSpec::command("sh", Vec::new(), std::env::temp_dir());
+        let pane = cx.new(|cx| super::TerminalPane::new(spec, ROW_FONT_SIZE_PX, cx));
+        let (seen, _subscription) = watch(cx, &pane);
+
+        let status = jerry_core::ExitStatusWire {
+            success: false,
+            code: 3,
+            signal: None,
+        };
+        pane.update(cx, |pane, cx| pane.mark_exited_from_event(&status, cx));
+
+        assert_eq!(
+            seen.borrow().as_slice(),
+            [TerminalPaneEvent::ProcessExited { clean: false }],
+            "an exit event delivered before any real attach must still mark the pane exited"
+        );
     }
 }
 
@@ -5119,8 +5348,8 @@ mod scrollback_pane_tests {
     /// dispatch is sent, not once it succeeds - see `ResizeLatch::session_resize_succeeded`'s own
     /// docs) proves the resize was *asked for*, never that it actually reached a live host. This
     /// proves the host side directly: settling below already sent at least one real
-    /// `SessionResize` through the pane's `host_client`, so dispatching a second, independent
-    /// real request through that same client and getting a real `Report::Ok` back is what the
+    /// `SessionResize` through the pane's `ControlPlane`, so dispatching a second, independent
+    /// real request through that same handle and getting a real `Report::Ok` back is what the
     /// throwaway host dropping immediately after spawn (before `TerminalPane::_test_host` kept it
     /// alive - GitHub issue #530) would have made fail with `SHUTTING_DOWN` instead.
     #[gpui::test]
@@ -5135,17 +5364,17 @@ mod scrollback_pane_tests {
         let pane = super::pty_pane_fixtures::spawn_pane(cx, "cmd", &["/d", "/c", "more"]);
         #[cfg(not(windows))]
         let pane = super::pty_pane_fixtures::spawn_pane(cx, "sh", &["-c", "cat >/dev/null"]);
-        let client = pane
-            .read_with(cx, |pane, _| pane.host_client_for_test())
-            .expect("a settled real-session pane has a real host client");
+        let control_plane = pane
+            .read_with(cx, |pane, _| pane.control_plane_for_test())
+            .expect("a settled real-session pane has a real control plane");
 
         let result: std::rc::Rc<std::cell::RefCell<Option<Result<Report, jerry_core::RpcError>>>> =
             std::rc::Rc::new(std::cell::RefCell::new(None));
         let recorder = std::rc::Rc::clone(&result);
         pane.update(cx, |_pane, cx| {
             cx.spawn(async move |_this, _cx| {
-                let report = client
-                    .request(Call::human(
+                let report = control_plane
+                    .dispatch(Call::human(
                         std::env::temp_dir(),
                         Request::Query(jerry_core::AppQuery::Status(Default::default())),
                     ))

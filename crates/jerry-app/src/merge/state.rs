@@ -73,6 +73,7 @@ pub struct MergeEditState {
 
 /// The state of a [`MergeFlow`] - every variant corresponds to an already-happened
 /// `jerry_git::merge` outcome (or an error from one), never a simulated intermediate state.
+#[derive(Debug)]
 pub enum MergeFlowState {
     /// The `git merge` child process is still running on a background thread.
     Running,

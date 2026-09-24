@@ -47,6 +47,10 @@ pub mod review;
 // agent changed since I last looked*, which is a different question with a different base and
 // different persisted state.
 pub mod review_notes;
+// The safe bridge from a blocking, real `jerry_core::client::Client` connection to GPUI's
+// cooperative scheduler (decisions.md §16's amendment, §24) - a dedicated OS thread per
+// repository, never a task the executor itself must poll forward.
+pub(crate) mod repo_host;
 pub mod root;
 // GitHub issue #227: agent history - the sidebar's repo -> worktree -> run index and the
 // run-transcript centre tab. Its own folder rather than a file inside `hooks` (which owns the

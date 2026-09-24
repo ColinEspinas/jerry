@@ -123,7 +123,7 @@ impl AdeApp {
         // `--settings` file and told, through its environment, where to report its hooks. Taken as
         // an owned snapshot because `self.agents.spawn` borrows `self.agents` mutably - see
         // `crate::hooks::HookRuntime::injection`.
-        let hook_injection = self.hook_injection_for(kind, cx);
+        let hook_injection = self.hook_injection_for(kind, &cwd);
         let id = self.agents.spawn(
             kind,
             cwd,
@@ -564,7 +564,7 @@ impl AdeApp {
         // A respawned agent is a freshly spawned one in every other respect, so it gets the same
         // real hook injection - otherwise "Retry" would silently produce an agent whose status
         // fell back to the quiescence heuristic.
-        let hook_injection = self.hook_injection_for(kind, cx);
+        let hook_injection = self.hook_injection_for(kind, &cwd);
         let respawned = self.agents.spawn(
             kind,
             cwd,
@@ -1661,7 +1661,7 @@ impl AdeApp {
                     this.spawn_with_minted_chat_id(kind, cwd, cx);
                     return;
                 }
-                let hook_injection = this.hook_injection_for(ProcessKind::Agent(kind), cx);
+                let hook_injection = this.hook_injection_for(ProcessKind::Agent(kind), &cwd);
                 let id = this.agents.spawn(
                     ProcessKind::Agent(kind),
                     cwd,

@@ -45,7 +45,7 @@ pub enum SessionKind {
 /// Which real agent CLI, if any, a session is running - `None` for a plain interactive shell.
 /// Mirrors `jerry_host::AgentRecord`'s existing `kind` convention: a free-form label the
 /// registering caller chose (`jerry-app`'s own `AgentKind::label()`), never interpreted here.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SessionAgentInfo {
     pub kind: String,
     pub agent_id: AgentId,
@@ -82,6 +82,14 @@ pub struct SessionRecord {
     /// rather than a control-plane round trip of its own, since a session's pid never changes
     /// once spawned - set once, at spawn time, and left as-is once the session exits.
     pub process_id: Option<u32>,
+    /// This session's real pty size - set at spawn time, updated on every real `SessionResize`
+    /// dispatched against it (`SessionManager::resize`, never through `Command::execute` - see
+    /// `SessionSpawn`'s own docs). `0` for an `AgentTable`-compatibility registration with no pty
+    /// to size at all. What a socket-attached (out-of-process) `TerminalPane`'s own resize
+    /// dispatch has to verify against, since it has no in-process `PtySession` to read the applied
+    /// size back from directly (`docs/architecture/decisions.md` §24's amendment).
+    pub rows: u16,
+    pub cols: u16,
 }
 
 /// Spawns a new PTY session in the caller's worktree, owned by the host from then on
@@ -101,6 +109,13 @@ pub struct SessionSpawn {
     pub env: Vec<(String, String)>,
     pub rows: u16,
     pub cols: u16,
+    /// Associates the new session with an agent identity atomically at spawn time, so there is
+    /// never a window in which a hook from that agent id arrives before its worktree confinement
+    /// is in place - the caller (`jerry-app`'s own `Agents::spawn_resolved`) already minted this
+    /// id before spawning, since `JERRY_AGENT_ID` must reach the child's own environment. `None`
+    /// for a plain interactive shell, which carries no agent identity at all.
+    #[serde(default)]
+    pub agent: Option<SessionAgentInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

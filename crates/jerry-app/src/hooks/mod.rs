@@ -18,38 +18,32 @@ mod integration_tests;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use futures::channel::mpsc;
 use futures::StreamExt;
-use gpui::{AppContext as _, Context, Task};
-use jerry_host::LocalClient;
+use gpui::{Context, Task};
+use jerry_core::Message;
 use serde_json::Value;
 
 use crate::root::AdeApp;
 use crate::work_surface::agents::AgentId;
 
-/// Everything one Jerry launch needs to receive hooks: the generated `--settings` file, the
-/// facts learned from it so far, and the task consuming the host's own notifications. Dropping
-/// it cancels that task and removes the settings file.
+/// Everything one Jerry launch needs to receive hooks: the generated `--settings` file and the
+/// facts learned from it so far. Holds no connection of its own - `event/hook` notifications
+/// reach it through whichever repository's own event subscription happens to be forwarding them
+/// (`crate::host::ensure_repo_host_connected`, [`spawn_consumer`]), the same per-repository
+/// pipeline `worktree_created`/`session_exited` already use.
 pub struct HookRuntime {
     files: settings_file::HookFiles,
-    /// The socket a spawned `jerry hook` should connect to - see [`HookInjection`].
-    host_socket: PathBuf,
     inbox: Arc<Mutex<inbox::HookInbox>>,
     edits: Arc<Mutex<inbox::EditLog>>,
-    /// Cancelled (not detached) when this runtime drops, so no task outlives the app state it
-    /// writes into.
-    _consumer: Task<()>,
 }
 
 impl HookRuntime {
-    /// Writes this launch's `--settings` file naming `jerry_binary`, and spawns the task that
-    /// consumes `event/hook` notifications from `client` for as long as this runtime lives.
-    pub fn start(
-        parent: &Path,
-        jerry_binary: &Path,
-        host_socket: PathBuf,
-        client: LocalClient,
-        cx: &mut Context<AdeApp>,
-    ) -> Option<HookRuntime> {
+    /// Writes this launch's `--settings` file naming `jerry_binary`. `None` when hooks are
+    /// unsupported on this platform, or the settings file could not be written - both permanent
+    /// for the life of this `AdeApp` (see `crate::hooks::flow::AdeApp::hook_injection_for`'s own
+    /// one-shot bring-up).
+    pub fn start(parent: &Path, jerry_binary: &Path) -> Option<HookRuntime> {
         if !settings_file::is_supported() {
             log::info!(
                 "agent hooks are not supported on this platform - agent status will use the \
@@ -64,29 +58,32 @@ impl HookRuntime {
                 return None;
             }
         };
-        let inbox: Arc<Mutex<inbox::HookInbox>> = Arc::new(Mutex::new(inbox::HookInbox::default()));
-        let edits: Arc<Mutex<inbox::EditLog>> = Arc::new(Mutex::new(inbox::EditLog::default()));
-        let consumer = spawn_consumer(client, Arc::clone(&inbox), Arc::clone(&edits), cx);
         log::info!(
             "agent hook settings ready at {}",
             files.settings_path().display()
         );
         Some(HookRuntime {
             files,
-            host_socket,
-            inbox,
-            edits,
-            _consumer: consumer,
+            inbox: Arc::new(Mutex::new(inbox::HookInbox::default())),
+            edits: Arc::new(Mutex::new(inbox::EditLog::default())),
         })
     }
 
-    /// An owned handle carrying everything a spawn needs, detached from `self`.
-    pub fn injection(&self) -> HookInjection {
+    /// An owned handle carrying everything a spawn needs, detached from `self` - `host_socket` is
+    /// the spawning repository's own socket (`crate::host::AdeApp::host_socket_for`), resolved
+    /// fresh per spawn since different agents in the same launch can belong to different
+    /// repositories.
+    pub fn injection(&self, host_socket: PathBuf) -> HookInjection {
         HookInjection {
             settings_path: self.files.settings_path().to_path_buf(),
             plugin_dir: self.files.plugin_dir().to_path_buf(),
-            host_socket: self.host_socket.clone(),
+            host_socket,
         }
+    }
+
+    /// Records one `event/hook` notification's params - see [`spawn_consumer`].
+    fn record(&self, params: Value) {
+        record_hook_notification(&self.inbox, &self.edits, params);
     }
 
     /// This agent's current hook fact, for [`crate::rail::status::derive_status`].
@@ -161,23 +158,30 @@ impl HookRuntime {
     }
 }
 
-/// Spawns the task that loops over `client`'s notifications for as long as it is held - see
-/// [`HookRuntime::start`]. Runs on the background executor: it never touches `Window` or a
-/// `Context`, only the shared `inbox`/`edits` this app's UI-thread methods above also lock.
-fn spawn_consumer(
-    client: LocalClient,
-    inbox: Arc<Mutex<inbox::HookInbox>>,
-    edits: Arc<Mutex<inbox::EditLog>>,
+/// Drains `events` for as long as the returned `Task` is held - one per repository connection
+/// (`crate::host::ensure_repo_host_connected`), all feeding the same [`HookRuntime`] regardless
+/// of which repository the notification came from, mirroring `crate::work_surface::
+/// worktree_created::spawn_consumer`'s own shape exactly. An `event/hook` that arrives before
+/// [`HookRuntime`] exists yet (hooks unsupported, or its lazy bring-up has not run -
+/// `crate::hooks::flow::AdeApp::hook_injection_for`) is silently dropped, the same as one
+/// arriving after it has already been torn down.
+pub(crate) fn spawn_consumer(
+    mut events: mpsc::UnboundedReceiver<Message>,
     cx: &mut Context<AdeApp>,
 ) -> Task<()> {
-    cx.background_spawn(async move {
-        let mut events = client.subscribe();
+    cx.spawn(async move |this, cx| {
         while let Some(message) = events.next().await {
-            if let jerry_core::Message::Notification { method, params } = message {
-                if method == "event/hook" {
-                    record_hook_notification(&inbox, &edits, params);
-                }
+            let Message::Notification { method, params } = message else {
+                continue;
+            };
+            if method != "event/hook" {
+                continue;
             }
+            let _ = this.update(cx, |app, _cx| {
+                if let Some(runtime) = &app.hook_runtime {
+                    runtime.record(params);
+                }
+            });
         }
     })
 }

@@ -49,6 +49,8 @@ pub enum HostError {
     },
     #[error("already listening on {}", path.display())]
     AlreadyListening { path: PathBuf },
+    #[error(transparent)]
+    SocketDirectory(#[from] jerry_core::registry::RegistryError),
 }
 
 /// One agent this host is tracking: the worktree it's confined to, and which CLI it runs -
@@ -60,14 +62,17 @@ pub struct AgentRecord {
     pub kind: String,
 }
 
-/// The agents this host spawned, by the identity it injected as `JERRY_AGENT_ID`. Shared by the
-/// app, which registers and forgets, and the dispatcher, which classifies callers against it and
-/// answers `AgentsQuery` from it.
+/// An agent identity registered with this host without a `SessionSpawn` of its own - the
+/// dispatcher classifies callers against it and answers `AgentsQuery` from it exactly like a real
+/// session's own `SessionSpawn::agent` association (`SessionManager::worktree_of_agent`/
+/// `agent_entries` read both the same way). `jerry-app`'s own `Agents` no longer calls this for a
+/// session it spawns itself - `SessionSpawn::agent` makes that association atomically instead -
+/// but this stays the real path for an agent identity that exists without a session this host
+/// owns a process for (a hook-only test double, or a future non-PTY agent kind).
 ///
 /// A thin view over [`SessionManager`] (`docs/architecture/decisions.md` §23) - kept as its own
-/// type, rather than every caller reaching for `SessionManager` directly, only because its public
-/// shape (`register`/`forget`/`worktree_of`/`list`) predates the session table and `jerry-app`
-/// still calls exactly this during its own migration to it. There is exactly one underlying
+/// type, rather than every caller reaching for `SessionManager` directly, only for its narrower
+/// public shape (`register`/`forget`/`worktree_of`/`list`). There is exactly one underlying
 /// table: constructing one from scratch is not offered - see [`SessionManager::agent_table`].
 #[derive(Clone)]
 pub struct AgentTable(SessionManager);
@@ -82,9 +87,7 @@ impl AgentTable {
     }
 
     /// [`SessionManager::forget_session`] - the real `SessionId` a spawn minted, distinct from
-    /// [`Self::forget`]'s synthetic `agent:<id>` key (`crate::work_surface::agents::Agents::close`
-    /// needs both: the synthetic key for a `ProcessKind::Agent`'s `AgentTable`-compatibility
-    /// registration, this for the real session `SessionSpawn` created).
+    /// [`Self::forget`]'s synthetic `agent:<id>` key.
     pub fn forget_session(&self, id: &SessionId) {
         self.0.forget_session(id);
     }
@@ -314,14 +317,23 @@ impl Host {
         }
     }
 
-    /// Accepts socket clients at `socket`. The registry descriptor should be published only
-    /// after this returns, so a discoverable entry always has a listener behind it.
+    /// Accepts socket clients at `socket`, first ensuring its parent directory exists (the same
+    /// `ensure_private_dir` `DataPlane::bind` already calls for a per-session socket - every
+    /// caller, `main.rs`'s production bind and every test's in-process one alike, needs this, not
+    /// just the data plane's own). A caller that binds under a directory nothing has created yet
+    /// (a fresh CI runner's own `$TMPDIR`, before anything else has touched it) used to fail here
+    /// with a raw `NotFound`, invisible as anything but "every Command in this test errors". The
+    /// registry descriptor should be published only after this returns, so a discoverable entry
+    /// always has a listener behind it.
     pub fn listen(&self, socket: &Path) -> Result<(), HostError> {
         let mut listening = lock(&self.listening);
         if let Some(existing) = &*listening {
             return Err(HostError::AlreadyListening {
                 path: existing.socket().to_path_buf(),
             });
+        }
+        if let Some(parent) = socket.parent() {
+            jerry_core::registry::ensure_private_dir(parent)?;
         }
         *listening = Some(listener::listen(Arc::clone(&self.inner), socket)?);
         Ok(())
@@ -495,6 +507,53 @@ impl LocalClient {
 }
 
 #[cfg(test)]
+mod listen_tests {
+    use super::Host;
+    use jerry_core::client::Client;
+    use jerry_core::{AppQuery, Call, Request};
+    use std::time::Duration;
+
+    /// The regression this exists to make impossible again: unlike `DataPlane::bind`'s per-session
+    /// sockets (`session::session_manager_tests::spawn_creates_its_own_sockets_directory_when_it_
+    /// does_not_exist_yet`), `Host::listen`'s own control-plane bind had no directory-creation step
+    /// at all - a fresh runner whose socket directory nothing had created yet (a `#[cfg(test)]`
+    /// in-process `RepoHost` on a CI worker with no shared runtime dir left over from an earlier
+    /// test, unlike this machine's own) failed the bind outright, so every `Call` a test then
+    /// dispatched against that host answered a connection error - indistinguishable, from the
+    /// dispatching side, from "nothing downstream ran" (the real Linux/macOS CI regression this
+    /// test would have caught before it shipped). A definitely-fresh, never-created directory
+    /// makes the bug deterministic on every platform, matching the data-plane test's own reasoning
+    /// for why it does not rely on unrelated test ordering.
+    #[test]
+    fn listen_creates_its_own_socket_directory_when_it_does_not_exist_yet() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        // Short on purpose - the same margin-for-macOS's-own-long-$TMPDIR reasoning as the
+        // data-plane test this mirrors.
+        let socket = temp.path().join("nc").join("h.sock");
+        assert!(
+            !socket.parent().expect("parent").exists(),
+            "sanity check: truly not created yet"
+        );
+        let host = Host::start().expect("host");
+        host.listen(&socket)
+            .expect("listen must succeed even when its own directory does not exist yet");
+
+        let repo = test_support::seed_empty_repo();
+        let mut client =
+            Client::connect(&socket, Duration::from_secs(5)).expect("connect to the real socket");
+        let report = client
+            .request(&Call::human(
+                repo.path(),
+                Request::Query(AppQuery::Status(Default::default())),
+            ))
+            .expect("a real request over the newly bound socket");
+        assert!(report.is_ok(), "{report:?}");
+
+        host.shutdown_and_join();
+    }
+}
+
+#[cfg(test)]
 mod host_dispatch_tests {
     use super::Host;
     use futures::executor::block_on;
@@ -564,6 +623,212 @@ mod host_dispatch_tests {
             block_on(client.call(Call::agent(repo.path(), id, status()))).expect_err("forgotten");
         assert_eq!(forgotten.code, rpc_code::FORBIDDEN);
         host.shutdown_and_join();
+    }
+
+    fn spawn_command(agent_id: AgentId) -> Request {
+        Request::Command(AppCommand::SessionSpawn(jerry_core::SessionSpawn {
+            program: if cfg!(windows) { "cmd" } else { "sh" }.into(),
+            args: if cfg!(windows) {
+                vec!["/c".into(), "echo hi".into()]
+            } else {
+                vec!["-c".into(), "echo hi".into()]
+            },
+            env: Vec::new(),
+            rows: 24,
+            cols: 80,
+            agent: Some(jerry_core::SessionAgentInfo {
+                kind: "Claude".into(),
+                agent_id,
+            }),
+        }))
+    }
+
+    /// The confinement path `SessionSpawn::agent` replaces the separate `AgentTable::register`
+    /// call for: a session spawned with a real agent association is confined to its own worktree
+    /// the moment it exists, through the real `command/session-spawn` dispatch - never a second,
+    /// separate in-process registration step with its own window for a hook to arrive first.
+    #[test]
+    fn a_session_spawned_with_an_agent_is_confined_to_its_worktree_through_the_real_command_path() {
+        let repo = seed_empty_repo();
+        let host = Host::start().expect("host");
+        let client = host.client();
+        let id = AgentId::from("agent-confined-1");
+
+        let spawned = block_on(client.request(Call::human(repo.path(), spawn_command(id.clone()))))
+            .expect("spawn dispatched");
+        assert!(spawned.is_ok(), "{spawned:?}");
+
+        let hook = Request::Hook(HookEvent {
+            event: "PostToolUse".into(),
+            payload: serde_json::json!({ "tool_name": "Edit" }),
+        });
+        let report = block_on(client.request(Call::agent(repo.path(), id.clone(), hook.clone())))
+            .expect("the spawning worktree accepts its own agent's hook");
+        assert!(report.is_ok(), "{report:?}");
+
+        let elsewhere = seed_empty_repo();
+        let confined = block_on(client.call(Call::agent(elsewhere.path(), id, hook)))
+            .expect_err("a hook from outside the spawned worktree is confined");
+        assert_eq!(confined.code, rpc_code::CONFINED);
+        host.shutdown_and_join();
+    }
+
+    /// [`SessionSpawn::agent`]'s own denial rule: two live sessions must never answer to the same
+    /// agent identity - `Report::Denied` with `agent-id-taken`, never a silent second registration
+    /// that would leave confinement unable to tell which session a later hook call meant.
+    #[test]
+    fn a_second_spawn_reusing_a_live_agent_id_is_denied() {
+        let repo = seed_empty_repo();
+        let host = Host::start().expect("host");
+        let client = host.client();
+        let id = AgentId::from("agent-reused-1");
+
+        let sleep = if cfg!(windows) {
+            "ping -n 30 127.0.0.1 >NUL"
+        } else {
+            "sleep 30"
+        };
+        let first = jerry_core::SessionSpawn {
+            program: if cfg!(windows) { "cmd" } else { "sh" }.into(),
+            args: if cfg!(windows) {
+                vec!["/c".into(), sleep.into()]
+            } else {
+                vec!["-c".into(), sleep.into()]
+            },
+            env: Vec::new(),
+            rows: 24,
+            cols: 80,
+            agent: Some(jerry_core::SessionAgentInfo {
+                kind: "Claude".into(),
+                agent_id: id.clone(),
+            }),
+        };
+        let spawned = block_on(client.request(Call::human(
+            repo.path(),
+            Request::Command(AppCommand::SessionSpawn(first)),
+        )))
+        .expect("first spawn dispatched");
+        let Report::Ok { outcome } = spawned else {
+            panic!("expected ok, got {spawned:?}")
+        };
+        let first_id = outcome["id"].clone();
+
+        let second = block_on(client.request(Call::human(repo.path(), spawn_command(id))))
+            .expect("second spawn dispatched, even though it is refused");
+        match second {
+            Report::Denied { code, .. } => assert_eq!(code, "agent-id-taken"),
+            other => panic!("expected denied, got {other:?}"),
+        }
+
+        // Cleanup: kill the still-sleeping first session so this test does not leak it.
+        let kill = Request::Command(AppCommand::SessionKill(jerry_core::SessionKill {
+            id: jerry_core::SessionId::from(first_id.as_str().expect("id string").to_owned()),
+        }));
+        let _ = block_on(client.request(Call::human(repo.path(), kill)));
+        host.shutdown_and_join();
+    }
+
+    /// `AgentsQuery` stops listing an agent the moment its real session exits - no separate
+    /// "forget" call needed, unlike the retired synthetic-registration mechanism this replaces -
+    /// and the same agent id becomes spawnable again immediately afterwards, exactly because
+    /// `SessionManager::agent_is_live`/`agent_entries` both key off `record.exit`, not a second,
+    /// independent removal step that could race or be forgotten. A real `SessionKill`, not a
+    /// natural exit, drives the process's end: an idle real shell on Windows never produces its
+    /// own exit at all without something answering ConPTY's own startup query first (see
+    /// `session::session_manager_tests::answer_cursor_position_query`'s own docs), which this
+    /// test - checking only `AgentsQuery`, never draining the session's own output - never does.
+    #[test]
+    fn agents_query_stops_listing_an_agent_the_moment_its_real_session_exits() {
+        let repo = seed_empty_repo();
+        let host = Host::start().expect("host");
+        let client = host.client();
+        let id = AgentId::from("agent-exit-1");
+
+        // A real, still-running session at the moment of the kill below - `spawn_command`'s own
+        // quick `echo hi` could have already exited on its own by then, racing the kill dispatch
+        // into a `NotOwned` error instead of a clean, real kill.
+        let sleep = if cfg!(windows) {
+            "ping -n 30 127.0.0.1 >NUL"
+        } else {
+            "sleep 30"
+        };
+        let long_running = jerry_core::SessionSpawn {
+            program: if cfg!(windows) { "cmd" } else { "sh" }.into(),
+            args: if cfg!(windows) {
+                vec!["/c".into(), sleep.into()]
+            } else {
+                vec!["-c".into(), sleep.into()]
+            },
+            env: Vec::new(),
+            rows: 24,
+            cols: 80,
+            agent: Some(jerry_core::SessionAgentInfo {
+                kind: "Claude".into(),
+                agent_id: id.clone(),
+            }),
+        };
+        let spawned = block_on(client.request(Call::human(
+            repo.path(),
+            Request::Command(AppCommand::SessionSpawn(long_running)),
+        )))
+        .expect("spawn dispatched");
+        let Report::Ok { outcome } = spawned else {
+            panic!("expected ok, got {spawned:?}")
+        };
+        let session_id =
+            jerry_core::SessionId::from(outcome["id"].as_str().expect("id string").to_owned());
+
+        let listed = block_on(client.request(Call::human(repo.path(), status_agents_query())))
+            .expect("agents query");
+        let Report::Ok { outcome } = listed else {
+            panic!("expected ok, got {listed:?}")
+        };
+        assert_eq!(
+            outcome
+                .as_array()
+                .expect("array")
+                .iter()
+                .filter(|entry| entry["id"] == "agent-exit-1")
+                .count(),
+            1,
+            "the live agent must be listed: {outcome:?}"
+        );
+
+        let kill = Request::Command(AppCommand::SessionKill(jerry_core::SessionKill {
+            id: session_id,
+        }));
+        let killed =
+            block_on(client.request(Call::human(repo.path(), kill))).expect("kill dispatched");
+        assert!(killed.is_ok(), "{killed:?}");
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                let listed =
+                    block_on(client.request(Call::human(repo.path(), status_agents_query())))
+                        .expect("agents query");
+                let Report::Ok { outcome } = listed else {
+                    return false;
+                };
+                outcome
+                    .as_array()
+                    .is_some_and(|entries| !entries.iter().any(|e| e["id"] == "agent-exit-1"))
+            }),
+            "AgentsQuery must stop listing the agent once its real process exits"
+        );
+
+        // The same id is immediately spawnable again - a dead session's own stale record must
+        // never keep denying it as "already live".
+        let reused = block_on(client.request(Call::human(repo.path(), spawn_command(id))))
+            .expect("second spawn dispatched");
+        assert!(
+            reused.is_ok(),
+            "a dead agent's id must be reusable, got {reused:?}"
+        );
+        host.shutdown_and_join();
+    }
+
+    fn status_agents_query() -> Request {
+        Request::Query(AppQuery::Agents(Default::default()))
     }
 
     #[test]

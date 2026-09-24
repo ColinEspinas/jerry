@@ -2,17 +2,11 @@
 //! data-plane socket (`command/session-attach`, `docs/architecture/decisions.md` §24) - the
 //! second implementer of that trait besides `jerry_host::SessionHandle`'s in-process one. Never
 //! calls `jerry_host::`/`jerry_pty::` beyond the trait itself: everything here is a plain socket
-//! read/write plus one injected callback for the one thing that still needs the control plane
-//! (`command/session-kill`, on [`SocketSessionAdapter::shutdown`]). No exit signal is
-//! synthesized: the socket just ends once the host closes it.
-//!
-//! Real and unit-tested against a real socket pair (below), but **not yet wired into
-//! `Agents::spawn_inner`**: doing so reproducibly hung every UI test that spawns a real session
-//! and lets it reach an interactive prompt, inside `TestAppContext::run_until_parked` itself,
-//! after every one of this module's and the surrounding dispatch chain's own steps had already
-//! completed - see §24's own note on this. Root-causing that GPUI-test-executor interaction is
-//! this module's own follow-up, not a reason to drop the adapter itself.
-#![allow(dead_code)]
+//! read/write plus one injected callback for `command/session-kill`
+//! ([`SocketSessionAdapter::shutdown`]) - see decisions.md §16's amendment for why that closure
+//! must dispatch through `crate::repo_host::RemoteRepoHost`, never `jerry_host::LocalClient`. No
+//! exit signal is synthesized: the socket just ends once the host closes it. Wired into
+//! production by `crate::host::attach_remote_session`.
 
 use futures::channel::mpsc;
 use futures::SinkExt;

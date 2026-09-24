@@ -1447,7 +1447,7 @@ mod merge_regression_tests {
                 .as_ref()
                 .expect("merge_flow after start_merge");
             let merge::MergeFlowState::Conflicted { files, .. } = &flow.state else {
-                panic!("expected a conflicted merge");
+                panic!("expected a conflicted merge, got {:?}", flow.state);
             };
             assert_eq!(files.len(), 2, "both a.txt and b.txt should be conflicted");
         });
@@ -1467,7 +1467,7 @@ mod merge_regression_tests {
         app.read_with(cx, |app, _| {
             let flow = app.merge_flow.as_ref().expect("merge_flow still present");
             let merge::MergeFlowState::Conflicted { files, .. } = &flow.state else {
-                panic!("expected a conflicted merge");
+                panic!("expected a conflicted merge, got {:?}", flow.state);
             };
             assert!(
                 merge::all_resolved(files),
@@ -1569,7 +1569,7 @@ mod merge_regression_tests {
                 .as_ref()
                 .expect("merge_flow after start_merge");
             let merge::MergeFlowState::Conflicted { files, .. } = &flow.state else {
-                panic!("expected a conflicted merge");
+                panic!("expected a conflicted merge, got {:?}", flow.state);
             };
             let ConflictedPath::Text(file) = &files[0] else {
                 panic!("expected a real text conflict for f.txt");
@@ -1672,7 +1672,7 @@ mod merge_regression_tests {
         app.read_with(cx, |app, _| {
             let flow = app.merge_flow.as_ref().expect("merge_flow still present");
             let merge::MergeFlowState::Conflicted { files, .. } = &flow.state else {
-                panic!("expected a conflicted merge");
+                panic!("expected a conflicted merge, got {:?}", flow.state);
             };
             let ConflictedPath::Text(file) = &files[0] else {
                 panic!("expected a real text conflict for f.txt");
@@ -2027,7 +2027,7 @@ mod merge_regression_tests {
         app.read_with(cx, |app, _| {
             let flow = app.merge_flow.as_ref().expect("merge_flow still present");
             let merge::MergeFlowState::Conflicted { files, .. } = &flow.state else {
-                panic!("expected a conflicted merge state");
+                panic!("expected a conflicted merge state, got {:?}", flow.state);
             };
             assert!(
                 merge::all_resolved(files),
@@ -2087,7 +2087,7 @@ mod merge_regression_tests {
         let hunk_count = app.read_with(cx, |app, _| {
             let flow = app.merge_flow.as_ref().expect("merge_flow");
             let merge::MergeFlowState::Conflicted { files, .. } = &flow.state else {
-                panic!("expected conflicted");
+                panic!("expected conflicted, got {:?}", flow.state);
             };
             assert_eq!(files.len(), 1, "one conflicted file expected");
             let ConflictedPath::Text(file) = &files[0] else {
@@ -2107,7 +2107,7 @@ mod merge_regression_tests {
         app.read_with(cx, |app, _| {
             let flow = app.merge_flow.as_ref().expect("merge_flow");
             let merge::MergeFlowState::Conflicted { files, .. } = &flow.state else {
-                panic!("expected conflicted");
+                panic!("expected conflicted, got {:?}", flow.state);
             };
             let ConflictedPath::Text(file) = &files[0] else {
                 panic!("expected text");
@@ -2166,7 +2166,7 @@ mod merge_regression_tests {
         app.read_with(cx, |app, _| {
             let flow = app.merge_flow.as_ref().expect("merge_flow");
             let merge::MergeFlowState::Conflicted { files, .. } = &flow.state else {
-                panic!("expected conflicted");
+                panic!("expected conflicted, got {:?}", flow.state);
             };
             assert!(merge::all_resolved(files));
             assert!(app.merge_edit.is_none());
@@ -2215,7 +2215,7 @@ mod merge_regression_tests {
         app.read_with(cx, |app, _| {
             let flow = app.merge_flow.as_ref().expect("merge_flow");
             let merge::MergeFlowState::Conflicted { files, .. } = &flow.state else {
-                panic!("expected conflicted");
+                panic!("expected conflicted, got {:?}", flow.state);
             };
             assert_eq!(files.len(), 2, "both a.txt and b.txt should be conflicted");
         });
@@ -2247,7 +2247,7 @@ mod merge_regression_tests {
         app.read_with(cx, |app, _| {
             let flow = app.merge_flow.as_ref().expect("merge_flow");
             let merge::MergeFlowState::Conflicted { files, .. } = &flow.state else {
-                panic!("expected conflicted");
+                panic!("expected conflicted, got {:?}", flow.state);
             };
             assert!(
                 merge::all_resolved(files),
@@ -2663,7 +2663,10 @@ mod merge_regression_tests {
                 "the stale call must not have touched the live, fresh flow's own identity"
             );
             let merge::MergeFlowState::Conflicted { files, .. } = &flow.state else {
-                panic!("expected the live flow to still be conflicted");
+                panic!(
+                    "expected the live flow to still be conflicted, got {:?}",
+                    flow.state
+                );
             };
             assert_eq!(
                 files.len(),
@@ -2809,7 +2812,7 @@ mod merge_regression_tests {
         let files_before = app.read_with(cx, |app, _| {
             let flow = app.merge_flow.as_ref().expect("merge_flow");
             let merge::MergeFlowState::Conflicted { files, .. } = &flow.state else {
-                panic!("expected conflicted");
+                panic!("expected conflicted, got {:?}", flow.state);
             };
             files.clone()
         });
@@ -2857,7 +2860,7 @@ mod merge_regression_tests {
         let files_after = app.read_with(cx, |app, _| {
             let flow = app.merge_flow.as_ref().expect("merge_flow still present");
             let merge::MergeFlowState::Conflicted { files, .. } = &flow.state else {
-                panic!("expected conflicted");
+                panic!("expected conflicted, got {:?}", flow.state);
             };
             files.clone()
         });
@@ -3009,7 +3012,7 @@ mod merge_regression_tests {
         let files_after = app.read_with(cx, |app, _| {
             let flow = app.merge_flow.as_ref().expect("merge_flow still present");
             let merge::MergeFlowState::Conflicted { files, .. } = &flow.state else {
-                panic!("expected conflicted");
+                panic!("expected conflicted, got {:?}", flow.state);
             };
             files.clone()
         });

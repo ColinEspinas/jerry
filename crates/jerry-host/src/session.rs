@@ -184,6 +184,7 @@ impl SessionManager {
         agent: Option<SessionAgentInfo>,
         options: SpawnOptions,
     ) -> Result<(SessionId, Arc<SessionHandle>), SessionSpawnError> {
+        let (rows, cols) = (options.rows, options.cols);
         let mut session = jerry_pty::spawn(options)?;
         let raw_output = session
             .take_output()
@@ -199,6 +200,8 @@ impl SessionManager {
             started_at: unix_now(),
             exit: None,
             process_id,
+            rows,
+            cols,
         };
         let process = Arc::new(Mutex::new(session));
         let data_plane = DataPlane::bind(&self.sockets_dir, Arc::clone(&process))?;
@@ -260,14 +263,21 @@ impl SessionManager {
         lock(&self.entries).get(id)?.handle.clone()
     }
 
-    /// Resizes a session's real pty. `NotOwned` for an `AgentTable`-compatibility registration,
-    /// which has no process to resize.
+    /// Resizes a session's real pty and records the new size on its own `SessionRecord`
+    /// (`SessionsQuery`'s own real, observable proof a resize actually took effect - the one a
+    /// socket-attached, out-of-process `TerminalPane` has to verify against, since it has no
+    /// in-process `PtySession` to read the applied size back from directly). `NotOwned` for an
+    /// `AgentTable`-compatibility registration, which has no process to resize.
     pub fn resize(&self, id: &SessionId, rows: u16, cols: u16) -> Result<(), SessionError> {
         self.process_for(id)?
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .resize(rows, cols)
-            .map_err(SessionError::from)
+            .resize(rows, cols)?;
+        if let Some(entry) = lock(&self.entries).get_mut(id) {
+            entry.record.rows = rows;
+            entry.record.cols = cols;
+        }
+        Ok(())
     }
 
     /// Kills a session's process tree. Non-blocking, like `jerry_pty::PtySession::kill` itself:
@@ -350,6 +360,8 @@ impl SessionManager {
             started_at: unix_now(),
             exit: None,
             process_id: None,
+            rows: 0,
+            cols: 0,
         };
         lock(&self.entries).insert(
             id,
@@ -383,10 +395,40 @@ impl SessionManager {
         }
     }
 
+    /// The worktree a real session's own `SessionSpawn` associated `agent_id` with
+    /// (`SessionSpawn::agent`) - `confine`'s own lookup, keyed by the same identity `jerry
+    /// hook`/every other agent call carries. Prefers a still-live entry over an exited one so a
+    /// dead session's stale record cannot keep confining an id a fresh spawn has already reused.
     pub(crate) fn worktree_of_agent(&self, agent_id: &AgentId) -> Option<PathBuf> {
-        lock(&self.entries)
-            .get(&agent_session_id(agent_id))
+        let entries = lock(&self.entries);
+        let matches = || {
+            entries.values().filter(|entry| {
+                entry
+                    .record
+                    .agent
+                    .as_ref()
+                    .is_some_and(|agent| &agent.agent_id == agent_id)
+            })
+        };
+        matches()
+            .find(|entry| entry.record.exit.is_none())
+            .or_else(|| matches().next())
             .map(|entry| entry.record.worktree.clone())
+    }
+
+    /// Whether `agent_id` already names a real, still-running session - [`SessionSpawn::agent`]'s
+    /// own denial rule (decisions.md §24): two live sessions must never answer to the same agent
+    /// identity, since `confine`'s lookup above would then have to guess which one a hook call
+    /// meant.
+    pub(crate) fn agent_is_live(&self, agent_id: &AgentId) -> bool {
+        lock(&self.entries).values().any(|entry| {
+            entry.record.exit.is_none()
+                && entry
+                    .record
+                    .agent
+                    .as_ref()
+                    .is_some_and(|agent| &agent.agent_id == agent_id)
+        })
     }
 
     pub(crate) fn agent_count(&self) -> usize {
@@ -396,9 +438,15 @@ impl SessionManager {
             .count()
     }
 
+    /// Every still-live agent (`record.exit.is_none()`) this host is tracking, for `AgentsQuery` -
+    /// unlike [`Self::list`] (`SessionsQuery`'s own answer), which still reports an exited
+    /// session's record once. An exited real session's own `agent` association is never cleared,
+    /// only its liveness - `SessionSpawn::agent`'s own doc comment covers why an agent id becomes
+    /// reusable again the moment this stops counting it as live.
     pub(crate) fn agent_entries(&self) -> Vec<(AgentId, PathBuf, String)> {
         lock(&self.entries)
             .values()
+            .filter(|entry| entry.record.exit.is_none())
             .filter_map(|entry| {
                 let agent = entry.record.agent.as_ref()?;
                 Some((

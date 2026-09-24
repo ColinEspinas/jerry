@@ -1,422 +1,718 @@
-//! The app's side of the session host: brings `jerry_host::Host` up in this process, publishes
-//! one registry descriptor listing every open repository, hands agents to the host's table, and
-//! dispatches Commands and Queries through it.
+//! `Hosts`: this app's real connections to the session host serving each open repository
+//! (`docs/architecture/decisions.md` §24) - one real `jerry-host` process per repository in
+//! production, one fresh in-process `jerry_host::Host` per repository in tests
+//! (`#[cfg(test)]`-only). `AdeApp::dispatch` resolves a request's `cwd` to its repository's
+//! common `.git` directory (cached) and routes through that repository's own connection - never
+//! a single connection shared across every open repository. Each connection also carries its own
+//! `worktree_created`/`session_exited`/`event/hook` subscriptions, feeding the same app-wide
+//! handlers regardless of which repository an event came from - see `ensure_repo_host_connected`
+//! for both.
 
+use crate::repo_host::RemoteRepoHost;
 use crate::root::AdeApp;
-use futures::channel::mpsc;
-use gpui::{AppContext, Context, Task};
-use jerry_core::registry::{Instance, Registry, RegistryError};
+use crate::terminal::pane::SessionAdapter;
+use crate::terminal::socket_adapter::SocketSessionAdapter;
+use gpui::{AppContext, AsyncApp, Context, Task};
 use jerry_core::wire::rpc_code;
-use jerry_core::{Call, Message, Report, Request, RpcError};
-use jerry_host::{AgentTable, DispatchFuture, Host, HostError, LocalClient, SessionManager};
+use jerry_core::{
+    AppCommand, AppQuery, Call, Report, Request, RpcError, SessionAttach, SessionId, SessionKill,
+    SessionRecord, SessionsQuery,
+};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::thread;
+use std::sync::Arc;
+#[cfg(not(test))]
+use std::time::Duration;
 
-#[derive(Debug, thiserror::Error)]
-pub enum HostStartError {
-    #[error(transparent)]
-    Registry(#[from] RegistryError),
-    #[error(transparent)]
-    Host(#[from] HostError),
+/// Why a repository has no working connection right now - a visible, per-repository error state
+/// (decisions.md §24), never a silent in-process fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RepoHostState {
+    Connected,
+    VersionMismatch { theirs: u32, ours: u32 },
+    CannotSpawn { error: String },
 }
 
-pub struct HostRuntime {
-    /// `None` only while `Drop` hands the host to its cleanup thread.
-    host: Option<Host>,
-    /// An unpublished host's dispatch loop, spawned on the first dispatch rather than at
-    /// construction, so a test app that never dispatches has no extra task in flight.
-    pending_dispatch: Option<DispatchFuture>,
-    registry_dir: PathBuf,
-    instance: Instance,
-    /// Common git dirs published so far; republished as a whole when one is added.
-    repos: Vec<PathBuf>,
-    /// Registered with the host's fanout by [`Self::subscribe_events`], synchronously, the moment
-    /// this runtime is adopted - before it can ever be dispatched against - so a notification
-    /// broadcast before the draining task itself starts ([`Self::start_event_consumers`],
-    /// possibly much later for an unpublished/test host) sits buffered in the channel instead of
-    /// being lost. This was `work_surface::session_exited`'s Linux flake: a real process can exit,
-    /// and its `event/session-exited` be broadcast, before a lazily-*subscribed* consumer ever
-    /// existed to receive it. `None` once [`Self::start_event_consumers`] has taken it.
-    pending_worktree_created_events: Option<mpsc::UnboundedReceiver<Message>>,
-    /// [`Self::pending_worktree_created_events`], for `event/session-exited`.
-    pending_session_exited_events: Option<mpsc::UnboundedReceiver<Message>>,
-    /// `crate::work_surface::worktree_created::spawn_consumer`'s draining task, started by
-    /// [`Self::start_event_consumers`] - held here (rather than detached) so it is cancelled, not
-    /// orphaned, when this runtime drops (§16, CLAUDE.md's entity-lifecycle rule). `None` until
-    /// started.
-    worktree_created_consumer: Option<Task<()>>,
-    /// `crate::work_surface::session_exited::spawn_consumer`'s draining task - the same lifecycle
-    /// as [`Self::worktree_created_consumer`], started alongside it.
-    session_exited_consumer: Option<Task<()>>,
+impl RepoHostState {
+    /// The one-line message [`crate::rail::render::AdeApp::render_repo_host_error_banner`] shows
+    /// for a non-[`Self::Connected`] state - `None` for `Connected` itself, since that has nothing
+    /// to show.
+    pub(crate) fn error_message(&self) -> Option<String> {
+        match self {
+            RepoHostState::Connected => None,
+            RepoHostState::VersionMismatch { theirs, ours } => Some(format!(
+                "this repository's session host speaks protocol version {theirs}, this app \
+                 speaks {ours} - restart its sessions once both match"
+            )),
+            RepoHostState::CannotSpawn { error } => Some(format!(
+                "could not start this repository's session host: {error}"
+            )),
+        }
+    }
 }
 
-impl HostRuntime {
-    /// Blocking (registry I/O and a socket bind): call from a background task. The returned
-    /// dispatch loop must be spawned by the caller, on GPUI's background executor in the app,
-    /// so blocking git work never runs on the UI thread and a test drives it deterministically.
-    pub fn start(registry_dir: PathBuf) -> Result<(HostRuntime, DispatchFuture), HostStartError> {
-        let registry = Registry::open(registry_dir.clone())?;
-        let instance = registry.allocate()?;
-        let (host, dispatch) = Host::start_detached(registry_dir.clone());
-        host.listen(&instance.socket)?;
-        let runtime = HostRuntime {
-            host: Some(host),
-            pending_dispatch: None,
-            registry_dir,
-            instance,
-            repos: Vec::new(),
-            pending_worktree_created_events: None,
-            pending_session_exited_events: None,
-            worktree_created_consumer: None,
-            session_exited_consumer: None,
-        };
-        Ok((runtime, dispatch))
+enum Connection {
+    Remote(RemoteRepoHost),
+    #[cfg(test)]
+    InProcess {
+        /// Kept alive for as long as this `RepoHost` lives - dropping it shuts the host down.
+        host: jerry_host::Host,
+        client: jerry_host::LocalClient,
+    },
+}
+
+/// One repository's connection - real (`Connection::Remote`) or, in tests, a throwaway in-process
+/// host reached the same way. `None` connection only pairs with a non-`Connected` state.
+pub(crate) struct RepoHost {
+    connection: Option<Connection>,
+    state: RepoHostState,
+    socket: Option<PathBuf>,
+    /// `worktree_created`/`session_exited`'s own draining tasks - held here (rather than
+    /// detached) so they are cancelled, not orphaned, when this entry leaves `Hosts::by_repo`
+    /// (§16, CLAUDE.md's entity-lifecycle rule).
+    _events: Vec<Task<()>>,
+}
+
+impl RepoHost {
+    /// Read by [`AdeApp::repo_host_state_for`] - `crate::rail::render`'s own per-repository error
+    /// banner (`VersionMismatch`/`CannotSpawn`, with a real "Restart sessions" action).
+    pub(crate) fn state(&self) -> &RepoHostState {
+        &self.state
     }
 
-    pub fn start_default() -> Result<(HostRuntime, DispatchFuture), HostStartError> {
-        Self::start(jerry_core::registry::runtime_dir()?)
+    /// The socket a spawned agent's `JERRY_HOST_SOCKET` should carry - `None` unless
+    /// [`Self::state`] is [`RepoHostState::Connected`]. Read by [`AdeApp::host_socket_for`].
+    pub(crate) fn socket(&self) -> Option<&Path> {
+        self.socket.as_deref()
     }
 
-    /// A host with no socket and no registry entry: the same dispatch path, reachable only from
-    /// this process. What a test app runs on, so `jerry` never finds a test instance. Its
-    /// dispatch loop starts with the first dispatch. Every session's own data-plane socket still
-    /// binds for real (`jerry_host::default_sockets_dir`) - `command/session-attach` hands back a
-    /// real, connectable path even for this unpublished host, exactly as a real out-of-process one
-    /// would (`docs/architecture/decisions.md` §24).
-    pub fn in_process() -> HostRuntime {
-        let (host, dispatch) = Host::start_detached(jerry_host::default_sockets_dir());
-        HostRuntime {
-            host: Some(host),
-            pending_dispatch: Some(dispatch),
-            registry_dir: PathBuf::new(),
-            instance: Instance {
-                name: String::new(),
-                socket: PathBuf::new(),
-                descriptor: PathBuf::new(),
-            },
-            repos: Vec::new(),
-            pending_worktree_created_events: None,
-            pending_session_exited_events: None,
-            worktree_created_consumer: None,
-            session_exited_consumer: None,
+    fn unavailable(state: RepoHostState) -> RepoHost {
+        RepoHost {
+            connection: None,
+            state,
+            socket: None,
+            _events: Vec::new(),
         }
     }
 
-    fn is_published(&self) -> bool {
-        !self.instance.name.is_empty()
+    /// Test-only: wraps an already-connected, real socket `Client` (typically to a `jerry_host::
+    /// Host` this test started and is `.listen()`ing on itself, exactly like `Self::dispatch`'s
+    /// own production path would reach) - for a test that needs a genuinely socket-backed
+    /// connection rather than the ordinary in-process one `open_test_app` already wires up
+    /// (`provenance::integration_tests`, `hooks::integration_tests`).
+    #[cfg(test)]
+    pub(crate) fn for_test_remote(
+        client: jerry_core::client::Client,
+        socket: PathBuf,
+    ) -> std::io::Result<RepoHost> {
+        Ok(RepoHost {
+            connection: Some(Connection::Remote(RemoteRepoHost::new(client)?)),
+            state: RepoHostState::Connected,
+            socket: Some(socket),
+            _events: Vec::new(),
+        })
     }
 
-    /// The slow half of publishing an already-running (`Self::in_process`) runtime: opens the
-    /// registry directory (real filesystem I/O) and reserves a fresh instance name. Needs no live
-    /// host reference, so it runs entirely off the UI thread; `Self::publish` does the fast
-    /// remainder (the socket bind) synchronously against the runtime itself. Blocking - call from
-    /// a background task.
-    pub fn allocate_instance(registry_dir: PathBuf) -> Result<(PathBuf, Instance), HostStartError> {
-        let registry = Registry::open(registry_dir.clone())?;
-        let instance = registry.allocate()?;
-        Ok((registry_dir, instance))
-    }
-
-    /// Upgrades this already-running, unpublished runtime (`Self::in_process`) to a discoverable
-    /// one: binds its socket and records where it registered - the state `Self::start` builds all
-    /// at once instead, for a caller with no existing runtime to upgrade (a few tests still want
-    /// exactly that). A no-op, `Ok(())`, if already published - guards against a second startup
-    /// attempt racing the first (decisions.md §23).
-    pub fn publish(&mut self, registry_dir: PathBuf, instance: Instance) -> Result<(), HostError> {
-        if self.is_published() {
-            return Ok(());
+    /// Test-only: wraps an already-started, real socket-listening in-process `jerry_host::Host` -
+    /// for a test that needs `crate::hooks::flow::AdeApp::hook_injection_for`'s own lazy bring-up
+    /// to find a real socket for this repository, unlike [`Self::for_test_remote`].
+    #[cfg(test)]
+    pub(crate) fn for_test_in_process(host: jerry_host::Host, socket: PathBuf) -> RepoHost {
+        let client = host.client();
+        RepoHost {
+            connection: Some(Connection::InProcess { host, client }),
+            state: RepoHostState::Connected,
+            socket: Some(socket),
+            _events: Vec::new(),
         }
-        let Some(host) = self.host.as_ref() else {
-            // Draining toward `Drop`; nothing left to publish.
-            return Ok(());
-        };
-        host.listen(&instance.socket)?;
-        self.registry_dir = registry_dir;
-        self.instance = instance;
-        Ok(())
     }
 
-    /// Records `repo_common_dir` as served and returns what a background task needs to write
-    /// the descriptor: the registry is a path, so the write itself never touches the UI thread.
-    pub fn serve(&mut self, repo_common_dir: PathBuf) -> (PathBuf, Instance, Vec<PathBuf>) {
-        if !self.repos.contains(&repo_common_dir) {
-            self.repos.push(repo_common_dir);
+    /// Test-only: a repository whose connection failed or mismatched, for exercising
+    /// [`Self::dispatch`]'s own error-reporting branches without a real spawn-or-connect.
+    #[cfg(test)]
+    pub(crate) fn for_test_unavailable(state: RepoHostState) -> RepoHost {
+        RepoHost::unavailable(state)
+    }
+
+    /// Dispatches `request` (already known to be for this repository) and blocks the calling
+    /// thread only inside whichever background task actually reaches the connection - see
+    /// `crate::repo_host`'s own docs for why that block is always safe here, including under
+    /// GPUI's single-threaded test scheduler.
+    fn dispatch(
+        &self,
+        cwd: PathBuf,
+        request: Request,
+        cx: &mut Context<AdeApp>,
+    ) -> Task<Result<Report, RpcError>> {
+        match &self.state {
+            RepoHostState::Connected => {}
+            RepoHostState::VersionMismatch { theirs, ours } => {
+                return Task::ready(Err(RpcError::new(
+                    rpc_code::UNSUPPORTED_VERSION,
+                    format!(
+                        "this repository's session host speaks protocol version {theirs}, this \
+                         app speaks {ours} - restart its sessions once both match"
+                    ),
+                )));
+            }
+            RepoHostState::CannotSpawn { error } => {
+                return Task::ready(Err(RpcError::new(rpc_code::NEEDS_HOST, error.clone())));
+            }
         }
-        (
-            self.registry_dir.clone(),
-            self.instance.clone(),
-            self.repos.clone(),
+        match &self.connection {
+            Some(Connection::Remote(remote)) => {
+                let remote = remote.clone();
+                cx.background_spawn(async move { remote.dispatch(Call::human(cwd, request)) })
+            }
+            #[cfg(test)]
+            Some(Connection::InProcess { client, .. }) => {
+                let client = client.clone();
+                cx.spawn(async move |_this, _cx| client.request(Call::human(cwd, request)).await)
+            }
+            None => Task::ready(Err(RpcError::new(
+                rpc_code::NEEDS_HOST,
+                "this repository has no session host connection",
+            ))),
+        }
+    }
+}
+
+/// Every repository this app has open, and the connection serving each - see the module docs.
+#[derive(Default)]
+pub(crate) struct Hosts {
+    by_repo: HashMap<PathBuf, RepoHost>,
+    /// Every worktree path this app has already resolved to its repository's common `.git`
+    /// directory, so a repeat dispatch for the same worktree never re-shells to git.
+    common_dir_of: HashMap<PathBuf, PathBuf>,
+}
+
+impl Hosts {
+    fn common_dir_for(&self, cwd: &Path) -> Option<&PathBuf> {
+        self.common_dir_of.get(cwd)
+    }
+
+    fn repo_host_for(&self, common_dir: &Path) -> Option<&RepoHost> {
+        self.by_repo.get(common_dir)
+    }
+
+    /// The socket a spawned agent belonging to `cwd`'s repository should carry as its
+    /// `JERRY_HOST_SOCKET` - `None` for a repository with no working connection yet
+    /// (`RepoHostState::Connected` only), or for a `cwd` this instance has not resolved at all.
+    fn socket_for(&self, cwd: &Path) -> Option<PathBuf> {
+        let common_dir = self.common_dir_of.get(cwd)?;
+        self.by_repo
+            .get(common_dir)?
+            .socket()
+            .map(Path::to_path_buf)
+    }
+}
+
+/// Connects to (or, in tests, starts) the real session host for the repository at `common_dir` -
+/// `#[cfg(test)]`'s in-process alternative to a genuine `jerry_core::host_spawn::spawn_or_connect`
+/// call, reached the identical way by everything downstream of it (`RepoHost::dispatch`). Blocking
+/// work (registry I/O, a process spawn or a real socket connect) runs entirely inside `cx.
+/// background_spawn`.
+#[cfg_attr(test, allow(unused_variables))]
+async fn connect_repo_host(common_dir: PathBuf, cx: &mut AsyncApp) -> RepoHost {
+    #[cfg(test)]
+    {
+        start_in_process_repo_host(cx).await
+    }
+    #[cfg(not(test))]
+    {
+        connect_production_repo_host(common_dir, cx).await
+    }
+}
+
+/// Starts and binds a throwaway, always-fresh in-process host for a test that has never before
+/// opened this repository - `#[cfg(test)]`'s own stand-in for `connect_production_repo_host`,
+/// never a real spawn-or-connect. Panics (rather than modeling `RepoHostState::CannotSpawn`) if
+/// binding fails: unlike production, where a real `jerry-host` genuinely can be unreachable, a
+/// throwaway host failing to bind its own socket in a test is always a fixture bug - a directory
+/// nothing created yet, a path over `MAX_SOCKET_PATH_BYTES` - never a real state any test should
+/// have to model or a caller should have to notice indirectly through every dispatch answering a
+/// confusing error. `RepoHost::for_test_unavailable`/`RepoHost::adopt_repo_host_for_test` remain
+/// the real, deliberate way to construct a broken connection for testing the error-banner paths
+/// themselves.
+#[cfg(test)]
+async fn start_in_process_repo_host(cx: &mut AsyncApp) -> RepoHost {
+    let started = cx
+        .background_spawn(async move {
+            let sockets_dir = jerry_host::default_sockets_dir();
+            let socket = sockets_dir.join(format!(
+                "th-{:x}-{:08x}.sock",
+                std::process::id(),
+                jerry_core::registry::fresh_u32()
+            ));
+            let (host, dispatch) = jerry_host::Host::start_detached(sockets_dir);
+            host.listen(&socket).map(|()| (host, socket, dispatch))
+        })
+        .await;
+    let (host, socket, dispatch) = started.unwrap_or_else(|error| {
+        panic!(
+            "a test's own throwaway in-process host must always be able to bind its socket - \
+             this is a fixture bug, not a state any test should model: {error}"
         )
-    }
-
-    /// The dispatch loop still to be spawned, if this host was built unpublished.
-    pub fn take_pending_dispatch(&mut self) -> Option<DispatchFuture> {
-        self.pending_dispatch.take()
-    }
-
-    pub fn client(&self) -> Option<LocalClient> {
-        self.host.as_ref().map(Host::client)
-    }
-
-    pub fn agents(&self) -> Option<AgentTable> {
-        self.host.as_ref().map(Host::agents)
-    }
-
-    /// The session table (`docs/architecture/decisions.md` §23): what `TerminalPane` attaches to
-    /// via `SessionManager::handle_for` once its own `SessionSpawn` dispatch resolves.
-    pub fn sessions(&self) -> Option<SessionManager> {
-        self.host.as_ref().map(Host::sessions)
-    }
-
-    pub fn socket(&self) -> &Path {
-        &self.instance.socket
-    }
-
-    /// Registers both event sinks with the host's fanout - a plain synchronous call, no future -
-    /// so nothing broadcast from this moment on can be lost even if
-    /// [`Self::start_event_consumers`] itself does not run until much later. Call this exactly
-    /// once, as early as this runtime exists (`AdeApp::adopt_host`); a second call would open a
-    /// second, independent sink and miss whatever was broadcast between the two.
-    pub(crate) fn subscribe_events(&mut self, client: &LocalClient) {
-        self.pending_worktree_created_events = Some(client.subscribe());
-        self.pending_session_exited_events = Some(client.subscribe());
-    }
-
-    /// Starts draining whichever subscriptions [`Self::subscribe_events`] registered and this
-    /// runtime has not already started draining - a no-op past the first call, so every call site
-    /// (`AdeApp::adopt_host` for an already-published runtime, `AdeApp::publish_host`,
-    /// `AdeApp::dispatch`'s first real call) can call this unconditionally without racing each
-    /// other to double-start it. Deliberately still lazy for an unpublished (test) host: starting
-    /// the `Task` itself here unconditionally, rather than on first dispatch, is what an earlier
-    /// test regressed on (`Self::pending_dispatch`'s own docs) - a test app that never dispatches
-    /// must carry no extra pending future.
-    pub(crate) fn start_event_consumers(&mut self, cx: &mut Context<AdeApp>) {
-        if let Some(events) = self.pending_worktree_created_events.take() {
-            self.worktree_created_consumer = Some(
-                crate::work_surface::worktree_created::spawn_consumer(events, cx),
-            );
-        }
-        if let Some(events) = self.pending_session_exited_events.take() {
-            self.session_exited_consumer = Some(
-                crate::work_surface::session_exited::spawn_consumer(events, cx),
-            );
-        }
+    });
+    cx.background_spawn(dispatch).detach();
+    let client = host.client();
+    RepoHost {
+        connection: Some(Connection::InProcess { host, client }),
+        state: RepoHostState::Connected,
+        socket: Some(socket),
+        _events: Vec::new(),
     }
 }
 
-impl Drop for HostRuntime {
-    /// The joins and the registry unlink happen on a cleanup thread: a `HostRuntime` is an
-    /// `AdeApp` field and drops on the UI thread.
-    fn drop(&mut self) {
-        let Some(host) = self.host.take() else {
-            return;
-        };
-        if !self.is_published() {
-            let _ = host.shutdown();
-            return;
+#[cfg(not(test))]
+async fn connect_production_repo_host(common_dir: PathBuf, cx: &mut AsyncApp) -> RepoHost {
+    let registry_dir = match jerry_core::registry::runtime_dir() {
+        Ok(dir) => dir,
+        Err(error) => {
+            return RepoHost::unavailable(RepoHostState::CannotSpawn {
+                error: error.to_string(),
+            })
         }
-        let registry_dir = self.registry_dir.clone();
-        let instance = self.instance.clone();
-        let spawned = thread::Builder::new()
-            .name("jerry-host-cleanup".into())
-            .spawn(move || {
-                host.shutdown_and_join();
-                if let Ok(registry) = Registry::open(registry_dir) {
-                    let _ = registry.remove(&instance);
+    };
+    let outcome = cx
+        .background_spawn(async move {
+            #[cfg(windows)]
+            let breakaway_forbidden =
+                || crate::job_object::breakaway_is_forbidden_for_current_process().unwrap_or(false);
+            #[cfg(not(windows))]
+            let breakaway_forbidden = || false;
+            jerry_core::host_spawn::spawn_or_connect_with(
+                registry_dir,
+                &common_dir,
+                Duration::from_secs(5),
+                Duration::from_secs(10),
+                jerry_core::jerry_binary::locate_named,
+                breakaway_forbidden,
+            )
+        })
+        .await;
+    match outcome {
+        Ok(jerry_core::host_spawn::Outcome::Connected { client, descriptor }) => {
+            match RemoteRepoHost::new(client) {
+                Ok(remote) => RepoHost {
+                    connection: Some(Connection::Remote(remote)),
+                    state: RepoHostState::Connected,
+                    socket: Some(descriptor.socket),
+                    _events: Vec::new(),
+                },
+                Err(error) => RepoHost::unavailable(RepoHostState::CannotSpawn {
+                    error: format!("could not start this repository's own request thread: {error}"),
+                }),
+            }
+        }
+        Ok(jerry_core::host_spawn::Outcome::VersionMismatch { descriptor }) => {
+            RepoHost::unavailable(RepoHostState::VersionMismatch {
+                theirs: descriptor.protocol_version,
+                ours: jerry_core::wire::PROTOCOL_VERSION,
+            })
+        }
+        Err(error) => RepoHost::unavailable(RepoHostState::CannotSpawn {
+            error: error.to_string(),
+        }),
+    }
+}
+
+/// Resolves `cwd`'s own repository (its common `.git` directory, or `cwd` itself for a plain,
+/// non-git directory - `crate::test_support::temp_root`'s own supported case) and ensures
+/// [`Hosts::by_repo`] has a connection for it, opening one if this is the first time this
+/// instance has ever seen this repository. Returns the resolved common directory either way, so
+/// the caller can look up whatever [`RepoHost`] (or its absence) resulted. Blocking git/socket
+/// work runs off the UI thread; a concurrent call for the same never-before-seen repository may
+/// open two connections that race to be inserted - see `jerry_core::registry::Registry::claim`'s
+/// own docs for why that race is safe rather than a caller's problem to avoid.
+async fn ensure_repo_host_connected(
+    this: &gpui::WeakEntity<AdeApp>,
+    cwd: PathBuf,
+    cx: &mut AsyncApp,
+) -> PathBuf {
+    // `jerry_git::git_common_dir` absolutizes `--git-common-dir`'s own (often relative) output
+    // against whatever spelling of `cwd` it was given - so a worktree reached through a symlinked
+    // temp-directory parent (macOS's own `/var` -> `/private/var`) and the repository's own root,
+    // reached through the already-canonical spelling `crate::test_support::temp_repo` hands out,
+    // resolve to two *different strings* for the same real directory. Canonicalizing here, once,
+    // is what makes them collide into the same `Hosts::by_repo` key regardless of which spelling
+    // of `cwd` a caller happened to pass in - `dunce::canonicalize`, not `std::fs::canonicalize`,
+    // since the latter's Windows `\\?\`-prefixed form is one `git` itself rejects
+    // (`crate::test_support::canonicalized`'s own identical reasoning).
+    let common_dir = cx
+        .background_spawn({
+            let cwd = cwd.clone();
+            async move {
+                let resolved = jerry_git::git_common_dir(&cwd).unwrap_or_else(|_| cwd.clone());
+                dunce::canonicalize(&resolved).unwrap_or(resolved)
+            }
+        })
+        .await;
+    let already_open = this
+        .update(cx, |this, _cx| {
+            this.hosts.common_dir_of.insert(cwd, common_dir.clone());
+            this.hosts.by_repo.contains_key(&common_dir)
+        })
+        .unwrap_or(true);
+    if already_open {
+        return common_dir;
+    }
+
+    let mut repo_host = connect_repo_host(common_dir.clone(), cx).await;
+
+    // Three dedicated event subscriptions - `worktree_created`/`session_exited`/`event/hook` each
+    // filter for their own `event/*` name - opened off the UI thread for a real socket connection
+    // (blocking connect + handshake), or synchronously for the in-process fanout tap
+    // (`LocalClient::subscribe`, never blocking).
+    let events = match &repo_host.connection {
+        Some(Connection::Remote(_)) => {
+            let socket = repo_host.socket.clone();
+            cx.background_spawn(async move {
+                let socket = socket?;
+                match (
+                    crate::repo_host::subscribe_remote(&socket),
+                    crate::repo_host::subscribe_remote(&socket),
+                    crate::repo_host::subscribe_remote(&socket),
+                ) {
+                    (Ok(a), Ok(b), Ok(c)) => Some((a, b, c)),
+                    (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+                        log::warn!(
+                            "jerry-app: could not subscribe to this repository's own events: \
+                             {error}"
+                        );
+                        None
+                    }
                 }
-            });
-        if spawned.is_err() {
-            // No thread to hand it to: the non-blocking shutdown still runs when `host` drops
-            // here, leaving only the descriptor for the next discovery to sweep.
-            log::warn!("jerry-host: could not spawn the cleanup thread; shutting down inline");
+            })
+            .await
         }
-    }
-}
+        #[cfg(test)]
+        Some(Connection::InProcess { client, .. }) => {
+            Some((client.subscribe(), client.subscribe(), client.subscribe()))
+        }
+        None => None,
+    };
 
-/// Writes the descriptor for `(registry_dir, instance, repos)`, as handed out by
-/// [`HostRuntime::serve`]. Blocking.
-fn publish(
-    registry_dir: PathBuf,
-    instance: Instance,
-    repos: Vec<PathBuf>,
-) -> Result<(), RegistryError> {
-    Registry::open(registry_dir)?.publish(&instance, &repos)?;
-    Ok(())
+    let _ = this.update(cx, |this, cx| {
+        if let Some((worktree_created_events, session_exited_events, hook_events)) = events {
+            repo_host
+                ._events
+                .push(crate::work_surface::worktree_created::spawn_consumer(
+                    worktree_created_events,
+                    cx,
+                ));
+            repo_host
+                ._events
+                .push(crate::work_surface::session_exited::spawn_consumer(
+                    session_exited_events,
+                    cx,
+                ));
+            repo_host
+                ._events
+                .push(crate::hooks::spawn_consumer(hook_events, cx));
+        }
+        this.hosts.by_repo.insert(common_dir.clone(), repo_host);
+    });
+    common_dir
 }
 
 impl AdeApp {
-    /// Publishes the host `Self::new_with_settings` already installed (`HostRuntime::in_process`,
-    /// unpublished) so `jerry` can find this instance - the slow half of startup
-    /// (`HostRuntime::allocate_instance`'s registry I/O) runs off the UI thread; a failure is
-    /// logged and every dispatch keeps answering `NEEDS_HOST`, so nothing pretends a host exists.
-    pub(crate) fn start_host(&mut self, cx: &mut Context<Self>) {
+    /// Ensures the repository `cwd` belongs to has a connection, opening one if this is the
+    /// first time this instance has ever seen it - a cheap no-op once one already exists
+    /// (including for a second worktree of an already-open repository). Blocking git/socket work
+    /// runs off the UI thread. Called eagerly from [`Self::add_repo`] so a repository's
+    /// connection is already resolving before its first real dispatch, and lazily from
+    /// [`Self::dispatch`]'s own cache-miss fallback for a `cwd` nothing opened this way in
+    /// advance (a worktree created directly on disk, or spawned into before an eager call for it
+    /// resolved) - both converge on the same connection once resolved, never open two.
+    pub(crate) fn open_repo_host(&mut self, cwd: PathBuf, cx: &mut Context<Self>) {
+        if self.hosts.common_dir_for(&cwd).is_some() {
+            return;
+        }
         cx.spawn(async move |this, cx| {
-            let registry_dir = match jerry_core::registry::runtime_dir() {
-                Ok(dir) => dir,
-                Err(error) => {
-                    log::warn!("jerry-host could not resolve its registry directory: {error}");
-                    return;
-                }
-            };
-            let allocated = cx
-                .background_spawn(async move { HostRuntime::allocate_instance(registry_dir) })
-                .await;
-            match allocated {
-                Ok((registry_dir, instance)) => {
-                    let _ =
-                        this.update(cx, |this, cx| this.publish_host(registry_dir, instance, cx));
-                }
-                Err(error) => log::warn!(
-                    "jerry-host could not start; `jerry` cannot reach this instance: {error}"
-                ),
-            }
+            let _ = ensure_repo_host_connected(&this, cwd, cx).await;
         })
         .detach();
     }
 
-    /// Binds the already-running host's socket, starts draining the event subscriptions
-    /// `Self::adopt_host` already registered, and publishes every repository already open,
-    /// including any added while the registry work above was in flight.
-    pub(crate) fn publish_host(
-        &mut self,
-        registry_dir: PathBuf,
-        instance: Instance,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(runtime) = self.host_runtime.as_mut() else {
-            return;
-        };
-        if let Err(error) = runtime.publish(registry_dir, instance) {
-            log::warn!(
-                "jerry-host could not bind its socket; `jerry` cannot reach this instance: {error}"
-            );
-            return;
-        }
-        runtime.start_event_consumers(cx);
-        let repo_paths: Vec<PathBuf> = self.repos.iter().map(|repo| repo.path.clone()).collect();
-        for path in repo_paths {
-            self.serve_repo_from_host(path, cx);
-        }
-    }
-
-    /// Installs a started runtime, hands the host every agent already open, and publishes
-    /// every repository open right now, including any added while the host was starting.
-    pub(crate) fn adopt_host(&mut self, mut runtime: HostRuntime, cx: &mut Context<Self>) {
-        if let Some(agents) = runtime.agents() {
-            self.agents.attach_host(agents);
-        }
-        // Registers both event sinks with the fanout right now, synchronously, before this
-        // runtime can be dispatched against from anywhere - `HostRuntime::subscribe_events`'s own
-        // docs cover why this must not wait for the draining task below. A published host's
-        // socket is already listening by this point (`HostRuntime::start`), so a real agent could
-        // connect and dispatch `WorktreeCreate` at any moment - the draining task starts right
-        // here too. An unpublished (test-only) host has no socket at all, so nothing outside
-        // `Self::dispatch` can ever reach it; starting that task there instead, lazily on first
-        // dispatch, mirrors `HostRuntime::pending_dispatch`'s own reasoning exactly - a test app
-        // that never dispatches carries no extra pending future, which the deterministic test
-        // scheduler's interleaving is sensitive to (see `sidebar::render::virtualization_tests::
-        // file_tree_row_and_header_actions_clear_the_real_scrollbar`, which a second such future
-        // broke).
-        if let Some(client) = runtime.client() {
-            runtime.subscribe_events(&client);
-        }
-        if runtime.is_published() {
-            runtime.start_event_consumers(cx);
-        }
-        self.host_runtime = Some(runtime);
-        let repo_paths: Vec<PathBuf> = self.repos.iter().map(|repo| repo.path.clone()).collect();
-        for path in repo_paths {
-            self.serve_repo_from_host(path, cx);
-        }
-    }
-
-    /// Adds a repository to the descriptor, off the UI thread. A no-op before the host is up
-    /// (`adopt_host` publishes everything open at that moment) and for an unpublished host.
-    pub(crate) fn serve_repo_from_host(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if !self
-            .host_runtime
-            .as_ref()
-            .is_some_and(HostRuntime::is_published)
-        {
-            return;
-        }
-        cx.spawn(async move |this, cx| {
-            let common = cx
-                .background_spawn({
-                    let path = path.clone();
-                    async move { jerry_git::git_common_dir(&path) }
-                })
-                .await;
-            let common = match common {
-                Ok(common) => common,
-                Err(error) => {
-                    log::warn!("jerry-host: {} is not served: {error}", path.display());
-                    return;
-                }
-            };
-            let handed = this.update(cx, |this, _cx| {
-                this.host_runtime
-                    .as_mut()
-                    .map(|runtime| runtime.serve(common))
-            });
-            let Ok(Some((dir, instance, repos))) = handed else {
-                return;
-            };
-            if let Err(error) = cx
-                .background_spawn(async move { publish(dir, instance, repos) })
-                .await
-            {
-                log::warn!("jerry-host: could not publish {}: {error}", path.display());
-            }
-        })
-        .detach();
-    }
-
-    /// Dispatches through the host. `cwd` is the worktree the action is requested from; the
-    /// host derives the repository from it.
+    /// Dispatches through the repository `cwd` belongs to - `NEEDS_HOST` for a repository whose
+    /// connection could not be opened at all (`RepoHostState::CannotSpawn`/`VersionMismatch`
+    /// answer their own, more specific codes instead - see [`RepoHost::dispatch`]).
     pub fn dispatch(
         &mut self,
         cwd: PathBuf,
         request: Request,
         cx: &mut Context<Self>,
     ) -> Task<Result<Report, RpcError>> {
-        if let Some(dispatch) = self
-            .host_runtime
-            .as_mut()
-            .and_then(HostRuntime::take_pending_dispatch)
+        if let Some(common_dir) = self.hosts.common_dir_for(&cwd).cloned() {
+            if let Some(repo_host) = self.hosts.repo_host_for(&common_dir) {
+                return repo_host.dispatch(cwd, request, cx);
+            }
+        }
+        cx.spawn(async move |this, cx| {
+            let common_dir = ensure_repo_host_connected(&this, cwd.clone(), cx).await;
+            let dispatched = this.update(cx, |this, cx| {
+                this.hosts
+                    .repo_host_for(&common_dir)
+                    .map(|repo_host| repo_host.dispatch(cwd, request, cx))
+            });
+            match dispatched {
+                Ok(Some(task)) => task.await,
+                _ => Err(RpcError::new(
+                    rpc_code::NEEDS_HOST,
+                    "this repository's session host could not be reached",
+                )),
+            }
+        })
+    }
+
+    /// The session table's own in-process handle for the repository `cwd` belongs to, for a
+    /// caller that needs to attach to a spawned session's data-plane adapter (`SessionManager::
+    /// handle_for`) rather than dispatch a Command - see `docs/architecture/decisions.md` §23.
+    /// Real only for a `#[cfg(test)]` in-process repository: a production (`Connection::Remote`)
+    /// one has no in-process table to reach into at all - `attach_remote_session` is
+    /// `Agents::spawn_inner`'s own path for that case instead. `None` also for a `cwd` with no
+    /// connection yet.
+    pub fn sessions_for(&self, cwd: &Path) -> Option<jerry_host::SessionManager> {
+        let common_dir = self.hosts.common_dir_for(cwd)?;
+        #[cfg_attr(not(test), allow(unused))]
+        let connection = &self.hosts.repo_host_for(common_dir)?.connection;
+        #[cfg(test)]
+        if let Some(Connection::InProcess { host, .. }) = connection {
+            return Some(host.sessions());
+        }
+        None
+    }
+
+    /// The `#[cfg(test)]` in-process half of [`Self::control_plane_for`] - real only for a
+    /// `#[cfg(test)]` in-process repository, matching [`Self::sessions_for`]'s own reasoning.
+    #[cfg(test)]
+    fn host_client_for(&self, cwd: &Path) -> Option<jerry_host::LocalClient> {
+        let common_dir = self.hosts.common_dir_for(cwd)?;
+        if let Some(Connection::InProcess { client, .. }) =
+            &self.hosts.repo_host_for(common_dir)?.connection
         {
-            cx.background_spawn(dispatch).detach();
+            return Some(client.clone());
         }
-        let Some(client) = self.host_runtime.as_ref().and_then(HostRuntime::client) else {
-            return Task::ready(Err(RpcError::new(
-                rpc_code::NEEDS_HOST,
-                "the session host is not running in this instance",
-            )));
-        };
-        // The lazy half of `Self::adopt_host`'s eager-subscribe/lazy-drain split: an unpublished
-        // host's draining task starts here, on this first real dispatch, rather than at adoption
-        // - see that method's own docs for why. The subscription itself already happened at
-        // adoption, so nothing broadcast between then and now is lost; `start_event_consumers` is
-        // a no-op if a task is already running.
-        if let Some(runtime) = self.host_runtime.as_mut() {
-            runtime.start_event_consumers(cx);
-        }
-        cx.spawn(async move |_this, _cx| client.request(Call::human(cwd, request)).await)
+        None
     }
 
-    /// The session table's own in-process handle, for a caller that needs to attach to a
-    /// spawned session's data-plane adapter (`SessionManager::handle_for`) rather than dispatch a
-    /// Command - see `docs/architecture/decisions.md` §23. `None` only in the same narrow window
-    /// `Self::dispatch`'s own `NEEDS_HOST` case covers.
-    pub fn sessions(&self) -> Option<SessionManager> {
-        self.host_runtime.as_ref().and_then(HostRuntime::sessions)
+    /// The `ControlPlane` handle a newly attached `TerminalPane` needs for its own
+    /// `SessionResize` dispatch (`TerminalPane::attach_session`, decisions.md §23 - resize never
+    /// travels on the data plane) - `ControlPlane::Remote` for a production `Connection::Remote`
+    /// repository (or a test that swapped one in via `RepoHost::for_test_remote`),
+    /// `ControlPlane::InProcess` for a `#[cfg(test)]` in-process one. `None` only when the
+    /// repository has no working connection at all.
+    pub(crate) fn control_plane_for(
+        &self,
+        cwd: &Path,
+    ) -> Option<crate::terminal::pane::ControlPlane> {
+        if let Some(remote) = self.remote_host_for(cwd) {
+            return Some(crate::terminal::pane::ControlPlane::Remote(remote));
+        }
+        #[cfg(test)]
+        if let Some(client) = self.host_client_for(cwd) {
+            return Some(crate::terminal::pane::ControlPlane::InProcess(client));
+        }
+        None
     }
 
-    /// The host's own dispatch handle, for a caller (`TerminalPane::attach_session`) that needs
-    /// to reach the control plane directly for something narrower than a full `Self::dispatch`
-    /// call - `SessionResize` (decisions.md §23).
-    pub fn host_client(&self) -> Option<LocalClient> {
-        self.host_runtime.as_ref().and_then(HostRuntime::client)
+    /// [`Hosts::socket_for`] - `crate::hooks::flow`'s own per-repository `JERRY_HOST_SOCKET`
+    /// resolution.
+    pub(crate) fn host_socket_for(&self, cwd: &Path) -> Option<PathBuf> {
+        self.hosts.socket_for(cwd)
+    }
+
+    /// The repository `cwd` belongs to's own connection state, for `crate::rail::render`'s
+    /// per-repository error banner - `None` for a repository this instance has never resolved a
+    /// connection for at all (including one still resolving), which is not itself an error.
+    pub(crate) fn repo_host_state_for(&self, cwd: &Path) -> Option<RepoHostState> {
+        let common_dir = self.hosts.common_dir_for(cwd)?;
+        Some(self.hosts.repo_host_for(common_dir)?.state().clone())
+    }
+
+    /// The real "Restart sessions" action on `crate::rail::render`'s per-repository error banner:
+    /// drops the repository `cwd` belongs to's own stale entry (a `VersionMismatch`/`CannotSpawn`
+    /// state has no live connection to shut down - only a genuinely `Connected` one would, and
+    /// this is never offered for that state) and re-runs [`Self::open_repo_host`] as if this were
+    /// the first time this instance had ever seen the repository. Also drops the `cwd` -> common
+    /// dir cache entry, not just `Hosts::by_repo`'s: `Self::open_repo_host`'s own early-return
+    /// guard checks that cache alone, so leaving it behind would make this a silent no-op.
+    pub(crate) fn restart_repo_host(&mut self, cwd: PathBuf, cx: &mut Context<Self>) {
+        if let Some(common_dir) = self.hosts.common_dir_of.remove(&cwd) {
+            self.hosts.by_repo.remove(&common_dir);
+        }
+        self.open_repo_host(cwd, cx);
+    }
+
+    /// The repository `cwd` belongs to's own [`RemoteRepoHost`], for `attach_remote_session`'s
+    /// synchronous `command/session-kill` dispatch on [`SessionAdapter::shutdown`] - a plain
+    /// blocking call safe from any thread (§16's amendment), never through [`Self::dispatch`]/
+    /// GPUI's executor, since `shutdown` is a synchronous trait method with no `.await` of its
+    /// own to run one under. Real for a production `Connection::Remote` repository, and for a
+    /// test that swapped one in via `RepoHost::for_test_remote`; `None` for a `#[cfg(test)]`
+    /// in-process repository (which kills through `SessionManager::kill` directly instead - see
+    /// [`Self::sessions_for`]) or one with no working connection at all.
+    fn remote_host_for(&self, cwd: &Path) -> Option<RemoteRepoHost> {
+        let common_dir = self.hosts.common_dir_for(cwd)?;
+        match &self.hosts.repo_host_for(common_dir)?.connection {
+            Some(Connection::Remote(remote)) => Some(remote.clone()),
+            _ => None,
+        }
+    }
+
+    /// Test-only: installs `repo_host` (already connected, typically [`RepoHost::for_test_remote`]
+    /// or [`RepoHost::for_test_in_process`]) as the connection for the repository `cwd` belongs
+    /// to, in place of whatever `Self::open_repo_host` would otherwise resolve - see that
+    /// constructor's own docs for why a test reaches for this. Also wires the same
+    /// `worktree_created`/`session_exited`/`event/hook` subscriptions `ensure_repo_host_connected`
+    /// would, so a test driving a hook or a worktree-created notification through `repo_host`'s
+    /// own connection sees it reach `self` exactly as production would. Resolving `cwd`'s own
+    /// common directory is a real (if quick) git call, acceptable here since this only ever runs
+    /// in a test's own synchronous setup, never on a path this crate's own conventions ask to keep
+    /// off the UI thread.
+    #[cfg(test)]
+    pub(crate) fn adopt_repo_host_for_test(
+        &mut self,
+        cwd: PathBuf,
+        mut repo_host: RepoHost,
+        cx: &mut Context<Self>,
+    ) {
+        wire_test_repo_host_events(&mut repo_host, cx);
+        // Canonicalized for the identical reason `ensure_repo_host_connected` is - see its own
+        // docs: a symlinked temp-directory parent must not make this collide with a *different*
+        // `Hosts::by_repo` entry than the one a real dispatch for the same repository resolves.
+        let resolved = jerry_git::git_common_dir(&cwd).unwrap_or_else(|_| cwd.clone());
+        let common_dir = dunce::canonicalize(&resolved).unwrap_or(resolved);
+        self.hosts.common_dir_of.insert(cwd, common_dir.clone());
+        self.hosts.by_repo.insert(common_dir, repo_host);
+    }
+}
+
+/// Resolves `session_id`'s own real, attachable adapter for `Agents::spawn_resolved` to hand to a
+/// pane, for a repository with no in-process table to reach into at all (`AdeApp::sessions_for`
+/// answering `None` - a production `Connection::Remote`, or a test that swapped one in via
+/// `RepoHost::for_test_remote`): dispatches a real `command/session-attach` for the socket, a
+/// `SessionsQuery` for the session's own pid (`SocketSessionAdapter::connect`'s own docs - a
+/// value only a Query can resolve, never fetched by the adapter itself), then connects
+/// off the UI thread. `Err` is a real, honest attach failure the caller reports as a failed spawn,
+/// never a silent no-op.
+pub(crate) async fn attach_remote_session(
+    this: &gpui::WeakEntity<AdeApp>,
+    cwd: PathBuf,
+    session_id: SessionId,
+    cx: &mut AsyncApp,
+) -> Result<Arc<dyn SessionAdapter>, String> {
+    const APP_DROPPED: &str = "the app itself was dropped before this session could attach";
+
+    let attach_call = this
+        .update(cx, |this, cx| {
+            this.dispatch(
+                cwd.clone(),
+                Request::Command(AppCommand::SessionAttach(SessionAttach {
+                    id: session_id.clone(),
+                })),
+                cx,
+            )
+        })
+        .map_err(|_| APP_DROPPED.to_string())?;
+    let socket = match attach_call.await {
+        Ok(Report::Ok { outcome }) => outcome
+            .get("socket")
+            .and_then(serde_json::Value::as_str)
+            .map(PathBuf::from)
+            .ok_or_else(|| "internal error: session-attach answered with no socket".to_string())?,
+        Ok(other) => return Err(format!("could not attach to this session: {other:?}")),
+        Err(error) => return Err(error.message),
+    };
+
+    // Never fatal on its own - a session whose pid could not be resolved still attaches, just
+    // without `SessionsQuery::process_id` ever answering for it (the pane header falls back to
+    // showing none, exactly as `SocketSessionAdapter::process_id`'s own docs describe).
+    let sessions_call = this.update(cx, |this, cx| {
+        this.dispatch(
+            cwd.clone(),
+            Request::Query(AppQuery::Sessions(SessionsQuery::default())),
+            cx,
+        )
+    });
+    let process_id = match sessions_call {
+        Ok(task) => match task.await {
+            Ok(Report::Ok { outcome }) => serde_json::from_value::<Vec<SessionRecord>>(outcome)
+                .ok()
+                .and_then(|records| records.into_iter().find(|record| record.id == session_id))
+                .and_then(|record| record.process_id),
+            _ => None,
+        },
+        Err(_) => None,
+    };
+
+    let remote = this
+        .update(cx, |this, _cx| this.remote_host_for(&cwd))
+        .map_err(|_| APP_DROPPED.to_string())?
+        .ok_or_else(|| {
+            "internal error: this repository has no remote session host to kill through".to_string()
+        })?;
+    let kill_id = session_id.clone();
+    let kill_cwd = cwd.clone();
+    let kill = move || -> Result<(), String> {
+        match remote.dispatch(Call::human(
+            kill_cwd.clone(),
+            Request::Command(AppCommand::SessionKill(SessionKill {
+                id: kill_id.clone(),
+            })),
+        )) {
+            Ok(Report::Ok { .. }) => Ok(()),
+            Ok(other) => Err(format!("{other:?}")),
+            Err(error) => Err(error.message),
+        }
+    };
+
+    cx.background_spawn(async move {
+        SocketSessionAdapter::connect(&socket, session_id, process_id, kill)
+            .map(|adapter| Arc::new(adapter) as Arc<dyn SessionAdapter>)
+            .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+/// [`AdeApp::adopt_repo_host_for_test`]'s own event wiring - a synchronous twin of
+/// `ensure_repo_host_connected`'s, since a test-adopted connection is always already fully
+/// connected (no async spawn-or-connect to await first).
+#[cfg(test)]
+fn wire_test_repo_host_events(repo_host: &mut RepoHost, cx: &mut Context<AdeApp>) {
+    let events = match &repo_host.connection {
+        Some(Connection::Remote(_)) => repo_host.socket.clone().and_then(|socket| {
+            match (
+                crate::repo_host::subscribe_remote(&socket),
+                crate::repo_host::subscribe_remote(&socket),
+                crate::repo_host::subscribe_remote(&socket),
+            ) {
+                (Ok(a), Ok(b), Ok(c)) => Some((a, b, c)),
+                _ => None,
+            }
+        }),
+        Some(Connection::InProcess { client, .. }) => {
+            Some((client.subscribe(), client.subscribe(), client.subscribe()))
+        }
+        None => None,
+    };
+    if let Some((worktree_created_events, session_exited_events, hook_events)) = events {
+        repo_host
+            ._events
+            .push(crate::work_surface::worktree_created::spawn_consumer(
+                worktree_created_events,
+                cx,
+            ));
+        repo_host
+            ._events
+            .push(crate::work_surface::session_exited::spawn_consumer(
+                session_exited_events,
+                cx,
+            ));
+        repo_host
+            ._events
+            .push(crate::hooks::spawn_consumer(hook_events, cx));
     }
 }
 
@@ -532,60 +828,31 @@ mod find_jerry_binary_tests {
 
 #[cfg(test)]
 mod app_dispatch_tests {
-    use super::HostRuntime;
+    use super::RepoHost;
     use crate::test_support::{open_test_app, temp_repo};
-    use gpui::{AppContext, TestAppContext};
+    use gpui::TestAppContext;
     use jerry_core::wire::rpc_code;
-    use jerry_core::{AgentSpec, AppCommand, AppQuery, Call, Report, Request, WorktreeCreate};
+    use jerry_core::{AppCommand, AppQuery, Report, Request, SessionSpawn, SessionsQuery};
     use std::path::PathBuf;
-    use std::time::Duration;
-    use test_support::{seed_empty_repo, wait_until};
-
-    /// A registry directory of this test's own, short enough for every platform's `sun_path`,
-    /// removed on drop even when the test fails.
-    struct RegistryDir {
-        path: PathBuf,
-        _temp: Option<tempfile::TempDir>,
-    }
-
-    impl Drop for RegistryDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
-
-    fn registry_dir(tag: &str) -> RegistryDir {
-        if cfg!(windows) {
-            let path = jerry_core::registry::runtime_dir()
-                .expect("runtime dir")
-                .join(format!("a-{:x}-{tag}", std::process::id()));
-            RegistryDir { path, _temp: None }
-        } else {
-            let temp = tempfile::TempDir::new().expect("tempdir");
-            RegistryDir {
-                path: temp.path().join("r"),
-                _temp: Some(temp),
-            }
-        }
-    }
 
     #[gpui::test]
-    async fn the_app_dispatches_a_query_through_its_host_and_reads_the_report(
+    async fn the_app_dispatches_a_query_through_its_repos_own_host_and_reads_the_report(
         cx: &mut TestAppContext,
     ) {
-        let repo = seed_empty_repo();
-        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
+        let repo = temp_repo();
+        let (app, cx) = open_test_app(cx, repo.to_path_buf());
+        cx.run_until_parked();
 
         let report = app
             .update(cx, |app, cx| {
                 app.dispatch(
-                    repo.path().to_path_buf(),
+                    repo.to_path_buf(),
                     Request::Query(AppQuery::Status(Default::default())),
                     cx,
                 )
             })
             .await
-            .expect("the in-process host answers");
+            .expect("the repo's own host answers");
         match report {
             Report::Ok { outcome } => {
                 let worktree = PathBuf::from(outcome["worktree_path"].as_str().expect("path"));
@@ -599,130 +866,431 @@ mod app_dispatch_tests {
     }
 
     #[gpui::test]
-    async fn a_published_host_removes_its_socket_when_the_runtime_is_dropped(
-        cx: &mut TestAppContext,
-    ) {
-        let repo = seed_empty_repo();
-        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
-        let dir = registry_dir("dispatch");
-        let (runtime, dispatch) = HostRuntime::start(dir.path.clone()).expect("host");
-        let socket = runtime.socket().to_path_buf();
-        app.update(cx, |app, cx| {
-            cx.background_spawn(dispatch).detach();
-            app.adopt_host(runtime, cx);
-        });
-        assert!(socket.exists());
-
-        app.update(cx, |app, _cx| app.host_runtime = None);
-        assert!(
-            wait_until(Duration::from_secs(5), || !socket.exists()),
-            "dropping the runtime removes its socket from a cleanup thread"
-        );
-    }
-
-    /// The regression behind `work_surface::session_exited`'s Linux flake: a notification
-    /// broadcast before this app's own draining task has ever run must still reach it once that
-    /// task starts, rather than being silently lost because no sink existed yet to catch it.
-    /// Swaps in a brand-new, unpublished host runtime first - `open_test_app`'s own guaranteed
-    /// startup shell (`AdeApp::spawn_initial_shell_for_opened_repo`) already dispatches once
-    /// against the original one, so only a fresh runtime's draining task is provably still
-    /// unstarted. Dispatches the triggering command directly through `AdeApp::host_client`,
-    /// bypassing `AdeApp::dispatch` entirely, so that draining task (started only by
-    /// `AdeApp::dispatch`'s own lazy half for an unpublished host) provably has not run before the
-    /// assertion below.
-    #[gpui::test]
-    async fn an_event_published_before_the_draining_task_starts_is_still_delivered(
-        cx: &mut TestAppContext,
-    ) {
-        let repo = temp_repo();
-        let (app, cx) = open_test_app(cx, repo.to_path_buf());
+    async fn two_open_repositories_dispatch_through_two_different_hosts(cx: &mut TestAppContext) {
+        let repo_a = temp_repo();
+        let repo_b = temp_repo();
+        let (app, cx) = open_test_app(cx, repo_a.to_path_buf());
         cx.run_until_parked();
         app.update(cx, |app, cx| {
-            app.adopt_host(HostRuntime::in_process(), cx);
-            // The fresh runtime's own job-processing loop, spawned directly rather than through
-            // `AdeApp::dispatch` (`HostRuntime::take_pending_dispatch`'s own docs) - needed for
-            // `client.request` below to be answered at all, and deliberately kept separate from
-            // starting the event-draining task, which is the one thing this test must not trigger
-            // yet.
-            if let Some(dispatch) = app
-                .host_runtime
-                .as_mut()
-                .and_then(HostRuntime::take_pending_dispatch)
-            {
-                cx.background_spawn(dispatch).detach();
-            }
+            app.add_repo(repo_b.to_path_buf(), cx);
         });
-
-        let client = app
-            .read_with(cx, |app, _cx| app.host_client())
-            .expect("a test app's in-process host has a client");
-        let create = Request::Command(AppCommand::WorktreeCreate(WorktreeCreate {
-            branch: "pre-drain".into(),
-            from: None,
-            agent: Some(AgentSpec::Claude),
-            prompt: Some("fix the bug".into()),
-        }));
-        let report = client
-            .request(Call::human(repo.to_path_buf(), create))
-            .await
-            .expect("the host executes the command directly; no app-level consumer is involved");
-        let Report::Ok { outcome } = report else {
-            panic!("expected ok, got {report:?}")
-        };
-        let created = PathBuf::from(outcome["path"].as_str().expect("path"));
-
-        // Sanity check: nothing has drained the notification yet, because nothing has called
-        // `AdeApp::dispatch` yet to start that task. A failure here would mean this test is not
-        // exercising the race it claims to.
-        cx.run_until_parked();
-        app.read_with(cx, |app, _cx| {
-            assert!(
-                !app.worktrees.iter().any(|item| item.path == created),
-                "sanity check: the draining task has not started, so nothing could have reacted \
-                 to the notification yet"
-            );
-        });
-
-        // The first real `AdeApp::dispatch` call for this app - an unrelated query - is what
-        // starts the draining task. The subscription itself happened at adoption, long before, so
-        // the notification above is still sitting in its channel.
-        app.update(cx, |app, cx| {
-            app.dispatch(
-                repo.to_path_buf(),
-                Request::Query(AppQuery::Status(Default::default())),
-                cx,
-            )
-        })
-        .await
-        .expect("status query");
         cx.run_until_parked();
 
-        app.read_with(cx, |app, _cx| {
-            assert!(
-                app.worktrees.iter().any(|item| item.path == created),
-                "an event published before the draining task started must still be delivered \
-                 once it does"
-            );
-        });
-
-        let _ = std::fs::remove_dir_all(created.parent().expect("parent"));
-    }
-
-    #[gpui::test]
-    async fn without_a_host_a_dispatch_says_so_instead_of_pretending(cx: &mut TestAppContext) {
-        let repo = seed_empty_repo();
-        let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
-        app.update(cx, |app, _cx| app.host_runtime = None);
-        let err = app
+        let report_a = app
             .update(cx, |app, cx| {
                 app.dispatch(
-                    repo.path().to_path_buf(),
+                    repo_a.to_path_buf(),
                     Request::Query(AppQuery::Status(Default::default())),
                     cx,
                 )
             })
             .await
-            .expect_err("no host");
+            .expect("repo a's own host answers");
+        let Report::Ok { outcome: outcome_a } = report_a else {
+            panic!("expected ok for repo a")
+        };
+        assert_eq!(
+            std::fs::canonicalize(outcome_a["worktree_path"].as_str().expect("path"))
+                .expect("canonical"),
+            std::fs::canonicalize(repo_a.path()).expect("canonical"),
+            "repo a's dispatch must answer from repo a's own host, not repo b's"
+        );
+
+        let report_b = app
+            .update(cx, |app, cx| {
+                app.dispatch(
+                    repo_b.to_path_buf(),
+                    Request::Query(AppQuery::Status(Default::default())),
+                    cx,
+                )
+            })
+            .await
+            .expect("repo b's own host answers");
+        let Report::Ok { outcome: outcome_b } = report_b else {
+            panic!("expected ok for repo b")
+        };
+        assert_eq!(
+            std::fs::canonicalize(outcome_b["worktree_path"].as_str().expect("path"))
+                .expect("canonical"),
+            std::fs::canonicalize(repo_b.path()).expect("canonical"),
+            "repo b's dispatch must answer from repo b's own host, not repo a's"
+        );
+    }
+
+    /// `Self::adopt_repo_host_for_test`/[`crate::host::RepoHost::for_test_remote`] swapped in for
+    /// the ordinary in-process default `open_test_app` wires up - proving `AdeApp::dispatch`
+    /// itself is agnostic to which `Connection` variant serves a repository, the same real socket
+    /// path production takes (`RemoteRepoHost`, `crate::repo_host`'s own tests, at a lower level).
+    #[gpui::test]
+    async fn dispatch_reaches_a_repository_served_over_a_real_remote_connection(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = temp_repo();
+        let (app, cx) = open_test_app(cx, repo.to_path_buf());
+        cx.run_until_parked();
+
+        let host = jerry_host::Host::start().expect("host");
+        let socket_dir = jerry_core::registry::runtime_dir().expect("runtime dir");
+        let socket = socket_dir.join(format!(
+            "rh-{:x}-{:08x}.sock",
+            std::process::id(),
+            jerry_core::registry::fresh_u32()
+        ));
+        host.listen(&socket).expect("listen");
+        let client =
+            jerry_core::client::Client::connect(&socket, std::time::Duration::from_secs(5))
+                .expect("connect to the real socket");
+        let repo_host =
+            RepoHost::for_test_remote(client, socket).expect("wrap the real connection");
+        app.update(cx, |app, cx| {
+            app.adopt_repo_host_for_test(repo.to_path_buf(), repo_host, cx);
+        });
+
+        let report = app
+            .update(cx, |app, cx| {
+                app.dispatch(
+                    repo.to_path_buf(),
+                    Request::Query(AppQuery::Status(Default::default())),
+                    cx,
+                )
+            })
+            .await
+            .expect("the real remote connection answers");
+        match report {
+            Report::Ok { outcome } => {
+                assert_eq!(
+                    std::fs::canonicalize(outcome["worktree_path"].as_str().expect("path"))
+                        .expect("canonical"),
+                    std::fs::canonicalize(repo.path()).expect("canonical")
+                );
+            }
+            other => panic!("expected ok, got {other:?}"),
+        }
+        host.shutdown_and_join();
+    }
+
+    /// A repository whose real host speaks a different protocol version is a visible,
+    /// per-repository error - `UNSUPPORTED_VERSION`, never a silent fallback to some other
+    /// connection - decisions.md §24's own "no in-process fallback on version mismatch" rule.
+    #[gpui::test]
+    async fn a_version_mismatched_repository_answers_unsupported_version_not_silently(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = temp_repo();
+        let (app, cx) = open_test_app(cx, repo.to_path_buf());
+        cx.run_until_parked();
+
+        app.update(cx, |app, cx| {
+            app.adopt_repo_host_for_test(
+                repo.to_path_buf(),
+                crate::host::RepoHost::for_test_unavailable(
+                    crate::host::RepoHostState::VersionMismatch {
+                        theirs: 99,
+                        ours: jerry_core::wire::PROTOCOL_VERSION,
+                    },
+                ),
+                cx,
+            );
+        });
+
+        let err = app
+            .update(cx, |app, cx| {
+                app.dispatch(
+                    repo.to_path_buf(),
+                    Request::Query(AppQuery::Status(Default::default())),
+                    cx,
+                )
+            })
+            .await
+            .expect_err("a version mismatch must never silently answer");
+        assert_eq!(err.code, rpc_code::UNSUPPORTED_VERSION);
+    }
+
+    /// [`crate::host::RepoHostState::CannotSpawn`] - the other visible, per-repository error
+    /// state, for a repository whose real host could not be reached or spawned at all.
+    #[gpui::test]
+    async fn a_repository_that_could_not_spawn_a_host_answers_needs_host_not_silently(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = temp_repo();
+        let (app, cx) = open_test_app(cx, repo.to_path_buf());
+        cx.run_until_parked();
+
+        app.update(cx, |app, cx| {
+            app.adopt_repo_host_for_test(
+                repo.to_path_buf(),
+                crate::host::RepoHost::for_test_unavailable(
+                    crate::host::RepoHostState::CannotSpawn {
+                        error: "no jerry-host binary was found".to_string(),
+                    },
+                ),
+                cx,
+            );
+        });
+
+        let err = app
+            .update(cx, |app, cx| {
+                app.dispatch(
+                    repo.to_path_buf(),
+                    Request::Query(AppQuery::Status(Default::default())),
+                    cx,
+                )
+            })
+            .await
+            .expect_err("a repository that could not spawn a host must never silently answer");
         assert_eq!(err.code, rpc_code::NEEDS_HOST);
+        assert!(err.message.contains("no jerry-host binary was found"));
+    }
+
+    /// A `cwd` never opened through `add_repo` (a worktree created directly on disk - `crate::
+    /// merge::flow`'s own real-worktree fixtures do exactly this) still gets a real connection,
+    /// lazily, the moment something dispatches against it - not a permanent `NEEDS_HOST` just
+    /// because no call site happened to open it first.
+    #[gpui::test]
+    async fn dispatch_lazily_opens_a_connection_for_a_cwd_never_explicitly_opened(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = temp_repo();
+        let (app, cx) = open_test_app(cx, repo.to_path_buf());
+        cx.run_until_parked();
+
+        let never_opened = temp_repo();
+        let report = app
+            .update(cx, |app, cx| {
+                app.dispatch(
+                    never_opened.to_path_buf(),
+                    Request::Query(AppQuery::Status(Default::default())),
+                    cx,
+                )
+            })
+            .await
+            .expect("a real connection opens lazily rather than answering NEEDS_HOST forever");
+        match report {
+            Report::Ok { outcome } => {
+                assert_eq!(
+                    std::fs::canonicalize(outcome["worktree_path"].as_str().expect("path"))
+                        .expect("canonical"),
+                    std::fs::canonicalize(never_opened.path()).expect("canonical")
+                );
+            }
+            other => panic!("expected ok, got {other:?}"),
+        }
+    }
+
+    /// The defensive half of `ensure_repo_host_connected`'s own `dunce::canonicalize` step: a
+    /// worktree reached through a real symlinked parent - standing in for macOS's own ambient
+    /// `/var` -> `/private/var` (this test makes its own, so the invariant is checked on every
+    /// platform, not only wherever an ambient symlink happens to differ) - must dispatch through
+    /// the *same* host entry the repository's own canonical path already opened, never a second,
+    /// independent one: a session spawned through the symlinked path must be visible through a
+    /// `SessionsQuery` against the canonical path too.
+    #[gpui::test]
+    async fn a_worktree_path_reached_through_a_symlinked_parent_dispatches_through_the_same_host(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = temp_repo();
+        let (app, cx) = open_test_app(cx, repo.to_path_buf());
+        cx.run_until_parked();
+
+        let symlink_parent = tempfile::TempDir::new().expect("tempdir");
+        let symlinked_repo = symlink_parent.path().join("repo-via-symlink");
+        #[cfg(unix)]
+        let created = std::os::unix::fs::symlink(repo.path(), &symlinked_repo).is_ok();
+        #[cfg(windows)]
+        let created = std::os::windows::fs::symlink_dir(repo.path(), &symlinked_repo).is_ok();
+        if !created {
+            // A sandboxed or unprivileged environment may refuse real symlink creation
+            // (`SeCreateSymbolicLinkPrivilege` on Windows without Developer Mode) - a graceful
+            // skip, not a hard failure, matching `hooks::integration_tests::skip_or_fail`'s own
+            // reasoning for an environment-dependent precondition this test does not control.
+            eprintln!(
+                "skipping a_worktree_path_reached_through_a_symlinked_parent_dispatches_through_the_same_host: \
+                 could not create a real symlink in this environment"
+            );
+            return;
+        }
+
+        #[cfg(windows)]
+        let idle_command = (PathBuf::from("cmd"), Vec::new());
+        #[cfg(not(windows))]
+        let idle_command = (PathBuf::from("sh"), Vec::new());
+        let (program, args) = idle_command;
+        let spawn_report = app
+            .update(cx, |app, cx| {
+                app.dispatch(
+                    symlinked_repo.clone(),
+                    Request::Command(AppCommand::SessionSpawn(SessionSpawn {
+                        program,
+                        args,
+                        env: Vec::new(),
+                        rows: 24,
+                        cols: 80,
+                        agent: None,
+                    })),
+                    cx,
+                )
+            })
+            .await
+            .expect("spawn through the symlinked path must succeed");
+        let Report::Ok { outcome } = spawn_report else {
+            panic!("expected ok, got {spawn_report:?}")
+        };
+        let session_id = outcome["id"]
+            .as_str()
+            .expect("the outcome carries a real session id")
+            .to_owned();
+
+        let sessions_report = app
+            .update(cx, |app, cx| {
+                app.dispatch(
+                    repo.to_path_buf(),
+                    Request::Query(AppQuery::Sessions(SessionsQuery::default())),
+                    cx,
+                )
+            })
+            .await
+            .expect("query through the repository's own canonical path must succeed");
+        let Report::Ok { outcome } = sessions_report else {
+            panic!("expected ok, got {sessions_report:?}")
+        };
+        let ids: Vec<String> = outcome
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|record| record["id"].as_str().expect("id").to_owned())
+            .collect();
+        assert!(
+            ids.contains(&session_id),
+            "a session spawned through a symlinked path to this repository must be visible \
+             through the repository's own canonical path too - proving both resolved to the \
+             same host; {ids:?} did not contain {session_id}"
+        );
+    }
+
+    /// The identical invariant the symlink test above checks, exercised through a path
+    /// `dunce::canonicalize` resolves without needing any OS-level symlink privilege - a trailing
+    /// `.` component, still the exact same real directory. Kept alongside the symlink test rather
+    /// than instead of it: this one runs unconditionally on every platform (including a
+    /// sandboxed Windows environment that refuses real symlink creation, where the symlink test
+    /// above gracefully skips), so the fix has at least one always-real proof here even where the
+    /// symlink case cannot be exercised.
+    #[gpui::test]
+    async fn a_worktree_path_with_a_redundant_component_dispatches_through_the_same_host(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = temp_repo();
+        let (app, cx) = open_test_app(cx, repo.to_path_buf());
+        cx.run_until_parked();
+
+        let redundant_path = repo.path().join(".");
+
+        #[cfg(windows)]
+        let idle_command = (PathBuf::from("cmd"), Vec::new());
+        #[cfg(not(windows))]
+        let idle_command = (PathBuf::from("sh"), Vec::new());
+        let (program, args) = idle_command;
+        let spawn_report = app
+            .update(cx, |app, cx| {
+                app.dispatch(
+                    redundant_path,
+                    Request::Command(AppCommand::SessionSpawn(SessionSpawn {
+                        program,
+                        args,
+                        env: Vec::new(),
+                        rows: 24,
+                        cols: 80,
+                        agent: None,
+                    })),
+                    cx,
+                )
+            })
+            .await
+            .expect("spawn through the redundant-component path must succeed");
+        let Report::Ok { outcome } = spawn_report else {
+            panic!("expected ok, got {spawn_report:?}")
+        };
+        let session_id = outcome["id"]
+            .as_str()
+            .expect("the outcome carries a real session id")
+            .to_owned();
+
+        let sessions_report = app
+            .update(cx, |app, cx| {
+                app.dispatch(
+                    repo.to_path_buf(),
+                    Request::Query(AppQuery::Sessions(SessionsQuery::default())),
+                    cx,
+                )
+            })
+            .await
+            .expect("query through the repository's own canonical path must succeed");
+        let Report::Ok { outcome } = sessions_report else {
+            panic!("expected ok, got {sessions_report:?}")
+        };
+        let ids: Vec<String> = outcome
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|record| record["id"].as_str().expect("id").to_owned())
+            .collect();
+        assert!(
+            ids.contains(&session_id),
+            "a session spawned through a redundant-component path to this repository must be \
+             visible through the repository's own canonical path too - proving both resolved to \
+             the same host; {ids:?} did not contain {session_id}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod in_process_test_host_socket_length_tests {
+    use jerry_core::registry::{runtime_dir_for, Os, MAX_SOCKET_PATH_BYTES};
+    use std::ffi::OsString;
+
+    fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
+        move |key| {
+            pairs
+                .iter()
+                .find(|(candidate, _)| *candidate == key)
+                .map(|(_, value)| OsString::from(*value))
+        }
+    }
+
+    /// `start_in_process_repo_host`'s own `th-<pid>-<fresh>.sock` naming, worst case, against
+    /// every platform's runtime directory shape - the same margin check `jerry-host`'s own
+    /// `data_plane::socket_length_tests` runs for its data-plane sockets, applied here since this
+    /// test-only control socket is one byte longer (`"th-"` vs `"d-"`) and had never itself been
+    /// checked.
+    #[test]
+    fn every_platforms_runtime_dir_leaves_real_margin_for_the_in_process_test_hosts_own_socket() {
+        let cases = [
+            (
+                Os::Windows,
+                vec![("LOCALAPPDATA", r"C:\Users\someone\AppData\Local")],
+            ),
+            (
+                Os::MacOs,
+                vec![
+                    (
+                        "TMPDIR",
+                        "/private/var/folders/36/0123456789abcdefghijklmnop/T/",
+                    ),
+                    ("USER", "someuser"),
+                ],
+            ),
+            (Os::Unix, vec![("XDG_RUNTIME_DIR", "/run/user/4294967295")]),
+        ];
+        let worst_case_name = format!("th-{:x}-{:08x}.sock", u32::MAX, u32::MAX);
+        for (os, pairs) in cases {
+            let dir = runtime_dir_for(os, &env(&pairs)).expect("runtime dir");
+            let socket = dir.join(&worst_case_name);
+            let len = socket.as_os_str().len();
+            assert!(
+                len <= MAX_SOCKET_PATH_BYTES,
+                "{os:?}: {} is {len} bytes, over the {MAX_SOCKET_PATH_BYTES}-byte limit - a \
+                 test's own in-process repo host would fail to bind its control socket",
+                socket.display()
+            );
+        }
     }
 }
