@@ -34,8 +34,33 @@ safe `std` wrapper — no `unsafe`. *Detecting* a forbidding job needs the real 
 lives in `jerry-app`'s and `jerry-host`'s own `job_object.rs` instead (CLAUDE.md's unsafe list),
 injected into `jerry_core::host_spawn::spawn_or_connect_with` by whichever of those calls it.
 
-**Does not own.** ANSI/terminal-grid parsing (that's `crates/jerry-app/src/terminal/`), any git concern,
-any gpui dependency, and (deliberately) any `unsafe` code at all.
+**Does not own.** ANSI/terminal-grid parsing (that's `jerry-term`), any git concern, any gpui
+dependency, and (deliberately) any `unsafe` code at all.
+
+## `jerry-term`
+
+**Scope.** ANSI/VT100 terminal grid emulation via `alacritty_terminal::Term` - the pure engine
+behind every real terminal grid this workspace draws or reasons about, headless or rendered.
+Extracted from `crates/jerry-app/src/terminal/{grid,mouse,osc}.rs` (decisions.md §25) so
+`jerry-host` could gain its own per-session headless grid without either depending on `gpui` or
+duplicating the VT parser - it never depended on `gpui` even while it lived inside `jerry-app`.
+
+**Owns.** `TerminalGrid` (bytes in via `append_bytes`, a resolved-color `GridCell` grid out via
+`visible_rows`/`visible_rows_plain`/`scrollback_tail`, real cursor-addressed VT100 state -
+scrollback, wide characters, mouse-report modes, bracketed paste, OSC 9/9;4/777 progress and
+title). `TerminalPalette`, the one interface between a live theme and this pure module (GitHub
+issue #208). `seed_from_snapshot`: rebuilds a grid's real `Term` state from an already-rendered
+`GridCell` snapshot by synthesizing the minimal SGR/cursor-position bytes to reproduce it, through
+the same `append_bytes` parser every other byte goes through - what a reattaching client
+(`jerry-app`'s `SocketSessionAdapter`) and, on the host side, nothing (the host's own grid is fed
+real bytes from the start) use to make a grid painted from a `jerry_core::SessionSnapshot` behave
+identically to one that had lived through every byte itself. `mouse`/`osc` - mouse-report encoding
+and the tee'd OSC 9/9;4/777 watcher, unchanged from their pre-extraction shape.
+
+**Does not own.** `jerry_core::SessionSnapshot`/`SnapshotCell` (the wire twin of `GridCell`,
+kept in `jerry-core` so that crate never depends on `jerry-term`/`alacritty_terminal` at all) -
+`jerry-host` converts field-by-field in both directions at its own boundary. Any `gpui` dependency,
+any process/PTY concern (`jerry-pty`), any git concern.
 
 ## `jerry-core`
 
@@ -77,8 +102,12 @@ client does not count as "connected" for `Host::run_lifecycle`'s own idle check.
 table and the real `jerry_pty::PtySession` behind each session it spawns (`SessionSpawn`/
 `SessionResize`/`SessionKill`/`SessionsQuery`, decisions.md §23) - `AgentTable` is now a thin view
 over it, kept for its pre-existing callers. The data-plane adapter (`SessionHandle`): an
-in-process byte stream and `write_input`, handed out directly, never through `Call`/`Report` -
-still in-process only; the per-session socket #507 adds is not built yet.
+in-process byte stream and `write_input`, handed out directly, never through `Call`/`Report`. A
+real per-session AF_UNIX/named-pipe socket (`crate::data_plane`) for an out-of-process attach, and
+a `jerry_term::TerminalGrid` per session (`crate::session::spawn_relay`, decisions.md §25) fed the
+identical bytes the data plane is, so `command/session-attach` can answer a real
+`jerry_core::SessionSnapshot` - what a client seeds its own grid from before consuming a single
+live byte, never a raw byte replay.
 
 **Does not own (yet).** The wire contract and the Git-locality implementations (`jerry-core`);
 any rendering, anything `gpui`. The hook store (still `jerry-app`'s `hooks/store.rs`) and
