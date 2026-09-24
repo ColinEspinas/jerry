@@ -57,6 +57,16 @@ pub struct HookInboxEntry {
     pub payload: serde_json::Value,
 }
 
+/// Everything `jerry-host`'s `HookStore` holds for one agent: its current coarse status (what
+/// `jerry hooks`/MCP read) and its full raw inbox, oldest first (what a freshly connected
+/// `jerry-app` replays through its own local `HookInbox`/`event.rs` pipeline - decisions.md §26 -
+/// so a relaunched instance renders exactly what a live `event/hook` stream would have).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookAgentSnapshot {
+    pub status: HookStatus,
+    pub entries: Vec<HookInboxEntry>,
+}
+
 /// Asks the connected Jerry for the current hook status of one agent, or every agent it is
 /// tracking - `Locality::Session` (§15), answered directly from `jerry-host`'s own `HookStore`,
 /// exactly like `AgentsQuery`/`SessionsQuery`. An agent caller may only ask about its own id;
@@ -69,7 +79,7 @@ pub struct HooksQuery {
 }
 
 impl Query for HooksQuery {
-    type Outcome = Vec<HookStatus>;
+    type Outcome = Vec<HookAgentSnapshot>;
     const NAME: &'static str = "hooks";
 
     fn locality(&self) -> Locality {
@@ -77,7 +87,7 @@ impl Query for HooksQuery {
     }
 
     /// Never actually reached - see the type's own docs.
-    fn run(&self, _ctx: &Ctx) -> Result<Vec<HookStatus>, Error> {
+    fn run(&self, _ctx: &Ctx) -> Result<Vec<HookAgentSnapshot>, Error> {
         Err(Error::new(
             "needs-host",
             "the hook store lives on the session host, not in this process",

@@ -894,10 +894,17 @@ mod host_dispatch_tests {
         let Report::Ok { outcome } = queried else {
             panic!("expected ok, got {queried:?}")
         };
-        let statuses = outcome.as_array().expect("array");
-        assert_eq!(statuses.len(), 1, "{statuses:?}");
-        assert_eq!(statuses[0]["agent_id"], serde_json::json!("agent-2"));
-        assert_eq!(statuses[0]["kind"], serde_json::json!("done"));
+        let snapshots = outcome.as_array().expect("array");
+        assert_eq!(snapshots.len(), 1, "{snapshots:?}");
+        assert_eq!(
+            snapshots[0]["status"]["agent_id"],
+            serde_json::json!("agent-2")
+        );
+        assert_eq!(snapshots[0]["status"]["kind"], serde_json::json!("done"));
+        assert_eq!(
+            snapshots[0]["entries"][0]["event"],
+            serde_json::json!("Stop")
+        );
 
         let anonymous = block_on(client.call(Call::human(
             repo.path(),
@@ -1115,9 +1122,14 @@ mod host_dispatch_tests {
             panic!("expected ok, got {still_there:?}")
         };
         assert_eq!(
-            outcome[0]["kind"],
+            outcome[0]["status"]["kind"],
             serde_json::json!("done"),
             "acknowledging the raw inbox must not touch the current status: {outcome:?}"
+        );
+        assert_eq!(
+            outcome[0]["entries"],
+            serde_json::json!([]),
+            "the acknowledged entry must be pruned from the raw inbox: {outcome:?}"
         );
         host.shutdown_and_join();
     }

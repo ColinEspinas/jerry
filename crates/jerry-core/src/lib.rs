@@ -39,7 +39,7 @@ pub use commands::{
 };
 pub use ctx::{AgentId, Caller, Ctx};
 pub use error::Error;
-pub use hooks::{HookAck, HookInboxEntry, HookKind, HookStatus, HooksQuery};
+pub use hooks::{HookAck, HookAgentSnapshot, HookInboxEntry, HookKind, HookStatus, HooksQuery};
 pub use mcp::{all_tools, method_for_tool_name, tool_name, ToolSpec};
 pub use method::Method;
 pub use queries::{

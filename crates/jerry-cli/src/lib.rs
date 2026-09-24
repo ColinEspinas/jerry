@@ -813,10 +813,11 @@ fn hooks(
                 let _ = writeln!(err, "jerry: unreadable hook status list: {outcome}");
                 return exit::FAILED;
             };
-            for entry in entries {
-                let agent_id = entry["agent_id"].as_str().unwrap_or("?");
-                let kind = entry["kind"].as_str().unwrap_or("?");
-                let message = entry["message"].as_str().unwrap_or("-");
+            for snapshot in entries {
+                let status = &snapshot["status"];
+                let agent_id = status["agent_id"].as_str().unwrap_or("?");
+                let kind = status["kind"].as_str().unwrap_or("?");
+                let message = status["message"].as_str().unwrap_or("-");
                 let _ = writeln!(out, "{agent_id}\t{kind}\t{message}");
             }
         }
@@ -1670,8 +1671,18 @@ mod run_tests {
         let (code, out, err) = invoke(&["hooks", "--json"], &env, repo.path());
         assert_eq!(code, 0, "stderr: {err}");
         let response: serde_json::Value = serde_json::from_str(out.trim()).expect("json");
-        assert_eq!(response["outcome"][0]["agent_id"], serde_json::json!("a-1"));
-        assert_eq!(response["outcome"][0]["kind"], serde_json::json!("waiting"));
+        assert_eq!(
+            response["outcome"][0]["status"]["agent_id"],
+            serde_json::json!("a-1")
+        );
+        assert_eq!(
+            response["outcome"][0]["status"]["kind"],
+            serde_json::json!("waiting")
+        );
+        assert_eq!(
+            response["outcome"][0]["entries"][0]["event"],
+            serde_json::json!("PermissionRequest")
+        );
 
         let (code, out, err) = invoke(&["hooks", "--agent", "a-1"], &env, repo.path());
         assert_eq!(code, 0, "stderr: {err}");

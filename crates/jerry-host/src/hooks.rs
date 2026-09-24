@@ -129,6 +129,30 @@ impl HookStore {
             .collect()
     }
 
+    /// This agent's current status plus its full raw inbox, oldest first - `HooksQuery`'s own
+    /// answer shape (`jerry_core::HookAgentSnapshot`), what a freshly connecting `jerry-app`
+    /// replays through its own local `HookInbox`/`event.rs` pipeline (decisions.md §26).
+    pub fn snapshot(&self, agent_id: &AgentId) -> Option<(HookStatus, Vec<HookInboxEntry>)> {
+        let state = lock(&self.0);
+        let entry = state.agents.get(agent_id)?;
+        Some((entry.status.clone(), entry.inbox.iter().cloned().collect()))
+    }
+
+    /// [`Self::snapshot`], for every agent this store is currently tracking.
+    pub fn snapshots(&self) -> Vec<(AgentId, HookStatus, Vec<HookInboxEntry>)> {
+        lock(&self.0)
+            .agents
+            .iter()
+            .map(|(id, entry)| {
+                (
+                    id.clone(),
+                    entry.status.clone(),
+                    entry.inbox.iter().cloned().collect(),
+                )
+            })
+            .collect()
+    }
+
     /// Drops every raw entry `agent_id` has with `seq <= up_to` - `HookAck`'s own effect. A
     /// no-op for an unknown agent or an `up_to` older than everything already dropped.
     pub fn ack(&self, agent_id: &AgentId, up_to: u64) {
@@ -153,11 +177,7 @@ impl HookStore {
 /// own `crate::hooks::event::EventKind` documents at length, kept here only in its coarsest form:
 /// this store never sees enough of `jerry-app`'s own state (which question was already on record,
 /// for instance) to fold a nudge in any richer way, and does not try.
-///
-/// `pub`: `jerry-app`'s own local `HookStatusCache` (`crate::hooks::store` there) calls this same
-/// function to update its cache from each `event/hook` notification, so its coarse status can
-/// never drift from what this store itself would have computed for the identical event.
-pub fn derive_status(event: &str, payload: &Value) -> Option<(HookKind, Option<String>)> {
+fn derive_status(event: &str, payload: &Value) -> Option<(HookKind, Option<String>)> {
     match event {
         "SessionStart" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse" => {
             let message = payload

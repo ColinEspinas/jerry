@@ -1694,55 +1694,58 @@ have the cross-*instance-visibility* gap the issue is about) and `hooks/mod.rs`'
   intentionally coarser: it does not reproduce `EventKind`'s nudge-suppression nuance (a
   `Notification` never overwrites a *richer* previous message the way `jerry-app`'s own
   `merge_nudge` does), only whether it should overwrite the coarse `kind` at all.
-- **`jerry-app`'s `hooks/store.rs` gains `HookStatusCache`**, a local mirror of the host's
-  `HookStatus` per agent - seeded via a real `HooksQuery` dispatch the moment a repository's
-  connection opens (`AdeApp::seed_hook_status_cache`, called from both `ensure_repo_host_connected`
-  and the test-only `adopt_repo_host_for_test`, so a test-adopted host seeds identically to a real
-  one rather than silently skipping the step) and kept current by `hooks/mod.rs`'s existing
-  `spawn_consumer`, which now deserializes each `event/hook` notification into a typed
-  `HookInboxEntry` and calls `HookStatusCache::apply` - itself calling the identical
-  `jerry_host::hooks::derive_status` the host used to build the notification in the first place, so
-  the cache can never compute a different answer than the host already gave. Seeding *merges*
-  rather than replacing: the cache is one field spanning every open repository, `HooksQuery` is
-  dispatched per repository, and a naive clear-then-insert would let a second repository's connect
-  erase the first repository's entries.
-- **`hooks/mod.rs`'s existing rich local pipeline (`HookRuntime`/`HookInbox`/`EditLog`,
-  `hooks/event.rs`'s `parse`/`merge_nudge`, `hooks/inbox.rs`) is unchanged in behavior** - only
-  adapted from digging fields out of a raw `serde_json::Value` to reading the typed
-  `HookInboxEntry` the notification now carries (`record_hook_notification`'s new signature). The
-  rail (`signal_for`/`text_for`/`session_id_for`/`run_facts_for`/`drain_edits`) still reads this
-  local pipeline exclusively; `HookStatusCache` is not wired into any render site by this issue.
-  This is a deliberate, narrower scope than the issue's own text suggested ("rewrite every
-  read/write site... to dispatch a Command/Query instead"): the rich pipeline's own fidelity
-  (activity vs. question kept apart, per-file edit tracking for issue #284, turns/first-prompt/
-  session-id for issue #227, nudge-aware merging) has no lossless counterpart in the coarse
-  `HookStatus` the host now answers with, and collapsing it down to match `HooksQuery`'s shape
-  would be a real rendering regression, not a refactor. What moved is exactly the piece that had a
-  real cross-instance-visibility gap and a coarse-enough shape to move safely; the rest stays,
-  documented rather than silently left as if untouched.
+- **`HooksQuery`'s outcome is `Vec<HookAgentSnapshot { status, entries }>`, not just the coarse
+  status** - `entries` is the agent's full raw inbox, oldest first. This is what makes the seed
+  below a real replay rather than a second, coarser cache: `jerry-app` never keeps its own
+  derived `HookStatus` at all. `jerry hooks`/MCP read `.status` and ignore `.entries`;
+  `jerry-app`'s seed reads `.entries` and ignores `.status`.
+- **No separate app-side cache. A repository's connection replays the host's prior hook history
+  through the exact same pipeline a live `event/hook` notification already takes.**
+  `crate::hooks::apply_entry(app, entry)` (`hooks/mod.rs`) is the one real function both
+  `spawn_consumer` (a live notification) and `AdeApp::seed_hook_runtime` (`host.rs`, the
+  repository-connect replay) feed an entry through - `HookRuntime::record` ->
+  `record_hook_notification` -> `event::parse` + `HookInbox`/`EditLog`, entirely unchanged
+  business logic, just now fed from two call sites instead of one. `seed_hook_runtime` dispatches
+  `HooksQuery`, then for each agent's `entries` (oldest first) calls `apply_entry` once per entry
+  before dispatching one `HookAck` for that agent's last entry. Called from both
+  `ensure_repo_host_connected` (production) and the test-only `adopt_repo_host_for_test`
+  (`wire_test_repo_host_events` now takes the resolved `common_dir` too), so a test-adopted host
+  behaves identically to a real one. A no-op while `AdeApp::hook_runtime` has not started yet
+  (`apply_entry`'s own docs) - the same lazy bring-up gate (`hooks::flow::AdeApp::
+  hook_injection_for`) a live event already respects, not a new limitation the seed adds: a
+  repository connects long before any agent has spawned in the common case, so the seed's real
+  effect is felt on the *next* repository this instance opens after its first `HookRuntime`
+  bring-up, or a reconnect after one already exists - documented, not hidden, as a real boundary
+  of this change rather than solved by starting `HookRuntime` eagerly (out of scope here).
+- **`HookAck` is real and dispatched for real**, both by `seed_hook_runtime` (one ack per agent,
+  after replaying that agent's entries) and by `spawn_consumer` (one ack per live entry applied,
+  best-effort, awaited but not retried on failure). The host's `HookStore::ack` prunes acknowledged
+  entries from its bounded inbox - consumption-driven pruning, not only the `HOOK_INBOX_CAP_PER_
+  AGENT`/`MAX_TRACKED_AGENTS` caps catching up eventually. Proven against a real host:
+  `hook_ack_is_denied_to_agents_and_leaves_the_current_status_intact` (jerry-host) shows an ack
+  prunes `entries` but never `status`; `a_relaunched_instance_replays_the_hosts_prior_hook_history_
+  exactly_as_the_live_path_would` (jerry-app) shows a real two-event replay through a real
+  in-process host leaves that agent's `HooksQuery` `entries` empty afterward.
 - **The persisted, cross-restart history (`AgentStatusState`, issue #227) is untouched and stays
   in `jerry-app`.** It is not the store this issue's motivating problem is about: it already
   merges across instances via its own `save_merged_at` (a real file-based CRDT-shaped merge, not
   in-memory state one instance holds exclusively), and its fields (`files_changed`/`insertions`/
   `deletions`, `ended_at_unix`, the five-way `Status`) are rendering/history-specific in exactly the
   way `HookStatus`'s deliberately coarse four-way `kind` is not meant to carry.
-- **`HookAck` is real but not yet dispatched anywhere in `jerry-app`.** The Command exists,
-  round-trips, is denied to agents, and is proven against a real host (`hook_ack_is_denied_to_
-  agents_and_leaves_the_current_status_intact`), but `hooks/mod.rs`'s consumer does not call it
-  after applying an entry - the host's own `HOOK_INBOX_CAP_PER_AGENT` FIFO already bounds memory
-  regardless, so this is a real, deferred optimization (letting the host prune acknowledged
-  entries early) rather than something correctness depends on. A future caller has a real, tested
-  Command to dispatch when this is worth doing.
 - **`jerry hooks [--agent <id>] [--json]`** (`crates/jerry-cli/src/lib.rs`) lists `HooksQuery`'s
-  answer, one line as `<agent_id>\t<kind>\t<message>`, mirroring `jerry agents`/`jerry sessions`
-  exactly - the MCP tool catalogue picks up `HooksQuery`/`HookAck` automatically, since both are
-  now `AppQuery`/`AppCommand` variants `Request::examples()` already covers.
+  answer, one line as `<agent_id>\t<kind>\t<message>` read from each snapshot's `.status`,
+  mirroring `jerry agents`/`jerry sessions` exactly - the MCP tool catalogue picks up
+  `HooksQuery`/`HookAck` automatically, since both are now `AppQuery`/`AppCommand` variants
+  `Request::examples()` already covers.
 
 **Consequences:** A hook posted to one instance is now visible to every other one watching the
-same host - the issue's own motivating problem - for the coarse status a `HooksQuery` answers
-with; the rail's own richer status still depends on that instance having seen the live event
-itself (or, since this issue, the connect-time seed narrowing that gap to "before this instance
-ever connected" rather than "for this instance's whole lifetime"). `hooks/event.rs`'s ~350 lines
-and `hooks/inbox.rs`'s own tests are unmodified by this issue, deliberately - see the scope bullet
-above. `crates/jerry-host/src/session.rs` and `data_plane.rs` were not touched, keeping this
-change small alongside issue #507's own concurrent work on those files.
+same host - the issue's own motivating problem - and a relaunched instance's rail renders an
+already-known agent's status exactly as the live-event path would have, proven by a test that
+compares the two computations directly rather than assuming they agree. `hooks/event.rs`'s ~350
+lines, `hooks/inbox.rs`, and their own existing tests are unmodified by this issue, deliberately -
+the rich local pipeline's fidelity (activity vs. question kept apart, per-file edit tracking for
+issue #284, turns/first-prompt/session-id for issue #227, nudge-aware merging) has no lossless
+counterpart in the coarse `HookStatus` `jerry hooks`/MCP need, so it was never a candidate to move
+or be replaced - only fed from a second call site. `crates/jerry-host/src/session.rs` and
+`data_plane.rs` were not touched, keeping this change small alongside issue #507's own concurrent
+work on those files.

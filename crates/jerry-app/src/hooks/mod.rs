@@ -157,18 +157,29 @@ impl HookRuntime {
     }
 }
 
+/// Applies one raw entry to [`AdeApp::hook_runtime`] - the one real path both [`spawn_consumer`]
+/// (a live `event/hook` notification) and `crate::host::AdeApp::seed_hook_runtime` (a
+/// repository-connect replay, decisions.md §26) feed an entry through, so a relaunched instance's
+/// rail renders exactly what it would have if it had been running the whole time. A no-op while
+/// [`HookRuntime`] has not started yet (hooks unsupported, or its lazy bring-up has not run -
+/// `crate::hooks::flow::AdeApp::hook_injection_for`) - the same silent drop an early live event
+/// already had.
+pub(crate) fn apply_entry(app: &AdeApp, entry: &jerry_core::HookInboxEntry) {
+    if let Some(runtime) = &app.hook_runtime {
+        runtime.record(entry);
+    }
+}
+
 /// Drains `events` for as long as the returned `Task` is held - one per repository connection
 /// (`crate::host::ensure_repo_host_connected`), all feeding the same [`HookRuntime`] regardless
 /// of which repository the notification came from, mirroring `crate::work_surface::
-/// worktree_created::spawn_consumer`'s own shape exactly. Also updates [`crate::hooks::store::
-/// HookStatusCache`] (decisions.md §26), independent of whether [`HookRuntime`] itself has
-/// started yet - the cache has no bring-up gate of its own. An `event/hook` whose params are not
-/// a real [`jerry_core::HookInboxEntry`], or one that arrives before [`HookRuntime`] exists yet
-/// (hooks unsupported, or its lazy bring-up has not run - `crate::hooks::flow::AdeApp::
-/// hook_injection_for`), is silently dropped for the runtime's own half, the same as one arriving
-/// after it has already been torn down.
+/// worktree_created::spawn_consumer`'s own shape exactly. Acknowledges what it applied
+/// (`HookAck`, best-effort, decisions.md §26) so the host's own bounded inbox is pruned by real
+/// consumption, not just its cap. An `event/hook` whose params are not a real
+/// [`jerry_core::HookInboxEntry`] is silently dropped.
 pub(crate) fn spawn_consumer(
     mut events: mpsc::UnboundedReceiver<Message>,
+    common_dir: PathBuf,
     cx: &mut Context<AdeApp>,
 ) -> Task<()> {
     cx.spawn(async move |this, cx| {
@@ -182,12 +193,27 @@ pub(crate) fn spawn_consumer(
             let Ok(entry) = serde_json::from_value::<jerry_core::HookInboxEntry>(params) else {
                 continue;
             };
-            let _ = this.update(cx, |app, _cx| {
-                app.hook_status_cache.apply(&entry);
-                if let Some(runtime) = &app.hook_runtime {
-                    runtime.record(&entry);
-                }
+            if this
+                .update(cx, |app, _cx| apply_entry(app, &entry))
+                .is_err()
+            {
+                continue;
+            }
+            let ack = this.update(cx, |app, cx| {
+                app.dispatch(
+                    common_dir.clone(),
+                    jerry_core::Request::Command(jerry_core::AppCommand::HookAck(
+                        jerry_core::HookAck {
+                            agent_id: entry.agent_id.clone(),
+                            up_to: entry.seq,
+                        },
+                    )),
+                    cx,
+                )
             });
+            if let Ok(task) = ack {
+                let _ = task.await;
+            }
         }
     })
 }

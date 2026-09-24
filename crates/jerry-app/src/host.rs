@@ -15,8 +15,8 @@ use crate::terminal::socket_adapter::SocketSessionAdapter;
 use gpui::{AppContext, AsyncApp, Context, Task};
 use jerry_core::wire::rpc_code;
 use jerry_core::{
-    AppCommand, AppQuery, Call, HookStatus, HooksQuery, Report, Request, RpcError, SessionAttach,
-    SessionId, SessionKill, SessionRecord, SessionsQuery,
+    AppCommand, AppQuery, Call, HookAck, HookAgentSnapshot, HooksQuery, Report, Request, RpcError,
+    SessionAttach, SessionId, SessionKill, SessionRecord, SessionsQuery,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -407,12 +407,14 @@ async fn ensure_repo_host_connected(
                     session_exited_events,
                     cx,
                 ));
-            repo_host
-                ._events
-                .push(crate::hooks::spawn_consumer(hook_events, cx));
+            repo_host._events.push(crate::hooks::spawn_consumer(
+                hook_events,
+                common_dir.clone(),
+                cx,
+            ));
         }
         this.hosts.by_repo.insert(common_dir.clone(), repo_host);
-        this.seed_hook_status_cache(common_dir.clone(), cx);
+        this.seed_hook_runtime(common_dir.clone(), cx);
     });
     common_dir
 }
@@ -437,16 +439,21 @@ impl AdeApp {
     }
 
     /// Decisions.md §26's own seed: dispatches `HooksQuery` for `common_dir`'s repository and
-    /// merges the answer into [`Self::hook_status_cache`], so an agent whose hooks fired before
-    /// this connection existed shows something real immediately, rather than nothing until its
-    /// own next live `event/hook`. Best-effort - a repository with no live host answers
-    /// `NEEDS_HOST` and this simply leaves the cache exactly as it already was. Called from both
+    /// replays every raw entry it returns into [`crate::hooks::apply_entry`], oldest first, per
+    /// agent - the same real processing a live `event/hook` notification takes
+    /// ([`crate::hooks::spawn_consumer`]), so a relaunched instance's rail renders an existing
+    /// agent's status exactly as it would have if this instance had been running the whole time.
+    /// A no-op while [`AdeApp::hook_runtime`] has not started yet (`apply_entry`'s own docs) - the
+    /// same lazy-bring-up gate a live event already respects, not a new limitation this seed
+    /// adds. Acknowledges what it replayed (`HookAck`, best-effort, one per agent) so the host's
+    /// own bounded inbox is pruned by real consumption. Best-effort throughout - a repository
+    /// with no live host answers `NEEDS_HOST` and this simply replays nothing. Called from both
     /// [`ensure_repo_host_connected`] (production) and [`Self::adopt_repo_host_for_test`] (the
     /// test-only connection-adoption path), so a test-adopted host behaves identically to a real
     /// one here rather than silently skipping this step.
-    pub(crate) fn seed_hook_status_cache(&mut self, common_dir: PathBuf, cx: &mut Context<Self>) {
+    pub(crate) fn seed_hook_runtime(&mut self, common_dir: PathBuf, cx: &mut Context<Self>) {
         let seed = self.dispatch(
-            common_dir,
+            common_dir.clone(),
             Request::Query(AppQuery::Hooks(HooksQuery::default())),
             cx,
         );
@@ -454,10 +461,33 @@ impl AdeApp {
             let Ok(Report::Ok { outcome }) = seed.await else {
                 return;
             };
-            let Ok(statuses) = serde_json::from_value::<Vec<HookStatus>>(outcome) else {
+            let Ok(snapshots) = serde_json::from_value::<Vec<HookAgentSnapshot>>(outcome) else {
                 return;
             };
-            let _ = this.update(cx, |this, _cx| this.hook_status_cache.seed(statuses));
+            for snapshot in snapshots {
+                let Some(up_to) = snapshot.entries.last().map(|entry| entry.seq) else {
+                    continue;
+                };
+                let agent_id = snapshot.status.agent_id.clone();
+                let applied = this.update(cx, |this, _cx| {
+                    for entry in &snapshot.entries {
+                        crate::hooks::apply_entry(this, entry);
+                    }
+                });
+                if applied.is_err() {
+                    continue;
+                }
+                let ack = this.update(cx, |this, cx| {
+                    this.dispatch(
+                        common_dir.clone(),
+                        Request::Command(AppCommand::HookAck(HookAck { agent_id, up_to })),
+                        cx,
+                    )
+                });
+                if let Ok(task) = ack {
+                    let _ = task.await;
+                }
+            }
         })
         .detach();
     }
@@ -605,15 +635,15 @@ impl AdeApp {
         mut repo_host: RepoHost,
         cx: &mut Context<Self>,
     ) {
-        wire_test_repo_host_events(&mut repo_host, cx);
         // Canonicalized for the identical reason `ensure_repo_host_connected` is - see its own
         // docs: a symlinked temp-directory parent must not make this collide with a *different*
         // `Hosts::by_repo` entry than the one a real dispatch for the same repository resolves.
         let resolved = jerry_git::git_common_dir(&cwd).unwrap_or_else(|_| cwd.clone());
         let common_dir = dunce::canonicalize(&resolved).unwrap_or(resolved);
+        wire_test_repo_host_events(&mut repo_host, common_dir.clone(), cx);
         self.hosts.common_dir_of.insert(cwd, common_dir.clone());
         self.hosts.by_repo.insert(common_dir.clone(), repo_host);
-        self.seed_hook_status_cache(common_dir, cx);
+        self.seed_hook_runtime(common_dir, cx);
     }
 }
 
@@ -708,7 +738,11 @@ pub(crate) async fn attach_remote_session(
 /// `ensure_repo_host_connected`'s, since a test-adopted connection is always already fully
 /// connected (no async spawn-or-connect to await first).
 #[cfg(test)]
-fn wire_test_repo_host_events(repo_host: &mut RepoHost, cx: &mut Context<AdeApp>) {
+fn wire_test_repo_host_events(
+    repo_host: &mut RepoHost,
+    common_dir: PathBuf,
+    cx: &mut Context<AdeApp>,
+) {
     let events = match &repo_host.connection {
         Some(Connection::Remote(_)) => repo_host.socket.clone().and_then(|socket| {
             match (
@@ -740,7 +774,7 @@ fn wire_test_repo_host_events(repo_host: &mut RepoHost, cx: &mut Context<AdeApp>
             ));
         repo_host
             ._events
-            .push(crate::hooks::spawn_consumer(hook_events, cx));
+            .push(crate::hooks::spawn_consumer(hook_events, common_dir, cx));
     }
 }
 

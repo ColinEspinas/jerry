@@ -185,20 +185,30 @@ fn agents_entries(inner: &Inner) -> Vec<jerry_core::AgentsEntry> {
 /// removal path - the real mechanism behind decisions.md §26's "cleared when the session is
 /// forgotten": once `inner.agents()` stops listing an id, `HooksQuery` stops answering for it too,
 /// even though the store's own bounded map may still hold a stale entry until eviction.
-fn hooks_entries(inner: &Inner, agent: Option<&AgentId>) -> Vec<jerry_core::HookStatus> {
+fn hooks_entries(inner: &Inner, agent: Option<&AgentId>) -> Vec<jerry_core::HookAgentSnapshot> {
     let known: HashSet<AgentId> = inner
         .agents()
         .list()
         .into_iter()
         .map(|(id, _)| id)
         .collect();
-    let statuses = match agent {
-        Some(id) => inner.hooks().status(id).into_iter().collect(),
-        None => inner.hooks().statuses(),
+    let snapshots: Vec<(
+        AgentId,
+        jerry_core::HookStatus,
+        Vec<jerry_core::HookInboxEntry>,
+    )> = match agent {
+        Some(id) => inner
+            .hooks()
+            .snapshot(id)
+            .map(|(status, entries)| (id.clone(), status, entries))
+            .into_iter()
+            .collect(),
+        None => inner.hooks().snapshots(),
     };
-    statuses
+    snapshots
         .into_iter()
-        .filter(|status| known.contains(&status.agent_id))
+        .filter(|(id, _, _)| known.contains(id))
+        .map(|(_, status, entries)| jerry_core::HookAgentSnapshot { status, entries })
         .collect()
 }
 
