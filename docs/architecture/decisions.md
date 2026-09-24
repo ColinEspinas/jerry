@@ -356,7 +356,12 @@ unless this has been called. A real shell process (`cmd.exe` on Windows in parti
 its own OSC 0 window title as part of its ConPTY startup handshake) can also now report state to
 the grid before a test's own `run_until_parked` returns, where the old polling design accidentally
 never drained it at all; tests asserting on a pane's "hasn't reported anything yet" state need to
-clear it explicitly (`TerminalPane::reset_grid_for_test`) rather than assume it.
+clear it explicitly (`TerminalPane::reset_grid_for_test`) rather than assume it. Clearing once
+isn't always enough under GPUI's randomized task order in a full-suite run - a real process can
+still report a *second* time later in the same test, racing a subsequent injection or assertion
+(GitHub issue #524). `TerminalPane::freeze_input_for_test`/`thaw_input_for_test` close that off for
+good: they park the same output task this paragraph describes, so a test can make its own
+synthetic injections the pane's only source of truth for as long as it needs to.
 
 ## 9. `crates/test-support` is a real crate, not a feature-gated one
 
