@@ -3965,6 +3965,20 @@ mod tab_scoping_tests {
                 .active_id()
                 .expect("the real startup shell agent")
         });
+        // Freeze the real startup shell's own output before this test ever pumps the executor,
+        // so from here on only this test's own `set_live_title` injections can move this pane's
+        // title - see `TerminalPane::freeze_input_for_test`'s docs (GitHub issue #524). This
+        // cannot undo whatever the real process already wrote before this line (its own ConPTY
+        // startup handshake); `set_live_title(.., "")` below still clears that explicitly.
+        let shell_pane = app.read_with(cx, |app, _| {
+            app.agents
+                .iter()
+                .find(|agent| agent.id == shell_id)
+                .expect("shell agent")
+                .pane
+                .clone()
+        });
+        shell_pane.update(cx, |pane, _cx| pane.freeze_input_for_test());
         cx.run_until_parked();
         // A real Windows `cmd.exe` sets its own OSC 0 title (its own full executable path) as
         // part of its ConPTY startup handshake - genuinely, not a fixture artifact - and the
@@ -4705,8 +4719,7 @@ mod terminal_action_tests {
     /// where a freshly-spawned shell's own prompt lands, so the row this test then selects can't
     /// be overwritten by real shell output arriving in the background.
     ///
-    /// Waits out a freshly (re)mounted pane's own settle before seeding, then retries the whole
-    /// reset+inject+select cycle until a real drain leaves it untouched - neither is optional:
+    /// Waits out a freshly (re)mounted pane's own settle before seeding - not optional:
     ///
     /// A pane newly promoted to [`Agents::active`] paints for the first time with no measured
     /// [`TerminalPane::content_bounds`] yet, so its first render sizes off the whole window
@@ -4723,9 +4736,13 @@ mod terminal_action_tests {
     /// Separately, a freshly attached real session can *still* be mid-round-trip on its own
     /// control-plane `SessionResize` once the pty exists (`docs/architecture/decisions.md` §23) -
     /// ConPTY answers that by repainting its whole screen from the real child process, which can
-    /// land *after* a single post-settle injection and silently overwrite row 9 the same way. The
-    /// retry loop below covers that: any miss re-seeds and resets the streak, rather than trusting
-    /// the round trip to be over just because it hasn't landed yet.
+    /// land *after* a single post-settle injection and silently overwrite row 9 the same way.
+    /// [`TerminalPane::freeze_input_for_test`] (GitHub issue #524) is what actually closes that
+    /// off: called only once the dimension settle above holds (freezing any earlier risks
+    /// starving that same real handshake of a reply it's blocking on - see that method's own
+    /// docs), it makes the seed below this pane's last word for the rest of the test, rather
+    /// than trusting the round trip to be over just because a repaint hasn't landed yet - what
+    /// this used to do by re-seeding and resetting a streak until three checks in a row agreed.
     fn seed_active_pane(app: &gpui::Entity<AdeApp>, cx: &mut gpui::VisualTestContext, text: &str) {
         let pane = app
             .read_with(cx, |app, _| app.agents.active().map(|s| s.pane.clone()))
@@ -4751,28 +4768,18 @@ mod terminal_action_tests {
             "the pane's grid dimensions never stopped changing within {PTY_ROUND_TRIP:?}"
         );
 
-        let reseed = |cx: &mut gpui::VisualTestContext| {
-            pane.update(cx, |pane, cx| {
-                pane.reset_grid_for_test(cx);
-                pane.inject_bytes_for_test(format!("\x1b[10;1H{text}").as_bytes(), cx);
-                pane.select_cells_for_test(9, 0..text.chars().count());
-            });
-        };
-        reseed(cx);
-        let mut consecutive_clean = 0;
-        let settled = pump_until(cx, |cx| {
-            if pane.read_with(cx, |pane, _| pane.selected_text_for_test()) == Some(text.to_string())
-            {
-                consecutive_clean += 1;
-            } else {
-                consecutive_clean = 0;
-                reseed(cx);
-            }
-            consecutive_clean >= 3
+        pane.update(cx, |pane, cx| {
+            pane.freeze_input_for_test();
+            pane.reset_grid_for_test(cx);
+            pane.inject_bytes_for_test(format!("\x1b[10;1H{text}").as_bytes(), cx);
+            pane.select_cells_for_test(9, 0..text.chars().count());
         });
-        assert!(
-            settled,
-            "the seeded selection never survived a real drain within {PTY_ROUND_TRIP:?}"
+        cx.run_until_parked();
+        assert_eq!(
+            pane.read_with(cx, |pane, _| pane.selected_text_for_test()),
+            Some(text.to_string()),
+            "the seeded selection must land exactly as injected - frozen, nothing else can \
+             reach this pane's grid to disturb it"
         );
     }
 
