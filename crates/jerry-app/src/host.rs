@@ -14,9 +14,7 @@
 //! subscription - two dedicated sockets in production (`crate::repo_host::subscribe_remote`), the
 //! in-process fanout tapped twice in tests - feeding the same app-wide handlers regardless of
 //! which repository an event came from. Not yet complete: `event/hook` is not one of the two
-//! subscribed events yet, and `crate::work_surface::agents::Agents::host_agents` still points at
-//! whichever repository connected most recently rather than being resolved per agent - both
-//! tracked in decisions.md §24 as this cutover's own remaining steps.
+//! subscribed events yet - tracked in decisions.md §24 as this cutover's own remaining step.
 
 use crate::repo_host::RemoteRepoHost;
 use crate::root::AdeApp;
@@ -382,15 +380,6 @@ async fn ensure_repo_host_connected(
     };
 
     let _ = this.update(cx, |this, cx| {
-        // `#[cfg(test)]` only: a fresh in-process host's `AgentTable` is the shortcut `Agents::
-        // spawn_resolved` still calls directly (this cutover's own remaining step, per the
-        // module docs) - attached here so it exists before any agent in this repository spawns.
-        // Overwrites a previous repository's own table for a multi-repository test, an
-        // explicitly accepted narrow gap until that step lands.
-        #[cfg(test)]
-        if let Some(Connection::InProcess { host, .. }) = &repo_host.connection {
-            this.agents.attach_host(host.agents());
-        }
         if let Some((worktree_created_events, session_exited_events)) = events {
             repo_host
                 ._events
@@ -516,13 +505,6 @@ impl AdeApp {
     ) {
         let common_dir = jerry_git::git_common_dir(&cwd).unwrap_or_else(|_| cwd.clone());
         self.hosts.common_dir_of.insert(cwd, common_dir.clone());
-        // `Self::open_repo_host`'s own attach step: without this, `Agents.host_agents` keeps
-        // pointing at whatever `open_test_app` already wired up for this same repository, and a
-        // registration `Agents::spawn_resolved` makes afterwards would land in that orphaned
-        // table instead of the one this call is actually replacing it with.
-        if let Some(Connection::InProcess { host, .. }) = &repo_host.connection {
-            self.agents.attach_host(host.agents());
-        }
         self.hosts.by_repo.insert(common_dir, repo_host);
     }
 }

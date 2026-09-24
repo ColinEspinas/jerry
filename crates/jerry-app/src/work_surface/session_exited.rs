@@ -1,10 +1,12 @@
 //! Reacts to the host's `event/session-exited` notification (`docs/architecture/decisions.md`
 //! §23): the control-plane signal every subscribed client sees, unlike a pane's own data-plane
 //! byte stream (`crate::terminal::pane::SessionAdapter::take_output`), which only the one
-//! attached pane observes. Forgets the exited process from the host's agent table so
-//! `AgentsQuery` stops listing it, even while [`crate::work_surface::agents::Agents::close`]'s
-//! "an unclean exit keeps its tab open" policy leaves the pane itself in place. Owns no state of
-//! its own - see `crate::work_surface::worktree_created`, the identical pattern this mirrors.
+//! attached pane observes. `AgentsQuery` already stops listing an exited agent on its own
+//! (`SessionManager::agent_entries` filters by the real record's own exit status - no client
+//! action needed); what this module still owns is `Agents::pending_exits`, the real Linux race
+//! where the notification can arrive before `Agents::set_host_session_id` has even run. Owns no
+//! other state of its own - see `crate::work_surface::worktree_created`, the identical pattern
+//! this mirrors.
 
 use crate::root::AdeApp;
 use futures::channel::mpsc;
@@ -36,13 +38,14 @@ pub(crate) fn spawn_consumer(
 }
 
 impl AdeApp {
-    /// `event/session-exited`'s own handler: resolves which open agent (if any) the host's
-    /// session id belongs to and forgets it from the host's agent table. When no agent matches
-    /// yet, the id is recorded (`Agents::note_unmatched_session_exit`) rather than dropped: a
-    /// process short-lived enough (`sh -c exit`) can exit before `Agents::set_host_session_id`
-    /// itself has run, particularly on Linux, and that method applies the exit the moment it
-    /// does. Still a genuine no-op for a session this instance never spawns at all (another
-    /// client's session on the same host).
+    /// `event/session-exited`'s own handler: when no open agent's `host_session_id` matches yet,
+    /// the id is recorded (`Agents::note_unmatched_session_exit`) so `Agents::
+    /// set_host_session_id` can still clear it once that agent's id is finally known - a process
+    /// short-lived enough (`sh -c exit`) can exit before that call itself has run, particularly on
+    /// Linux. Once a match already exists there is nothing left to do here: `AgentsQuery` already
+    /// stopped listing the exited agent on its own (this method's own module docs), and a session
+    /// this instance never spawned at all (another client's session on the same host) never
+    /// matches to begin with.
     fn handle_session_exited(&mut self, params: Value, _cx: &mut Context<Self>) {
         let Some(session_id) = params
             .get("id")
@@ -51,9 +54,8 @@ impl AdeApp {
         else {
             return;
         };
-        match self.agents.agent_for_host_session(&session_id) {
-            Some(id) => self.agents.forget_host_agent(id),
-            None => self.agents.note_unmatched_session_exit(session_id),
+        if self.agents.agent_for_host_session(&session_id).is_none() {
+            self.agents.note_unmatched_session_exit(session_id);
         }
     }
 }
@@ -64,6 +66,7 @@ mod tests {
     use crate::test_support::{open_test_app, temp_repo};
     use crate::work_surface::agents::{AgentKind, ProcessKind};
     use gpui::TestAppContext;
+    use jerry_core::{AppQuery, Report, Request};
     use std::time::Duration;
 
     /// A real child process that does nothing but exit `0`, spelled for this platform's own
@@ -83,17 +86,14 @@ mod tests {
     /// Spawns a real, genuinely-exiting process tagged as an agent (via
     /// `Agents::spawn_with_explicit_command_for_test`, since a real `claude`/`codex`/
     /// `cursor-agent` binary would never exit on its own within a test's budget, and this
-    /// workspace's own nextest mitigation deliberately keeps `claude` off `PATH` anyway), waits
-    /// for the host to observe its real exit and publish `event/session-exited`, and checks the
-    /// host's own agent table - the same table `AgentsQuery` answers from - to prove this
-    /// instance's own subscriber reacted to the notification rather than merely to its pane's own
-    /// data-plane stream. This test's agent tab is left open the whole time (an unclean exit
-    /// keeps its tab - `Agents::close`'s own policy), so the table entry going away could not be
-    /// explained by the tab having been closed instead.
+    /// workspace's own nextest mitigation deliberately keeps `claude` off `PATH` anyway), and
+    /// waits for a real `AgentsQuery` dispatch to stop listing it once the host observes the real
+    /// exit - proving `SessionManager::agent_entries`'s own exit filter, not a shortcut into any
+    /// in-process table. This test's agent tab is left open the whole time (an unclean exit keeps
+    /// its tab - `Agents::close`'s own policy), so the listing going away could not be explained
+    /// by the tab having been closed instead.
     #[gpui::test]
-    fn a_real_agents_exit_is_forgotten_from_the_agent_table_once_its_event_arrives(
-        cx: &mut TestAppContext,
-    ) {
+    async fn a_real_agents_exit_stops_agentsquery_listing_it(cx: &mut TestAppContext) {
         let repo = temp_repo();
         let (app, cx) = open_test_app(cx, repo.path().to_path_buf());
         cx.run_until_parked();
@@ -108,32 +108,50 @@ mod tests {
                 cx,
             )
         });
-        // Checked before any `run_until_parked` at all, deliberately: `Agents::spawn_inner`'s own
-        // `spawn_resolved` registers this agent-table entry synchronously, inside the same
-        // `update_in` call above, before the `SessionSpawn` dispatch task that starts the real,
-        // genuinely-exiting process even runs - so nothing async has had a chance to race this
-        // read yet. A post-drain read here raced the real exit on Linux: the child could exit and
-        // its `event/session-exited` be processed - forgetting the agent - inside the very same
-        // `run_until_parked` this sanity check would have shared with the wait loop below, making
-        // an already-empty table look like the registration itself never happened.
-        let registered = app.read_with(cx, |app, _| app.agents.host_agent_ids_for_test());
+        cx.run_until_parked();
+
+        let listed = app
+            .update(cx, |app, cx| {
+                app.dispatch(
+                    repo.path().to_path_buf(),
+                    Request::Query(AppQuery::Agents(Default::default())),
+                    cx,
+                )
+            })
+            .await
+            .expect("agents query");
+        let Report::Ok { outcome } = listed else {
+            panic!("expected ok, got {listed:?}")
+        };
         assert_eq!(
-            registered.len(),
+            outcome.as_array().expect("array").len(),
             1,
-            "sanity check: the real spawn must have registered one agent-table entry - got \
-             {registered:?}"
+            "sanity check: the real spawn must be listed once its SessionSpawn dispatch \
+             resolves - got {outcome:?}"
         );
 
-        let forgotten = test_support::wait_until(Duration::from_secs(30), || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut forgotten = false;
+        while std::time::Instant::now() < deadline {
             cx.run_until_parked();
-            app.read_with(cx, |app, _| app.agents.host_agent_ids_for_test().is_empty())
-        });
-        let remaining = app.read_with(cx, |app, _| app.agents.host_agent_ids_for_test());
+            let listed = app
+                .update(cx, |app, cx| {
+                    app.dispatch(
+                        repo.path().to_path_buf(),
+                        Request::Query(AppQuery::Agents(Default::default())),
+                        cx,
+                    )
+                })
+                .await;
+            if matches!(listed, Ok(Report::Ok { outcome }) if outcome.as_array().is_some_and(Vec::is_empty))
+            {
+                forgotten = true;
+                break;
+            }
+        }
         assert!(
             forgotten,
-            "the host agent table must stop listing this agent once its real exit's \
-             event/session-exited notification reaches this instance's own subscriber - still \
-             has {remaining:?}"
+            "AgentsQuery must stop listing this agent once its real exit is observed"
         );
     }
 }

@@ -60,14 +60,17 @@ pub struct AgentRecord {
     pub kind: String,
 }
 
-/// The agents this host spawned, by the identity it injected as `JERRY_AGENT_ID`. Shared by the
-/// app, which registers and forgets, and the dispatcher, which classifies callers against it and
-/// answers `AgentsQuery` from it.
+/// An agent identity registered with this host without a `SessionSpawn` of its own - the
+/// dispatcher classifies callers against it and answers `AgentsQuery` from it exactly like a real
+/// session's own `SessionSpawn::agent` association (`SessionManager::worktree_of_agent`/
+/// `agent_entries` read both the same way). `jerry-app`'s own `Agents` no longer calls this for a
+/// session it spawns itself - `SessionSpawn::agent` makes that association atomically instead -
+/// but this stays the real path for an agent identity that exists without a session this host
+/// owns a process for (a hook-only test double, or a future non-PTY agent kind).
 ///
 /// A thin view over [`SessionManager`] (`docs/architecture/decisions.md` §23) - kept as its own
-/// type, rather than every caller reaching for `SessionManager` directly, only because its public
-/// shape (`register`/`forget`/`worktree_of`/`list`) predates the session table and `jerry-app`
-/// still calls exactly this during its own migration to it. There is exactly one underlying
+/// type, rather than every caller reaching for `SessionManager` directly, only for its narrower
+/// public shape (`register`/`forget`/`worktree_of`/`list`). There is exactly one underlying
 /// table: constructing one from scratch is not offered - see [`SessionManager::agent_table`].
 #[derive(Clone)]
 pub struct AgentTable(SessionManager);
@@ -82,9 +85,7 @@ impl AgentTable {
     }
 
     /// [`SessionManager::forget_session`] - the real `SessionId` a spawn minted, distinct from
-    /// [`Self::forget`]'s synthetic `agent:<id>` key (`crate::work_surface::agents::Agents::close`
-    /// needs both: the synthetic key for a `ProcessKind::Agent`'s `AgentTable`-compatibility
-    /// registration, this for the real session `SessionSpawn` created).
+    /// [`Self::forget`]'s synthetic `agent:<id>` key.
     pub fn forget_session(&self, id: &SessionId) {
         self.0.forget_session(id);
     }
