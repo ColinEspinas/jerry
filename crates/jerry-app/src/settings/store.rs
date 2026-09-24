@@ -49,11 +49,11 @@ pub struct AgentsSettings {
     /// environment).
     pub cursor_hooks_enabled: bool,
     /// `[agents.orchestrator]` in `settings.toml` - what `jerry wt new --agent <kind>
-    /// --orchestrator` grants the agent it spawns (`docs/architecture/decisions.md` §26).
+    /// --orchestrator` grants the agent it spawns (`docs/architecture/decisions.md` §28).
     pub orchestrator: OrchestratorSettings,
 }
 
-/// An orchestrator's own grants (`docs/architecture/decisions.md` §26): wire method names beyond
+/// An orchestrator's own grants (`docs/architecture/decisions.md` §28): wire method names beyond
 /// what its `Invocability` alone allows - `jerry-host`'s dispatcher consults exactly these
 /// (`SessionAgentInfo::grants`) for an agent caller. Its own section, not folded into
 /// [`AgentsSettings`] directly, so a future orchestrator-only setting has somewhere to go without
@@ -1633,7 +1633,7 @@ mod tests {
 
     #[test]
     fn orchestrator_grants_default_to_session_send_and_round_trip_through_a_real_file() {
-        // `docs/architecture/decisions.md` §26: `jerry wt new --orchestrator` must be useful with
+        // `docs/architecture/decisions.md` §28: `jerry wt new --orchestrator` must be useful with
         // no `settings.toml` editing at all.
         assert_eq!(
             Settings::default().agents.orchestrator.grants,

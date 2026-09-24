@@ -284,7 +284,7 @@ fn publish_worktree_created(
 }
 
 /// An agent caller's own `SessionAgentInfo::grants` can open a method its `Invocability` alone
-/// would refuse (orchestrator policy, `docs/architecture/decisions.md` §26) - a human is already
+/// would refuse (orchestrator policy, `docs/architecture/decisions.md` §28) - a human is already
 /// permitted everything by `permits` itself, so this is only ever worth consulting for
 /// `Caller::Agent`.
 fn granted(inner: &Inner, caller: &Caller, call: &Call) -> bool {
@@ -295,7 +295,7 @@ fn granted(inner: &Inner, caller: &Caller, call: &Call) -> bool {
     inner.sessions().grants_for_agent(id).contains(&method)
 }
 
-/// A `Stop` hook's own reply outcome (`docs/architecture/decisions.md` §26): when `child` was
+/// A `Stop` hook's own reply outcome (`docs/architecture/decisions.md` §28): when `child` was
 /// spawned with a known orchestrator (`SessionAgentInfo::parent`), forwards `event/child-stopped`
 /// to it and answers whatever decision that orchestrator pre-registered
 /// (`SessionStopPolicy`, consumed exactly once) - `"continue"` if none was, and always

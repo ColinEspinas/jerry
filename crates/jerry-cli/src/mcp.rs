@@ -116,7 +116,7 @@ fn initialize_result() -> Value {
 
 /// Only the tools this caller's `Invocability` allows - an agent sees `Allowed` variants only, a
 /// human caller (no `JERRY_AGENT_ID` in its environment) sees everything, mirroring the socket's
-/// own `permits` rule - plus, per `docs/architecture/decisions.md` §26, whatever an orchestrator's
+/// own `permits` rule - plus, per `docs/architecture/decisions.md` §28, whatever an orchestrator's
 /// own grants open beyond that, exactly as they open the underlying method on the socket
 /// (`jerry_host::dispatch::granted`): `tools/list` reflects the same authority `tools/call` would
 /// actually honor, rather than listing a tool a grant makes callable but hiding it anyway.
@@ -476,7 +476,7 @@ mod mcp_server_tests {
         assert!(agent_tools.len() < human_tools.len());
     }
 
-    /// `docs/architecture/decisions.md` §26: an orchestrator's own `SessionAgentInfo::grants`
+    /// `docs/architecture/decisions.md` §28: an orchestrator's own `SessionAgentInfo::grants`
     /// widens its `tools/list` beyond `Invocability` alone - `command_session-send` is `Denied`
     /// by default (an ordinary agent never sees it, proven by the test above), but a real,
     /// granted orchestrator session does.

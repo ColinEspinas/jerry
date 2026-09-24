@@ -72,7 +72,7 @@ impl AdeApp {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         // Who a `--orchestrator` child's `Stop` hook is forwarded to (`docs/architecture/
-        // decisions.md` §26) - `None` for a plain human `jerry wt new`, or when `requested_by`
+        // decisions.md` §28) - `None` for a plain human `jerry wt new`, or when `requested_by`
         // itself fails to parse (never trusted blindly; a malformed payload just means no parent).
         let parent = params
             .get("requested_by")
@@ -145,7 +145,7 @@ impl AdeApp {
     /// spawn_with_prompt`, a no-op prefix when `prompt` is `None` - exactly [`Agents::spawn`]'s
     /// own behavior). `orchestrator` (`--orchestrator` on `jerry wt new`) grants the spawned
     /// agent `Settings.agents.orchestrator.grants`, and `parent` records who asked for it, so a
-    /// later `Stop` from this agent forwards to them (`docs/architecture/decisions.md` §26).
+    /// later `Stop` from this agent forwards to them (`docs/architecture/decisions.md` §28).
     #[allow(clippy::too_many_arguments)]
     fn spawn_created_worktree_agent(
         &mut self,

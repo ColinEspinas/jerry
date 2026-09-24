@@ -268,7 +268,7 @@ pub struct WorktreeCreate {
     pub from: Option<String>,
     pub agent: Option<AgentSpec>,
     pub prompt: Option<String>,
-    /// Grants the spawned agent orchestrator policy (`docs/architecture/decisions.md` §26): the
+    /// Grants the spawned agent orchestrator policy (`docs/architecture/decisions.md` §28): the
     /// app applies `Settings.agents.orchestrator.grants` to its `SessionSpawn` when this is set,
     /// rather than spawning it as an ordinary agent. Meaningless without `agent` - `jerry wt new
     /// --orchestrator` with no `--agent` still creates a plain worktree with nothing to grant.

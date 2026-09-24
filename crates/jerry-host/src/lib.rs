@@ -142,7 +142,7 @@ pub(crate) struct Inner {
     /// the one wake with nothing reading it.
     shutdown_tx: std_mpsc::SyncSender<()>,
     /// Pending `SessionStopPolicy` decisions, keyed by the child agent id the *next* `Stop` hook
-    /// from them should honour (`docs/architecture/decisions.md` §26) - consumed once
+    /// from them should honour (`docs/architecture/decisions.md` §28) - consumed once
     /// ([`Self::take_stop_policy`]). Registrations are rare (one per orchestrator-managed stop),
     /// never a hot path, so a plain mutex-guarded map is enough.
     stop_policies: Mutex<HashMap<AgentId, (StopDecision, Option<String>)>>,
@@ -200,7 +200,7 @@ impl Inner {
         lock(&self.connections).push(stream);
     }
 
-    /// `SessionStopPolicy`'s own write side (`docs/architecture/decisions.md` §26): registers, or
+    /// `SessionStopPolicy`'s own write side (`docs/architecture/decisions.md` §28): registers, or
     /// replaces, the decision `child`'s next `Stop` hook should answer with.
     pub(crate) fn register_stop_policy(
         &self,
@@ -212,7 +212,7 @@ impl Inner {
     }
 
     /// Consumes and returns the pending policy for `child`, if any - a registered policy applies
-    /// to exactly one `Stop` (`docs/architecture/decisions.md` §26).
+    /// to exactly one `Stop` (`docs/architecture/decisions.md` §28).
     pub(crate) fn take_stop_policy(
         &self,
         child: &AgentId,
@@ -997,7 +997,7 @@ mod host_dispatch_tests {
 
     /// `event/worktree-created`'s own `requested_by` names a real agent caller, not just
     /// `{"kind": "human"}` - the data `jerry-app`'s own `work_surface::worktree_created` reads to
-    /// record the spawned agent's `parent` (`docs/architecture/decisions.md` §26), so a child
+    /// record the spawned agent's `parent` (`docs/architecture/decisions.md` §28), so a child
     /// agent's later `Stop` hook has somewhere real to forward to.
     #[test]
     fn a_worktree_create_requested_by_an_agent_names_that_agent_in_the_notification() {
@@ -1127,7 +1127,7 @@ mod host_dispatch_tests {
         jerry_core::SessionId::from(outcome_path(&report, "id"))
     }
 
-    /// `AttentionRaise` (`docs/architecture/decisions.md` §26): `Invocability::Allowed`, but only
+    /// `AttentionRaise` (`docs/architecture/decisions.md` §28): `Invocability::Allowed`, but only
     /// meaningful for an agent caller - a human has no session of their own for the host to key
     /// the event to, and the dispatcher refuses it the same way it refuses an anonymous `Hook`.
     #[test]
@@ -1185,7 +1185,7 @@ mod host_dispatch_tests {
         host.shutdown_and_join();
     }
 
-    /// `SessionSend` (`docs/architecture/decisions.md` §26): `Invocability::Denied` by default,
+    /// `SessionSend` (`docs/architecture/decisions.md` §28): `Invocability::Denied` by default,
     /// opened per agent through `SessionAgentInfo::grants`; refuses a caller sending to its own
     /// session, and a dead/unknown target is a real error, not a silent no-op.
     #[test]
@@ -1285,7 +1285,7 @@ mod host_dispatch_tests {
     /// A `Stop` hook from a child with no registered orchestrator, or no registered policy,
     /// answers `continue`; a `SessionStopPolicy` registered for a child answers `stop` with its
     /// own reason exactly once, then reverts to `continue` - and `event/child-stopped` is
-    /// published only for a child with a known parent (`docs/architecture/decisions.md` §26).
+    /// published only for a child with a known parent (`docs/architecture/decisions.md` §28).
     #[test]
     fn a_stop_hooks_reply_honours_a_registered_policy_exactly_once() {
         let repo = seed_empty_repo();

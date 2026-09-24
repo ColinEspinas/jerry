@@ -490,7 +490,7 @@ impl Agents {
     /// human types at the end of the command line. For `event/worktree-created`'s own agent
     /// spawn (`docs/architecture/decisions.md` §21), where the prompt travels on the wire rather
     /// than being typed - and, per that same event, `grants`/`parent` for a spawn requested with
-    /// `--orchestrator` (`docs/architecture/decisions.md` §26): empty/`None` for an ordinary
+    /// `--orchestrator` (`docs/architecture/decisions.md` §28): empty/`None` for an ordinary
     /// spawn, exactly [`Self::spawn`]'s own contract.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_with_prompt(
@@ -826,7 +826,7 @@ impl Agents {
     }
 
     /// Reattaches a tab to an already-live host session instead of spawning a fresh process
-    /// (`docs/architecture/decisions.md` §26, decision Q21's reconnect-on-launch reconciliation):
+    /// (`docs/architecture/decisions.md` §28, decision Q21's reconnect-on-launch reconciliation):
     /// creates the pane and its table entry exactly like [`Self::spawn`] does, but skips
     /// `SessionSpawn` entirely and attaches straight to `session_id` - what makes a reattached
     /// tab paint its session's real history immediately (`SessionAttach`'s own snapshot) instead

@@ -1766,11 +1766,10 @@ on the same worktree while `load_worktrees_for_opened_repo`'s own fetch is still
 than the reliably-reproducing case above (it needs a real click during a real async window, not a
 deterministic double call), and not covered by a regression test.
 
-## 26. Orchestrator policy: `jerry attention`, `jerry send`, per-agent grants, the `Stop` decision
+## 28. Orchestrator policy: `jerry attention`, `jerry send`, per-agent grants, the `Stop` decision
 
-**Status:** Accepted (2026-09-24, issue #508). The host-side mechanism is real and tested end to
-end; the CLI's own emission of a `Stop` hook's `"stop"` decision into the format the spawning
-agent CLI expects on stdout is not - see the third bullet below.
+**Status:** Accepted (2026-09-24, issue #508). Real and tested end to end, host through the CLI's
+own stdout emission for the spawning agent CLI.
 
 **Context:** By the time #443 (worktree supervision) and #507 (reattach) landed, an agent could
 already spawn another agent (`WorktreeCreate`, §21) but had no way to *act* on what it spawned:
@@ -1835,19 +1834,19 @@ new per-session grants list for the second and third (only an agent explicitly t
   gets `"continue"`, and nothing is forwarded (there is no orchestrator to forward to). This is
   the part of #496's reserved transport this issue actually spends: the `hook` request already had
   room for a real reply, unused until now.
-
-  **Not done: the CLI's own emission of `"stop"` into the spawning agent's expected format.**
-  `jerry hook`'s existing "always exit 0, print nothing to stdout" contract is unconditionally
-  correct for `"continue"` (every event before this issue, and a `Stop` with no policy). For a
-  real `"stop"`, four separate fetches of `code.claude.com/docs/en/hooks.md` (via `WebFetch`, from
-  this exact machine) each truncated before reaching the JSON-Output subsection specific to
-  `Stop`/`SubagentStop` - the page does confirm `hookSpecificOutput` as an event-specific decision
-  object and `permissionDecision` (`"allow"`/`"deny"`) as the field for *tool-related* events, but
-  never confirmed whether `Stop` uses that same shape or a different top-level field. Per
-  CLAUDE.md's "don't guess an API signature" rule, `jerry_cli::emit_stop_decision` is a real
-  `todo!("unverified: ...")` rather than a guessed field name that would fail silently the moment
-  it actually mattered. The host-side mechanism above needs nothing from this to be real and
-  tested; only Jerry's own decision reaching the agent CLI's stop-blocking mechanism is open.
+- **`jerry hook`'s own emission, `jerry_cli::emit_stop_decision`.** Claude Code's `Stop`/
+  `SubagentStop` hooks use a top-level `{"decision": "block", "reason": "..."}` printed to stdout
+  (exit 0 either way) to keep the agent from stopping - a different, flatter shape than the
+  `hookSpecificOutput`/`permissionDecision` object `PreToolUse`-family events use, which an initial
+  pass of this entry conflated it with after four separate `code.claude.com/docs/en/hooks.md`
+  fetches each truncated before the page's own `Stop`-specific example. `hook` maps its own
+  `"stop"` outcome (the orchestrator wants the child to *keep working*, i.e. block the stop) to
+  Claude Code's `"block"`, and prints nothing at all for `"continue"` - exactly the pre-existing
+  "always exit 0, print nothing to stdout" contract every other event, and a `Stop` with no
+  policy, already had. Never a `todo!()`: reached only when a policy actually fires, so the prior
+  gap never regressed anything the existing hook tests already exercised, but leaving it
+  unreachable-but-panicking was still a real bug in `hook`'s own "never panics" contract, caught
+  and fixed before this entry's first PR merged.
 
 **Consequences:** `crates/jerry-host/src/session.rs` gained `session_id_for_agent`,
 `grants_for_agent`, `parent_of_agent`, and `write_input` (mirroring `resize`/`kill`'s own

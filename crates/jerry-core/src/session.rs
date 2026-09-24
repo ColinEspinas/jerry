@@ -52,12 +52,12 @@ pub struct SessionAgentInfo {
     /// Wire method names (e.g. `"command/session-send"`) this agent may call beyond what its own
     /// `Invocability` alone allows - `jerry-host`'s dispatcher consults this for an agent caller
     /// whose `Invocability::Denied` would otherwise refuse the call (orchestrator policy,
-    /// `docs/architecture/decisions.md` §26). Empty for an ordinary, non-orchestrator agent.
+    /// `docs/architecture/decisions.md` §28). Empty for an ordinary, non-orchestrator agent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub grants: Vec<String>,
     /// The agent id that asked `WorktreeCreate` to spawn this session, if any - who a `Stop`
     /// hook from this agent is forwarded to as `event/child-stopped`
-    /// (`docs/architecture/decisions.md` §26). `None` for a session a human spawned directly.
+    /// (`docs/architecture/decisions.md` §28). `None` for a session a human spawned directly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<AgentId>,
 }
@@ -320,7 +320,7 @@ impl Command for SessionAttach {
     }
 }
 
-/// Wakes the human working on this repository (`docs/architecture/decisions.md` §26): the host
+/// Wakes the human working on this repository (`docs/architecture/decisions.md` §28): the host
 /// records it against the calling agent's own live session and publishes `event/attention
 /// { session_id, agent_id, message }`, so the app can raise the same attention signal it already
 /// shows for an OSC 9/777 ping, keyed to that agent's own tab. `Locality::Session` (meaningless
@@ -364,7 +364,7 @@ fn default_submit() -> bool {
 }
 
 /// Writes to another live session's stdin over the control plane (`docs/architecture/decisions.md`
-/// §26): `text`, plus a trailing Enter when `submit` (the default - `--no-submit` on the CLI
+/// §28): `text`, plus a trailing Enter when `submit` (the default - `--no-submit` on the CLI
 /// leaves the text sitting unentered, e.g. to let a human finish it by hand). `Locality::Session`,
 /// `Invocability::Denied` by default - opened per agent through `SessionAgentInfo::grants`
 /// (`"command/session-send"`), never a blanket `Allowed`, since this is one live session directly
@@ -408,7 +408,7 @@ impl Command for SessionSend {
 
 /// Whether a child's *next* `Stop` hook should be blocked (kept going) or let through -
 /// [`SessionStopPolicy`]'s own decision, and the `hook` reply's own outcome for a `Stop` event
-/// once one is registered (`docs/architecture/decisions.md` §26).
+/// once one is registered (`docs/architecture/decisions.md` §28).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum StopDecision {
@@ -417,7 +417,7 @@ pub enum StopDecision {
 }
 
 /// Pre-registers this orchestrator's own decision for the *next* `Stop` hook `child` fires
-/// (`docs/architecture/decisions.md` §26) - consumed exactly once, so a policy left registered
+/// (`docs/architecture/decisions.md` §28) - consumed exactly once, so a policy left registered
 /// after the `Stop` it was meant for does not also apply to the one after that.
 /// `Locality::Session`, `Invocability::Denied` by default - opened per agent through
 /// `SessionAgentInfo::grants` (`"command/session-stop-policy"`), the same as [`SessionSend`].

@@ -41,7 +41,7 @@ pub enum Command {
     Attention(AttentionArgs),
     /// Write to another live session's stdin over the control plane. `Invocability::Denied` by
     /// default - opened per agent through its own orchestrator grants
-    /// (`docs/architecture/decisions.md` §26).
+    /// (`docs/architecture/decisions.md` §28).
     Send(SendArgs),
     /// Start or stop the Jerry host for this repository directly - for headless use, without
     /// `jerry-app` running (`docs/architecture/decisions.md` §24). Agents never reach this:

@@ -930,7 +930,7 @@ impl TerminalPane {
     }
 
     /// Marks this pane as already-exited from the moment it was created - a restored, already-
-    /// gone tab (`docs/architecture/decisions.md` §26, decision Q21's third reconciliation case:
+    /// gone tab (`docs/architecture/decisions.md` §28, decision Q21's third reconciliation case:
     /// a persisted tab whose recorded session the host no longer has), never a live process this
     /// app actually watched finish. Deliberately does **not** emit
     /// [`TerminalPaneEvent::ProcessExited`], unlike [`Self::mark_exited_from_event`]: that
@@ -1237,7 +1237,7 @@ impl TerminalPane {
     }
 
     /// Latches the same attention signal an OSC 9/777 desktop notification does, but raised by
-    /// `command/attention-raise` (`docs/architecture/decisions.md` §26) rather than parsed from
+    /// `command/attention-raise` (`docs/architecture/decisions.md` §28) rather than parsed from
     /// this pane's own byte stream - what `crate::work_surface::attention`'s `event/attention`
     /// consumer calls once it has resolved which pane the host keyed the event to. Answered the
     /// same way a real OSC ping is: the human typing into this pane, or a new process taking it

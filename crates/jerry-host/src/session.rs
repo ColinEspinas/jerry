@@ -472,7 +472,7 @@ impl SessionManager {
 
     /// The live session id `agent_id` is currently spawned as, if any - the real counterpart to
     /// [`Self::worktree_of_agent`], used to resolve an `AttentionRaise`/`SessionSend` caller's own
-    /// session (`docs/architecture/decisions.md` §26). Same "prefer a still-live entry" rule as
+    /// session (`docs/architecture/decisions.md` §28). Same "prefer a still-live entry" rule as
     /// that method.
     pub(crate) fn session_id_for_agent(&self, agent_id: &AgentId) -> Option<SessionId> {
         let entries = lock(&self.entries);
@@ -494,7 +494,7 @@ impl SessionManager {
     /// `SessionAgentInfo::grants` for `agent_id`'s own live session, empty for none/not found -
     /// what the dispatcher's `permits` check consults for an agent caller whose own
     /// `Invocability::Denied` would otherwise refuse a call (`docs/architecture/decisions.md`
-    /// §26).
+    /// §28).
     pub(crate) fn grants_for_agent(&self, agent_id: &AgentId) -> Vec<String> {
         lock(&self.entries)
             .values()
@@ -511,7 +511,7 @@ impl SessionManager {
     }
 
     /// `SessionAgentInfo::parent` for `agent_id`'s own live session - the orchestrator a `Stop`
-    /// hook from it is forwarded to, if any (`docs/architecture/decisions.md` §26).
+    /// hook from it is forwarded to, if any (`docs/architecture/decisions.md` §28).
     pub(crate) fn parent_of_agent(&self, agent_id: &AgentId) -> Option<AgentId> {
         lock(&self.entries)
             .values()
@@ -527,7 +527,7 @@ impl SessionManager {
     }
 
     /// Writes to a live session's real pty input - `SessionSend`'s own execution
-    /// (`docs/architecture/decisions.md` §26). `NotOwned` for an `AgentTable`-compatibility
+    /// (`docs/architecture/decisions.md` §28). `NotOwned` for an `AgentTable`-compatibility
     /// registration or an already-exited session (both have no process to write to), exactly like
     /// [`Self::resize`]/[`Self::kill`].
     pub fn write_input(&self, id: &SessionId, data: &[u8]) -> Result<(), SessionError> {

@@ -284,9 +284,9 @@ fn unreachable_standalone() -> Result<Client, ClientError> {
 ///
 /// For a `Stop` event specifically, the reply may carry a real `{"decision": "stop"|"continue"}`
 /// outcome - an orchestrator's pre-registered `SessionStopPolicy` (`docs/architecture/
-/// decisions.md` §26). `"continue"` (the default, and every non-`Stop` event) prints nothing on
-/// stdout, exactly as before. `"stop"` is real, host-side policy with nowhere left to go: see
-/// [`emit_stop_decision`]'s own docs for why its stdout emission is not implemented yet.
+/// decisions.md` §28). `"continue"` (the default, and every non-`Stop` event) prints nothing on
+/// stdout, exactly as before - `"stop"` prints the real block decision (see
+/// [`emit_stop_decision`]).
 fn hook(
     session: &mut Session,
     args: &HookArgs,
@@ -327,12 +327,18 @@ fn hook(
     exit::DONE
 }
 
-/// Prints the real, host-decided `Stop` refusal in whatever JSON the spawning agent CLI expects
-/// on stdout to actually block the stop. Unverified against the real contract - see
-/// `docs/architecture/decisions.md` §26 for what was checked and why it stayed a gap rather than
-/// a guess (CLAUDE.md's "don't guess an API signature" rule). `reason` is already resolved.
-fn emit_stop_decision(reason: &str, _out: &mut dyn Write) {
-    todo!("unverified: Claude Code's exact Stop-hook JSON-on-stdout contract - reason={reason:?}")
+/// Prints the real `Stop`/`SubagentStop` block decision Claude Code's hooks expect on stdout: a
+/// top-level `{"decision": "block", "reason": "<reason>"}` (never the `hookSpecificOutput`/
+/// `permissionDecision` shape `PreToolUse`-family events use - that is a different event
+/// family's contract, not this one). Exit 0 either way is `hook`'s own job, in its caller
+/// (`Self::hook`); this only ever writes when the host's own decision blocks the stop, so
+/// `reason` is always real by the time it gets here.
+fn emit_stop_decision(reason: &str, out: &mut dyn Write) {
+    let _ = writeln!(
+        out,
+        "{}",
+        serde_json::json!({ "decision": "block", "reason": reason })
+    );
 }
 
 /// Reads `stdin` up to `cap` bytes (a longer payload is silently truncated, never an error - a
@@ -816,7 +822,7 @@ fn sessions(session: &mut Session, json: bool, out: &mut dyn Write, err: &mut dy
 
 /// `jerry attention <message>`: wakes the human. `Invocability::Allowed` - meant for an agent to
 /// call on itself, so the host can resolve *which* session to key the attention signal to
-/// (`docs/architecture/decisions.md` §26); a human running this has no session of their own for
+/// (`docs/architecture/decisions.md` §28); a human running this has no session of their own for
 /// the host to record it against, and gets back whatever refusal the host itself answers with.
 fn attention(
     session: &mut Session,
@@ -1545,7 +1551,7 @@ mod run_tests {
         registry.remove(&instance).expect("remove");
     }
 
-    /// `--orchestrator` (`docs/architecture/decisions.md` §26) reaches the wire as
+    /// `--orchestrator` (`docs/architecture/decisions.md` §28) reaches the wire as
     /// `WorktreeCreate.orchestrator`, carried into `event/worktree-created` for the app to act on.
     #[test]
     fn wt_new_orchestrator_flag_reaches_the_worktree_created_notification() {
@@ -1750,7 +1756,7 @@ mod run_tests {
 
     /// `jerry attention <message>`, dispatched as a real agent the host recognizes, reaches a
     /// real published Jerry and publishes a real `event/attention` (`docs/architecture/
-    /// decisions.md` §26).
+    /// decisions.md` §28).
     #[test]
     fn attention_reaches_a_running_jerry_and_publishes_a_real_event() {
         let repo = seed_empty_repo();
@@ -1809,7 +1815,7 @@ mod run_tests {
         assert!(out.is_empty());
     }
 
-    /// `jerry send --to <session-id> <text>` (`docs/architecture/decisions.md` §26): denied for
+    /// `jerry send --to <session-id> <text>` (`docs/architecture/decisions.md` §28): denied for
     /// an ordinary agent with no `command/session-send` grant, and a granted orchestrator's send
     /// really reaches the target's real process.
     #[test]
@@ -2113,6 +2119,106 @@ mod run_tests {
         let (code, out, _err) = invoke_with_stdin(&["hook", "Stop"], &env, repo.path(), b"{}");
         assert_eq!(code, 0);
         assert!(out.is_empty());
+        host.shutdown_and_join();
+    }
+
+    /// The real session-spawn half both `Stop`-decision tests below share: a child session with a
+    /// known `parent`, so `jerry-host`'s `Stop` forwarding has somewhere to look
+    /// (`docs/architecture/decisions.md` §28).
+    fn spawn_child_with_parent(host: &jerry_host::Host, repo: &Path, child: &str, parent: &str) {
+        let sleep = if cfg!(windows) {
+            "ping -n 30 127.0.0.1 >NUL"
+        } else {
+            "sleep 30"
+        };
+        let spawn = jerry_core::Request::Command(jerry_core::AppCommand::SessionSpawn(
+            jerry_core::SessionSpawn {
+                program: if cfg!(windows) { "cmd" } else { "sh" }.into(),
+                args: if cfg!(windows) {
+                    vec!["/c".into(), sleep.into()]
+                } else {
+                    vec!["-c".into(), sleep.into()]
+                },
+                env: Vec::new(),
+                rows: 24,
+                cols: 80,
+                agent: Some(jerry_core::SessionAgentInfo {
+                    kind: "Claude".into(),
+                    agent_id: jerry_core::AgentId::from(child),
+                    grants: Vec::new(),
+                    parent: Some(jerry_core::AgentId::from(parent)),
+                }),
+            },
+        ));
+        let report = futures::executor::block_on(
+            host.client().request(jerry_core::Call::human(repo, spawn)),
+        )
+        .expect("child spawn dispatched");
+        assert!(report.is_ok(), "{report:?}");
+    }
+
+    /// `docs/architecture/decisions.md` §28: with no `SessionStopPolicy` registered, a real `Stop`
+    /// hook prints nothing - the host's own default is `"continue"`, and `hook` must never print a
+    /// block decision it was not actually given.
+    #[test]
+    fn hook_stop_prints_nothing_when_no_policy_blocks_it() {
+        let repo = seed_empty_repo();
+        let host = jerry_host::Host::start().expect("host");
+        let socket = socket_path("stop-continue");
+        host.listen(&socket.path).expect("listen");
+        spawn_child_with_parent(&host, repo.path(), "child-continue", "parent-continue");
+        let env = env(&[
+            (crate::SOCKET_ENV, socket.path.as_path()),
+            (AGENT_ENV, Path::new("child-continue")),
+        ]);
+
+        let (code, out, err) = invoke_with_stdin(&["hook", "Stop"], &env, repo.path(), b"{}");
+        assert_eq!(code, 0, "stderr: {err}");
+        assert!(out.is_empty(), "{out:?}");
+        host.shutdown_and_join();
+    }
+
+    /// `docs/architecture/decisions.md` §28: a real, pre-registered `SessionStopPolicy` makes a
+    /// real `Stop` hook print Claude Code's own block-decision JSON - a top-level `{"decision":
+    /// "block", "reason": ...}`, never the `hookSpecificOutput`/`permissionDecision` shape
+    /// `PreToolUse`-family events use.
+    #[test]
+    fn hook_stop_prints_a_real_block_decision_when_a_policy_blocks_it() {
+        let repo = seed_empty_repo();
+        let host = jerry_host::Host::start().expect("host");
+        let socket = socket_path("stop-block");
+        host.listen(&socket.path).expect("listen");
+        spawn_child_with_parent(&host, repo.path(), "child-block", "parent-block");
+
+        let policy = jerry_core::Request::Command(jerry_core::AppCommand::SessionStopPolicy(
+            jerry_core::SessionStopPolicy {
+                child: jerry_core::AgentId::from("child-block"),
+                decision: jerry_core::StopDecision::Stop,
+                reason: Some("keep going, more work is coming".into()),
+            },
+        ));
+        let registered = futures::executor::block_on(
+            host.client()
+                .request(jerry_core::Call::human(repo.path(), policy)),
+        )
+        .expect("policy registered");
+        assert!(registered.is_ok(), "{registered:?}");
+
+        let env = env(&[
+            (crate::SOCKET_ENV, socket.path.as_path()),
+            (AGENT_ENV, Path::new("child-block")),
+        ]);
+        let (code, out, err) = invoke_with_stdin(&["hook", "Stop"], &env, repo.path(), b"{}");
+        assert_eq!(code, 0, "stderr: {err}");
+        let printed: serde_json::Value =
+            serde_json::from_str(out.trim()).unwrap_or_else(|e| panic!("{out:?} not JSON: {e}"));
+        assert_eq!(
+            printed,
+            serde_json::json!({
+                "decision": "block",
+                "reason": "keep going, more work is coming",
+            })
+        );
         host.shutdown_and_join();
     }
 

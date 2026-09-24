@@ -1,4 +1,4 @@
-//! Reacts to the host's `event/attention` notification (`docs/architecture/decisions.md` §26):
+//! Reacts to the host's `event/attention` notification (`docs/architecture/decisions.md` §28):
 //! `command/attention-raise`'s own effect, an agent waking the human. Raises the same attention
 //! signal an OSC 9/777 desktop notification already does (`TerminalPane::raise_attention_ping`),
 //! keyed to the agent's own tab via its real host session id - the rail badge is the one real,
