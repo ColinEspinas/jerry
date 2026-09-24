@@ -10,11 +10,12 @@
 //! resolved) - see `ensure_repo_host_connected`'s own docs for the rare, harmless race when both
 //! happen concurrently for a repository neither has seen yet.
 //!
-//! Each repository connection carries its own `worktree_created`/`session_exited` event
-//! subscription - two dedicated sockets in production (`crate::repo_host::subscribe_remote`), the
-//! in-process fanout tapped twice in tests - feeding the same app-wide handlers regardless of
-//! which repository an event came from. Not yet complete: `event/hook` is not one of the two
-//! subscribed events yet - tracked in decisions.md §24 as this cutover's own remaining step.
+//! Each repository connection carries its own `worktree_created`/`session_exited`/`event/hook`
+//! subscription - three dedicated sockets in production (`crate::repo_host::subscribe_remote`),
+//! the in-process fanout tapped three times in tests - feeding the same app-wide handlers
+//! regardless of which repository an event came from. A spawned agent's own `JERRY_HOST_SOCKET`
+//! (`crate::hooks::flow::AdeApp::hook_injection_for`) is that same repository's socket
+//! ([`AdeApp::host_socket_for`]), never a single app-wide one.
 
 use crate::repo_host::RemoteRepoHost;
 use crate::root::AdeApp;
@@ -68,10 +69,7 @@ impl RepoHost {
     }
 
     /// The socket a spawned agent's `JERRY_HOST_SOCKET` should carry - `None` unless
-    /// [`Self::state`] is [`RepoHostState::Connected`]. Not yet read anywhere: per-repository
-    /// `JERRY_HOST_SOCKET` injection is this cutover's own remaining "hooks" step (decisions.md
-    /// §24).
-    #[allow(dead_code)]
+    /// [`Self::state`] is [`RepoHostState::Connected`]. Read by [`AdeApp::host_socket_for`].
     pub(crate) fn socket(&self) -> Option<&Path> {
         self.socket.as_deref()
     }
@@ -105,7 +103,7 @@ impl RepoHost {
 
     /// Test-only: wraps an already-started, real socket-listening in-process `jerry_host::Host` -
     /// for a test that needs `crate::hooks::flow::AdeApp::hook_injection_for`'s own lazy bring-up
-    /// (`AdeApp::any_in_process_host_client_and_socket`) to find it, unlike [`Self::for_test_remote`].
+    /// to find a real socket for this repository, unlike [`Self::for_test_remote`].
     #[cfg(test)]
     pub(crate) fn for_test_in_process(host: jerry_host::Host, socket: PathBuf) -> RepoHost {
         let client = host.client();
@@ -193,23 +191,15 @@ impl Hosts {
         self.by_repo.iter()
     }
 
-    /// Any one connected repository's in-process client and socket, for
-    /// `crate::hooks::flow::AdeApp::hook_injection_for`'s bring-up - a stand-in until hook
-    /// injection becomes properly per-repository (`docs/architecture/decisions.md` §24's own
-    /// remaining "hooks" step), real only for a `#[cfg(test)]` in-process repository exactly like
-    /// [`AdeApp::sessions_for`]. `None` in production, and `None` before any repository connects.
-    #[cfg_attr(not(test), allow(unused_variables))]
-    fn any_in_process_client_and_socket(&self) -> Option<(jerry_host::LocalClient, PathBuf)> {
-        self.by_repo.values().find_map(|repo_host| {
-            #[cfg(test)]
-            if let Some(Connection::InProcess { client, .. }) = &repo_host.connection {
-                return repo_host
-                    .socket
-                    .clone()
-                    .map(|socket| (client.clone(), socket));
-            }
-            None
-        })
+    /// The socket a spawned agent belonging to `cwd`'s repository should carry as its
+    /// `JERRY_HOST_SOCKET` - `None` for a repository with no working connection yet
+    /// (`RepoHostState::Connected` only), or for a `cwd` this instance has not resolved at all.
+    fn socket_for(&self, cwd: &Path) -> Option<PathBuf> {
+        let common_dir = self.common_dir_of.get(cwd)?;
+        self.by_repo
+            .get(common_dir)?
+            .socket()
+            .map(Path::to_path_buf)
     }
 }
 
@@ -347,10 +337,10 @@ async fn ensure_repo_host_connected(
 
     let mut repo_host = connect_repo_host(common_dir.clone(), cx).await;
 
-    // Two dedicated event subscriptions - `worktree_created`/`session_exited` each filter for
-    // their own `event/*` name - opened off the UI thread for a real socket connection (blocking
-    // connect + handshake), or synchronously for the in-process fanout tap (`LocalClient::
-    // subscribe`, never blocking).
+    // Three dedicated event subscriptions - `worktree_created`/`session_exited`/`event/hook` each
+    // filter for their own `event/*` name - opened off the UI thread for a real socket connection
+    // (blocking connect + handshake), or synchronously for the in-process fanout tap
+    // (`LocalClient::subscribe`, never blocking).
     let events = match &repo_host.connection {
         Some(Connection::Remote(_)) => {
             let socket = repo_host.socket.clone();
@@ -359,9 +349,10 @@ async fn ensure_repo_host_connected(
                 match (
                     crate::repo_host::subscribe_remote(&socket),
                     crate::repo_host::subscribe_remote(&socket),
+                    crate::repo_host::subscribe_remote(&socket),
                 ) {
-                    (Ok(a), Ok(b)) => Some((a, b)),
-                    (Err(error), _) | (_, Err(error)) => {
+                    (Ok(a), Ok(b), Ok(c)) => Some((a, b, c)),
+                    (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
                         log::warn!(
                             "jerry-app: could not subscribe to this repository's own events: \
                              {error}"
@@ -374,13 +365,13 @@ async fn ensure_repo_host_connected(
         }
         #[cfg(test)]
         Some(Connection::InProcess { client, .. }) => {
-            Some((client.subscribe(), client.subscribe()))
+            Some((client.subscribe(), client.subscribe(), client.subscribe()))
         }
         None => None,
     };
 
     let _ = this.update(cx, |this, cx| {
-        if let Some((worktree_created_events, session_exited_events)) = events {
+        if let Some((worktree_created_events, session_exited_events, hook_events)) = events {
             repo_host
                 ._events
                 .push(crate::work_surface::worktree_created::spawn_consumer(
@@ -393,6 +384,9 @@ async fn ensure_repo_host_connected(
                     session_exited_events,
                     cx,
                 ));
+            repo_host
+                ._events
+                .push(crate::hooks::spawn_consumer(hook_events, cx));
         }
         this.hosts.by_repo.insert(common_dir.clone(), repo_host);
     });
@@ -483,29 +477,73 @@ impl AdeApp {
         None
     }
 
-    /// [`Hosts::any_in_process_client_and_socket`] - `crate::hooks::flow`'s own bring-up.
-    pub(crate) fn any_in_process_host_client_and_socket(
-        &self,
-    ) -> Option<(jerry_host::LocalClient, PathBuf)> {
-        self.hosts.any_in_process_client_and_socket()
+    /// [`Hosts::socket_for`] - `crate::hooks::flow`'s own per-repository `JERRY_HOST_SOCKET`
+    /// resolution.
+    pub(crate) fn host_socket_for(&self, cwd: &Path) -> Option<PathBuf> {
+        self.hosts.socket_for(cwd)
     }
 
-    /// Test-only: installs `repo_host` (already connected, typically [`RepoHost::for_test_remote`])
-    /// as the connection for the repository `cwd` belongs to, in place of whatever `Self::
-    /// open_repo_host` would otherwise resolve - see that constructor's own docs for why a test
-    /// reaches for this. Resolving `cwd`'s own common directory is a real (if quick) git call,
-    /// acceptable here since this only ever runs in a test's own synchronous setup, never on a
-    /// path this crate's own conventions ask to keep off the UI thread.
+    /// Test-only: installs `repo_host` (already connected, typically [`RepoHost::for_test_remote`]
+    /// or [`RepoHost::for_test_in_process`]) as the connection for the repository `cwd` belongs
+    /// to, in place of whatever `Self::open_repo_host` would otherwise resolve - see that
+    /// constructor's own docs for why a test reaches for this. Also wires the same
+    /// `worktree_created`/`session_exited`/`event/hook` subscriptions `ensure_repo_host_connected`
+    /// would, so a test driving a hook or a worktree-created notification through `repo_host`'s
+    /// own connection sees it reach `self` exactly as production would. Resolving `cwd`'s own
+    /// common directory is a real (if quick) git call, acceptable here since this only ever runs
+    /// in a test's own synchronous setup, never on a path this crate's own conventions ask to keep
+    /// off the UI thread.
     #[cfg(test)]
     pub(crate) fn adopt_repo_host_for_test(
         &mut self,
         cwd: PathBuf,
-        repo_host: RepoHost,
-        _cx: &mut Context<Self>,
+        mut repo_host: RepoHost,
+        cx: &mut Context<Self>,
     ) {
+        wire_test_repo_host_events(&mut repo_host, cx);
         let common_dir = jerry_git::git_common_dir(&cwd).unwrap_or_else(|_| cwd.clone());
         self.hosts.common_dir_of.insert(cwd, common_dir.clone());
         self.hosts.by_repo.insert(common_dir, repo_host);
+    }
+}
+
+/// [`AdeApp::adopt_repo_host_for_test`]'s own event wiring - a synchronous twin of
+/// `ensure_repo_host_connected`'s, since a test-adopted connection is always already fully
+/// connected (no async spawn-or-connect to await first).
+#[cfg(test)]
+fn wire_test_repo_host_events(repo_host: &mut RepoHost, cx: &mut Context<AdeApp>) {
+    let events = match &repo_host.connection {
+        Some(Connection::Remote(_)) => repo_host.socket.clone().and_then(|socket| {
+            match (
+                crate::repo_host::subscribe_remote(&socket),
+                crate::repo_host::subscribe_remote(&socket),
+                crate::repo_host::subscribe_remote(&socket),
+            ) {
+                (Ok(a), Ok(b), Ok(c)) => Some((a, b, c)),
+                _ => None,
+            }
+        }),
+        Some(Connection::InProcess { client, .. }) => {
+            Some((client.subscribe(), client.subscribe(), client.subscribe()))
+        }
+        None => None,
+    };
+    if let Some((worktree_created_events, session_exited_events, hook_events)) = events {
+        repo_host
+            ._events
+            .push(crate::work_surface::worktree_created::spawn_consumer(
+                worktree_created_events,
+                cx,
+            ));
+        repo_host
+            ._events
+            .push(crate::work_surface::session_exited::spawn_consumer(
+                session_exited_events,
+                cx,
+            ));
+        repo_host
+            ._events
+            .push(crate::hooks::spawn_consumer(hook_events, cx));
     }
 }
 

@@ -122,10 +122,10 @@ fn run_jerry_hook(
 /// (decisions.md §15: "`jerry-core` owns no threads. The listener, dispatch task and session
 /// table are `jerry-host`'s"), so this half of the contract - the wire transport - is proven
 /// here, against the host's real, thread-driven dispatch, exactly like `jerry-host`'s and
-/// `jerry-cli`'s own test suites already do. The other half - the app's own `HookRuntime`
-/// consumer task correctly recording what a notification carries - is proven separately below,
-/// through the app's in-process `LocalClient`, which never crosses a real thread boundary and so
-/// stays inside a `#[gpui::test]` safely.
+/// `jerry-cli`'s own test suites already do. The other half - the app's own event subscription
+/// correctly recording what a notification carries into `HookRuntime` - is proven separately
+/// below, through the app's in-process `LocalClient`, which never crosses a real thread boundary
+/// and so stays inside a `#[gpui::test]` safely.
 #[test]
 fn jerry_hook_reaches_a_real_host_over_a_real_socket_and_the_notification_can_be_recorded() {
     let repo = test_support::seed_empty_repo();
@@ -187,12 +187,14 @@ fn jerry_hook_reaches_a_real_host_over_a_real_socket_and_the_notification_can_be
     host.shutdown_and_join();
 }
 
-/// The app's own `HookRuntime` consumer task, driven through the same in-process `LocalClient`
-/// `AdeApp::dispatch` itself uses - so this stays fully inside GPUI's deterministic executor
-/// (see the plain test above for why a real socket cannot join this one). A real, socket-backed
-/// `HostRuntime` is still swapped in for `open_test_app`'s own unpublished default so
-/// `HookInjection::env_only`'s `JERRY_HOST_SOCKET` string names a real path, matching production;
-/// nothing here ever connects to that socket.
+/// The app's own per-repository `event/hook` subscription and `HookRuntime`, driven through the
+/// same in-process `LocalClient` `AdeApp::dispatch` itself uses - so this stays fully inside
+/// GPUI's deterministic executor (see the plain test above for why a real socket cannot join this
+/// one). A real, socket-listening `jerry_host::Host` is still swapped in for `open_test_app`'s own
+/// throwaway default (`RepoHost::for_test_in_process`/`adopt_repo_host_for_test`, which wires the
+/// identical subscription `ensure_repo_host_connected` would), so `HookInjection::env_only`'s
+/// `JERRY_HOST_SOCKET` string names a real path, matching production; nothing here ever connects
+/// to that socket over the wire.
 #[gpui::test]
 async fn a_hook_dispatched_through_the_apps_own_host_reaches_its_hook_runtimes_consumer_task(
     cx: &mut TestAppContext,
@@ -214,30 +216,33 @@ async fn a_hook_dispatched_through_the_apps_own_host_reaches_its_hook_runtimes_c
         repo.path().to_path_buf(),
         "Claude".into(),
     );
-    // `HookRuntime`'s own `client` is `host`'s in-process `LocalClient` - the identical seam
-    // `AdeApp::dispatch` would reach through `Hosts` for a real repository, not exercised through
-    // `app` at all here since this test drives the hook call and the runtime bring-up directly.
+    // `host`'s in-process `LocalClient` - the identical seam `AdeApp::dispatch` would reach
+    // through `Hosts` for a real repository, kept here so this test can submit the hook call
+    // below directly rather than through a real spawned agent.
     let client = host.client();
+    // Swapped in for `open_test_app`'s own throwaway default - `adopt_repo_host_for_test` wires
+    // the identical `worktree_created`/`session_exited`/`event/hook` subscriptions
+    // `ensure_repo_host_connected` would, which is what lets the request below reach the app's own
+    // `HookRuntime` at all.
+    let repo_host = crate::host::RepoHost::for_test_in_process(host, socket);
+    app.update(cx, |app, cx| {
+        app.adopt_repo_host_for_test(repo.path().to_path_buf(), repo_host, cx);
+    });
 
     // The app's own `HookRuntime`, brought up exactly as `hook_injection_for` would - but
     // without going through its `find_jerry_binary` gate, which reads this machine's real `PATH`
     // and this test binary's real location rather than anything this test controls. The path
     // only ever ends up embedded in generated text; it is never actually executed here.
     let hook_settings_dir = tempfile::tempdir().expect("hook settings dir");
-    app.update(cx, |app, cx| {
-        app.hook_runtime = crate::hooks::HookRuntime::start(
-            hook_settings_dir.path(),
-            Path::new("jerry"),
-            socket,
-            client.clone(),
-            cx,
-        );
+    app.update(cx, |app, _cx| {
+        app.hook_runtime =
+            crate::hooks::HookRuntime::start(hook_settings_dir.path(), Path::new("jerry"));
         assert!(
             app.hook_runtime.is_some(),
             "the runtime must start against a real, reachable host"
         );
     });
-    // The consumer task's first poll is what actually calls `LocalClient::subscribe` and
+    // The event subscription's first poll is what actually calls `LocalClient::subscribe` and
     // registers it with the host's fanout; without this, the request below could broadcast its
     // notification before anything is listening for it, and the message is gone rather than
     // queued for a subscriber that arrives later.
@@ -605,10 +610,10 @@ fn jerry_s_settings_file_does_not_disable_the_user_s_own_hooks() {
 /// [`crate::hooks::HookRuntime`] brought up by the real lazy `hook_injection_for` gate - then
 /// asserts the fact comes back out of the app's own runtime under that agent's own real id.
 ///
-/// Needs a real, socket-listening host swapped in for the test app's own default
-/// (`HostRuntime::in_process`, which a spawned `jerry hook` subprocess has nothing to connect
-/// to) and a real, locatable `jerry` binary - both graceful skips, matching `real_claude()`'s own
-/// shape, rather than a hard requirement of this test file.
+/// Needs a real, socket-listening host swapped in for the test app's own default (the throwaway
+/// in-process one `open_test_app` wires up, which a spawned `jerry hook` subprocess has nothing to
+/// connect to) and a real, locatable `jerry` binary - both graceful skips, matching
+/// `real_claude()`'s own shape, rather than a hard requirement of this test file.
 #[ignore = "external: claude, jerry; see docs/testing.md"]
 #[gpui::test]
 async fn a_claude_agent_spawned_through_the_real_app_path_really_reports_its_hooks(
@@ -635,8 +640,9 @@ async fn a_claude_agent_spawned_through_the_real_app_path_really_reports_its_hoo
     let host = jerry_host::Host::start_at(registry.path.clone()).expect("host must start");
     host.listen(&instance.socket).expect("listen");
     // In-process, not `for_test_remote`: this test exercises `hook_injection_for`'s own real lazy
-    // bring-up, which finds a repository's connection through `any_in_process_host_client_and_
-    // socket` - real only for an in-process one (`crate::host`'s own docs).
+    // bring-up, which resolves this repository's own socket through `AdeApp::host_socket_for` -
+    // real for either connection kind, but only an in-process one also gives `app.new_agent`
+    // below a real in-process attach (`crate::host`'s own docs).
     let repo_host = crate::host::RepoHost::for_test_in_process(host, instance.socket);
     app.update(cx, |app, cx| {
         app.adopt_repo_host_for_test(repo.path().to_path_buf(), repo_host, cx);

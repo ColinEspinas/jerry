@@ -46,18 +46,21 @@ async fn a_real_hook_edit_event_becomes_a_real_per_agent_attribution_on_a_real_c
 
     // A real, socket-listening host swapped in for the test app's own default (the throwaway
     // in-process one `open_test_app` already wires up, which a real `jerry hook` invocation has
-    // nothing to connect to), and the app's own `HookRuntime` brought up against it directly -
-    // bypassing `hook_injection_for`'s `find_jerry_binary` gate, which reads this machine's real
-    // `PATH` rather than anything this test controls. Once `hook_runtime` already exists,
-    // `hook_injection_for` (which the real spawn below still goes through) reuses it as-is.
+    // nothing to connect to) - `adopt_repo_host_for_test` wires the same `event/hook` subscription
+    // `ensure_repo_host_connected` would, so a hook submitted through this repository's own
+    // in-process fanout reaches the app's `HookRuntime` exactly as production would. The app's own
+    // `HookRuntime` is brought up against it directly, bypassing `hook_injection_for`'s
+    // `find_jerry_binary` gate, which reads this machine's real `PATH` rather than anything this
+    // test controls. Once `hook_runtime` already exists, `hook_injection_for` (which the real
+    // spawn below still goes through) reuses it as-is.
     //
-    // The dispatch loop runs on GPUI's own background executor (`cx.background_spawn`), not a
-    // raw `std::thread` - GPUI's deterministic test scheduler panics ("your test is not
-    // deterministic") the moment a genuinely independent OS thread wakes a `cx.background_spawn`
-    // task, which a raw-thread dispatch loop's own fan-out eventually does once `HookRuntime`'s
-    // consumer task subscribes to it. The hook calls below go through the same in-process
-    // `LocalClient` for the identical reason - see `hooks::integration_tests`'s own module docs
-    // for the full explanation and where the real-socket transport is proven instead.
+    // Every task on this chain runs on GPUI's own executor (`cx.spawn`), not a raw `std::thread` -
+    // GPUI's deterministic test scheduler panics ("your test is not deterministic") the moment a
+    // genuinely independent OS thread wakes one of its tasks, which a raw-thread dispatch loop's
+    // own fan-out eventually does once the event subscription taps it. The hook calls below go
+    // through the same in-process `LocalClient` for the identical reason - see
+    // `hooks::integration_tests`'s own module docs for the full explanation and where the
+    // real-socket transport is proven instead.
     let registry = registry_dir("provenance-e2e");
     let instance = jerry_core::registry::Registry::open(registry.path.clone())
         .expect("registry")
@@ -76,14 +79,9 @@ async fn a_real_hook_edit_event_becomes_a_real_per_agent_attribution_on_a_real_c
         app.adopt_repo_host_for_test(repo.path().to_path_buf(), repo_host, cx);
     });
     let hook_settings_dir = tempfile::tempdir().expect("hook settings dir");
-    app.update(cx, |app, cx| {
-        app.hook_runtime = crate::hooks::HookRuntime::start(
-            hook_settings_dir.path(),
-            Path::new("jerry"),
-            socket.clone(),
-            client.clone(),
-            cx,
-        );
+    app.update(cx, |app, _cx| {
+        app.hook_runtime =
+            crate::hooks::HookRuntime::start(hook_settings_dir.path(), Path::new("jerry"));
         assert!(
             app.hook_runtime.is_some(),
             "the runtime must start against a real host"

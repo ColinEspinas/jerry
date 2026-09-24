@@ -51,7 +51,7 @@ impl AdeApp {
         // GitHub issue #239 phase 2's injection, exactly as a fresh spawn would get it - a
         // resumed conversation is exactly as real an agent as a new one, and should keep
         // reporting its status through the same hook side-channel.
-        let hook_injection = self.hook_injection_for(process_kind, cx);
+        let hook_injection = self.hook_injection_for(process_kind, &past.worktree);
         let font_size = self.settings.appearance.terminal_font_size;
         let shell_override = self.settings.terminal.shell_override();
         let id = match (past.kind, past.session_id.clone()) {
@@ -94,11 +94,16 @@ impl AdeApp {
         true
     }
 
-    /// The hook injection for an agent about to be spawned, bringing the runtime up on first use.
+    /// The hook injection for an agent about to be spawned into `cwd`, bringing the runtime up on
+    /// first use. `cwd`'s own repository must already have a resolved socket
+    /// ([`AdeApp::host_socket_for`]) for this to return `Some` - a real, transient window every
+    /// launch passes through before `Self::open_repo_host`'s async connect (`crate::host`) has
+    /// resolved, which simply means this particular spawn falls back to the terminal-title and
+    /// quiescence signals rather than burning the one bring-up attempt on a race.
     pub(crate) fn hook_injection_for(
         &mut self,
         kind: crate::work_surface::agents::ProcessKind,
-        cx: &mut Context<Self>,
+        cwd: &std::path::Path,
     ) -> Option<crate::hooks::HookInjection> {
         use crate::work_surface::agents::{AgentKind, ProcessKind};
         let wants_injection = match kind {
@@ -113,43 +118,32 @@ impl AdeApp {
         if !wants_injection {
             return None;
         }
-        // Bring-up is attempted exactly once per `AdeApp`. Keyed on a `tried` flag rather than on
+        // Bring-up is attempted exactly once per `AdeApp`, keyed on a `tried` flag rather than on
         // `hook_runtime.is_none()`, because those differ precisely in the failure case: without
-        // it, an instance that cannot start a runtime re-ran the whole attempt on the UI thread
-        // on *every* subsequent Claude spawn, and re-logged the same warning each time, for a
-        // condition that will not have changed since the last try.
-        //
-        // The one exception: the session host still starting is *not* counted as an attempt.
-        // Every launch passes through a real, transient window where `Self::open_repo_host`'s
-        // async connect (`crate::host`) has not resolved yet, and unlike an unwritable temp
-        // directory or a missing `jerry` binary, that resolves itself within moments - burning
-        // the one shot
-        // on it would permanently disable hook injection for the whole session over a race.
+        // it, an instance that cannot start a runtime re-ran the whole attempt on every subsequent
+        // Claude spawn, and re-logged the same warning each time, for a condition (hooks
+        // unsupported, or the settings file unwritable) that will not have changed since the last
+        // try. Unlike before this cutover, bringing the runtime up needs no host connection at all
+        // - only the socket looked up below does, and that is resolved fresh per call rather than
+        // baked into this one-shot flag, so a repository whose connection is still resolving is
+        // simply retried on the next spawn rather than counted as a failed attempt.
         if self.hook_runtime.is_none() && !self.hook_runtime_tried {
-            let ready = self.any_in_process_host_client_and_socket();
-            if let Some((client, host_socket)) = ready {
-                self.hook_runtime_tried = true;
-                match crate::host::find_jerry_binary() {
-                    Some(jerry_binary) => {
-                        self.hook_runtime = crate::hooks::HookRuntime::start(
-                            &std::env::temp_dir(),
-                            &jerry_binary,
-                            host_socket,
-                            client,
-                            cx,
-                        );
-                    }
-                    None => log::warn!(
-                        "could not locate the `jerry` binary next to this executable, under its \
-                         bin/, or on PATH - agent hook injection is disabled; agent status will \
-                         use the terminal-title and quiescence signals only"
-                    ),
+            self.hook_runtime_tried = true;
+            match crate::host::find_jerry_binary() {
+                Some(jerry_binary) => {
+                    self.hook_runtime =
+                        crate::hooks::HookRuntime::start(&std::env::temp_dir(), &jerry_binary);
                 }
+                None => log::warn!(
+                    "could not locate the `jerry` binary next to this executable, under its \
+                     bin/, or on PATH - agent hook injection is disabled; agent status will \
+                     use the terminal-title and quiescence signals only"
+                ),
             }
         }
-        self.hook_runtime
-            .as_ref()
-            .map(crate::hooks::HookRuntime::injection)
+        let runtime = self.hook_runtime.as_ref()?;
+        let host_socket = self.host_socket_for(cwd)?;
+        Some(runtime.injection(host_socket))
     }
 
     /// Reconciles `~/.cursor/hooks.json` against the current `agents.cursor_hooks_enabled`

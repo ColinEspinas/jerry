@@ -164,7 +164,7 @@ impl AdeApp {
                     kind,
                     session_id: Some(session_id),
                 } if kind.resume_args(&session_id).is_some() => {
-                    let hook_injection = self.hook_injection_for(ProcessKind::Agent(kind), cx);
+                    let hook_injection = self.hook_injection_for(ProcessKind::Agent(kind), &cwd);
                     let id = self.agents.spawn_resume(
                         kind,
                         cwd.clone(),

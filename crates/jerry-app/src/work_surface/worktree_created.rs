@@ -2,7 +2,7 @@
 //! (`docs/architecture/decisions.md` §21): opens the new worktree using the same code path a
 //! rail click takes, and - when the event carried one - spawns the named agent there via the
 //! existing `Agents::spawn`/`spawn_with_prompt`. Owns no state of its own; the consuming `Task`
-//! is `crate::host::HostRuntime`'s, cancelled when that runtime drops.
+//! is `crate::host::RepoHost`'s, cancelled when that repository's connection drops.
 
 use crate::root::AdeApp;
 use crate::work_surface::agents::{AgentKind, ProcessKind};
@@ -14,9 +14,9 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 /// Drains `events` for as long as the returned `Task` is held - a channel-woken loop, never a
-/// timer (§16). The subscription itself already happened, synchronously, when `events` was
-/// created (`crate::host::HostRuntime::subscribe_events`), so this task can start arbitrarily
-/// later than that with nothing lost in between. `this.update_in` reaches this launch's one real
+/// timer (§16). The subscription itself already happened, synchronously or over a real socket,
+/// when `events` was created (`crate::host::ensure_repo_host_connected`), so this task can start
+/// arbitrarily later than that with nothing lost in between. `this.update_in` reaches this launch's one real
 /// window through GPUI's own entity-to-window lookup, exactly as
 /// `AdeApp::spawn_with_minted_chat_id` already does from an identical async-continuation shape.
 pub(crate) fn spawn_consumer(
@@ -136,7 +136,7 @@ impl AdeApp {
     ) {
         let font_size = self.settings.appearance.terminal_font_size;
         let shell_override = self.settings.terminal.shell_override().map(str::to_owned);
-        let hook_injection = self.hook_injection_for(ProcessKind::Agent(agent_kind), cx);
+        let hook_injection = self.hook_injection_for(ProcessKind::Agent(agent_kind), &cwd);
         let id = match prompt {
             Some(prompt) => self.agents.spawn_with_prompt(
                 agent_kind,

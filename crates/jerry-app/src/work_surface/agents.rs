@@ -1432,7 +1432,7 @@ impl AdeApp {
                 .spawn(async move { mint_chat_id(binary, &mint_cwd) })
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
-                let hook_injection = this.hook_injection_for(ProcessKind::Agent(agent_kind), cx);
+                let hook_injection = this.hook_injection_for(ProcessKind::Agent(agent_kind), &cwd);
                 let id = match chat_id {
                     Some(chat_id) => this.agents.spawn_resume(
                         agent_kind,
