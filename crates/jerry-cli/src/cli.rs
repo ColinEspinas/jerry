@@ -37,6 +37,8 @@ pub enum Command {
     Agents,
     /// List every PTY session Jerry is currently tracking, agents and plain terminal tabs alike.
     Sessions,
+    /// Report the current hook-derived status of one agent, or every agent Jerry is tracking.
+    Hooks(HooksArgs),
     /// Start or stop the Jerry host for this repository directly - for headless use, without
     /// `jerry-app` running (`docs/architecture/decisions.md` §24). Agents never reach this:
     /// `Shutdown`'s own `Invocability::Denied` refuses it, and nothing spawns a host on an
@@ -80,6 +82,13 @@ pub struct GitEditorArgs {
 pub struct HookArgs {
     /// The agent CLI's own event name, e.g. `PreToolUse`.
     pub event: String,
+}
+
+#[derive(Debug, Args)]
+pub struct HooksArgs {
+    /// Only this agent's status, instead of every agent Jerry is tracking.
+    #[arg(long, value_name = "ID")]
+    pub agent: Option<String>,
 }
 
 #[derive(Debug, Args)]

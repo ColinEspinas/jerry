@@ -15,8 +15,8 @@ pub(crate) mod mcp;
 pub mod transport;
 
 use crate::cli::{
-    Cli, Command, GitEditorArgs, GitSequenceEditorArgs, HookArgs, HostAction, MergeArgs, WtAction,
-    WtNewArgs,
+    Cli, Command, GitEditorArgs, GitSequenceEditorArgs, HookArgs, HooksArgs, HostAction, MergeArgs,
+    WtAction, WtNewArgs,
 };
 use crate::transport::{ChooseError, Transport};
 use clap::Parser;
@@ -26,9 +26,9 @@ use jerry_core::registry::{runtime_dir_for, Os, Registry};
 use jerry_core::wire::rpc_code;
 use jerry_core::{
     execute_locally, AgentId, AgentSpec, AppCommand, AppQuery, Call, Caller, ConflictKind, Ctx,
-    HookEvent, LocalDispatchError, MergeAbort, MergeAttempt, MergeAttemptOutcome, MergeComplete,
-    MergeStatusOutcome, MergeStatusQuery, Report, Request, RpcError, Shutdown, StageResolved,
-    WorktreeCreate,
+    HookEvent, HooksQuery, LocalDispatchError, MergeAbort, MergeAttempt, MergeAttemptOutcome,
+    MergeComplete, MergeStatusOutcome, MergeStatusQuery, Report, Request, RpcError, Shutdown,
+    StageResolved, WorktreeCreate,
 };
 use std::ffi::OsString;
 use std::io::{Read, Write};
@@ -158,6 +158,7 @@ pub fn run(
         },
         Command::Agents => agents(&mut session, cli.json, out, err),
         Command::Sessions => sessions(&mut session, cli.json, out, err),
+        Command::Hooks(args) => hooks(&mut session, args, cli.json, out, err),
         Command::Host(args) => match args.action {
             HostAction::Start => host_start(env, &session, out, err),
             HostAction::Stop => host_stop(&mut session, out, err),
@@ -778,6 +779,45 @@ fn sessions(session: &mut Session, json: bool, out: &mut dyn Write, err: &mut dy
                 let agent = entry["agent"]["kind"].as_str().unwrap_or("-");
                 let worktree = entry["worktree"].as_str().unwrap_or("?");
                 let _ = writeln!(out, "{id}\t{kind}\t{agent}\t{worktree}");
+            }
+        }
+        other => explain(other, err),
+    }
+    exit::for_report(&report)
+}
+
+/// Reports the current hook-derived status of one agent (`--agent <id>`), or every agent Jerry is
+/// tracking, one per line as `<agent_id>\t<kind>\t<message>` (`<message>` is `-` when there is
+/// none), or a JSON array with `--json`. `Locality::Session`, so this always needs a running
+/// Jerry, exactly like [`agents`]/[`sessions`].
+fn hooks(
+    session: &mut Session,
+    args: &HooksArgs,
+    json: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> u8 {
+    let query = HooksQuery {
+        agent: args.agent.clone().map(AgentId::from),
+    };
+    let report = match session.call(Request::Query(AppQuery::Hooks(query)), err) {
+        Ok(report) => report,
+        Err(code) => return code,
+    };
+    if json {
+        return emit_json(&report, out);
+    }
+    match &report {
+        Report::Ok { outcome } => {
+            let Some(entries) = outcome.as_array() else {
+                let _ = writeln!(err, "jerry: unreadable hook status list: {outcome}");
+                return exit::FAILED;
+            };
+            for entry in entries {
+                let agent_id = entry["agent_id"].as_str().unwrap_or("?");
+                let kind = entry["kind"].as_str().unwrap_or("?");
+                let message = entry["message"].as_str().unwrap_or("-");
+                let _ = writeln!(out, "{agent_id}\t{kind}\t{message}");
             }
         }
         other => explain(other, err),
@@ -1589,6 +1629,73 @@ mod run_tests {
     }
 
     #[test]
+    fn hooks_lists_a_real_recorded_agents_status_plain_json_and_filtered() {
+        let repo = seed_empty_repo();
+        let runtime = tempfile::TempDir::new().expect("runtime");
+        let env = env(&[(runtime_env_key(), runtime.path())]);
+        let registry_dir =
+            jerry_core::registry::runtime_dir_for(Os::host(), &env).expect("runtime dir");
+        let registry = Registry::open(registry_dir).expect("registry");
+        let instance = registry.allocate().expect("instance");
+        let host = jerry_host::Host::start().expect("host");
+        host.listen(&instance.socket).expect("listen");
+        let common = jerry_core::Ctx::from_cwd(repo.path(), jerry_core::Caller::Human)
+            .expect("a repo")
+            .repo_path;
+        registry.publish(&instance, &[common]).expect("publish");
+        host.agents().register(
+            jerry_core::AgentId::from("a-1"),
+            repo.path().to_path_buf(),
+            "Claude".into(),
+        );
+
+        // A real hook dispatch, through the same `Request::Hook` path a spawned agent's own
+        // `jerry hook <event>` invocation takes - not a shortcut into `HookStore` directly.
+        let hook = jerry_core::Request::Hook(jerry_core::HookEvent {
+            event: "PermissionRequest".into(),
+            payload: serde_json::json!({ "tool_name": "Bash" }),
+        });
+        let report = futures::executor::block_on(host.client().request(jerry_core::Call::agent(
+            repo.path(),
+            jerry_core::AgentId::from("a-1"),
+            hook,
+        )))
+        .expect("hook dispatched");
+        assert!(report.is_ok(), "{report:?}");
+
+        let (code, out, err) = invoke(&["hooks"], &env, repo.path());
+        assert_eq!(code, 0, "stderr: {err}");
+        assert!(out.contains("a-1\twaiting\tBash needs permission"), "{out}");
+
+        let (code, out, err) = invoke(&["hooks", "--json"], &env, repo.path());
+        assert_eq!(code, 0, "stderr: {err}");
+        let response: serde_json::Value = serde_json::from_str(out.trim()).expect("json");
+        assert_eq!(response["outcome"][0]["agent_id"], serde_json::json!("a-1"));
+        assert_eq!(response["outcome"][0]["kind"], serde_json::json!("waiting"));
+
+        let (code, out, err) = invoke(&["hooks", "--agent", "a-1"], &env, repo.path());
+        assert_eq!(code, 0, "stderr: {err}");
+        assert!(out.contains("a-1\twaiting\t"), "{out}");
+
+        let (code, out, err) = invoke(&["hooks", "--agent", "no-such-agent"], &env, repo.path());
+        assert_eq!(code, 0, "stderr: {err}");
+        assert!(out.is_empty(), "{out}");
+
+        host.shutdown_and_join();
+        registry.remove(&instance).expect("remove");
+    }
+
+    #[test]
+    fn hooks_needs_a_running_jerry_standalone() {
+        let repo = seed_empty_repo();
+        let runtime = tempfile::TempDir::new().expect("runtime");
+        let env = env(&[(runtime_env_key(), runtime.path())]);
+        let (code, out, err) = invoke(&["hooks"], &env, repo.path());
+        assert_eq!(code, 4, "{err}");
+        assert!(out.is_empty());
+    }
+
+    #[test]
     fn skill_prints_a_real_non_empty_document_mentioning_wt_new() {
         let repo = seed_empty_repo();
         let env = env(&[]);
@@ -1610,9 +1717,9 @@ mod run_tests {
         assert!(out.contains("status"), "{out}");
         assert!(out.contains("merge"), "{out}");
         assert!(
-            !out.contains("hook"),
+            !out.split_whitespace().any(|word| word == "hook"),
             "hook is Jerry's own generated entry, not part of the CLI's stable, documented \
-             surface: {out}"
+             surface (the real query, `hooks`, is a distinct, visible word): {out}"
         );
     }
 
@@ -1669,8 +1776,9 @@ mod run_tests {
         let (code, out, _) = invoke(&["--help"], &env, repo.path());
         assert_eq!(code, 0);
         assert!(
-            !out.contains("hook"),
-            "hook is not part of the CLI's stable, documented surface: {out}"
+            !out.split_whitespace().any(|word| word == "hook"),
+            "hook is not part of the CLI's stable, documented surface (the real query, `hooks`, \
+             is a distinct, visible word): {out}"
         );
         let (code, _, _) = invoke_with_stdin(&["hook", "Stop"], &env, repo.path(), b"{}");
         assert_eq!(code, 0, "hidden from help must not mean unparseable");
@@ -1714,7 +1822,7 @@ mod run_tests {
         match received.expect("received") {
             jerry_core::Message::Notification { method, params } => {
                 assert_eq!(method, "event/hook");
-                assert_eq!(params["agent"], serde_json::json!("9"));
+                assert_eq!(params["agent_id"], serde_json::json!("9"));
                 assert_eq!(params["event"], serde_json::json!("PreToolUse"));
                 assert_eq!(params["payload"]["tool_name"], serde_json::json!("Bash"));
             }
