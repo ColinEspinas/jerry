@@ -862,6 +862,34 @@ impl TerminalPane {
         }
     }
 
+    /// Marks this pane exited from a real `event/session-exited` control-plane notification
+    /// (`crate::work_surface::session_exited`) rather than the data plane's own `PtyOutput::
+    /// Exited` item - the only way a socket-attached (production) session's real exit is ever
+    /// observed, since `SocketSessionAdapter` synthesizes no exit signal of its own
+    /// (`docs/architecture/decisions.md` §25). Mirrors that data-plane handling exactly, so a
+    /// pane behaves identically regardless of which one told it; a no-op if this pane already
+    /// recorded its own exit (the data plane's own `PtyOutput::Exited`, for an in-process
+    /// session, arrives too - never double-report the same exit).
+    pub(crate) fn mark_exited_from_event(
+        &mut self,
+        status: &jerry_core::ExitStatusWire,
+        cx: &mut Context<Self>,
+    ) {
+        if self.exit_status.is_some() {
+            return;
+        }
+        let status = match &status.signal {
+            Some(signal) => ExitStatus::with_signal(signal),
+            None => ExitStatus::with_exit_code(status.code),
+        };
+        let clean = status.success();
+        self.exit_status = Some(status);
+        self.session = None;
+        self.grid.mark_ended();
+        cx.emit(TerminalPaneEvent::ProcessExited { clean });
+        cx.notify();
+    }
+
     /// Attaches this pane to a live (or scripted) session and starts the "wait for the next
     /// item, update the grid, or record exit" loop against its output stream - what
     /// `Self::new` used to do itself, against a `jerry_pty::PtySession` it spawned directly,
@@ -3590,10 +3618,10 @@ mod process_exit_event_tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use gpui::TestAppContext;
+    use gpui::{AppContext as _, TestAppContext};
 
     use super::pty_pane_fixtures::{pump_until, release, spawn_pane};
-    use super::TerminalPaneEvent;
+    use super::{TerminalPaneEvent, TerminalSpec, ROW_FONT_SIZE_PX};
 
     /// A real child process that does nothing but exit with `code`, spelled for this platform's
     /// own always-present interpreter - `cmd.exe` ships with every Windows install, `/bin/sh`
@@ -3656,6 +3684,35 @@ mod process_exit_event_tests {
         );
 
         release(cx, pane);
+    }
+
+    /// The deterministic counterpart of the two real-process tests above, for the race
+    /// `crate::work_surface::agents::Agents::set_host_session_id`'s own docs describe: a
+    /// socket-attached (production) session's real `event/session-exited` notification can
+    /// arrive - and, on Linux, be applied - before `Agents::spawn_resolved` ever calls
+    /// `Self::attach_session` at all, since that adapter synthesizes no exit signal of its own on
+    /// the data plane. A pane that never attached anything must still report the exit correctly
+    /// once `Self::mark_exited_from_event` delivers it.
+    #[gpui::test]
+    fn an_exit_event_arriving_before_any_attach_still_marks_the_pane_exited(
+        cx: &mut TestAppContext,
+    ) {
+        let spec = TerminalSpec::command("sh", Vec::new(), std::env::temp_dir());
+        let pane = cx.new(|cx| super::TerminalPane::new(spec, ROW_FONT_SIZE_PX, cx));
+        let (seen, _subscription) = watch(cx, &pane);
+
+        let status = jerry_core::ExitStatusWire {
+            success: false,
+            code: 3,
+            signal: None,
+        };
+        pane.update(cx, |pane, cx| pane.mark_exited_from_event(&status, cx));
+
+        assert_eq!(
+            seen.borrow().as_slice(),
+            [TerminalPaneEvent::ProcessExited { clean: false }],
+            "an exit event delivered before any real attach must still mark the pane exited"
+        );
     }
 }
 
