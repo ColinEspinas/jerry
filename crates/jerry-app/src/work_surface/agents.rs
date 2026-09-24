@@ -144,7 +144,13 @@ impl ProcessKind {
         extras: Option<SpawnExtras>,
     ) -> TerminalSpec {
         match self {
-            ProcessKind::Shell => TerminalSpec::shell(cwd, shell_override),
+            ProcessKind::Shell => {
+                // A shell gets `jerry` on PATH so the user can run it, but never the hook
+                // extras: no agent id, so every `jerry` call from it acts as the human.
+                let mut spec = TerminalSpec::shell(cwd, shell_override);
+                spec.env = with_jerry_on_path(spec.env, jerry_core::jerry_binary::locate);
+                spec
+            }
             ProcessKind::Agent(agent) => {
                 let (args, env) = extras.unwrap_or_default();
                 let env = with_jerry_on_path(env, jerry_core::jerry_binary::locate);
@@ -1478,8 +1484,9 @@ mod tests {
         let shell = ProcessKind::Shell.spec(PathBuf::from("/tmp"), None, extras);
         assert!(shell.args.is_empty(), "a shell must get no injected args");
         assert!(
-            shell.env.is_empty(),
-            "a shell must never see the hook environment"
+            shell.env.iter().all(|(key, _)| key == "PATH"),
+            "a shell may only get `jerry` on PATH, never the hook environment: {:?}",
+            shell.env
         );
     }
 

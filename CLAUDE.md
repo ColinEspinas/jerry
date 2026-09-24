@@ -29,7 +29,7 @@ in CI's nightly job (see "Testing" below). `cargo nextest`, not `cargo test`: `.
 gives each test its own process and a real timeout, so a hung test fails that test instead of
 sitting on the whole run forever.
 
-Run the app with `cargo run --release -p jerry-app [repo-path]`. Use `--release` unless you're actively
+Build the three binaries the app needs with `cargo build --release -p jerry-app -p jerry-host -p jerry-cli`, then run `target/release/jerry-app [repo-path]`: the app spawns `jerry-host` and puts `jerry` on every terminal's PATH, and `cargo run -p jerry-app` alone builds neither. Use `--release` unless you're actively
 recompiling every few seconds: a debug-profile GPUI build is commonly 5–20× slower for the per-frame
 work this app does (layout/paint, `tree-sitter` parsing, terminal-grid decode), and no performance
 observation made against a debug build is trustworthy.

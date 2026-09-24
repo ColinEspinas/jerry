@@ -230,8 +230,11 @@ registers a launcher entry; no warning appears on Linux at all, so there's nothi
 ```sh
 git clone https://github.com/ColinEspinas/jerry
 cd jerry
-cargo run --release -p jerry-app [path-to-a-repo]
+cargo build --release -p jerry-app -p jerry-host -p jerry-cli
+./target/release/jerry-app [path-to-a-repo]
 ```
+
+The app runs sessions in a separate `jerry-host` process and puts the `jerry` CLI on every terminal's PATH, so all three binaries have to be built; `cargo run -p jerry-app` alone builds only the app.
 
 Uses the toolchain pinned in [`rust-toolchain.toml`](rust-toolchain.toml). Keep `--release` unless
 you're actively recompiling — [`CLAUDE.md`](CLAUDE.md#commands) explains why a debug build isn't

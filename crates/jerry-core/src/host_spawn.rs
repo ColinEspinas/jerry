@@ -20,7 +20,7 @@ pub enum SpawnOrConnectError {
     /// never happen; surfaced rather than guessed at.
     #[error("{} live Jerry hosts already claim this repository", .0.len())]
     Ambiguous(Vec<Descriptor>),
-    #[error("no jerry-host binary was found next to this process")]
+    #[error("no jerry-host binary was found next to this process (run `cargo build --release -p jerry-host -p jerry-cli`)")]
     BinaryNotFound,
     /// The OS refused the detached spawn for a reason other than a forbidding job - never a
     /// silent in-process fallback (decision Q20).
