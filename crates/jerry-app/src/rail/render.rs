@@ -728,78 +728,67 @@ impl AdeApp {
     /// repository with no working connection at all otherwise fails silently: every dispatch into
     /// it already answers a real, typed error (`AdeApp::dispatch`), but nothing told the user why.
     /// "Restart sessions" drops the stale connection and re-attempts spawn-or-connect
-    /// (`AdeApp::restart_repo_host`); `Connected` (the ordinary case) shows nothing.
+    /// (`AdeApp::restart_repo_host`); `Connected` (the ordinary case) shows nothing. Built on
+    /// [`jerry_ui::Banner`] with a [`jerry_ui::Button`] action (decisions.md §27's second
+    /// migrated call site - this is "the repo-host error banner" issue #503's brief names).
+    /// Same known text-size gap as [`Self::render_worktrees_error_banner`]'s own docs.
     pub(in crate::rail) fn render_repo_host_error_banner(
         &self,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
         let repo_path = self.focused_repo_path();
         let message = self.repo_host_state_for(&repo_path)?.error_message()?;
+        let ui_theme = theme::jerry_ui_theme();
+        let fail: gpui::Hsla = theme::status::FAIL.resolve().into();
+
+        let restart_button =
+            jerry_ui::Button::new("rail-repo-host-restart", "Restart sessions", ui_theme)
+                .debug_selector(|| "rail-repo-host-restart".to_string())
+                .text_color(fail)
+                .border_color(fail)
+                .hover_bg(theme::status::FAIL_BG.resolve().opacity(0.7).into())
+                .font_family(theme::font::MONO)
+                .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                    let repo_path = this.focused_repo_path();
+                    this.restart_repo_host(repo_path, cx);
+                    cx.notify();
+                }));
+
         Some(
-            div()
-                .id("rail-repo-host-error")
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap(px(8.0))
-                .px(px(10.0))
-                .py(px(6.0))
-                .bg(theme::status::FAIL_BG)
-                .border_b_1()
-                .border_color(theme::border::RAIL_INNER)
-                .child(
-                    div()
-                        .flex_1()
-                        .font(font(theme::font::MONO))
-                        .text_size(self.ui_text_size(10.0))
-                        .text_color(theme::status::FAIL)
-                        .child(message),
-                )
-                .child(
-                    div()
-                        .id("rail-repo-host-restart")
-                        .debug_selector(|| "rail-repo-host-restart".to_string())
-                        .flex_none()
-                        .cursor_pointer()
-                        .px(px(8.0))
-                        .py(px(2.0))
-                        .rounded(px(4.0))
-                        .border_1()
-                        .border_color(theme::status::FAIL)
-                        .hover(|el| el.bg(theme::status::FAIL_BG.resolve().opacity(0.7)))
-                        .font(font(theme::font::MONO))
-                        .text_size(self.ui_text_size(10.0))
-                        .text_color(theme::status::FAIL)
-                        .child("Restart sessions")
-                        .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
-                            let repo_path = this.focused_repo_path();
-                            this.restart_repo_host(repo_path, cx);
-                            cx.notify();
-                        })),
-                ),
+            jerry_ui::Banner::new(
+                "rail-repo-host-error",
+                jerry_ui::BannerVariant::Fail,
+                message,
+                ui_theme,
+            )
+            .shape(jerry_ui::BannerShape::Strip)
+            .border_color(theme::border::RAIL_INNER.resolve().into())
+            .font_family(theme::font::MONO)
+            .action(restart_button),
         )
     }
 
     /// A visible error banner for [`Self::worktrees_error`] (`jerry_git::list_worktrees_porcelain`
     /// failing outright, e.g. a corrupt repository) - shown as a standing banner rather than
     /// replacing the whole agent list, so already-open agents stay usable even when the
-    /// worktree listing itself is broken.
+    /// worktree listing itself is broken. Built on [`jerry_ui::Banner`] (`jerry_ui::BannerShape::
+    /// Strip`, decisions.md §27's first migrated call site) rather than a hand-rolled `div()`.
+    /// Known gap: `jerry_ui::Banner`'s text size is a fixed `px(10.0)`, not routed through
+    /// [`Self::ui_text_size`] - `jerry-ui` has no `Settings.appearance.interface_scale_percent`
+    /// concept of its own, so this one banner stops respecting that setting until a scale token
+    /// is added to `jerry_ui::Theme` (tracked in the follow-up issue this migration files).
     pub(in crate::rail) fn render_worktrees_error_banner(&self) -> Option<impl IntoElement> {
         let error = self.worktrees_error.as_ref()?;
         Some(
-            div()
-                .id("rail-worktrees-error")
-                .flex_none()
-                .px(px(10.0))
-                .py(px(6.0))
-                .bg(theme::status::FAIL_BG)
-                .border_b_1()
-                .border_color(theme::border::RAIL_INNER)
-                .font(font(theme::font::MONO))
-                .text_size(self.ui_text_size(10.0))
-                .text_color(theme::status::FAIL)
-                .child(format!("failed to list worktrees: {error}")),
+            jerry_ui::Banner::new(
+                "rail-worktrees-error",
+                jerry_ui::BannerVariant::Fail,
+                format!("failed to list worktrees: {error}"),
+                theme::jerry_ui_theme(),
+            )
+            .shape(jerry_ui::BannerShape::Strip)
+            .border_color(theme::border::RAIL_INNER.resolve().into())
+            .font_family(theme::font::MONO),
         )
     }
 
@@ -1511,8 +1500,10 @@ impl AdeApp {
         }
 
         let path = row.path.clone();
-        let header = div()
-            .id(id.clone())
+        // The selected/hover shell (`jerry_ui::ListRow`, decisions.md §27) - everything else
+        // about this row (caret, context menu, locked tooltip) still lives here, wired up via
+        // `ListRow`'s own `on_click`/`on_right_click`/`child`.
+        let header = jerry_ui::ListRow::new(id.clone())
             // Test-only bounds lookup, the same real `gpui::VisualTestContext::debug_bounds`
             // hook this file's `repo-group-header-N` already carries - so a
             // test can simulate a real mouse click at this row's painted position rather than
@@ -1522,22 +1513,16 @@ impl AdeApp {
             // whole point is that the row is genuinely rendered and genuinely clickable for a
             // repo that isn't focused.
             .debug_selector(move || id)
-            .cursor_pointer()
-            .w_full()
-            .flex()
             .items_center()
-            .h(px(27.0))
+            .height(px(27.0))
             .pl(px(6.0))
             .pr(px(10.0))
             .gap(px(6.0))
-            // The 2px gutter is always reserved (§4m: "The 2px gutter stays for alignment"); it
-            // is only *painted* when this row is the selected one. A `None` border colour paints
-            // nothing at all, which is the off state of a one-meaning channel.
-            .border_l(px(2.0))
-            .when_some(edge_color, |el, token| el.border_color(token))
-            .when(is_selected, |el| el.bg(theme::rail::WORKTREE_ACTIVE_BG))
-            .when(!is_selected, |el| {
-                el.hover(|el| el.bg(theme::rail::WORKTREE_HOVER_BG))
+            .selected(is_selected)
+            .selected_bg(theme::rail::WORKTREE_ACTIVE_BG.resolve().into())
+            .hover_bg(theme::rail::WORKTREE_HOVER_BG.resolve().into())
+            .when_some(edge_color, |el, token| {
+                el.edge_color(token.resolve().into())
             })
             .on_click(cx.listener({
                 let path = path.clone();
@@ -1548,22 +1533,19 @@ impl AdeApp {
             // The worktree row's context menu (GitHub issue #290) - anchored to the pointer, not
             // to the row (rows are 27px and the pointer is what the user aimed with), and
             // painted at the root, outside this scroller.
-            .on_mouse_down(
-                gpui::MouseButton::Right,
-                cx.listener({
-                    let path = path.clone();
-                    move |this, event: &gpui::MouseDownEvent, window, cx| {
-                        cx.stop_propagation();
-                        this.open_rail_row_menu(
-                            crate::rail::menu::RailMenuTarget::Worktree(path.clone()),
-                            f32::from(event.position.x),
-                            f32::from(event.position.y),
-                            window,
-                            cx,
-                        );
-                    }
-                }),
-            )
+            .on_right_click(cx.listener({
+                let path = path.clone();
+                move |this, event: &gpui::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.open_rail_row_menu(
+                        crate::rail::menu::RailMenuTarget::Worktree(path.clone()),
+                        f32::from(event.position.x),
+                        f32::from(event.position.y),
+                        window,
+                        cx,
+                    );
+                }
+            }))
             .child(caret)
             .child(branch_div)
             .when(!has_agents, |el| {
@@ -1724,36 +1706,26 @@ impl AdeApp {
             )
             .child(div().flex_none().w(px(1.0)).bg(theme::border::ZONE))
             .child(
-                div()
+                // The selected/hover shell (`jerry_ui::ListRow`, decisions.md §27). The
+                // designed agent row carries a *fixed* 2px edge slot, painted only for the
+                // focused agent - the 2px gutter is always reserved and simply left unpainted
+                // when this agent isn't the focused one, the same "a channel with one meaning
+                // has exactly two states, on and off" the worktree row's own edge follows
+                // (`worktree_row_edge`).
+                jerry_ui::ListRow::new(("agent-row-content", id))
                     .debug_selector(move || format!("agent-row-content-{id}"))
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
+                    .direction(jerry_ui::ListRowDirection::Col)
+                    .width(jerry_ui::ListRowWidth::Flex1)
                     .pl(px(7.0))
                     .pr(px(10.0))
                     // The tighter agent block: `5 10 6 7` -> `4 10 5 7`.
                     .pt(px(4.0))
                     .pb(px(5.0))
                     .gap(px(2.0))
-                    // The designed agent row carries a *fixed* 2px edge slot, painted only for
-                    // the focused agent. Two things were wrong with the width/colour pair
-                    // this replaces (`2px status` selected, `1px #1e2225` otherwise), both of
-                    // them created by moving the indent onto the wrapper above: the 1px fallback
-                    // is the *same* `#1e2225` as the connector `div` immediately to its left, so
-                    // an unselected row drew the connector twice as thick as the design's own
-                    // 1px; and the width flipping 1px -> 2px on selection shifted this row's
-                    // whole content box sideways by a pixel the moment you clicked it. The 2px
-                    // gutter is now always reserved and simply left unpainted when this agent
-                    // isn't the focused one - the same "a channel with one meaning has exactly
-                    // two states, on and off" the worktree row's own edge follows
-                    // (`worktree_row_edge`).
-                    .border_l(px(2.0))
-                    .when(is_selected, |el| el.border_color(status.color()))
-                    .when(is_selected, |el| el.bg(theme::surface::ROW_SELECTED))
-                    .when(!is_selected, |el| {
-                        el.hover(|el| el.bg(theme::rail::WORKTREE_HOVER_BG))
-                    })
+                    .selected(is_selected)
+                    .edge_color(status.color().into())
+                    .selected_bg(theme::surface::ROW_SELECTED.resolve().into())
+                    .hover_bg(theme::rail::WORKTREE_HOVER_BG.resolve().into())
                     .child(
                         // Line 1: chip · task title · elapsed.
                         div()

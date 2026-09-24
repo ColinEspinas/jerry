@@ -2238,23 +2238,9 @@ impl AdeApp {
         cx: &mut Context<Self>,
         on_click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
     ) -> impl IntoElement {
-        div()
-            .id(id)
+        jerry_ui::Button::new(id, label, theme::jerry_ui_theme())
             .debug_selector(move || id.to_string())
-            .cursor_pointer()
-            .h(px(20.0))
-            .px(px(8.0))
-            .rounded(theme::radius::BUTTON)
-            .border_1()
-            .border_color(theme::border::BUTTON)
-            .flex()
-            .items_center()
-            .font(font(theme::font::SANS))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_size(px(10.5))
-            .text_color(theme::text::MUTED)
-            .hover(|el| el.bg(theme::surface::ROW_HOVER_ALT))
-            .child(label)
+            .font_family(theme::font::SANS)
             .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
                 on_click(this, cx);
             }))
