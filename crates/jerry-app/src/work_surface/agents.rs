@@ -1225,6 +1225,30 @@ async fn attach_pane_to_session(
             }
         }
     };
+    // The real control-plane round trip just above (`command/session-attach`, resolving a real
+    // socket) is not instantaneous - a fast-exiting session's own real exit can land in
+    // `Agents::pending_exits` while it was in flight, exactly the race `Self::
+    // set_host_session_id`'s own docs describe, just discovered a moment later than the identical
+    // check above. Calling it again is what catches that: idempotent on `host_session_id` itself
+    // (already set), and a second, real answer from `pending_exits` if a new one arrived. A
+    // socket-attached session's own data-plane adapter synthesizes no exit signal of its own
+    // (decisions.md §25), so this is the last place such a session's exit would ever be observed
+    // if this check were skipped too - the real bug `e35f731` fixed for the check above, applying
+    // identically here.
+    let pending_exit_after_round_trip = this
+        .update(cx, |this, _cx| {
+            this.agents
+                .set_host_session_id(agent_id, session_id.clone())
+        })
+        .ok()
+        .flatten();
+    if let Some((pane, status)) = pending_exit_after_round_trip {
+        pane.update(cx, |pane, cx| pane.mark_exited_from_event(&status, cx));
+        // Never attached, so nothing owns this connection's own cleanup but this task - the
+        // session is already dead either way, so a failed shutdown here is not worth surfacing.
+        let _ = adapter.shutdown();
+        return;
+    }
     let attach_outcome = spawn_pane.update(cx, |pane, cx| {
         pane.attach_session(adapter.clone(), control_plane, cx)
     });

@@ -15,8 +15,8 @@ use crate::terminal::socket_adapter::SocketSessionAdapter;
 use gpui::{AppContext, AsyncApp, Context, Task};
 use jerry_core::wire::rpc_code;
 use jerry_core::{
-    AppCommand, AppQuery, Call, Report, Request, RpcError, SessionAttach, SessionId, SessionKill,
-    SessionRecord, SessionSnapshot, SessionsQuery, Shutdown,
+    AppCommand, Call, Report, Request, RpcError, SessionAttach, SessionId, SessionKill,
+    SessionSnapshot, Shutdown,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -561,31 +561,23 @@ impl AdeApp {
         }
     }
 
-    /// Sends a real `Shutdown` to every repository *this window* has a live, connected host for -
-    /// `crate::root::menu_commands::quit_and_stop_all_agents`'s own per-window half (it calls this
-    /// once for every open window before quitting the whole app). Blocking:
-    /// `RemoteRepoHost::dispatch` is a plain `std::sync::mpsc` round trip to a dedicated worker
-    /// thread, safe from any context including this one (decisions.md §16's amendment) - called
-    /// directly rather than through `cx.background_spawn`, since a pre-quit action handler has no
-    /// async context to await one from anyway. A repository whose connection never got past
-    /// `RepoHostState::Connected` (or is `#[cfg(test)]`-only in-process) has no real host process
-    /// to stop and is silently skipped - not an error, since there is nothing to do.
-    pub(crate) fn shutdown_all_repo_hosts_blocking(&self) {
-        for (common_dir, repo_host) in &self.hosts.by_repo {
-            let Some(Connection::Remote(remote)) = &repo_host.connection else {
-                continue;
-            };
-            if let Err(err) = remote.dispatch(Call::human(
-                common_dir.clone(),
-                Request::Command(AppCommand::Shutdown(Shutdown::default())),
-            )) {
-                log::warn!(
-                    "failed to stop {}'s session host on quit: {}",
-                    common_dir.display(),
-                    err.message
-                );
-            }
-        }
+    /// Every repository *this window* has a live, connected host for, as owned, cloneable
+    /// handles - `crate::root::menu_commands::quit_and_stop_all_agents`'s own per-window half (it
+    /// calls this once for every open window, then stops every host it found across all of them
+    /// concurrently - see [`shutdown_repo_hosts_with_deadline`]). A repository whose connection
+    /// never got past `RepoHostState::Connected` (or is `#[cfg(test)]`-only in-process) has no
+    /// real host process to stop and is silently skipped - not an error, since there is nothing
+    /// to do. Cheap and synchronous: cloning a `RemoteRepoHost` is just an `Arc` clone, never a
+    /// real dispatch of its own.
+    pub(crate) fn remote_hosts(&self) -> Vec<(PathBuf, RemoteRepoHost)> {
+        self.hosts
+            .by_repo
+            .iter()
+            .filter_map(|(common_dir, repo_host)| match &repo_host.connection {
+                Some(Connection::Remote(remote)) => Some((common_dir.clone(), remote.clone())),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Test-only: installs `repo_host` (already connected, typically [`RepoHost::for_test_remote`]
@@ -619,11 +611,12 @@ impl AdeApp {
 /// Resolves `session_id`'s own real, attachable adapter for `Agents::spawn_resolved` to hand to a
 /// pane, for a repository with no in-process table to reach into at all (`AdeApp::sessions_for`
 /// answering `None` - a production `Connection::Remote`, or a test that swapped one in via
-/// `RepoHost::for_test_remote`): dispatches a real `command/session-attach` for the socket, a
-/// `SessionsQuery` for the session's own pid (`SocketSessionAdapter::connect`'s own docs - a
-/// value only a Query can resolve, never fetched by the adapter itself), then connects
-/// off the UI thread. `Err` is a real, honest attach failure the caller reports as a failed spawn,
-/// never a silent no-op.
+/// `RepoHost::for_test_remote`): dispatches a real `command/session-attach` for the socket, the
+/// real snapshot, and the session's own pid (`SessionAttachOutcome::process_id`, mirrored from
+/// `SessionRecord` server-side - never a second `SessionsQuery` round trip of its own, which used
+/// to widen the real gap between this attach's own snapshot and the data-plane connect that
+/// follows it), then connects off the UI thread. `Err` is a real, honest attach failure the
+/// caller reports as a failed spawn, never a silent no-op.
 pub(crate) async fn attach_remote_session(
     this: &gpui::WeakEntity<AdeApp>,
     cwd: PathBuf,
@@ -643,7 +636,7 @@ pub(crate) async fn attach_remote_session(
             )
         })
         .map_err(|_| APP_DROPPED.to_string())?;
-    let (socket, snapshot) = match attach_call.await {
+    let (socket, process_id, snapshot) = match attach_call.await {
         Ok(Report::Ok { outcome }) => {
             let socket = outcome
                 .get("socket")
@@ -652,6 +645,12 @@ pub(crate) async fn attach_remote_session(
                 .ok_or_else(|| {
                     "internal error: session-attach answered with no socket".to_string()
                 })?;
+            // Never fatal on its own - a session whose pid could not be resolved still attaches,
+            // just without one, exactly as `SocketSessionAdapter::process_id`'s own docs describe.
+            let process_id = outcome
+                .get("process_id")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|id| u32::try_from(id).ok());
             let snapshot = outcome
                 .get("snapshot")
                 .cloned()
@@ -659,31 +658,10 @@ pub(crate) async fn attach_remote_session(
                 .ok_or_else(|| {
                     "internal error: session-attach answered with no snapshot".to_string()
                 })?;
-            (socket, snapshot)
+            (socket, process_id, snapshot)
         }
         Ok(other) => return Err(format!("could not attach to this session: {other:?}")),
         Err(error) => return Err(error.message),
-    };
-
-    // Never fatal on its own - a session whose pid could not be resolved still attaches, just
-    // without `SessionsQuery::process_id` ever answering for it (the pane header falls back to
-    // showing none, exactly as `SocketSessionAdapter::process_id`'s own docs describe).
-    let sessions_call = this.update(cx, |this, cx| {
-        this.dispatch(
-            cwd.clone(),
-            Request::Query(AppQuery::Sessions(SessionsQuery::default())),
-            cx,
-        )
-    });
-    let process_id = match sessions_call {
-        Ok(task) => match task.await {
-            Ok(Report::Ok { outcome }) => serde_json::from_value::<Vec<SessionRecord>>(outcome)
-                .ok()
-                .and_then(|records| records.into_iter().find(|record| record.id == session_id))
-                .and_then(|record| record.process_id),
-            _ => None,
-        },
-        Err(_) => None,
     };
 
     let remote = this
@@ -713,6 +691,170 @@ pub(crate) async fn attach_remote_session(
             .map_err(|error| error.to_string())
     })
     .await
+}
+
+/// `crate::root::menu_commands::quit_and_stop_all_agents`'s own real work: sends a real
+/// `Shutdown` to every one of `remotes` **concurrently** - one dedicated OS thread per host,
+/// `RemoteRepoHost::dispatch`'s own plain blocking round trip, safe from any thread (decisions.md
+/// §16's amendment) - and returns once every one of them has answered or acknowledged, *or*
+/// `deadline` has elapsed, whichever comes first. Never blocks the caller's own thread: this is
+/// itself `async`, polling a real, shared "are they all done yet" flag against a real
+/// `cx.background_executor().timer` rather than joining anything on the calling thread - the
+/// whole reason `quit_and_stop_all_agents` can call this from inside a `cx.spawn` task and still
+/// return control to the action handler immediately. A host that is still hung past the deadline
+/// is simply abandoned, not killed: the app is about to exit via `cx.quit()` regardless, and a
+/// detached worker thread blocked on a `dispatch` call that will now never be joined dies with
+/// the process the same instant every other thread does - there is nothing further to clean up.
+pub(crate) async fn shutdown_repo_hosts_with_deadline(
+    remotes: Vec<(PathBuf, RemoteRepoHost)>,
+    deadline: std::time::Duration,
+    cx: &AsyncApp,
+) {
+    if remotes.is_empty() {
+        return;
+    }
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done_for_thread = Arc::clone(&done);
+    let spawned = std::thread::Builder::new()
+        .name("jerry-app-quit-stop-all-agents".into())
+        .spawn(move || {
+            let workers: Vec<_> = remotes
+                .into_iter()
+                .filter_map(|(common_dir, remote)| {
+                    std::thread::Builder::new()
+                        .name("jerry-app-quit-stop-one-host".into())
+                        .spawn(move || {
+                            if let Err(err) = remote.dispatch(Call::human(
+                                common_dir.clone(),
+                                Request::Command(AppCommand::Shutdown(Shutdown::default())),
+                            )) {
+                                log::warn!(
+                                    "failed to stop {}'s session host on quit: {}",
+                                    common_dir.display(),
+                                    err.message
+                                );
+                            }
+                        })
+                        .ok()
+                })
+                .collect();
+            for worker in workers {
+                let _ = worker.join();
+            }
+            done_for_thread.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+    if spawned.is_err() {
+        return; // could not even start the coordinator thread - nothing left to wait on
+    }
+    let started = std::time::Instant::now();
+    while !done.load(std::sync::atomic::Ordering::SeqCst) && started.elapsed() < deadline {
+        cx.background_executor()
+            .timer(std::time::Duration::from_millis(50))
+            .await;
+    }
+}
+
+#[cfg(test)]
+mod shutdown_repo_hosts_with_deadline_tests {
+    use super::{shutdown_repo_hosts_with_deadline, RemoteRepoHost};
+    use gpui::TestAppContext;
+    use jerry_core::client::{Client, Listener};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc as std_mpsc, Arc};
+    use std::thread;
+    use std::time::Duration;
+    use test_support::wait_until;
+
+    /// A socket path short enough for every platform, removed on drop - mirrors
+    /// `crate::repo_host::remote_repo_host_tests`'s own helper.
+    struct SocketPath {
+        path: PathBuf,
+        _temp: Option<tempfile::TempDir>,
+    }
+
+    impl Drop for SocketPath {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    fn socket_path(tag: &str) -> SocketPath {
+        if cfg!(windows) {
+            let dir = jerry_core::registry::runtime_dir().expect("runtime dir");
+            std::fs::create_dir_all(&dir).expect("runtime dir exists");
+            SocketPath {
+                path: dir.join(format!("qa-{}-{tag}.sock", std::process::id())),
+                _temp: None,
+            }
+        } else {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            SocketPath {
+                path: temp.path().join(format!("{tag}.sock")),
+                _temp: Some(temp),
+            }
+        }
+    }
+
+    /// The audit finding this exists to guard: a host that never answers `Shutdown` must not
+    /// keep the whole "quit and stop all agents" flow from completing. Accepts one real
+    /// connection and then never reads or writes another byte, so `RemoteRepoHost::dispatch`'s
+    /// own worker thread blocks on it for real - exactly as a genuinely hung `jerry-host`
+    /// process would - while this function's own deadline still elapses on schedule. The
+    /// listener thread and the blocked worker thread are both deliberately left running past the
+    /// end of the test: there is nothing to join them against (they only unblock when the real
+    /// process exits), the same shape `shutdown_repo_hosts_with_deadline`'s own docs describe for
+    /// production.
+    #[gpui::test]
+    async fn a_host_that_never_replies_does_not_block_past_the_deadline(cx: &mut TestAppContext) {
+        let socket = socket_path("never-replies");
+        let listener = Listener::bind(&socket.path).expect("bind");
+        let (_never_send, block_forever) = std_mpsc::channel::<()>();
+        thread::Builder::new()
+            .name("jerry-app-test-never-replying-host".into())
+            .spawn(move || {
+                if let Ok((stream, _addr)) = listener.accept() {
+                    let _stream = stream; // held open so the client's own write never sees a reset
+                    let _ = block_forever.recv();
+                }
+            })
+            .expect("listener thread");
+
+        let client = Client::connect(&socket.path, Duration::from_secs(30)).expect("connect");
+        let remote = RemoteRepoHost::new(client).expect("worker thread");
+
+        let done = Arc::new(AtomicBool::new(false));
+        let done_writer = Arc::clone(&done);
+        const TEST_DEADLINE: Duration = Duration::from_millis(200);
+        // `AsyncApp` is not `Send`, so this runs on the foreground executor
+        // (`TestAppContext::spawn`) rather than `cx.executor().spawn` - exactly the shape
+        // `quit_and_stop_all_agents` itself uses via `App::spawn`.
+        cx.spawn(async move |cx: gpui::AsyncApp| {
+            shutdown_repo_hosts_with_deadline(
+                vec![(PathBuf::from("/never-replies"), remote)],
+                TEST_DEADLINE,
+                &cx,
+            )
+            .await;
+            done_writer.store(true, Ordering::SeqCst);
+        })
+        .detach();
+
+        let finished = wait_until(Duration::from_secs(5), || {
+            // `timer()` only resolves against an explicit clock advance under the test
+            // scheduler (see `work_surface::agents::collect_doomed_sessions`'s own docs for the
+            // same rule) - each poll both advances it and gives the background task a chance to
+            // run.
+            cx.executor().advance_clock(Duration::from_millis(50));
+            cx.run_until_parked();
+            done.load(Ordering::SeqCst)
+        });
+        assert!(
+            finished,
+            "shutdown_repo_hosts_with_deadline (deadline {TEST_DEADLINE:?}) must return even \
+             though the injected host never replies to Shutdown, got finished={finished}"
+        );
+    }
 }
 
 /// [`AdeApp::adopt_repo_host_for_test`]'s own event wiring - a synchronous twin of

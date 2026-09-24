@@ -1087,42 +1087,34 @@ mod session_restore_tests {
             // The real socket attach (`crate::host::attach_remote_session`) runs its own real
             // background threads - a single `run_until_parked` can return before they finish,
             // exactly like `remote_attach_tests`' own real-socket coverage - so this polls for
-            // real readiness rather than assuming one park is enough.
+            // real attach readiness rather than assuming one park is enough. Deliberately never
+            // waits for the *bare, unconfigured shell's own default prompt* to look non-empty
+            // first: whether a plain `sh`/`cmd` prints anything at all before a real command runs
+            // is shell-config-dependent (an empty `$PS1` on a minimal CI image prints nothing),
+            // and not something this test's own correctness should hinge on - `send_prompt`
+            // itself already refuses honestly (`false`) until `TerminalPane::session` is real, so
+            // retrying it directly is the precise, portable "is this genuinely attached yet" gate.
+            let mut sent = false;
             assert!(
                 wait_until(Duration::from_secs(15), || {
                     cx.run_until_parked();
-                    app.read_with(cx, |app, cx| {
-                        app.agents
-                            .iter()
-                            .find(|agent| agent.id == id)
-                            .is_some_and(|agent| {
-                                let pane = agent.pane.read(cx);
-                                pane.spawn_error().is_none()
-                                    && pane
-                                        .visible_text_lines()
-                                        .iter()
-                                        .any(|line| !line.trim().is_empty())
-                            })
-                    })
+                    if sent {
+                        return true;
+                    }
+                    sent = app.update(cx, |app, cx| {
+                        let Some(agent) = app.agents.iter().find(|agent| agent.id == id) else {
+                            return false;
+                        };
+                        let pane = agent.pane.clone();
+                        pane.update(cx, |pane, cx| {
+                            pane.send_prompt(&format!("echo {MARKER}"), cx)
+                        })
+                    });
+                    sent
                 }),
-                "the real shell must attach over the remote socket and produce its real prompt \
-                 before this test can send it anything"
+                "the real shell must attach over the remote socket and accept a real prompt \
+                 within the real timeout"
             );
-            app.update(cx, |app, cx| {
-                let pane = app
-                    .agents
-                    .iter()
-                    .find(|agent| agent.id == id)
-                    .expect("the agent just found above")
-                    .pane
-                    .clone();
-                pane.update(cx, |pane, cx| {
-                    assert!(
-                        pane.send_prompt(&format!("echo {MARKER}"), cx),
-                        "the real shell must be attached and ready to accept a real prompt"
-                    );
-                });
-            });
             assert!(
                 wait_until(Duration::from_secs(15), || {
                     cx.run_until_parked();
