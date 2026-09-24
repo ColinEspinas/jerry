@@ -2,19 +2,11 @@
 //! data-plane socket (`command/session-attach`, `docs/architecture/decisions.md` §24) - the
 //! second implementer of that trait besides `jerry_host::SessionHandle`'s in-process one. Never
 //! calls `jerry_host::`/`jerry_pty::` beyond the trait itself: everything here is a plain socket
-//! read/write plus one injected callback for the one thing that still needs the control plane
-//! (`command/session-kill`, on [`SocketSessionAdapter::shutdown`]). No exit signal is
-//! synthesized: the socket just ends once the host closes it.
-//!
-//! Wired into production by `crate::host::attach_remote_session`, `Agents::spawn_inner`'s own
-//! path for a repository with no in-process table to reach into at all (a production
-//! `Connection::Remote`). An earlier attempt at this wiring reproducibly hung
-//! `TestAppContext::run_until_parked` - root-caused since (decisions.md §16's amendment) to a
-//! `kill` closure that dispatched through `jerry_host::LocalClient` with `futures::executor::
-//! block_on`, deadlocking GPUI's single-threaded test scheduler. `attach_remote_session`'s own
-//! `kill` closure dispatches through `crate::repo_host::RemoteRepoHost` instead - a plain blocking
-//! call to a dedicated worker thread, safe from any context - which is what makes this wiring
-//! safe now.
+//! read/write plus one injected callback for `command/session-kill`
+//! ([`SocketSessionAdapter::shutdown`]) - see decisions.md §16's amendment for why that closure
+//! must dispatch through `crate::repo_host::RemoteRepoHost`, never `jerry_host::LocalClient`. No
+//! exit signal is synthesized: the socket just ends once the host closes it. Wired into
+//! production by `crate::host::attach_remote_session`.
 
 use futures::channel::mpsc;
 use futures::SinkExt;

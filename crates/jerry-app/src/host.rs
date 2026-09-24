@@ -1,21 +1,12 @@
 //! `Hosts`: this app's real connections to the session host serving each open repository
 //! (`docs/architecture/decisions.md` §24) - one real `jerry-host` process per repository in
-//! production, spawn-or-connected to via `jerry_core::host_spawn`; one fresh in-process
-//! `jerry_host::Host` per repository in tests (`#[cfg(test)]`-only), reached the identical way a
-//! real out-of-process one would be. `AdeApp::dispatch` resolves a request's `cwd` to its
-//! repository's common `.git` directory (cached) and routes through that repository's own
-//! connection - never a single connection shared across every open repository. `Self::add_repo`
-//! opens a connection eagerly; `Self::dispatch` opens one lazily for any `cwd` that reaches it
-//! first (a worktree created directly on disk, or dispatched into before an eager open for it
-//! resolved) - see `ensure_repo_host_connected`'s own docs for the rare, harmless race when both
-//! happen concurrently for a repository neither has seen yet.
-//!
-//! Each repository connection carries its own `worktree_created`/`session_exited`/`event/hook`
-//! subscription - three dedicated sockets in production (`crate::repo_host::subscribe_remote`),
-//! the in-process fanout tapped three times in tests - feeding the same app-wide handlers
-//! regardless of which repository an event came from. A spawned agent's own `JERRY_HOST_SOCKET`
-//! (`crate::hooks::flow::AdeApp::hook_injection_for`) is that same repository's socket
-//! ([`AdeApp::host_socket_for`]), never a single app-wide one.
+//! production, one fresh in-process `jerry_host::Host` per repository in tests
+//! (`#[cfg(test)]`-only). `AdeApp::dispatch` resolves a request's `cwd` to its repository's
+//! common `.git` directory (cached) and routes through that repository's own connection - never
+//! a single connection shared across every open repository. Each connection also carries its own
+//! `worktree_created`/`session_exited`/`event/hook` subscriptions, feeding the same app-wide
+//! handlers regardless of which repository an event came from - see `ensure_repo_host_connected`
+//! for both.
 
 use crate::repo_host::RemoteRepoHost;
 use crate::root::AdeApp;

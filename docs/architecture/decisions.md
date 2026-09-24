@@ -1622,3 +1622,12 @@ CI, and the resize fix the third amendment above deferred):**
 
 This closes every item this issue's plan named as its own scope, including both items the third
 amendment above had deferred.
+
+**Latent, noted rather than fixed here:** a `Connected` `RepoHost`'s three event-subscription
+threads (`worktree_created`/`session_exited`/`event/hook`) are never torn down, because nothing
+in production ever removes an entry from `Hosts::by_repo` once opened - there is no
+`remove_repo`/"close this repository" caller yet. Harmless today (a repository stays open for the
+app's whole lifetime), but whichever issue first needs to actually drop a `RepoHost` (issue #507's
+own detached-sessions work, or a later one) must make `RepoHost`'s `Drop` shut down its
+subscription sockets so those threads actually exit, not just leave the entry unreachable while
+its threads keep running.

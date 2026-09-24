@@ -1,20 +1,10 @@
 //! [`RemoteRepoHost`]: the safe bridge between a real, out-of-process `jerry-host` connection
-//! (`jerry_core::client::Client`, blocking, one call in flight - decisions.md §24) and GPUI's
-//! cooperative scheduler. A dedicated OS thread owns the one `Client`; every dispatch is a plain
-//! blocking round trip over `std::sync::mpsc`, safe to call from anywhere - a `cx.background_spawn`
-//! task, a bare OS thread, or synchronously - because that worker thread always progresses on its
-//! own, never as a task GPUI's own scheduler must poll forward (decisions.md §16's amendment: a
-//! `futures::executor::block_on` over an *executor-driven* future deadlocks GPUI's single-threaded
-//! test scheduler; blocking on a plain `std::sync::mpsc` reply from an independent thread does not).
-//! Owns nothing about *which* repository or session this connection is for - `crate::host` is
-//! where that bookkeeping lives. Also has [`subscribe_remote`]: a *second*, dedicated connection
-//! per repository carrying only `event/*` push notifications, the real out-of-process twin of
-//! `jerry_host::LocalClient::subscribe` - real socket I/O bridged to a channel from a bare OS
-//! thread, the same shape as everywhere else in this codebase that crosses that boundary.
-//!
-//! `HookRuntime`'s own simplification, the error-banner UI, and `SocketSessionAdapter`'s
-//! production wiring are `crate::host`'s own remaining follow-ups - `docs/architecture/
-//! decisions.md` §24 has the exact scope.
+//! (`jerry_core::client::Client`, blocking, one call in flight) and GPUI's cooperative scheduler -
+//! see decisions.md §16's amendment for why every dispatch is a plain blocking round trip over
+//! `std::sync::mpsc` rather than an `.await`. Owns nothing about *which* repository or session
+//! this connection is for - `crate::host` is where that bookkeeping lives. Also has
+//! [`subscribe_remote`]: a *second*, dedicated connection per repository carrying only `event/*`
+//! push notifications, the real out-of-process twin of `jerry_host::LocalClient::subscribe`.
 
 use futures::channel::mpsc;
 use futures::SinkExt;
@@ -309,13 +299,8 @@ mod remote_repo_host_tests {
     /// The regression this module exists to make impossible: a synchronous, blocking dispatch
     /// (`SocketSessionAdapter::shutdown`'s own real shape, `crate::terminal::socket_adapter`) run
     /// from *inside* a `cx.background_executor().spawn` task, under GPUI's single-threaded test
-    /// scheduler. The wrongly-shaped predecessor of this module blocked on a `jerry_host::
-    /// LocalClient` request instead of a real `Client`/worker thread - a future that could only
-    /// resolve once *another* task on that same single thread was polled forward, which the
-    /// blocked poll call could never do, so `run_until_parked` hung forever
-    /// (`docs/architecture/decisions.md` §16's amendment has the full mechanism). This dispatches
-    /// through a real worker thread instead, so the block is on a plain `std::sync::mpsc` reply
-    /// from an independent thread - safe regardless of which thread calls it.
+    /// scheduler - see `docs/architecture/decisions.md` §16's amendment for the deadlock this
+    /// dispatch shape avoids, and why.
     #[gpui::test]
     fn dispatch_is_safe_from_inside_a_background_executor_task_under_the_test_scheduler(
         cx: &mut gpui::TestAppContext,
