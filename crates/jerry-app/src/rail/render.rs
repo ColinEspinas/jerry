@@ -27,6 +27,21 @@ fn agent_state_word(status: Status) -> &'static str {
     }
 }
 
+/// The rail's own display label for one [`Self::render_detached_sessions_banner`] row - the
+/// session's own kind (a real agent's label, or "Shell" for a plain terminal), never a bare id a
+/// human has no way to recognize.
+fn detached_session_label(record: &jerry_core::SessionRecord) -> String {
+    match &record.agent {
+        Some(info) => match crate::work_surface::agents::AgentKind::from_label(&info.kind) {
+            Some(kind) => kind.label().to_string(),
+            // A future release's agent kind this build doesn't know the label of - shown
+            // honestly as what the host itself called it, rather than silently as "Shell".
+            None => info.kind.clone(),
+        },
+        None => "Shell".to_string(),
+    }
+}
+
 /// How many agents in this window are waiting on a human - the Worktrees cell's state marker
 /// (GitHub issue #291).
 fn agents_needing_you(rows: &[AgentRow]) -> usize {
@@ -706,6 +721,9 @@ impl AdeApp {
             .when_some(self.render_repo_host_error_banner(cx), |el, banner| {
                 el.child(banner)
             })
+            .when_some(self.render_detached_sessions_banner(cx), |el, banner| {
+                el.child(banner)
+            })
             .when_some(self.render_worktrees_error_banner(), |el, banner| {
                 el.child(banner)
             })
@@ -778,6 +796,95 @@ impl AdeApp {
                             cx.notify();
                         })),
                 ),
+        )
+    }
+
+    /// "Detached sessions" (decision Q21's third reconnect-on-launch outcome, `docs/architecture/
+    /// decisions.md` §26): every live host session, under one of the focused repository's own
+    /// worktrees, that reconnect found no persisted tab for - [`crate::work_surface::session::
+    /// AdeApp::apply_restored_session`]'s own `detached` output, kept on [`AdeApp::
+    /// detached_sessions`]. A session here is real and still running; it would otherwise be
+    /// invisible and unreachable forever. Clicking a row reattaches it as a real tab
+    /// ([`crate::work_surface::session::AdeApp::open_detached_session`]), removing it from this
+    /// list - `None` once nothing is left to show, the ordinary case.
+    pub(in crate::rail) fn render_detached_sessions_banner(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let worktree_paths: std::collections::HashSet<&std::path::Path> = self
+            .worktrees
+            .iter()
+            .map(|item| item.path.as_path())
+            .collect();
+        let mut rows: Vec<(PathBuf, jerry_core::SessionRecord)> = self
+            .detached_sessions
+            .iter()
+            .filter(|(worktree, _)| worktree_paths.contains(worktree.as_path()))
+            .flat_map(|(worktree, records)| {
+                records
+                    .iter()
+                    .cloned()
+                    .map(move |record| (worktree.clone(), record))
+            })
+            .collect();
+        if rows.is_empty() {
+            return None;
+        }
+        rows.sort_by_key(|(_, record)| record.started_at);
+
+        Some(
+            div()
+                .id("rail-detached-sessions")
+                .flex_none()
+                .flex()
+                .flex_col()
+                .border_b_1()
+                .border_color(theme::border::RAIL_INNER)
+                .child(
+                    div()
+                        .px(px(10.0))
+                        .py(px(4.0))
+                        .font(font(theme::font::MONO))
+                        .text_size(self.ui_text_size(9.0))
+                        .text_color(theme::text::DIM)
+                        .child(format!(
+                            "{} detached",
+                            plural::count(rows.len(), "session", None)
+                        )),
+                )
+                .children(rows.into_iter().map(|(worktree, record)| {
+                    let label = detached_session_label(&record);
+                    let session_id = record.id.clone();
+                    div()
+                        .id(gpui::SharedString::from(format!(
+                            "rail-detached-session-{}",
+                            record.id
+                        )))
+                        .debug_selector(move || format!("rail-detached-session-{}", record.id))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .px(px(10.0))
+                        .py(px(4.0))
+                        .cursor_pointer()
+                        .hover(|el| el.bg(theme::surface::ROW_HOVER))
+                        .child(
+                            div()
+                                .flex_1()
+                                .font(font(theme::font::MONO))
+                                .text_size(self.ui_text_size(10.0))
+                                .text_color(theme::text::STRONG)
+                                .child(label),
+                        )
+                        .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                            this.open_detached_session(
+                                worktree.clone(),
+                                session_id.clone(),
+                                window,
+                                cx,
+                            );
+                        }))
+                })),
         )
     }
 

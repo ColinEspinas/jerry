@@ -929,6 +929,33 @@ impl TerminalPane {
         cx.notify();
     }
 
+    /// Marks this pane as already-exited from the moment it was created - a restored, already-
+    /// gone tab (`docs/architecture/decisions.md` §26, decision Q21's third reconciliation case:
+    /// a persisted tab whose recorded session the host no longer has), never a live process this
+    /// app actually watched finish. Deliberately does **not** emit
+    /// [`TerminalPaneEvent::ProcessExited`], unlike [`Self::mark_exited_from_event`]: that
+    /// event's `clean` flag drives `Agents::register_agent`'s own "a process that just finished
+    /// cleanly closes its own tab" convenience, which is right for a run the user was watching
+    /// end and wrong here - a tab appearing for the first time already finished must stay
+    /// visible showing its last-known status, clean or not, exactly as Q21 asks, rather than
+    /// vanish the instant it's restored because an unknown status defaulted to looking clean.
+    pub(crate) fn mark_restored_as_gone(
+        &mut self,
+        status: &jerry_core::ExitStatusWire,
+        cx: &mut Context<Self>,
+    ) {
+        if self.exit_status.is_some() {
+            return;
+        }
+        self.exit_status = Some(match &status.signal {
+            Some(signal) => ExitStatus::with_signal(signal),
+            None => ExitStatus::with_exit_code(status.code),
+        });
+        self.session = None;
+        self.grid.mark_ended();
+        cx.notify();
+    }
+
     /// Attaches this pane to a live (or scripted) session and starts the "wait for the next
     /// item, update the grid, or record exit" loop against its output stream - what
     /// `Self::new` used to do itself, against a `jerry_pty::PtySession` it spawned directly,

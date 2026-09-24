@@ -2081,6 +2081,17 @@ pub struct AdeApp {
     /// [`crate::work_surface::session::AdeApp::restore_worktree_session`]), but it must not
     /// silently vanish either: each entry is logged as it happens and kept here.
     pub(crate) session_restore_notices: Vec<String>,
+    /// [`crate::work_surface::session::AdeApp::restore_worktree_session`]'s own async
+    /// reconciliation task (decision Q21) - a [`TaskPool`] rather than a single slot, since
+    /// switching worktrees in quick succession starts a fresh reconciliation for each one before
+    /// an earlier one may have resolved.
+    pub(crate) _session_restore_tasks: TaskPool,
+    /// Live host sessions with no persisted tab of their own (decision Q21's "orphans"), keyed by
+    /// worktree - `crate::rail::render`'s own "Detached sessions" section reads this to offer
+    /// reattaching one. Populated by [`crate::work_surface::session::AdeApp::
+    /// restore_worktree_session`]'s reconciliation pass; a worktree with no entry here has either
+    /// never been reconciled yet or genuinely has nothing detached.
+    pub(crate) detached_sessions: HashMap<PathBuf, Vec<jerry_core::SessionRecord>>,
     /// Which worktree of each repo (keyed by `crate::rail::repo::repo_key`) was last genuinely
     /// selected - the live mirror of `crate::rail::repo::RepoRecord::selected_worktree`, seeded
     /// from `repos.toml` at startup and updated by [`Self::select_worktree`].
