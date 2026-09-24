@@ -1252,6 +1252,18 @@ async fn attach_pane_to_session(
     let attach_outcome = spawn_pane.update(cx, |pane, cx| {
         pane.attach_session(adapter.clone(), control_plane, cx)
     });
+    if attach_outcome.is_ok() {
+        // The synchronous persist `Agents::spawn`'s own caller already made (`AdeApp::
+        // record_worktree_session`, from every real spawn site) recorded `host_session_id:
+        // None` - `Self::set_host_session_id` above is what first learns the real id, and only
+        // once this attach's own real `SessionSpawn`/`SessionAttach` round trip has resolved.
+        // Without a second persist here, a tab closed (or a window quit) before any *other*
+        // tab mutation happened to re-persist first would be recorded with no id to reattach
+        // by at all - a relaunch's own reconciliation (`docs/architecture/decisions.md` §25)
+        // would then always fall back to a fresh spawn instead of finding this session still
+        // live, even though it plainly still is.
+        let _ = this.update(cx, |this, cx| this.record_worktree_session(cx));
+    }
     if attach_outcome.is_err() {
         // The pane entity itself is already gone - not just doomed, which `TerminalPane::
         // attach_session` already handles on its own by leaving the session for whichever caller
@@ -1795,6 +1807,7 @@ mod remote_attach_tests {
     use crate::host::RepoHost;
     use crate::test_support::{open_test_app, temp_repo};
     use gpui::TestAppContext;
+    use jerry_core::Report;
     use std::time::Duration;
     use test_support::wait_until;
 
@@ -1875,6 +1888,103 @@ mod remote_attach_tests {
             }),
             "closing the tab must really kill the remote session - through RemoteRepoHost, never \
              a block_on over LocalClient - with run_until_parked never hanging while it does"
+        );
+
+        host.shutdown_and_join();
+    }
+
+    /// `docs/architecture/decisions.md` §25's own disconnect-vs-kill rule, at the socket-attached
+    /// path specifically: dropping the test app that holds a `SocketSessionAdapter` (closing its
+    /// window, the real trigger for GPUI to actually release the root view - see
+    /// `crate::test_support::dropping_a_test_app_leaves_no_spawned_agent_process_behind`'s own
+    /// identical pattern) must disconnect that adapter, never kill the session it was attached
+    /// to. Checked through a *second*, entirely independent client connection to the same real
+    /// host - the one honest way to prove the session outlived the app that spawned it, since
+    /// nothing about the (now-dropped) app's own state could be trusted to answer that question.
+    #[gpui::test]
+    async fn dropping_the_app_leaves_a_socket_attached_session_alive(cx: &mut TestAppContext) {
+        let repo = temp_repo();
+        let (app, cx) = open_test_app(cx, repo.to_path_buf());
+        cx.run_until_parked();
+
+        let host = jerry_host::Host::start().expect("host");
+        let socket_dir = jerry_core::registry::runtime_dir().expect("runtime dir");
+        let socket = socket_dir.join(format!(
+            "da-{:x}-{:08x}.sock",
+            std::process::id(),
+            jerry_core::registry::fresh_u32()
+        ));
+        host.listen(&socket).expect("listen");
+        let client = jerry_core::client::Client::connect(&socket, Duration::from_secs(5))
+            .expect("connect to the real socket");
+        let repo_host =
+            RepoHost::for_test_remote(client, socket.clone()).expect("wrap the real connection");
+        app.update(cx, |app, cx| {
+            app.adopt_repo_host_for_test(repo.to_path_buf(), repo_host, cx);
+        });
+
+        let id = app
+            .update_in(cx, |app, window, cx| {
+                app.new_agent(ProcessKind::Shell, window, cx);
+                app.agents.iter().last().map(|agent| agent.id)
+            })
+            .expect("a real shell tab was created");
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                cx.run_until_parked();
+                app.read_with(cx, |app, cx| {
+                    app.agents
+                        .iter()
+                        .find(|agent| agent.id == id)
+                        .is_some_and(|agent| {
+                            agent.pane.read(cx).spawn_error().is_none()
+                                && agent
+                                    .pane
+                                    .read(cx)
+                                    .visible_text_lines()
+                                    .iter()
+                                    .any(|line| !line.trim().is_empty())
+                        })
+                })
+            }),
+            "the real shell must attach over the remote socket and produce real prompt output"
+        );
+
+        // Standing in for the app itself closing - see `crate::work_surface::session::
+        // session_restore_tests`'s own `a_relaunch_against_a_still_running_host_reattaches_and_
+        // shows_the_snapshot` for why both steps (dropping the entity *and* removing its window)
+        // are required for GPUI to actually release the root view, and so this pane's own
+        // `SocketSessionAdapter`, right here rather than at some later, unobserved point.
+        drop(app);
+        for window in cx.windows() {
+            let _ = window.update(cx, |_, window, _| window.remove_window());
+        }
+        cx.run_until_parked();
+
+        let mut fresh_client = jerry_core::client::Client::connect(&socket, Duration::from_secs(5))
+            .expect("a second, independent connection to the same still-running host");
+        let report = fresh_client
+            .request(&jerry_core::Call::human(
+                repo.to_path_buf(),
+                jerry_core::Request::Query(jerry_core::AppQuery::Sessions(
+                    jerry_core::SessionsQuery::default(),
+                )),
+            ))
+            .expect("a fresh SessionsQuery must reach the still-running host");
+        let Report::Ok { outcome } = report else {
+            panic!("expected a real SessionsQuery answer, got {report:?}");
+        };
+        let sessions: Vec<jerry_core::SessionRecord> =
+            serde_json::from_value(outcome).expect("a real session list");
+        assert_eq!(
+            sessions.len(),
+            1,
+            "the app closing must not have spawned a duplicate or removed the real session"
+        );
+        assert!(
+            sessions[0].exit.is_none(),
+            "the session must still be alive - a plain app/window/pane drop only disconnects, \
+             it never kills (docs/architecture/decisions.md §25)"
         );
 
         host.shutdown_and_join();

@@ -217,6 +217,7 @@ impl SessionManager {
         let process = Arc::new(Mutex::new(session));
         let data_plane = DataPlane::bind(&self.sockets_dir, Arc::clone(&process))?;
         let grid = Arc::new(Mutex::new(jerry_term::grid::TerminalGrid::new(rows, cols)));
+        let relay_process = Arc::clone(&process);
         let handle = Arc::new(SessionHandle {
             id: id.clone(),
             process,
@@ -237,6 +238,7 @@ impl SessionManager {
             relay_tx,
             data_plane,
             grid,
+            relay_process,
             self.clone(),
         )
         .map_err(SessionSpawnError::Relay)?;
@@ -601,12 +603,24 @@ fn agent_session_id(agent_id: &AgentId) -> SessionId {
 /// none yet), and recording the session's exit on `manager` and `data_plane` the moment `Exited`
 /// is observed, before forwarding it downstream. Ends the moment `Exited` is forwarded, or the
 /// moment the downstream receiver (the attached client) is dropped, whichever comes first.
+///
+/// Also answers `grid`'s own [`jerry_term::grid::TerminalGrid::take_pending_pty_writes`] back
+/// into `process` whenever [`DataPlane::push`] reports a chunk as dropped (no client attached or
+/// armed to ever see it) - a real ConPTY's own startup handshake sends a cursor-position query
+/// (`ESC[6n`) and blocks its *entire* output stream on a real reply, so a session spawned before
+/// any client has attached (the ordinary "guaranteed startup shell" case) would otherwise hang
+/// forever with no output ever reaching anyone, real or headless. `crate::terminal::pane`'s own
+/// client-side task in `jerry-app` answers the identical query once a client *is* attached (or is
+/// racing to attach - `push`'s own `true` there means the client's own grid will see, and answer,
+/// these same bytes itself); only `push` answering `false` here is the signal this thread must
+/// step in instead, so a query is never answered twice.
 fn spawn_relay(
     id: SessionId,
     mut raw: futures_mpsc::Receiver<PtyOutput>,
     mut relay_tx: futures_mpsc::Sender<PtyOutput>,
     data_plane: Arc<DataPlane>,
     grid: Arc<Mutex<jerry_term::grid::TerminalGrid>>,
+    process: Arc<Mutex<PtySession>>,
     manager: SessionManager,
 ) -> io::Result<()> {
     thread::Builder::new()
@@ -615,8 +629,24 @@ fn spawn_relay(
             while let Some(item) = block_on(raw.next()) {
                 match &item {
                     PtyOutput::Bytes(chunk) => {
-                        data_plane.push(chunk);
-                        lock(&grid).append_bytes(chunk);
+                        let captured = data_plane.push(chunk);
+                        let pending_writes = {
+                            let mut grid = lock(&grid);
+                            grid.append_bytes(chunk);
+                            if captured {
+                                Vec::new()
+                            } else {
+                                grid.take_pending_pty_writes()
+                            }
+                        };
+                        if !pending_writes.is_empty() {
+                            if let Err(err) = lock(&process).write_input(&pending_writes) {
+                                log::warn!(
+                                    "jerry-host: failed to answer a terminal query for \
+                                     session {id} with no client attached yet: {err}"
+                                );
+                            }
+                        }
                     }
                     PtyOutput::Exited(status) => {
                         manager.record_exit(&id, status);

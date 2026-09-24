@@ -185,16 +185,29 @@ impl DataPlane {
     /// the ordinary case for a session's own idle output (there is still no *unconditional*
     /// pre-attach buffer - §25's own `SessionSnapshot` is what a later, ordinary attach paints
     /// from instead).
-    pub(crate) fn push(&self, chunk: &[u8]) {
+    ///
+    /// Returns whether `chunk` was actually captured (delivered live or buffered) rather than
+    /// dropped - [`crate::session::spawn_relay`]'s own signal for whether some future client will
+    /// ever see these exact bytes. That distinction is load-bearing, not informational: a chunk
+    /// this drops is a chunk no client's own `jerry_term::grid::TerminalGrid` will ever parse, so
+    /// if it contains a terminal query (`ESC[6n`, a real ConPTY's own startup handshake, which
+    /// blocks its entire output stream on a real reply - `crate::terminal::pane`'s own docs)
+    /// nobody would ever answer it and the session would hang forever with no client attached yet
+    /// to notice. A chunk this *does* capture will reach a client's own grid too (live, or via
+    /// [`Self::arm_for_attach`]'s queue), which answers it exactly once there - answering it here
+    /// as well would be a real, visible double-answer (a bogus second reply arriving as if typed
+    /// into the child's own stdin), so the caller must only answer on this method's own `false`.
+    pub(crate) fn push(&self, chunk: &[u8]) -> bool {
         let mut shared = lock(&self.shared);
         if let Some(sink) = &shared.sink {
             if sink.send(chunk.to_vec()).is_err() {
                 shared.sink = None;
+                return false;
             }
-            return;
+            return true;
         }
         if shared.stale || shared.pending.is_none() {
-            return;
+            return false;
         }
         let over_cap = shared
             .pending
@@ -203,11 +216,12 @@ impl DataPlane {
         if over_cap {
             shared.pending = None;
             shared.stale = true;
-            return;
+            return false;
         }
         if let Some(pending) = &mut shared.pending {
             pending.extend_from_slice(chunk);
         }
+        true
     }
 
     /// The session's `Exited` item has been observed: drops the live sink, if any, which is what

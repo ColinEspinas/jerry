@@ -171,6 +171,25 @@ impl SessionAdapter for SocketSessionAdapter {
     }
 }
 
+/// A plain drop - a window closing, a pane torn down without ever calling
+/// [`SessionAdapter::shutdown`], the app itself quitting - is a disconnect, never a kill
+/// (`docs/architecture/decisions.md` §25): the real session, and the process it owns, must
+/// outlive this adapter. Without this impl that was true in name only: nothing ever closed
+/// [`Self::shutdown_stream`]'s own real socket connection, and [`Self::connect`]'s reader thread
+/// (blocked in a plain `read`, waiting for the *next* byte, which may never come from an idling
+/// process) has no way to notice its own struct is gone - a real, standalone `UnixStream::
+/// shutdown` (never `close`) is what actually unblocks that read from here, on whichever thread
+/// drops this value, the same call [`Self::shutdown`] already makes for the "kill" path. Left
+/// unfixed, the connection - and so [`crate::data_plane::DataPlane`]'s own single-attach slot on
+/// the host - never frees up, and every later attach attempt for the same session answers
+/// `session-already-attached` forever, exactly the bug a real reattach after quitting Jerry
+/// (this issue's own point) would otherwise hit every single time.
+impl Drop for SocketSessionAdapter {
+    fn drop(&mut self) {
+        let _ = lock(&self.shutdown_stream).shutdown(std::net::Shutdown::Both);
+    }
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
