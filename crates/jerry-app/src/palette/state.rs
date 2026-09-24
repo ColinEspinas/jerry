@@ -161,10 +161,14 @@ pub enum PaletteCommand {
     /// findable before the user already knows something's up" reasoning - a user who suspects
     /// they're on an old build can check right now rather than wait for the next periodic tick.
     CheckForUpdates,
+    /// `crate::root::menu_commands::quit_and_stop_all_agents` - the palette's own path to the
+    /// same command the app menu carries (`docs/architecture/decisions.md` §25). Ordinary quit
+    /// detaches by default, so this is deliberately findable, not just menu-only.
+    QuitAndStopAllAgents,
 }
 
 impl PaletteCommand {
-    pub const ALL: [PaletteCommand; 14] = [
+    pub const ALL: [PaletteCommand; 15] = [
         PaletteCommand::NewShell,
         PaletteCommand::NewClaudeAgent,
         PaletteCommand::NewCodexAgent,
@@ -179,6 +183,7 @@ impl PaletteCommand {
         PaletteCommand::WindowControlsWindowsLinux,
         PaletteCommand::OpenGitGraph,
         PaletteCommand::CheckForUpdates,
+        PaletteCommand::QuitAndStopAllAgents,
     ];
 
     /// Whether this command belongs in the palette's `"Git"` group rather than `"Commands"` -
@@ -203,6 +208,7 @@ impl PaletteCommand {
             PaletteCommand::WindowControlsWindowsLinux => "Window Controls: Windows/Linux Style",
             PaletteCommand::OpenGitGraph => "Open Git Graph",
             PaletteCommand::CheckForUpdates => "Check for Updates",
+            PaletteCommand::QuitAndStopAllAgents => "Quit and Stop All Agents",
         }
     }
 
@@ -238,6 +244,9 @@ impl PaletteCommand {
             }
             PaletteCommand::OpenGitGraph => "git graph commit history branches log",
             PaletteCommand::CheckForUpdates => "update version release new github check",
+            PaletteCommand::QuitAndStopAllAgents => {
+                "quit exit close stop kill terminate agents sessions hosts detach"
+            }
         }
     }
 

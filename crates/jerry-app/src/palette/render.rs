@@ -219,6 +219,10 @@ impl AdeApp {
                 command: palette::PaletteCommand::CheckForUpdates,
                 secondary: "check GitHub for a newer release".to_string(),
             },
+            palette::CommandCandidate {
+                command: palette::PaletteCommand::QuitAndStopAllAgents,
+                secondary: "stop every open repository's session host, then quit".to_string(),
+            },
         ];
         // GitHub issue #90: a genuinely empty window has no real repo to graph -
         // `crate::graph_view::render::AdeApp::open_git_graph`'s own guard now refuses outright
@@ -437,6 +441,9 @@ impl AdeApp {
             }
             palette::PaletteCommand::OpenGitGraph => self.open_git_graph(window, cx),
             palette::PaletteCommand::CheckForUpdates => self.check_for_update(cx),
+            palette::PaletteCommand::QuitAndStopAllAgents => {
+                crate::root::menu_commands::quit_and_stop_all_agents(cx);
+            }
         }
     }
 

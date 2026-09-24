@@ -55,6 +55,7 @@ pub(crate) enum MenuCommand {
     HideOthers,
     ShowAll,
     Quit,
+    QuitAndStopAllAgents,
 }
 
 /// One row of a rendered menu: either a real, clickable [`MenuCommand`], or a plain visual
@@ -73,7 +74,7 @@ impl MenuCommand {
     /// ([`Self::action`], [`Self::label`], [`Self::keystroke_spec`]) are exhaustive over this
     /// same enum, so nothing here can silently end up with only some of the three - the same
     /// guarantee [`crate::root::menus::MenuSurface::ALL`] gives its own two matches.
-    pub(crate) const ALL: [MenuCommand; 30] = [
+    pub(crate) const ALL: [MenuCommand; 31] = [
         MenuCommand::OpenFile,
         MenuCommand::OpenFolder,
         MenuCommand::NewWindow,
@@ -104,6 +105,7 @@ impl MenuCommand {
         MenuCommand::HideOthers,
         MenuCommand::ShowAll,
         MenuCommand::Quit,
+        MenuCommand::QuitAndStopAllAgents,
     ];
 
     /// The real `gpui::Action` this command dispatches - a fresh boxed instance every call,
@@ -141,6 +143,7 @@ impl MenuCommand {
             MenuCommand::HideOthers => Box::new(root::HideOthers),
             MenuCommand::ShowAll => Box::new(root::ShowAll),
             MenuCommand::Quit => Box::new(root::Quit),
+            MenuCommand::QuitAndStopAllAgents => Box::new(root::QuitAndStopAllAgents),
         }
     }
 
@@ -183,6 +186,7 @@ impl MenuCommand {
             MenuCommand::HideOthers => "Hide Others",
             MenuCommand::ShowAll => "Show All",
             MenuCommand::Quit => "Quit Jerry",
+            MenuCommand::QuitAndStopAllAgents => "Quit and Stop All Agents",
         }
     }
 
@@ -224,7 +228,8 @@ impl MenuCommand {
             | MenuCommand::Hide
             | MenuCommand::HideOthers
             | MenuCommand::ShowAll
-            | MenuCommand::Quit => None,
+            | MenuCommand::Quit
+            | MenuCommand::QuitAndStopAllAgents => None,
         }
     }
 
@@ -280,10 +285,10 @@ impl MenuCommand {
     }
 
     /// The macOS application menu's own row order (the submenu under the app's own name, left of
-    /// `File`) - `About`, `Settings`, then the real `Hide`/`Hide Others`/`Show All`/`Quit` quartet
-    /// only a real `NSApp.mainMenu` can host at all (the Windows/Linux popover has no equivalent
-    /// surface for these four, since there is no window-manager-level "hide this app" concept to
-    /// wire them to there).
+    /// `File`) - `About`, `Settings`, then the real `Hide`/`Hide Others`/`Show All`/`Quit`/
+    /// `Quit and Stop All Agents` quintet only a real `NSApp.mainMenu` can host at all (the
+    /// Windows/Linux popover has no equivalent surface for these five, since there is no
+    /// window-manager-level "hide this app" concept to wire them to there).
     pub(crate) fn app_menu_rows() -> &'static [MenuRow] {
         use MenuRow::{Command, Separator};
         &[
@@ -296,6 +301,7 @@ impl MenuCommand {
             Command(MenuCommand::ShowAll),
             Separator,
             Command(MenuCommand::Quit),
+            Command(MenuCommand::QuitAndStopAllAgents),
         ]
     }
 }

@@ -16,7 +16,7 @@ use gpui::{AppContext, AsyncApp, Context, Task};
 use jerry_core::wire::rpc_code;
 use jerry_core::{
     AppCommand, AppQuery, Call, Report, Request, RpcError, SessionAttach, SessionId, SessionKill,
-    SessionRecord, SessionSnapshot, SessionsQuery,
+    SessionRecord, SessionSnapshot, SessionsQuery, Shutdown,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -558,6 +558,33 @@ impl AdeApp {
         match &self.hosts.repo_host_for(common_dir)?.connection {
             Some(Connection::Remote(remote)) => Some(remote.clone()),
             _ => None,
+        }
+    }
+
+    /// Sends a real `Shutdown` to every repository *this window* has a live, connected host for -
+    /// `crate::root::menu_commands::quit_and_stop_all_agents`'s own per-window half (it calls this
+    /// once for every open window before quitting the whole app). Blocking:
+    /// `RemoteRepoHost::dispatch` is a plain `std::sync::mpsc` round trip to a dedicated worker
+    /// thread, safe from any context including this one (decisions.md §16's amendment) - called
+    /// directly rather than through `cx.background_spawn`, since a pre-quit action handler has no
+    /// async context to await one from anyway. A repository whose connection never got past
+    /// `RepoHostState::Connected` (or is `#[cfg(test)]`-only in-process) has no real host process
+    /// to stop and is silently skipped - not an error, since there is nothing to do.
+    pub(crate) fn shutdown_all_repo_hosts_blocking(&self) {
+        for (common_dir, repo_host) in &self.hosts.by_repo {
+            let Some(Connection::Remote(remote)) = &repo_host.connection else {
+                continue;
+            };
+            if let Err(err) = remote.dispatch(Call::human(
+                common_dir.clone(),
+                Request::Command(AppCommand::Shutdown(Shutdown::default())),
+            )) {
+                log::warn!(
+                    "failed to stop {}'s session host on quit: {}",
+                    common_dir.display(),
+                    err.message
+                );
+            }
         }
     }
 

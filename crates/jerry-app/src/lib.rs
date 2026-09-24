@@ -889,6 +889,13 @@ pub fn run(repo_path: Option<PathBuf>) {
         // `AdeApp`'s own root instead - see `crate::root::menu_commands`'s own docs for why
         // these four are the one deliberate exception.
         cx.on_action(|_: &root::Quit, cx| cx.quit());
+        // `Quit`'s own sibling (decisions.md §25): stops every open window's repositories' real
+        // session hosts before quitting, rather than detaching by default - see
+        // `root::menu_commands::quit_and_stop_all_agents`'s own docs for why it has to be a
+        // global listener too, not a window-scoped `handle_*_menu_command`.
+        cx.on_action(|_: &root::QuitAndStopAllAgents, cx| {
+            root::menu_commands::quit_and_stop_all_agents(cx)
+        });
         cx.on_action(|_: &root::Hide, cx| cx.hide());
         cx.on_action(|_: &root::HideOthers, cx| cx.hide_other_apps());
         cx.on_action(|_: &root::ShowAll, cx| cx.unhide_other_apps());

@@ -86,7 +86,8 @@ impl AdeApp {
             | MenuCommand::Hide
             | MenuCommand::HideOthers
             | MenuCommand::ShowAll
-            | MenuCommand::Quit => true,
+            | MenuCommand::Quit
+            | MenuCommand::QuitAndStopAllAgents => true,
         }
     }
 
@@ -228,13 +229,13 @@ impl AdeApp {
                 self.open_settings(window, cx);
                 self.select_settings_page(settings::SettingsPage::About, window, cx);
             }
-            // The macOS application menu's own quartet - kept here purely so this `match` stays
+            // The macOS application menu's own quintet - kept here purely so this `match` stays
             // exhaustive and every command's real effect is documented in the one place this
             // module's own docs promise, even though this arm is never actually reached in
-            // practice: `MenuCommand::app_menu_rows` (the only place these four appear in any
+            // practice: `MenuCommand::app_menu_rows` (the only place these five appear in any
             // menu) is only ever consumed by the macOS-only native menu
             // (`crate::title_bar::native_menu`), never by the Windows/Linux popover, which is
-            // this function's only real caller. The real live path for these four is `crate::run`'s
+            // this function's only real caller. The real live path for these five is `crate::run`'s
             // global `cx.on_action` listeners - registered at the `App` level (no `AdeApp`/`Window`
             // in scope for a menu click with no window focused, e.g. Quit from the Dock menu),
             // calling the exact same `gpui::App`/`Context` methods as here.
@@ -242,6 +243,7 @@ impl AdeApp {
             MenuCommand::HideOthers => cx.hide_other_apps(),
             MenuCommand::ShowAll => cx.unhide_other_apps(),
             MenuCommand::Quit => cx.quit(),
+            MenuCommand::QuitAndStopAllAgents => quit_and_stop_all_agents(cx),
         }
     }
 
@@ -388,6 +390,25 @@ impl AdeApp {
     ) {
         self.perform_menu_command(MenuCommand::About, window, cx);
     }
+}
+
+/// [`MenuCommand::QuitAndStopAllAgents`]'s real effect: every open window's own repository hosts
+/// get a real `Shutdown`, then the app quits - `docs/architecture/decisions.md` §25's own
+/// deliberate exception to ordinary Quit's "detach by default" (every host is a separate process,
+/// unaffected by this app exiting, so `cx.quit()` alone leaves every one of them running). A free
+/// function, not an `AdeApp` method: it has to reach every open window, not just whichever one's
+/// `Context<AdeApp>` happened to be in scope when the command was picked, which is why this is
+/// also `crate::run`'s own global `on_action` listener rather than one more `handle_*_menu_command`
+/// on the window-scoped dispatch tree.
+pub(crate) fn quit_and_stop_all_agents(cx: &mut App) {
+    for handle in cx.windows() {
+        if let Some(window) = handle.downcast::<AdeApp>() {
+            let _ = window.update(cx, |ade_app, _window, _cx| {
+                ade_app.shutdown_all_repo_hosts_blocking();
+            });
+        }
+    }
+    cx.quit();
 }
 
 #[cfg(test)]

@@ -178,6 +178,12 @@ actions!(
         NewWindow,
         CloseWindow,
         Quit,
+        // `Quit`'s own sibling (decisions.md §25): ordinary Quit detaches by default (every
+        // repository's session host is a separate process, unaffected by this app exiting) -
+        // this is the one deliberate action that stops them all first. Registered the identical
+        // way `Quit` is (`crate::run`'s global `on_action`, no window/`AdeApp` in scope), since
+        // it has to reach every open window's own repositories, not just one.
+        QuitAndStopAllAgents,
         Hide,
         HideOthers,
         ShowAll,
