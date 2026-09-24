@@ -1,18 +1,20 @@
 //! Reacts to the host's `event/session-exited` notification (`docs/architecture/decisions.md`
-//! §23): the control-plane signal every subscribed client sees, unlike a pane's own data-plane
+//! §25): the control-plane signal every subscribed client sees, unlike a pane's own data-plane
 //! byte stream (`crate::terminal::pane::SessionAdapter::take_output`), which only the one
-//! attached pane observes. `AgentsQuery` already stops listing an exited agent on its own
-//! (`SessionManager::agent_entries` filters by the real record's own exit status - no client
-//! action needed); what this module still owns is `Agents::pending_exits`, the real Linux race
-//! where the notification can arrive before `Agents::set_host_session_id` has even run. Owns no
-//! other state of its own - see `crate::work_surface::worktree_created`, the identical pattern
-//! this mirrors.
+//! attached pane observes - and, for a socket-attached (production) session, the *only* place
+//! its real exit is ever observed at all, since that adapter synthesizes no exit signal of its
+//! own. `AgentsQuery` already stops listing an exited agent on its own (`SessionManager::
+//! agent_entries` filters by the real record's own exit status - no client action needed here for
+//! that); what this module owns is applying the real exit to the pane itself
+//! (`TerminalPane::mark_exited_from_event`) when a match already exists, and `Agents::
+//! pending_exits` (the real Linux race where the notification can arrive before `Agents::
+//! set_host_session_id` has even run) when it doesn't yet.
 
 use crate::root::AdeApp;
 use futures::channel::mpsc;
 use futures::StreamExt;
 use gpui::{Context, Task};
-use jerry_core::Message;
+use jerry_core::{ExitStatusWire, Message};
 use serde_json::Value;
 
 /// Drains `events` for as long as the returned `Task` is held - see
@@ -38,15 +40,18 @@ pub(crate) fn spawn_consumer(
 }
 
 impl AdeApp {
-    /// `event/session-exited`'s own handler: when no open agent's `host_session_id` matches yet,
-    /// the id is recorded (`Agents::note_unmatched_session_exit`) so `Agents::
-    /// set_host_session_id` can still clear it once that agent's id is finally known - a process
-    /// short-lived enough (`sh -c exit`) can exit before that call itself has run, particularly on
-    /// Linux. Once a match already exists there is nothing left to do here: `AgentsQuery` already
-    /// stopped listing the exited agent on its own (this method's own module docs), and a session
-    /// this instance never spawned at all (another client's session on the same host) never
-    /// matches to begin with.
-    fn handle_session_exited(&mut self, params: Value, _cx: &mut Context<Self>) {
+    /// `event/session-exited`'s own handler. A session this instance never spawned at all
+    /// (another client's session on the same host) matches no pane and is silently ignored -
+    /// there is nothing here for it to apply. Otherwise:
+    /// - a match already exists: applies the real exit to that pane directly
+    ///   (`TerminalPane::mark_exited_from_event`) - for a socket-attached session this is the
+    ///   *only* place its real exit is ever observed, since that adapter synthesizes none of its
+    ///   own.
+    /// - no match yet: the id (with its own status) is recorded
+    ///   (`Agents::note_unmatched_session_exit`) so `Agents::set_host_session_id` can still apply
+    ///   it once that agent's id is finally known - a process short-lived enough (`sh -c exit`)
+    ///   can exit before that call itself has run, particularly on Linux.
+    fn handle_session_exited(&mut self, params: Value, cx: &mut Context<Self>) {
         let Some(session_id) = params
             .get("id")
             .and_then(Value::as_str)
@@ -54,8 +59,17 @@ impl AdeApp {
         else {
             return;
         };
-        if self.agents.agent_for_host_session(&session_id).is_none() {
-            self.agents.note_unmatched_session_exit(session_id);
+        let Some(status) = params
+            .get("status")
+            .and_then(|value| serde_json::from_value::<ExitStatusWire>(value.clone()).ok())
+        else {
+            return;
+        };
+        match self.agents.pane_for_host_session(&session_id) {
+            Some(pane) => {
+                pane.update(cx, |pane, cx| pane.mark_exited_from_event(&status, cx));
+            }
+            None => self.agents.note_unmatched_session_exit(session_id, status),
         }
     }
 }
@@ -69,17 +83,26 @@ mod tests {
     use jerry_core::{AppQuery, Report, Request};
     use std::time::Duration;
 
-    /// A real child process that does nothing but exit `0`, spelled for this platform's own
-    /// always-present interpreter - the same idiom
-    /// `crate::terminal::pane::process_exit_event_tests::exiting_pane` uses.
+    /// A real child process that blocks reading one line from its own stdin, then exits `0` -
+    /// spelled for this platform's own always-present interpreter. Blocking keeps the process
+    /// alive until the test itself releases it (`send_prompt`, below), so the sanity check that
+    /// it is really listed cannot lose a race against a child that already exited on its own.
     fn exiting_command(cwd: std::path::PathBuf) -> TerminalSpec {
         #[cfg(windows)]
         {
-            TerminalSpec::command("cmd", vec!["/c".to_string(), "exit 0".to_string()], cwd)
+            TerminalSpec::command(
+                "cmd",
+                vec!["/c".to_string(), "set /p x=&exit 0".to_string()],
+                cwd,
+            )
         }
         #[cfg(unix)]
         {
-            TerminalSpec::command("sh", vec!["-c".to_string(), "exit 0".to_string()], cwd)
+            TerminalSpec::command(
+                "sh",
+                vec!["-c".to_string(), "read x; exit 0".to_string()],
+                cwd,
+            )
         }
     }
 
@@ -129,6 +152,22 @@ mod tests {
             "sanity check: the real spawn must be listed once its SessionSpawn dispatch \
              resolves - got {outcome:?}"
         );
+
+        // Releases the blocked child now that the sanity check above has observed it - on a
+        // fast CI runner the child could otherwise already be gone before that check even ran,
+        // which would make both assertions here order-dependent (issue #506 review).
+        let pane = app
+            .update(cx, |app, _cx| {
+                app.agents.active().map(|agent| agent.pane.clone())
+            })
+            .expect("the just-spawned agent must be the active one");
+        pane.update(cx, |pane, cx| {
+            assert!(
+                pane.send_prompt("x", cx),
+                "failed to release the blocked child"
+            );
+        });
+        cx.run_until_parked();
 
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         let mut forgotten = false;

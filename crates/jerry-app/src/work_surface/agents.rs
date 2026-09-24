@@ -2,7 +2,7 @@
 //! worktree it's running in, and tracks which agents are open and which one is active for
 //! the tabbed center pane. `TerminalPane` itself has no notion of tabs or of "which
 //! worktree" - see its module docs - this is that one layer up.
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -318,16 +318,20 @@ pub struct Agents {
     /// concern (`crate::root::task_pool::TaskPool`'s own docs list several such pools on
     /// `AdeApp` for exactly this reason).
     _close_tasks: crate::root::task_pool::TaskPool,
-    /// Host session ids an `event/session-exited` notification named before
-    /// [`Self::set_host_session_id`] ever recorded which agent that id belongs to - real on
-    /// Linux, where `sh -c exit` can finish inside the very dispatch round trip that spawned it,
-    /// so its exit event reaches this instance's subscriber before the spawn's own response has
-    /// even resolved (`crate::work_surface::session_exited`'s own docs). Consulted, and cleared
-    /// of any match, by [`Self::set_host_session_id`] the moment the id it was waiting for
-    /// finally arrives. An id belonging to a session this instance never spawns at all (another
-    /// client's session on the same host) is never claimed and stays here - accepted, since the
-    /// fanout only ever names a session id once per exit and each entry is a small string.
-    pending_exits: HashSet<jerry_core::SessionId>,
+    /// Host session ids (with their own real exit status) an `event/session-exited` notification
+    /// named before [`Self::set_host_session_id`] ever recorded which agent that id belongs to -
+    /// real on Linux, where `sh -c exit` can finish inside the very dispatch round trip that
+    /// spawned it, so its exit event reaches this instance's subscriber before the spawn's own
+    /// response has even resolved (`crate::work_surface::session_exited`'s own docs). Consulted,
+    /// and cleared of any match, by [`Self::set_host_session_id`] the moment the id it was
+    /// waiting for finally arrives - its own return value is what lets the caller apply the
+    /// pane's real exit rather than losing it, since a socket-attached (production) session's own
+    /// data-plane adapter synthesizes no exit signal of its own (decisions.md §25) - the control
+    /// plane is the only place such a pane's real exit is ever observed. An id belonging to a
+    /// session this instance never spawns at all (another client's session on the same host) is
+    /// never claimed and stays here - accepted, since the fanout only ever names a session id
+    /// once per exit and each entry is small.
+    pending_exits: HashMap<jerry_core::SessionId, jerry_core::ExitStatusWire>,
 }
 
 impl Agents {
@@ -340,7 +344,7 @@ impl Agents {
             binary_overrides: HashMap::new(),
             _spawn_tasks: crate::root::task_pool::TaskPool::default(),
             _close_tasks: crate::root::task_pool::TaskPool::default(),
-            pending_exits: HashSet::new(),
+            pending_exits: HashMap::new(),
         }
     }
 
@@ -517,16 +521,27 @@ impl Agents {
     /// Records the host's own PTY session id a pane attached to - see [`Agent::host_session_id`].
     /// A no-op on [`Agent::host_session_id`] itself for an id that isn't open (the pane could
     /// have been closed in the interval between `SessionSpawn` dispatch and this resolving), but
-    /// `Self::pending_exits` is still consulted and cleared regardless: if this exact session id
-    /// already exited before this call ever ran (real on Linux - see [`Self::pending_exits`]'s
-    /// own docs), there is nothing left to apply - `AgentsQuery` already stopped listing it the
-    /// moment the host observed the real exit (`SessionManager::agent_entries`) - only the
-    /// bookkeeping to drop.
-    pub fn set_host_session_id(&mut self, id: AgentId, session_id: jerry_core::SessionId) {
-        if let Some(agent) = self.agents.iter_mut().find(|agent| agent.id == id) {
-            agent.host_session_id = Some(session_id.clone());
-        }
-        self.pending_exits.remove(&session_id);
+    /// `Self::pending_exits` is still consulted and cleared regardless. Returns that pane and its
+    /// own real exit status if this exact session id already exited before this call ever ran
+    /// (real on Linux - see [`Self::pending_exits`]'s own docs) - the caller applies it via
+    /// `TerminalPane::mark_exited_from_event`. Never touches a `Context` itself, so `Agents`'s own
+    /// tests stay plain, GPUI-free unit tests.
+    #[must_use]
+    pub fn set_host_session_id(
+        &mut self,
+        id: AgentId,
+        session_id: jerry_core::SessionId,
+    ) -> Option<(gpui::Entity<TerminalPane>, jerry_core::ExitStatusWire)> {
+        let pane = self
+            .agents
+            .iter_mut()
+            .find(|agent| agent.id == id)
+            .map(|agent| {
+                agent.host_session_id = Some(session_id.clone());
+                agent.pane.clone()
+            });
+        let status = self.pending_exits.remove(&session_id)?;
+        pane.map(|pane| (pane, status))
     }
 
     /// The open agent whose process the host knows as `session_id`, if any - the reverse of
@@ -539,21 +554,37 @@ impl Agents {
             .map(|agent| agent.id)
     }
 
+    /// The pane already attached to `session_id`, if any - `crate::work_surface::session_exited`'s
+    /// own matched case, applied the same way [`Self::set_host_session_id`]'s own return value is:
+    /// via `TerminalPane::mark_exited_from_event`.
+    pub fn pane_for_host_session(
+        &self,
+        session_id: &jerry_core::SessionId,
+    ) -> Option<gpui::Entity<TerminalPane>> {
+        self.agents
+            .iter()
+            .find(|agent| agent.host_session_id.as_ref() == Some(session_id))
+            .map(|agent| agent.pane.clone())
+    }
+
     /// [`Self::pending_exits`]'s own write side: `crate::work_surface::session_exited` calls
     /// this when an `event/session-exited` notification's id matches no agent yet, so
     /// [`Self::set_host_session_id`] can apply it once that agent's id is finally known instead
     /// of losing it - see that field's own docs for the real race this closes.
-    pub(crate) fn note_unmatched_session_exit(&mut self, session_id: jerry_core::SessionId) {
-        self.pending_exits.insert(session_id);
+    pub(crate) fn note_unmatched_session_exit(
+        &mut self,
+        session_id: jerry_core::SessionId,
+        status: jerry_core::ExitStatusWire,
+    ) {
+        self.pending_exits.insert(session_id, status);
     }
 
     /// Test-only: whether `session_id` is still recorded as an unmatched exit - [`Self::
-    /// pending_exits`]'s own state, direct, since [`Self::set_host_session_id`] clearing it has no
-    /// other externally-observable effect left (`AgentsQuery` already stops listing an exited
-    /// agent on its own, server-side).
+    /// pending_exits`]'s own state, direct, since [`Self::set_host_session_id`]'s own return value
+    /// is what an unmatched-then-matched real caller acts on.
     #[cfg(test)]
     pub(crate) fn has_pending_exit_for_test(&self, session_id: &jerry_core::SessionId) -> bool {
-        self.pending_exits.contains(session_id)
+        self.pending_exits.contains_key(session_id)
     }
 
     /// The conversation id this pane is attached to, if it was known at spawn time - `None` for
@@ -760,12 +791,23 @@ impl Agents {
                 let handle = this
                     .sessions_for(&spawn_cwd)
                     .and_then(|sessions| sessions.handle_for(&session_id));
-                this.agents.set_host_session_id(id, session_id.clone());
-                (handle, this.control_plane_for(&spawn_cwd))
+                let pending_exit = this.agents.set_host_session_id(id, session_id.clone());
+                (handle, this.control_plane_for(&spawn_cwd), pending_exit)
             });
-            let Ok((in_process_handle, control_plane)) = attached else {
+            let Ok((in_process_handle, control_plane, pending_exit)) = attached else {
                 return; // the app itself was dropped before this could even be asked
             };
+            if let Some((pane, status)) = pending_exit {
+                // This exact session already exited before this attach round trip even resolved
+                // (real on Linux - `Agents::pending_exits`'s own docs) - the process is already
+                // gone, so there is nothing left to attach. Apply the real exit directly and stop
+                // here, rather than attaching a (moot) adapter to a process that no longer exists:
+                // a socket-attached session's own data-plane adapter synthesizes no exit signal of
+                // its own, so this is the only place such a session's real exit is ever observed
+                // (decisions.md §25).
+                pane.update(cx, |pane, cx| pane.mark_exited_from_event(&status, cx));
+                return;
+            }
             let adapter: Arc<dyn SessionAdapter> = match in_process_handle {
                 Some(handle) => handle,
                 None => {
@@ -1562,14 +1604,26 @@ mod pending_exit_tests {
 
         // The exit arrives first - before anything has told `Agents` this session id belongs to
         // `agent_id` at all, exactly the Linux race this closes.
-        agents.note_unmatched_session_exit(session_id.clone());
+        let status = jerry_core::ExitStatusWire {
+            success: true,
+            code: 0,
+            signal: None,
+        };
+        agents.note_unmatched_session_exit(session_id.clone(), status);
         assert!(
             agents.has_pending_exit_for_test(&session_id),
             "sanity check: recorded as pending - nothing has applied it yet"
         );
 
-        // The spawn response resolves after the fact.
-        agents.set_host_session_id(agent_id, session_id.clone());
+        // The spawn response resolves after the fact. No real pane was ever spawned in this
+        // plain unit test, so the return value is `None` even though the pending entry itself is
+        // still consulted and cleared - `Self::has_pending_exit_for_test` below is what this test
+        // actually cares about.
+        let applied = agents.set_host_session_id(agent_id, session_id.clone());
+        assert!(
+            applied.is_none(),
+            "no real pane exists in this plain unit test"
+        );
 
         assert!(
             !agents.has_pending_exit_for_test(&session_id),
@@ -1586,7 +1640,9 @@ mod pending_exit_tests {
         let agent_id = 1;
         let session_id = jerry_core::SessionId::from("session-1");
 
-        agents.set_host_session_id(agent_id, session_id.clone());
+        assert!(agents
+            .set_host_session_id(agent_id, session_id.clone())
+            .is_none());
 
         assert!(
             !agents.has_pending_exit_for_test(&session_id),
