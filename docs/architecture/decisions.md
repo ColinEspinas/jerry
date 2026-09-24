@@ -1693,18 +1693,19 @@ dependency.
   `self.ui_text_size(10.0)` before; `jerry_ui::Banner` is a fixed `px(10.0)`). Real, visible only
   at a non-default scale, documented on both call sites' own doc comments rather than silently
   dropped.
-- **Follow-up, one issue per surface**, each carrying a real count of remaining hand-rolled
-  `.bg(`/`.rounded`/`.text_color(` instances that fit an existing `jerry_ui` shape: `rail/
-  render.rs` (the selection-notice banner above, plus everything past the two migrated rows),
-  `settings/render.rs` and `settings/widgets.rs` (the six other card/control shapes this pass
-  didn't touch), `work_surface/render.rs`, `sidebar/render.rs`, `title_bar/render.rs`,
-  `status_bar/render.rs` - the survey behind this issue counted 404 `.bg(`, 191 `.rounded`, and
-  547 `.text_color(` call sites across `crates/jerry-app/src` before this pass; migrating four of
-  them is a proof, not a completion. A presentational `Tab`/`TabStrip` component and a `Tooltip`
-  wrapper were scoped out of this pass too: the tab strip's real behaviour (drag reorder, settle
-  animation) has no safe small slice to extract yet, and GPUI already ships a real tooltip
-  mechanism `crate::root::widgets::text_tooltip` already wraps cleanly - re-wrapping it in
-  `jerry-ui` today would add a layer with nothing real behind it.
+- **Follow-up, one issue per surface**, each carrying a real, post-migration count of remaining
+  hand-rolled `.bg(`/`.rounded`/`.text_color(` instances that fit an existing `jerry_ui` shape:
+  issue #544 (`rail/render.rs` - the selection-notice banner above, plus everything past the two
+  migrated rows), #545 (`settings/render.rs` and `settings/widgets.rs` - the six other card/
+  control shapes this pass didn't touch), #546 (`work_surface/render.rs`), #547 (`sidebar/
+  render.rs`), #548 (`title_bar/render.rs`), #549 (`status_bar/render.rs`). The survey behind this
+  issue counted 404 `.bg(`, 191 `.rounded`, and 547 `.text_color(` call sites across
+  `crates/jerry-app/src` before this pass; migrating four of them is a proof, not a completion. A
+  presentational `Tab`/`TabStrip` component and a `Tooltip` wrapper were scoped out of this pass
+  too (tracked inside #546): the tab strip's real behaviour (drag reorder, settle animation) has
+  no safe small slice to extract yet, and GPUI already ships a real tooltip mechanism
+  `crate::root::widgets::text_tooltip` already wraps cleanly - re-wrapping it in `jerry-ui` today
+  would add a layer with nothing real behind it.
 
 **Consequences:** A new component earns its place in `jerry-ui` only once three or more real
 `jerry-app` call sites share its shape (the survey threshold this issue used) - it is not a
