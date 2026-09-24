@@ -28,6 +28,11 @@ use jerry_host::LocalClient;
 use jerry_host::SessionHandle;
 use jerry_pty::{ExitStatus, PtyError, PtyOutput};
 
+/// Only `Self::attach_session`'s output task names these, to freeze/thaw its own loop under test
+/// (GitHub issue #524) - a separate `use` so a non-test build never sees them as unused.
+#[cfg(test)]
+use gpui::{AsyncApp, WeakEntity};
+
 use crate::root::scrollbar::{self, ScrollableHandle};
 use crate::root::widgets::text_tooltip;
 use crate::terminal::grid::{
@@ -780,6 +785,23 @@ pub struct TerminalPane {
     /// this cancels whatever the previous task was doing, stopping an old session's output loop
     /// from racing a new one over the same struct fields.
     _task: Option<Task<()>>,
+    /// Test-only: while `true`, `Self::_task`'s loop (`Self::attach_session`) parks instead of
+    /// consuming `Self::session`'s output stream, so a real child's own bytes cannot land in
+    /// `Self::grid` while a test drives it via `Self::inject_bytes_for_test`/
+    /// `Self::select_cells_for_test` (GitHub issue #524). Set by `Self::freeze_input_for_test`,
+    /// cleared by `Self::thaw_input_for_test`. Always `false` in a non-test build.
+    #[cfg(test)]
+    frozen_for_test: bool,
+    /// Test-only: wakes `Self::_task` out of the park `Self::frozen_for_test` puts it in - see
+    /// `Self::thaw_input_for_test`. Never taken; every call sends on it, harmlessly queued if
+    /// the task isn't parked on `Self::thaw_rx` at that exact moment (it re-checks
+    /// `Self::frozen_for_test` fresh every time it wakes, so a stale/early send is never lost).
+    #[cfg(test)]
+    thaw_tx: futures::channel::mpsc::UnboundedSender<()>,
+    /// Test-only: the matching receiver, taken by `Self::attach_session`'s spawned task exactly
+    /// once - the same one-shot-take shape as `Self::session`'s own output stream.
+    #[cfg(test)]
+    thaw_rx: Option<futures::channel::mpsc::UnboundedReceiver<()>>,
     /// `true` between a real left mouse-down inside the grid and the matching mouse-up - i.e.
     /// while a text-selection drag is genuinely in progress (GitHub issue #158). Gates
     /// [`Self::handle_mouse_move`] so an ordinary hover never extends a selection; the
@@ -869,6 +891,8 @@ impl TerminalPane {
         // own `#[cfg(test)]` builds.
         #[cfg(test)]
         cx.background_executor().allow_parking();
+        #[cfg(test)]
+        let (thaw_tx, thaw_rx) = futures::channel::mpsc::unbounded();
 
         Self {
             spec,
@@ -889,6 +913,12 @@ impl TerminalPane {
             cell_width_px: None,
             resize_latch: ResizeLatch::default(),
             _task: None,
+            #[cfg(test)]
+            frozen_for_test: false,
+            #[cfg(test)]
+            thaw_tx,
+            #[cfg(test)]
+            thaw_rx: Some(thaw_rx),
             selecting: false,
             last_reported_cell: None,
             reported_presses: [false; 3],
@@ -1014,13 +1044,43 @@ impl TerminalPane {
         }
         cx.notify();
 
+        #[cfg(test)]
+        let mut thaw_rx = self.thaw_rx.take();
+        // A chunk this task already pulled off `output` before `Self::freeze_input_for_test`
+        // took effect (test-only: GPUI only ever drives this task from inside an explicit
+        // `run_until_parked`, so that can only happen if the chunk was in flight from a
+        // *previous* one) - stashed rather than applied or dropped, and replayed first once
+        // thawed, so `Self::thaw_input_for_test` sees exactly the bytes a never-frozen pane
+        // would have. Declared unconditionally (never written outside `#[cfg(test)]`) so the
+        // receive loop below needs only one shape for both builds.
+        let mut pending_item: Option<PtyOutput> = None;
+
         // Wakes exactly when the host's relay thread (or, on Windows, `jerry-pty`'s own
         // independent exit-wait thread - see `docs/architecture/decisions.md` §8) has something
         // ready, rather than draining a channel on a fixed interval. `Exited` ends this loop: it
         // is the stream's terminal item (guaranteed last on unix; see `PtyOutput`'s docs for
         // Windows' narrower guarantee, preserved by the host's relay - see decisions.md §23).
         let task = cx.spawn(async move |this, cx| {
-            while let Some(item) = output.next().await {
+            loop {
+                #[cfg(test)]
+                if !wait_while_frozen_for_test(&this, cx, &mut thaw_rx).await {
+                    break; // the pane entity was dropped
+                }
+
+                let item = match pending_item.take() {
+                    Some(item) => item,
+                    None => match output.next().await {
+                        Some(item) => item,
+                        None => break,
+                    },
+                };
+
+                #[cfg(test)]
+                if is_frozen_for_test(&this, cx) {
+                    pending_item = Some(item);
+                    continue;
+                }
+
                 let mut exited = false;
                 let updated = this.update(cx, |this, cx| match item {
                     PtyOutput::Bytes(chunk) => {
@@ -1817,6 +1877,29 @@ impl TerminalPane {
         cx.notify();
     }
 
+    /// Test-only seam: parks `Self::attach_session`'s output-consuming task before its next
+    /// item, so a real child process's own bytes cannot land in `Self::grid` while a test drives
+    /// it synthetically (`Self::inject_bytes_for_test`, `Self::select_cells_for_test`) - the
+    /// broader seam GitHub issue #524 asked for, replacing four different ad hoc workarounds for
+    /// the same race with one. Call it once this pane's real startup handshake (resize ack, any
+    /// cursor-position query reply) has already settled - freezing earlier than that risks
+    /// starving that handshake of the reply it's blocking on. Stays frozen until
+    /// `Self::thaw_input_for_test`, or for the rest of the test if that's never called; a test
+    /// that never needs the real process again doesn't need to call it.
+    #[cfg(test)]
+    pub(crate) fn freeze_input_for_test(&mut self) {
+        self.frozen_for_test = true;
+    }
+
+    /// Test-only seam: reverses `Self::freeze_input_for_test`, waking the parked task over the
+    /// same channel every other wake in this pane uses (`docs/architecture/decisions.md` §16) -
+    /// never a timer, never a busy poll.
+    #[cfg(test)]
+    pub(crate) fn thaw_input_for_test(&mut self) {
+        self.frozen_for_test = false;
+        let _ = self.thaw_tx.unbounded_send(());
+    }
+
     /// Test-only seam: the pane's real current selection text, so a test outside this module
     /// can assert on what a simulated drag actually selected.
     #[cfg(test)]
@@ -2109,6 +2192,41 @@ impl TerminalPane {
             .detach();
         }
     }
+}
+
+/// Test-only: `this`'s current [`TerminalPane::frozen_for_test`], or `false` if `this` was
+/// dropped - a dropped pane's own `Context::spawn` task is already on its way out via the
+/// `updated.is_err()` check further down [`TerminalPane::attach_session`]'s loop, so treating
+/// "gone" as "not frozen" here just lets that check be the one that actually stops the loop.
+#[cfg(test)]
+fn is_frozen_for_test(this: &WeakEntity<TerminalPane>, cx: &mut AsyncApp) -> bool {
+    this.update(cx, |this, _| this.frozen_for_test)
+        .unwrap_or(false)
+}
+
+/// Test-only: parks [`TerminalPane::attach_session`]'s output loop until
+/// [`TerminalPane::frozen_for_test`] reads `false`, waking only on a real
+/// [`TerminalPane::thaw_input_for_test`] send - `futures::channel::mpsc`, like every other wake
+/// this pane relies on (`docs/architecture/decisions.md` §16), never a timer or a busy poll.
+/// Returns `false` if `this` (and `TerminalPane::thaw_tx` with it) was dropped while parked,
+/// which the caller reads the same way as a closed output stream: stop the loop.
+#[cfg(test)]
+async fn wait_while_frozen_for_test(
+    this: &WeakEntity<TerminalPane>,
+    cx: &mut AsyncApp,
+    thaw_rx: &mut Option<futures::channel::mpsc::UnboundedReceiver<()>>,
+) -> bool {
+    while is_frozen_for_test(this, cx) {
+        match thaw_rx.as_mut() {
+            Some(rx) => {
+                if rx.next().await.is_none() {
+                    return false;
+                }
+            }
+            None => break,
+        }
+    }
+    true
 }
 
 /// Converts a pixel-space size into a `(rows, cols)` terminal grid size, given the
@@ -2957,6 +3075,33 @@ mod pty_pane_fixtures {
             std::env::temp_dir(),
         );
         let pane = new_pane_with_real_session(cx, spec);
+        cx.run_until_parked();
+        pane
+    }
+
+    /// As [`spawn_pane`], but frozen (`TerminalPane::freeze_input_for_test`) before its output
+    /// task is even created, not merely before the caller's next line - for a test whose very
+    /// first assertion is "nothing has happened yet" and that can't risk even this function's
+    /// own settling `run_until_parked` racing the child's first bytes (GitHub issue #524).
+    /// Freezing inside the same synchronous `cx.new` closure that spawns the task, rather than
+    /// after this function returns, means there is no task yet for any GPUI executor poll
+    /// ordering to race against. `TerminalPane::thaw_input_for_test` releases it.
+    pub(super) fn spawn_frozen_pane(
+        cx: &mut TestAppContext,
+        program: &str,
+        args: &[&str],
+    ) -> Entity<TerminalPane> {
+        let spec = TerminalSpec::command(
+            program,
+            args.iter().map(|arg| arg.to_string()).collect(),
+            std::env::temp_dir(),
+        );
+        let pane = cx.new(|cx| {
+            let mut pane = TerminalPane::new(spec.clone(), ROW_FONT_SIZE_PX, cx);
+            pane.freeze_input_for_test();
+            attach_real_session_for_test(&mut pane, &spec, cx);
+            pane
+        });
         cx.run_until_parked();
         pane
     }
@@ -3933,7 +4078,9 @@ mod clear_pty_signal_tests {
 /// escape bytes are produced by a real `printf`, exactly as a real agent CLI produces them.
 #[cfg(test)]
 mod terminal_signal_tests {
-    use super::pty_pane_fixtures::{pump_until, release, spawn_pane, stays_absent};
+    use super::pty_pane_fixtures::{
+        pump_until, release, spawn_frozen_pane, spawn_pane, stays_absent,
+    };
     use super::*;
     use crate::rail::title_signal::{classify_title, TitleSignal};
     use crate::terminal::osc::{Progress, ProgressState};
@@ -3945,6 +4092,13 @@ mod terminal_signal_tests {
     /// so the sequences and the wait are one child process.
     fn pane_emitting(cx: &mut TestAppContext, script: &str) -> gpui::Entity<TerminalPane> {
         spawn_pane(cx, "sh", &["-c", &format!("{script}; sleep 60")])
+    }
+
+    /// As [`pane_emitting`], frozen (`TerminalPane::freeze_input_for_test`) from before the
+    /// process is even spawned - for a test whose first assertion is that nothing has reached
+    /// the pane yet (GitHub issue #524).
+    fn pane_emitting_frozen(cx: &mut TestAppContext, script: &str) -> gpui::Entity<TerminalPane> {
+        spawn_frozen_pane(cx, "sh", &["-c", &format!("{script}; sleep 60")])
     }
 
     /// Drives the pane's real poll loop until `done` reports true, or gives up.
@@ -3983,11 +4137,15 @@ mod terminal_signal_tests {
     fn a_real_osc_9_notification_from_a_pty_process_latches_an_attention_ping(
         cx: &mut TestAppContext,
     ) {
-        let pane = pane_emitting(cx, "printf '\\033]9;Agent needs your input\\007'");
+        // Frozen from before the process even exists (see `pane_emitting_frozen`'s docs), so the
+        // sanity check below is deterministic rather than a race against how fast this runner's
+        // real `sh`/`printf` happens to be (GitHub issue #524).
+        let pane = pane_emitting_frozen(cx, "printf '\\033]9;Agent needs your input\\007'");
         assert!(
             !pane.read_with(cx, |pane, _| pane.has_pending_attention_ping()),
             "sanity check: nothing pinged before the process wrote anything"
         );
+        pane.update(cx, |pane, _cx| pane.thaw_input_for_test());
         assert!(
             poll_until(cx, &pane, |pane| pane.has_pending_attention_ping()),
             "a real OSC 9 notification off a real pty never reached the pane"
