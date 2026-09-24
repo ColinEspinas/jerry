@@ -137,6 +137,16 @@ impl AdeApp {
         row
     }
 
+    /// The clock [`Self::render_file_view`]'s freshness throttle reads - real `Instant::now()`,
+    /// unless [`Self::file_view_freshness_clock_override`] is set (test-only; GitHub issue #543).
+    fn freshness_clock_now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(now) = self.file_view_freshness_clock_override {
+            return now;
+        }
+        Instant::now()
+    }
+
     /// Surface C's File view: a breadcrumb, line-numbered/syntax-highlighted code
     /// (`crate::code_surface::code_view`), and a status bar for whichever file `relative_path` (resolved
     /// against [`Self::file_tree_root`]) names on disk.
@@ -149,7 +159,7 @@ impl AdeApp {
 
         // Throttled freshness check (see `file_view_last_freshness_check`'s docs); a path
         // mismatch always forces an immediate re-check regardless of the throttle window.
-        let now = Instant::now();
+        let now = self.freshness_clock_now();
         let should_check = match &self.file_view_last_freshness_check {
             Some((checked_path, checked_at)) => {
                 checked_path != &absolute_path

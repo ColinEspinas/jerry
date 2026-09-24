@@ -1073,6 +1073,12 @@ pub struct AdeApp {
     /// `Self::select_worktree` doesn't need to reset this since a worktree switch always changes
     /// `file_tree_root`, forcing a path mismatch and thus a fresh check anyway.
     pub(crate) file_view_last_freshness_check: Option<(PathBuf, Instant)>,
+    /// Test-only seam: when set, [`Self::render_file_view`]'s freshness throttle reads this
+    /// instead of the real `Instant::now()` (GitHub issue #543) - lets a test drive the
+    /// throttle window explicitly rather than racing a slow CI runner's real wall clock.
+    /// `#[cfg(test)]`-gated end to end, so no test-only state exists in a production build.
+    #[cfg(test)]
+    pub(crate) file_view_freshness_clock_override: Option<Instant>,
     /// See [`FileLoadState`]'s own docs.
     pub(crate) file_load_state: FileLoadState,
     /// Changed-line set (`code_view::changed_line_set`) for whichever `DiffFile`
