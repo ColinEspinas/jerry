@@ -387,18 +387,11 @@ async fn a_relaunched_instance_replays_the_hosts_prior_hook_history_exactly_as_t
         .report
         .clone();
 
-    // The runtime must already exist for the seed to have anything to replay into - the same
-    // lazy bring-up gate a live event already respects (`apply_entry`'s own docs).
-    let hook_settings_dir = tempfile::tempdir().expect("hook settings dir");
-    app.update(cx, |app, _cx| {
-        app.hook_runtime =
-            crate::hooks::HookRuntime::start(hook_settings_dir.path(), Path::new("jerry"));
-        assert!(
-            app.hook_runtime.is_some(),
-            "the runtime must start against a real, reachable host"
-        );
-    });
-
+    // No spawn anywhere in this test, and `app.hook_runtime` is never touched by hand: the seed
+    // itself must bring the runtime up (`AdeApp::ensure_hook_runtime`, decisions.md §26) before it
+    // has anything to replay into - the real scenario a relaunch that reattaches an already-running
+    // agent's session hits, since that spawns nothing at all and would otherwise never reach
+    // `hook_injection_for`'s own bring-up.
     let repo_host = crate::host::RepoHost::for_test_in_process(host, socket);
     app.update(cx, |app, cx| {
         app.adopt_repo_host_for_test(repo.path().to_path_buf(), repo_host, cx);

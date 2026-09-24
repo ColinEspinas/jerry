@@ -438,20 +438,24 @@ impl AdeApp {
         .detach();
     }
 
-    /// Decisions.md §26's own seed: dispatches `HooksQuery` for `common_dir`'s repository and
-    /// replays every raw entry it returns into [`crate::hooks::apply_entry`], oldest first, per
-    /// agent - the same real processing a live `event/hook` notification takes
+    /// Decisions.md §26's own seed: ensures [`AdeApp::hook_runtime`] exists
+    /// ([`Self::ensure_hook_runtime`]) - a relaunch that reattaches an already-running agent's
+    /// session spawns nothing at all, so `Self::hook_injection_for`'s own bring-up would never
+    /// otherwise run - then dispatches `HooksQuery` for `common_dir`'s repository and replays
+    /// every raw entry it returns into [`crate::hooks::apply_entry`], oldest first, per agent -
+    /// the same real processing a live `event/hook` notification takes
     /// ([`crate::hooks::spawn_consumer`]), so a relaunched instance's rail renders an existing
     /// agent's status exactly as it would have if this instance had been running the whole time.
-    /// A no-op while [`AdeApp::hook_runtime`] has not started yet (`apply_entry`'s own docs) - the
-    /// same lazy-bring-up gate a live event already respects, not a new limitation this seed
-    /// adds. Acknowledges what it replayed (`HookAck`, best-effort, one per agent) so the host's
-    /// own bounded inbox is pruned by real consumption. Best-effort throughout - a repository
-    /// with no live host answers `NEEDS_HOST` and this simply replays nothing. Called from both
-    /// [`ensure_repo_host_connected`] (production) and [`Self::adopt_repo_host_for_test`] (the
-    /// test-only connection-adoption path), so a test-adopted host behaves identically to a real
-    /// one here rather than silently skipping this step.
+    /// Acknowledges what it replayed (`HookAck`, best-effort, one per agent) so the host's own
+    /// bounded inbox is pruned by real consumption. Best-effort throughout - a repository with no
+    /// live host answers `NEEDS_HOST` and this simply replays nothing, and hooks genuinely
+    /// unsupported on this machine leaves `hook_runtime` `None` exactly as `ensure_hook_runtime`
+    /// already logs. Called from both [`ensure_repo_host_connected`] (production) and
+    /// [`Self::adopt_repo_host_for_test`] (the test-only connection-adoption path), so a
+    /// test-adopted host behaves identically to a real one here rather than silently skipping
+    /// this step.
     pub(crate) fn seed_hook_runtime(&mut self, common_dir: PathBuf, cx: &mut Context<Self>) {
+        self.ensure_hook_runtime();
         let seed = self.dispatch(
             common_dir.clone(),
             Request::Query(AppQuery::Hooks(HooksQuery::default())),

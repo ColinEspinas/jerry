@@ -118,32 +118,40 @@ impl AdeApp {
         if !wants_injection {
             return None;
         }
-        // Bring-up is attempted exactly once per `AdeApp`, keyed on a `tried` flag rather than on
-        // `hook_runtime.is_none()`, because those differ precisely in the failure case: without
-        // it, an instance that cannot start a runtime re-ran the whole attempt on every subsequent
-        // Claude spawn, and re-logged the same warning each time, for a condition (hooks
-        // unsupported, or the settings file unwritable) that will not have changed since the last
-        // try. Unlike before this cutover, bringing the runtime up needs no host connection at all
-        // - only the socket looked up below does, and that is resolved fresh per call rather than
-        // baked into this one-shot flag, so a repository whose connection is still resolving is
-        // simply retried on the next spawn rather than counted as a failed attempt.
-        if self.hook_runtime.is_none() && !self.hook_runtime_tried {
-            self.hook_runtime_tried = true;
-            match crate::host::find_jerry_binary() {
-                Some(jerry_binary) => {
-                    self.hook_runtime =
-                        crate::hooks::HookRuntime::start(&std::env::temp_dir(), &jerry_binary);
-                }
-                None => log::warn!(
-                    "could not locate the `jerry` binary next to this executable, under its \
-                     bin/, or on PATH - agent hook injection is disabled; agent status will \
-                     use the terminal-title and quiescence signals only"
-                ),
-            }
-        }
+        self.ensure_hook_runtime();
         let runtime = self.hook_runtime.as_ref()?;
         let host_socket = self.host_socket_for(cwd)?;
         Some(runtime.injection(host_socket))
+    }
+
+    /// Brings [`Self::hook_runtime`] up if it has not been tried yet - the one-shot bring-up
+    /// [`Self::hook_injection_for`] always needed before it had anything to inject, factored out
+    /// so `crate::host::AdeApp::seed_hook_runtime` (decisions.md §26) can ensure the same runtime
+    /// exists before it replays a repository's prior hook history into it, not only a spawn that
+    /// wants injection - a relaunch that reattaches an already-running agent's session spawns
+    /// nothing at all, so `hook_injection_for` would never otherwise run.
+    ///
+    /// Attempted exactly once per `AdeApp`, keyed on [`Self::hook_runtime_tried`] rather than on
+    /// `hook_runtime.is_none()`, because those differ precisely in the failure case: without it,
+    /// an instance that cannot start a runtime would re-run the whole attempt on every caller, and
+    /// re-log the same warning each time, for a condition (hooks unsupported, or the settings file
+    /// unwritable) that will not have changed since the last try.
+    pub(crate) fn ensure_hook_runtime(&mut self) {
+        if self.hook_runtime.is_some() || self.hook_runtime_tried {
+            return;
+        }
+        self.hook_runtime_tried = true;
+        match crate::host::find_jerry_binary() {
+            Some(jerry_binary) => {
+                self.hook_runtime =
+                    crate::hooks::HookRuntime::start(&std::env::temp_dir(), &jerry_binary);
+            }
+            None => log::warn!(
+                "could not locate the `jerry` binary next to this executable, under its \
+                 bin/, or on PATH - agent hook injection is disabled; agent status will \
+                 use the terminal-title and quiescence signals only"
+            ),
+        }
     }
 
     /// Reconciles `~/.cursor/hooks.json` against the current `agents.cursor_hooks_enabled`

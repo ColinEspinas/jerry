@@ -1710,13 +1710,24 @@ have the cross-*instance-visibility* gap the issue is about) and `hooks/mod.rs`'
   before dispatching one `HookAck` for that agent's last entry. Called from both
   `ensure_repo_host_connected` (production) and the test-only `adopt_repo_host_for_test`
   (`wire_test_repo_host_events` now takes the resolved `common_dir` too), so a test-adopted host
-  behaves identically to a real one. A no-op while `AdeApp::hook_runtime` has not started yet
-  (`apply_entry`'s own docs) - the same lazy bring-up gate (`hooks::flow::AdeApp::
-  hook_injection_for`) a live event already respects, not a new limitation the seed adds: a
-  repository connects long before any agent has spawned in the common case, so the seed's real
-  effect is felt on the *next* repository this instance opens after its first `HookRuntime`
-  bring-up, or a reconnect after one already exists - documented, not hidden, as a real boundary
-  of this change rather than solved by starting `HookRuntime` eagerly (out of scope here).
+  behaves identically to a real one.
+- **`seed_hook_runtime` ensures `AdeApp::hook_runtime` exists before it replays anything - it does
+  not wait for a spawn to bring it up.** The one-shot bring-up `hook_injection_for` always needed
+  (find the `jerry` binary, write the per-launch settings file, once per `AdeApp`) is factored into
+  its own `AdeApp::ensure_hook_runtime` (`hooks/flow.rs`), and `seed_hook_runtime` calls it before
+  dispatching `HooksQuery`. This matters for real: once #507 lands, a relaunch reattaches an
+  already-running agent's session without spawning anything at all, so `hook_injection_for`'s own
+  bring-up - gated on a spawn that "wants injection" - would never run, and a seed that only
+  replayed into an already-existing runtime would silently do nothing for exactly the case this
+  issue exists for. `ensure_hook_runtime` is keyed on the same `hook_runtime_tried` one-shot flag
+  either caller already shared (a failed attempt - hooks unsupported, no locatable binary - is not
+  retried by the other caller either), so there is still exactly one bring-up attempt per `AdeApp`,
+  from whichever of the two call sites reaches it first. Proven with no spawn anywhere in the test:
+  `hooks::integration_tests::a_relaunched_instance_replays_the_hosts_prior_hook_history_exactly_as_
+  the_live_path_would` seeds a real host with two hook events, opens a test app against it (`event/
+  hook`'s own subscription, `adopt_repo_host_for_test`) with `hook_runtime` never touched by hand,
+  and the seed itself brings the runtime up for real (a real `find_jerry_binary` - this machine's
+  own `jerry.exe` build - and a real settings-file write) before replaying.
 - **`HookAck` is real and dispatched for real**, both by `seed_hook_runtime` (one ack per agent,
   after replaying that agent's entries) and by `spawn_consumer` (one ack per live entry applied,
   best-effort, awaited but not retried on failure). The host's `HookStore::ack` prunes acknowledged
