@@ -1222,15 +1222,14 @@ not folded into this one as a partial pass. Tracked as issue #532's own scope, n
 gating
 
 **Status:** Accepted, fully landed (2026-09-23, issue #506; 2026-09-23, issue #507's own data
-plane; 2026-09-24, issue #506's own control-plane cutover and, the same day, its adapter
-wiring/error banner/external DoD test; plan decisions Q7, Q15, Q20, and §14's spike). The real
+plane; 2026-09-24, issue #506's own control-plane cutover, its adapter wiring/error banner/
+external DoD test, and a same-day fix so a socket-attached pane's resize is a real dispatch
+rather than a silent no-op; plan decisions Q7, Q15, Q20, and §14's spike). The real
 protocol/process pieces below, the data plane, the control-plane cutover (`Hosts`/`RepoHost`, one
 real per-repository connection with its own event subscriptions, and per-repository
 `JERRY_HOST_SOCKET` injection), and the third amendment's closing work (`SocketSessionAdapter`
-wired into `Agents::spawn_inner` for real, the per-repository error banner, and the external DoD
-test) are all shipped and tested. The one genuinely separate item the third amendment's own closing
-paragraph carves out - a socket-attached pane's resize has no out-of-process dispatch path yet - is
-tracked as new follow-up work, not this issue's own remaining scope.
+wired into `Agents::spawn_inner` for real, the per-repository error banner, the external DoD test,
+and `ControlPlane`'s own resize fix - see the fourth amendment) are all shipped and tested.
 
 **Context:** Through #505 (§23), the session host is a real, well-factored dispatcher and session
 table, but it still runs *inside* `jerry-app`'s own process (`HostRuntime`, §16's `pending_dispatch`
@@ -1574,8 +1573,52 @@ closing this issue's own remaining scope):**
   `spawn_or_connect_starts_a_real_jerry_host_binary_and_a_second_call_reuses_it` test already
   applies - so it is a permanent regression test in the ordinary gate, not a one-off manual check.
 
-This closes every item this issue's plan named as its own scope. What is left is genuinely
-separate follow-up work, tracked as new issues rather than folded back into this entry: `Agents`'
-resize path (`TerminalPane::host_client: Option<LocalClient>`) still has no out-of-process
-counterpart, so resizing a socket-attached pane is a silent no-op rather than a real dispatch - a
-`SessionResize` call for a production repository, unlike attach and kill, has nowhere to go yet.
+**Amended 2026-09-24 (#506 part 4 - a real `Host::listen` bug found by PR #539's own Linux/macOS
+CI, and the resize fix the third amendment above deferred):**
+
+- **`Host::listen` now creates its own socket's parent directory before binding**
+  (`jerry_core::registry::ensure_private_dir`, the same call `DataPlane::bind` already made for a
+  per-session socket - `Host::listen`'s own control-plane bind had never made the identical call).
+  A fresh CI runner's own runtime/socket directory does not exist until something creates it;
+  production's own bind is covered by `Registry::open` doing so moments earlier, but the
+  `#[cfg(test)]` in-process `RepoHost` (`start_in_process_repo_host`) binds directly under
+  `jerry_host::default_sockets_dir()` with no such call - Windows CI passed only because an
+  earlier test's own run had already created the shared directory, while a fresh Linux/macOS
+  runner's `listen()` failed outright, turning every dispatch in that test app into a `NEEDS_HOST`
+  error - the same shape `#[cfg(test)]`'s own start-up path modeled as `RepoHostState::
+  CannotSpawn` rather than surfacing loudly. `start_in_process_repo_host` now panics on that
+  failure instead: a throwaway test host failing to bind is always a fixture bug, never a real
+  state a test should have to model (`RepoHost::for_test_unavailable`/`adopt_repo_host_for_test`
+  remain the real, deliberate way to construct a broken connection for the error-banner tests
+  themselves). `jerry-host`'s own `listen_creates_its_own_socket_directory_when_it_does_not_exist_
+  yet` is the regression test.
+- **`ensure_repo_host_connected`/`adopt_repo_host_for_test` now `dunce::canonicalize` the resolved
+  common directory before using it as `Hosts::by_repo`'s key.** `jerry_git::git_common_dir`
+  absolutizes `--git-common-dir`'s own (often relative) output against whatever spelling of `cwd`
+  it was given, so a worktree reached through a symlinked parent (macOS's own `/var` ->
+  `/private/var`) and the repository's own already-canonical root resolve to two different
+  strings for the same real directory - a second, independent (and, in a test, session-less)
+  `RepoHost` opens for the mismatched spelling instead of reusing the first. Two regression tests
+  in `host::app_dispatch_tests`: a real symlinked parent (gracefully skipped where the environment
+  refuses unprivileged symlink creation) and a portable redundant-path-component case that runs
+  everywhere, both proving a session spawned through the alternate spelling is visible through the
+  canonical one.
+- **`TerminalPane` no longer holds a bare `LocalClient` at all - `ControlPlane` replaces it**,
+  closing the third amendment's own deferred gap: resizing a socket-attached (production) pane was
+  a silent no-op, since `SessionResize` had no path for that connection kind. `ControlPlane`
+  (`crate::terminal::pane`) is a small enum - `Remote(RemoteRepoHost)` in production, `InProcess
+  (LocalClient)` in tests - handed to a pane at attach time (`AdeApp::control_plane_for`, the same
+  shape `attach_remote_session`'s own kill closure already used) and dispatched off the UI thread
+  exactly as before: a plain blocking `RemoteRepoHost::dispatch` for the real case (safe from any
+  context, §16's amendment), a real `.await` over `LocalClient::request` for the in-process test
+  case (never a `block_on`, so equally safe to run from inside a background task). `SessionRecord`
+  gained `rows`/`cols`, set at spawn and updated on every real `SessionManager::resize` - what a
+  socket-attached pane's own resize test verifies against, since it has no in-process `PtySession`
+  to read the applied size back from directly.
+  `terminal::pane::control_plane_resize_tests::a_socket_attached_panes_resize_reaches_the_real_
+  host` is the regression test: a real, separate-socket-shaped `RemoteRepoHost`, a real spawned
+  shell, a real `TerminalPane::resize_to` call, and a fresh `SessionsQuery` confirming the applied
+  size landed at the host.
+
+This closes every item this issue's plan named as its own scope, including both items the third
+amendment above had deferred.

@@ -3025,6 +3025,146 @@ mod pty_pane_fixtures {
     }
 }
 
+/// `ControlPlane::Remote`'s own regression coverage - decisions.md §24's "resize of a
+/// socket-attached pane must not be a no-op" fix, closing the gap `pty_pane_fixtures`'s own
+/// `Connection::InProcess`-shaped `LocalClient` never exercised.
+#[cfg(test)]
+mod control_plane_resize_tests {
+    use super::{ControlPlane, TerminalPane, TerminalSpec, ROW_FONT_SIZE_PX};
+    use crate::repo_host::RemoteRepoHost;
+    use crate::terminal::socket_adapter::SocketSessionAdapter;
+    use gpui::{AppContext as _, TestAppContext};
+    use jerry_core::{
+        AppCommand, AppQuery, Call, Report, Request, SessionAttach, SessionId, SessionKill,
+        SessionRecord, SessionSpawn, SessionsQuery,
+    };
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use test_support::wait_until;
+
+    /// A real, separate `jerry-host` process shape (a real socket, never an in-process stand-in)
+    /// spawns a real, idling shell, attaches a real `SocketSessionAdapter` to it exactly as
+    /// `crate::host::attach_remote_session` would, resizes the pane through its
+    /// `ControlPlane::Remote` handle, and confirms a real `SessionResize` reached the host by
+    /// reading it straight back off a fresh `SessionsQuery` - the one thing an out-of-process
+    /// pane has no in-process `PtySession` to read back from directly. Before this fix,
+    /// `TerminalPane::resize_to` had no `ControlPlane` for this connection kind at all, so this
+    /// would have been a silent no-op.
+    #[gpui::test]
+    fn a_socket_attached_panes_resize_reaches_the_real_host(cx: &mut TestAppContext) {
+        let host = jerry_host::Host::start().expect("host");
+        let socket_dir = jerry_core::registry::runtime_dir().expect("runtime dir");
+        let socket = socket_dir.join(format!(
+            "cr-{:x}-{:08x}.sock",
+            std::process::id(),
+            jerry_core::registry::fresh_u32()
+        ));
+        host.listen(&socket).expect("listen");
+        let client = jerry_core::client::Client::connect(&socket, Duration::from_secs(5))
+            .expect("connect to the real socket");
+        let remote = RemoteRepoHost::new(client).expect("worker thread");
+
+        let cwd = std::env::temp_dir();
+        #[cfg(windows)]
+        let (program, args) = (PathBuf::from("cmd"), Vec::new());
+        #[cfg(not(windows))]
+        let (program, args) = (PathBuf::from("sh"), Vec::new());
+        let spawn_report = remote
+            .dispatch(Call::human(
+                cwd.clone(),
+                Request::Command(AppCommand::SessionSpawn(SessionSpawn {
+                    program,
+                    args,
+                    env: Vec::new(),
+                    rows: 24,
+                    cols: 80,
+                    agent: None,
+                })),
+            ))
+            .expect("the real host accepts a real spawn");
+        let Report::Ok { outcome } = spawn_report else {
+            panic!("expected ok, got {spawn_report:?}")
+        };
+        let session_id = SessionId(
+            outcome["id"]
+                .as_str()
+                .expect("the outcome carries a real session id")
+                .to_owned(),
+        );
+
+        let attach_report = remote
+            .dispatch(Call::human(
+                cwd.clone(),
+                Request::Command(AppCommand::SessionAttach(SessionAttach {
+                    id: session_id.clone(),
+                })),
+            ))
+            .expect("attach must succeed against a session with no client yet");
+        let Report::Ok { outcome } = attach_report else {
+            panic!("expected ok, got {attach_report:?}")
+        };
+        let data_socket = PathBuf::from(
+            outcome["socket"]
+                .as_str()
+                .expect("the outcome carries a real socket path"),
+        );
+
+        let kill_id = session_id.clone();
+        let kill_cwd = cwd.clone();
+        let kill_remote = remote.clone();
+        let adapter =
+            SocketSessionAdapter::connect(&data_socket, session_id.clone(), None, move || {
+                match kill_remote.dispatch(Call::human(
+                    kill_cwd.clone(),
+                    Request::Command(AppCommand::SessionKill(SessionKill {
+                        id: kill_id.clone(),
+                    })),
+                )) {
+                    Ok(Report::Ok { .. }) => Ok(()),
+                    Ok(other) => Err(format!("{other:?}")),
+                    Err(error) => Err(error.message),
+                }
+            })
+            .expect("connect to the real data plane");
+
+        let spec = TerminalSpec::command(PathBuf::from("sh"), Vec::new(), cwd.clone());
+        let pane = cx.new(|cx| TerminalPane::new(spec, ROW_FONT_SIZE_PX, cx));
+        pane.update(cx, |pane, cx| {
+            pane.attach_session(
+                Arc::new(adapter),
+                Some(ControlPlane::Remote(remote.clone())),
+                cx,
+            );
+            pane.resize_to(30, 100, cx);
+        });
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                cx.run_until_parked();
+                let sessions_report = remote
+                    .dispatch(Call::human(
+                        cwd.clone(),
+                        Request::Query(AppQuery::Sessions(SessionsQuery::default())),
+                    ))
+                    .expect("sessions query");
+                let Report::Ok { outcome } = sessions_report else {
+                    return false;
+                };
+                let records: Vec<SessionRecord> =
+                    serde_json::from_value(outcome).expect("a real list of session records");
+                records.iter().any(|record| {
+                    record.id == session_id && record.rows == 30 && record.cols == 100
+                })
+            }),
+            "a socket-attached pane's own resize must reach the real host as a real \
+             SessionResize, observable back through SessionsQuery"
+        );
+
+        host.shutdown_and_join();
+    }
+}
+
 #[cfg(test)]
 mod resize_tests {
     use super::*;
