@@ -16,7 +16,7 @@ use gpui::{AppContext, AsyncApp, Context, Task};
 use jerry_core::wire::rpc_code;
 use jerry_core::{
     AppCommand, AppQuery, Call, HookAck, HookAgentSnapshot, HooksQuery, Report, Request, RpcError,
-    SessionAttach, SessionId, SessionKill, SessionSnapshot, SessionsQuery, Shutdown,
+    SessionAttach, SessionId, SessionKill, SessionSnapshot, Shutdown,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
