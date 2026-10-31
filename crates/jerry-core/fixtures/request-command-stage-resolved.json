@@ -1,0 +1,7 @@
+{
+  "method": "command/stage-resolved",
+  "params": {
+    "cwd": "/repo",
+    "params": { "worktree_path": "/repo", "path": "src/a.rs" }
+  }
+}

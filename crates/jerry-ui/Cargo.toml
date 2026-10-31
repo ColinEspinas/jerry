@@ -1,0 +1,26 @@
+[package]
+name = "jerry-ui"
+version = { workspace = true }
+edition = { workspace = true }
+publish = { workspace = true }
+license = { workspace = true }
+description = "Jerry's design-system crate: semantic theming tokens and reusable GPUI components"
+
+[lints]
+workspace = true
+
+[dependencies]
+gpui = { workspace = true }
+# The theme schema (`crate::schema`) a user theme file populates - real (de)serialization, the
+# same "1.0.221"/"0.8" pins `Cargo.toml`'s own `[workspace.dependencies]` comment documents
+# jerry-app's settings file already uses, so a theme file and a settings file are read by the
+# same real TOML parser rather than two independently-drifting ones.
+serde = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+# Unlocks `#[gpui::test]`/`TestAppContext`/`VisualTestContext` - the real interactive test
+# harness (a real window, real layout/paint, `debug_bounds`), matching
+# `crates/jerry-app/Cargo.toml`'s own `gpui` dev-dependency for the identical reason.
+gpui = { workspace = true, features = ["test-support"] }

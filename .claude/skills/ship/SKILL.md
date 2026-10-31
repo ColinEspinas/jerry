@@ -22,7 +22,7 @@ changed and why from the diff alone.
    run `verify` and keep its final capture; if not, skip straight to committing rather than forcing
    a screenshot onto a logic-only change.
 
-3. **Commit.** Conventional style (`feat(app): ...`, `fix(pty-core): ...`), matching this repo's
+3. **Commit.** Conventional style (`feat(jerry-app): ...`, `fix(jerry-pty): ...`), matching this repo's
    existing history. If there are several logically separate pieces of work in the tree, several
    focused commits beat one large one — but don't split an atomic change just to inflate the
    commit count either.
@@ -40,7 +40,7 @@ changed and why from the diff alone.
      scoped tests from step 1); note anything that couldn't run and why, rather than leaving an
      unchecked box unexplained.
    - **Architecture notes** — only if this touches the crate boundary or added/changed a
-     Command/Query (e.g. "new Command: `AttemptCherryPick` in `wt-core`"); delete the section for a
+     Command/Query (e.g. "new Command: `AttemptCherryPick` in `jerry-git`"); delete the section for a
      change that doesn't touch any of that.
    - **Screenshot** — the `verify` capture, if there is one; delete the section entirely for a
      logic-only change rather than leaving it empty.

@@ -1,0 +1,11 @@
+{
+  "method": "command/session-stop-policy",
+  "params": {
+    "cwd": "/repo",
+    "params": {
+      "child": "agent-7",
+      "decision": "stop",
+      "reason": "still validating the migration"
+    }
+  }
+}

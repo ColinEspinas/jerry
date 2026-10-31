@@ -1,6 +1,6 @@
 # Jerry's syntax palette
 
-Design rationale for the ~270 syntax-highlighting color tokens in `crates/app/src/theme.rs`. For
+Design rationale for the ~270 syntax-highlighting color tokens in `crates/jerry-app/src/theme.rs`. For
 the theme *file format* and how to author/import/generate a whole theme (not just syntax colors),
 see [`themes.md`](./themes.md) instead — that's the user-facing guide; this is the design record
 for why the syntax tier specifically looks the way it does.
@@ -9,11 +9,11 @@ The full specification of Jerry Dark's syntax palette: every colour in OKLCH, it
 measured WCAG contrast against the editor background.
 
 Jerry Dark is the *source* palette. The five other bundled themes are generated from it
-programmatically (`crates/app/src/settings/builtin_themes.rs`); they are never hand-edited.
+programmatically (`crates/jerry-app/src/settings/builtin_themes.rs`); they are never hand-edited.
 Regenerate with:
 
 ```
-JERRY_REGENERATE_THEMES=1 cargo test -p app --lib builtin_themes -- --nocapture
+JERRY_REGENERATE_THEMES=1 cargo test -p jerry-app --lib builtin_themes -- --nocapture
 ```
 
 ---

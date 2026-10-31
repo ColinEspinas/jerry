@@ -1,6 +1,6 @@
 # Zone 3 — files, search and changes
 
-- **Code:** `crates/app/src/sidebar/`, `crates/app/src/search/`
+- **Code:** `crates/jerry-app/src/sidebar/`, `crates/jerry-app/src/search/`
 - **Tokens:** `theme::{tree, changes, lang, band, zone}`
 
 ## What it's for

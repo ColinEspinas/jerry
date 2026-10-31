@@ -27,7 +27,7 @@
 ## Architecture notes
 
 <!-- Only if this touches the crate boundary or the Command/Query shape - e.g. "new Command:
-     AttemptCherryPick in wt-core", "extracted X into its own crate per docs/architecture/decisions.md §N". Delete
+     AttemptCherryPick in jerry-git", "extracted X into its own crate per docs/architecture/decisions.md §N". Delete
      this section for a change that doesn't touch any of that. -->
 
 ## Screenshot

@@ -1,0 +1,422 @@
+//! Recording what the hooks taught Jerry about each agent, onto disk (GitHub issue #239 phase 2).
+
+use gpui::{AppContext as _, Context, Task, Window};
+
+use crate::root::AdeApp;
+use crate::work_surface::agents::ProcessKind;
+
+impl AdeApp {
+    /// Every currently open agent's own persisted-status key
+    /// (`crate::review::state::baseline_key`) - GitHub issue #227's "this one is still live, don't
+    /// show it twice under History" exclusion set for
+    /// [`crate::hooks::history::past_agents_for_worktree`].
+    pub(crate) fn live_agent_status_keys(&self) -> std::collections::HashSet<String> {
+        self.agents
+            .iter()
+            .filter_map(|agent| {
+                let ProcessKind::Agent(kind) = agent.kind else {
+                    return None;
+                };
+                Some(crate::review::state::baseline_key(
+                    &agent.cwd,
+                    kind,
+                    agent.spawned_at_unix,
+                ))
+            })
+            .collect()
+    }
+
+    /// GitHub issue #227's resume action: looks `key` up in
+    /// [`Self::agent_status_state`], selects its worktree, and spawns a real agent back into it.
+    pub(crate) fn resume_past_agent(
+        &mut self,
+        key: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(past) = crate::hooks::history::find(&self.agent_status_state, key) else {
+            return false;
+        };
+        if !self
+            .worktrees
+            .iter()
+            .any(|item| item.path == past.worktree && item.error.is_none())
+        {
+            return false;
+        }
+
+        self.select_worktree_by_path(&past.worktree, window, cx);
+
+        let process_kind = ProcessKind::Agent(past.kind);
+        // GitHub issue #239 phase 2's injection, exactly as a fresh spawn would get it - a
+        // resumed conversation is exactly as real an agent as a new one, and should keep
+        // reporting its status through the same hook side-channel.
+        let hook_injection = self.hook_injection_for(process_kind, &past.worktree);
+        let font_size = self.settings.appearance.terminal_font_size;
+        let shell_override = self.settings.terminal.shell_override();
+        let id = match (past.kind, past.session_id.clone()) {
+            // Every kind with a verified resume flag, not Claude alone - `spawn_resume` asks
+            // `AgentKind::resume_args` for the right spelling and spawns bare if there is none.
+            (kind, Some(session_id)) if kind.resume_args(&session_id).is_some() => {
+                self.agents.spawn_resume(
+                    kind,
+                    past.worktree.clone(),
+                    font_size,
+                    shell_override,
+                    hook_injection.as_ref(),
+                    session_id,
+                    window,
+                    cx,
+                )
+            }
+            _ => self.agents.spawn(
+                process_kind,
+                past.worktree.clone(),
+                font_size,
+                shell_override,
+                hook_injection.as_ref(),
+                window,
+                cx,
+            ),
+        };
+        // Mirrors `crate::work_surface::render::AdeApp::new_agent`'s own post-spawn steps: a real
+        // review baseline for the newly spawned pane, closing a now-invalid gated review tab, and
+        // moving focus onto it.
+        self.capture_review_baseline(id, cx);
+        self.close_gated_review_tab(window, cx);
+        self.focus_newly_spawned_agent(window, cx);
+        // A resumed agent is a real new tab in this worktree, and one whose whole point is that it
+        // carries a real session id forward - so it belongs in the persisted tab session too, and
+        // will itself be resumable again after the next quit. See `crate::work_surface::session`.
+        self.record_worktree_session(cx);
+        self.prune_confirm_armed = false;
+        cx.notify();
+        true
+    }
+
+    /// The hook injection for an agent about to be spawned into `cwd`, bringing the runtime up on
+    /// first use. `cwd`'s own repository must already have a resolved socket
+    /// ([`AdeApp::host_socket_for`]) for this to return `Some` - a real, transient window every
+    /// launch passes through before `Self::open_repo_host`'s async connect (`crate::host`) has
+    /// resolved, which simply means this particular spawn falls back to the terminal-title and
+    /// quiescence signals rather than burning the one bring-up attempt on a race.
+    pub(crate) fn hook_injection_for(
+        &mut self,
+        kind: crate::work_surface::agents::ProcessKind,
+        cwd: &std::path::Path,
+    ) -> Option<crate::hooks::HookInjection> {
+        use crate::work_surface::agents::{AgentKind, ProcessKind};
+        let wants_injection = match kind {
+            ProcessKind::Agent(AgentKind::Claude) => true,
+            // Opt-in (GitHub issue #479): unlike Claude's per-launch, entirely Jerry-owned
+            // `--settings <path>`, a Cursor injection implies a real write into
+            // `~/.cursor/hooks.json`, a file the user owns - see `crate::settings::store::Settings`'s
+            // `agents.cursor_hooks_enabled` and this app's own Agents settings page toggle.
+            ProcessKind::Agent(AgentKind::Cursor) => self.settings.agents.cursor_hooks_enabled,
+            _ => false,
+        };
+        if !wants_injection {
+            return None;
+        }
+        // Bring-up is attempted exactly once per `AdeApp` ([`Self::hook_runtime_tried`]'s own
+        // docs). Synchronous, on the calling thread - a real, pre-existing blocking call
+        // (`locate_and_start_hook_runtime`'s own docs): `Agents::spawn` needs the injection, if
+        // any, before its own synchronous "the tab exists, here is its id" contract resolves, so
+        // there is nothing to hand a background task here without redesigning that contract -
+        // out of scope for decisions.md §26's review finding. [`Self::ensure_hook_runtime`] is
+        // the off-thread twin for a caller with nothing synchronous to hand back.
+        if self.hook_runtime.is_none() && !self.hook_runtime_tried {
+            self.hook_runtime_tried = true;
+            self.hook_runtime = locate_and_start_hook_runtime();
+        }
+        let runtime = self.hook_runtime.as_ref()?;
+        let host_socket = self.host_socket_for(cwd)?;
+        Some(runtime.injection(host_socket))
+    }
+
+    /// Brings [`Self::hook_runtime`] up in the background if it has not been tried yet - the
+    /// off-thread twin of [`Self::hook_injection_for`]'s own inline bring-up, for a caller with
+    /// nothing synchronous to hand back once it resolves (`crate::host::AdeApp::
+    /// seed_hook_runtime`, decisions.md §26's review finding: locating the `jerry` binary is real
+    /// filesystem/`PATH` I/O, and writing the settings file is a real write - neither belongs on
+    /// the UI thread). A relaunch that reattaches an already-running agent's session spawns
+    /// nothing at all, so `hook_injection_for` would never otherwise run - this is what lets the
+    /// seed bring the runtime up regardless.
+    ///
+    /// [`Self::hook_runtime_tried`] is set *before* the background work starts, not after it
+    /// resolves, so a second caller racing this one (two repositories connecting back to back)
+    /// sees the flag already set and does not start a second attempt of its own. Returns a `Task`
+    /// the caller awaits before it needs [`Self::hook_runtime`] settled one way or the other -
+    /// already a real, immediately-resolving no-op once a bring-up has already been tried.
+    pub(crate) fn ensure_hook_runtime(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        if self.hook_runtime.is_some() || self.hook_runtime_tried {
+            return cx.spawn(async move |_this, _cx| {});
+        }
+        self.hook_runtime_tried = true;
+        cx.spawn(async move |this, cx| {
+            let runtime = cx
+                .background_spawn(async { locate_and_start_hook_runtime() })
+                .await;
+            let _ = this.update(cx, |this, _cx| {
+                this.hook_runtime = runtime;
+            });
+        })
+    }
+
+    /// Reconciles `~/.cursor/hooks.json` against the current `agents.cursor_hooks_enabled`
+    /// setting (GitHub issue #479): installs Jerry's managed entries when it's on, removes them
+    /// when it's off. Called once at startup (`Self::start_update_check_loop`'s own call site in
+    /// `crate::root::state`) so a stale entry from an older Jerry install, or a toggle flipped
+    /// while the app was closed, self-heals - and again immediately whenever the setting itself
+    /// flips, so turning it on or off has a real, immediate effect rather than "next restart".
+    /// Every real filesystem call happens on the background executor
+    /// (`crate::hooks::cursor_hooks_file`'s own I/O is all synchronous, like every other module
+    /// under `crate::hooks`) - never on the UI thread, per this codebase's GPUI blocking-call rule.
+    ///
+    /// A no-op under `cfg!(test)`: this is the one piece of hook wiring that would otherwise touch
+    /// the *real* user's home directory rather than a test-owned tempdir (every other hooks test
+    /// passes its own paths straight into `crate::hooks::cursor_hooks_file`'s pure functions),
+    /// mirroring `crate::updater::state::UPDATE_CHECK_ENABLED`'s identical reasoning for why a
+    /// background side effect with a real external footprint must not run under the test harness.
+    pub(crate) fn reconcile_cursor_hooks(&mut self, cx: &mut Context<Self>) {
+        if cfg!(test) {
+            return;
+        }
+        let enabled = self.settings.agents.cursor_hooks_enabled;
+        cx.background_spawn(async move {
+            let Some(hooks_json) = crate::hooks::cursor_hooks_file::hooks_json_path() else {
+                log::warn!("could not resolve a home directory - Cursor agent hooks are skipped");
+                return;
+            };
+            let result = if enabled {
+                match crate::host::find_jerry_binary() {
+                    Some(jerry_binary) => {
+                        crate::hooks::cursor_hooks_file::install(&hooks_json, &jerry_binary)
+                    }
+                    None => {
+                        log::warn!(
+                            "could not locate the `jerry` binary - Cursor agent hooks are skipped"
+                        );
+                        return;
+                    }
+                }
+            } else {
+                // Removal needs no `jerry_binary`: matching is structural (see
+                // `cursor_hooks_file`'s own docs), so a toggle can be turned off even when the
+                // binary that wrote an entry can no longer be found.
+                crate::hooks::cursor_hooks_file::remove_managed_entries(&hooks_json)
+            };
+            if let Err(err) = result {
+                log::warn!("could not reconcile {}: {err}", hooks_json.display());
+            }
+        })
+        .detach();
+    }
+
+    /// Folds every live agent's current real state into the persisted record, and writes the file
+    /// if anything changed.
+    pub(crate) fn record_agent_statuses(&mut self, cx: &mut Context<Self>) {
+        if self.agent_status_path.is_none() {
+            return;
+        }
+
+        let now = unix_now();
+        let mut changed = false;
+        let mut touched: Vec<String> = Vec::new();
+
+        // Only agents that have actually reported a hook are recorded, and that restriction is
+        // the whole point rather than an optimisation. `crate::hooks::store`'s module docs say it
+        // outright: a status derived from pty silence is a guess, and a guess written to disk is
+        // still a guess an hour later - it would give GitHub issue #227 a history of things Jerry
+        // never really knew. A Codex agent, a shell, and a Claude agent whose hooks have not
+        // fired have nothing real to record, so nothing is recorded for them.
+        //
+        // It also matters for cost. This runs on the status poll, and a save is two `fsync`s held
+        // under `crate::persisted_state_lock`'s *process-wide* mutex - the same one `repos.toml`,
+        // `file-tree-state.toml` and `tab-order.toml`'s writers contend for. Recording every
+        // agent meant writing on every ordinary quiescence transition
+        // (`NoProcess` -> `Run` -> `Idle`), which measurably slowed the whole app down and, in
+        // the test suite, destabilised unrelated timing-sensitive tests.
+        let Some(runtime) = &self.hook_runtime else {
+            return;
+        };
+        let recordable: Vec<(
+            crate::work_surface::agents::AgentId,
+            String,
+            std::path::PathBuf,
+            &'static str,
+            i64,
+        )> = self
+            .agents
+            .iter()
+            .filter_map(|agent| {
+                let crate::work_surface::agents::ProcessKind::Agent(kind) = agent.kind else {
+                    return None;
+                };
+                // The gate: a real, *unexpired* hook fact, or this agent is not recorded at all.
+                // `fresh()` rather than `.fact`, and the difference is the whole point - see
+                // `crate::rail::status::HookSignal::fresh`'s own docs.
+                runtime.signal_for(agent.id).fresh()?;
+                let key =
+                    crate::review::state::baseline_key(&agent.cwd, kind, agent.spawned_at_unix);
+                Some((
+                    agent.id,
+                    key,
+                    agent.cwd.clone(),
+                    agent.kind.label(),
+                    agent.spawned_at_unix,
+                ))
+            })
+            .collect();
+        if recordable.is_empty() {
+            return;
+        }
+
+        struct RecordedEntry {
+            key: String,
+            cwd: std::path::PathBuf,
+            kind_label: &'static str,
+            spawned_at_unix: i64,
+            status: crate::rail::status::Status,
+            activity: Option<String>,
+            question: Option<String>,
+            session_id: Option<String>,
+            run_facts: crate::hooks::inbox::RunFacts,
+        }
+
+        let entries: Vec<RecordedEntry> = recordable
+            .into_iter()
+            .filter_map(|(id, key, cwd, kind_label, spawned_at_unix)| {
+                let agent = self.agents.iter().find(|agent| agent.id == id)?;
+                let status = self.agent_status(agent, cx);
+                let (activity, question) = match &self.hook_runtime {
+                    Some(runtime) => runtime.text_for(id),
+                    None => (None, None),
+                };
+                // GitHub issue #227: the real Claude Code session id this agent's hooks have
+                // reported, if any - deliberately read without the `fresh()`/TTL gate
+                // `text_for` applies (see `HookRuntime::session_id_for`'s own docs), since a
+                // conversation stays exactly as resumable after its hooks go quiet as it was
+                // the instant its last one fired.
+                let session_id = self
+                    .hook_runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.session_id_for(id))
+                    // A hookless kind carries its own id on the pane instead, minted before its
+                    // spawn - see `crate::work_surface::agents::Agent::session_id`.
+                    .or_else(|| self.agents.session_id_for(id).map(str::to_owned));
+                // GitHub issue #227: the run's own title and completed-turn count, from the same
+                // real hook stream and read ungated for the same reason as the session id - both
+                // describe the run, not the present (`HookListener::run_facts_for`).
+                let run_facts = self
+                    .hook_runtime
+                    .as_ref()
+                    .map(|runtime| runtime.run_facts_for(id))
+                    .unwrap_or_default();
+                Some(RecordedEntry {
+                    key,
+                    cwd,
+                    kind_label,
+                    spawned_at_unix,
+                    status,
+                    activity,
+                    question,
+                    session_id,
+                    run_facts,
+                })
+            })
+            .collect();
+
+        for entry in entries {
+            if self.agent_status_state.set(
+                entry.key.clone(),
+                crate::hooks::store::LiveRun {
+                    worktree: &entry.cwd,
+                    kind: entry.kind_label,
+                    spawned_at_unix: entry.spawned_at_unix,
+                    status: entry.status,
+                    activity: entry.activity,
+                    question: entry.question,
+                    session_id: entry.session_id,
+                    title: entry.run_facts.title,
+                    turns: entry.run_facts.turns,
+                },
+                now,
+            ) {
+                changed = true;
+            }
+            touched.push(entry.key);
+        }
+
+        // Ownership is cumulative across the session: an agent the user has since closed stays
+        // owned, so its final recorded status keeps being written through on later saves instead
+        // of being dropped the moment its pane goes away. That closed agent is precisely what
+        // issue #227 most wants to show.
+        for key in touched {
+            self.agent_status_owned.insert(key);
+        }
+
+        if changed {
+            self.persist_agent_statuses(cx);
+            // A live agent's `session_id` is learned *here*, from its own hooks, some time after
+            // its tab was created and recorded - so the tab session written when the tab opened
+            // still says "no resumable session" for it. Re-recording on a real change is what
+            // turns that into a genuinely resumable entry before the user ever quits; without it,
+            // relaunching would honestly refuse to restore an agent that was, in fact, resumable
+            // the whole time (`crate::work_surface::session::AdeApp::restore_worktree_session`).
+            //
+            // Cheap despite riding the status poll: the recorder compares against what is already
+            // recorded and returns without touching the disk when nothing changed, which is every
+            // tick after the first one that learns an id.
+            self.record_worktree_session(cx);
+        }
+    }
+
+    /// Writes [`crate::root::AdeApp::agent_status_state`] to disk on the background executor.
+    pub(crate) fn persist_agent_statuses(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.agent_status_path.clone() else {
+            return;
+        };
+        let state = self.agent_status_state.clone();
+        let owned = self.agent_status_owned.clone();
+        let task = cx.spawn(async move |_this, cx| {
+            let save_path = path.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { state.save_merged_at(&save_path, &owned) })
+                .await;
+            if let Err(err) = result {
+                log::warn!("failed to save {}: {err}", path.display());
+            }
+        });
+        self._agent_status_persist_task = Some(task);
+    }
+}
+
+/// Seconds since the Unix epoch, mirroring `crate::work_surface::agents::unix_now`.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// The real, blocking half of bringing a `HookRuntime` up: locate the `jerry` binary, then write
+/// its settings file - real filesystem/`PATH` I/O either way. Pure - no `self`, no GPUI - so a
+/// caller can run it inline ([`AdeApp::hook_injection_for`]'s own synchronous contract, unchanged)
+/// or hand it to `cx.background_spawn` ([`AdeApp::ensure_hook_runtime`]).
+fn locate_and_start_hook_runtime() -> Option<crate::hooks::HookRuntime> {
+    match crate::host::find_jerry_binary() {
+        Some(jerry_binary) => {
+            crate::hooks::HookRuntime::start(&std::env::temp_dir(), &jerry_binary)
+        }
+        None => {
+            log::warn!(
+                "could not locate the `jerry` binary next to this executable, under its \
+                 bin/, or on PATH - agent hook injection is disabled; agent status will \
+                 use the terminal-title and quiescence signals only"
+            );
+            None
+        }
+    }
+}

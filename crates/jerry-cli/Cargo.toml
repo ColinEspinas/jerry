@@ -1,0 +1,32 @@
+[package]
+name = "jerry-cli"
+version = { workspace = true }
+edition = { workspace = true }
+publish = { workspace = true }
+license = { workspace = true }
+description = "The `jerry` command: a thin client that finds the Jerry serving this repository and dispatches Commands and Queries to it, or runs the git-only ones itself"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "jerry"
+path = "src/main.rs"
+
+[dependencies]
+jerry-core = { path = "../jerry-core" }
+# The hidden `git-sequence-editor`/`git-editor` subcommands (decisions.md §7) call
+# `jerry_git::rebase` directly - they are pure local sidecar-file mechanics git itself spawns as
+# `GIT_SEQUENCE_EDITOR`/`GIT_EDITOR`, not part of the Command/Query wire model.
+jerry-git = { path = "../jerry-git" }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+jerry-host = { path = "../jerry-host" }
+tempfile = "3"
+test-support = { path = "../test-support" }
+# `LocalClient::subscribe`'s `mpsc::UnboundedReceiver`, polled with `try_next` - see
+# `run_tests::hook_forwards_the_event_and_the_payload_to_the_host_as_an_agent_call`.
+futures = { workspace = true }

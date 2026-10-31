@@ -1,0 +1,9 @@
+{
+  "method": "command/session-kill",
+  "params": {
+    "cwd": "/repo",
+    "params": {
+      "id": "session-1"
+    }
+  }
+}

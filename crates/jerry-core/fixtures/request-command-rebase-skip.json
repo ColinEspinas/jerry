@@ -1,0 +1,7 @@
+{
+  "method": "command/rebase-skip",
+  "params": {
+    "cwd": "/repo",
+    "params": {}
+  }
+}

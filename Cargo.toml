@@ -1,10 +1,17 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/wt-core",
-    "crates/pty-core",
-    "crates/lsp-core",
-    "crates/app",
+    "crates/jerry-git",
+    "crates/jerry-pty",
+    "crates/jerry-lsp",
+    "crates/jerry-term",
+    "crates/jerry-core",
+    "crates/jerry-host",
+    "crates/jerry-cli",
+    "crates/jerry-app",
+    # Jerry's design-system crate (docs/architecture/decisions.md §27) - the second, and only
+    # other, crate in this workspace allowed to depend on `gpui`.
+    "crates/jerry-ui",
     # Dev-dependency only, and deliberately gpui-free so the core crates can use it too
     # (docs/architecture/decisions.md §1, docs/testing.md).
     "crates/test-support",
@@ -41,16 +48,27 @@ dbg_macro = "warn"
 gpui = { git = "https://github.com/zed-industries/zed", rev = "7b030b500810b04cf5fb4aa5973be99a502d9f36" }
 anyhow = "1"
 thiserror = "1"
+# `jerry-pty`'s awaitable output channel (`futures::channel::mpsc`), the `crates/jerry-app`
+# terminal pane task that awaits it (`futures::StreamExt::next`), and the host/app channel-woken
+# tasks (decisions.md §16) - matching `vendor/zed/Cargo.toml`'s own `futures = "0.3.32"` pin
+# (already resolved to 0.3.33 transitively via `gpui` itself, so this adds no new version to the
+# lock file).
+futures = "0.3"
 # Real config-file (de)serialization for `crate::settings_store::Settings`. Pinned to
 # the exact major versions `vendor/zed/Cargo.toml` itself pins (`serde = "1.0.221"`,
 # `toml = "0.8"`), matching this project's established "same versions Zed verified against"
-# convention for shared dependencies (see `crates/app/Cargo.toml`'s own `tree-sitter`/
+# convention for shared dependencies (see `crates/jerry-app/Cargo.toml`'s own `tree-sitter`/
 # `alacritty_terminal` comments for precedent). `serde_json` has no equivalent vendor/zed pin
 # to match (Zed's own `Cargo.toml` doesn't depend on it at the workspace level), so it's a
 # plain, unpinned-beyond-major-version dependency instead.
 serde = { version = "1.0.221", features = ["derive"] }
 toml = "0.8"
 serde_json = "1"
+# The `jerry` command line; the same 4.4 line Zed pins.
+clap = { version = "4.4", features = ["derive", "wrap_help"] }
+# JSON Schema derivation for `jerry mcp`'s generated tool list (decisions.md §22). Pinned to the
+# same "1.0" line `vendor/zed/Cargo.toml` itself pins.
+schemars = "1.0"
 
 # Debug info is the bulk of a debug `target/` on MSVC, and almost none of it is ever read: a
 # backtrace or a debugger session wants this workspace's own frames, not `aws-lc-sys`' or a

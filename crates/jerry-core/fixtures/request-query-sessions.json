@@ -1,0 +1,7 @@
+{
+  "method": "query/sessions",
+  "params": {
+    "cwd": "/repo",
+    "params": {}
+  }
+}

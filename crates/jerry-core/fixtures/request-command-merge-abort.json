@@ -1,0 +1,7 @@
+{
+  "method": "command/merge-abort",
+  "params": {
+    "cwd": "/repo",
+    "params": { "base_worktree_path": "/repo" }
+  }
+}

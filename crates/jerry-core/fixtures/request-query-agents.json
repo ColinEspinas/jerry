@@ -1,0 +1,7 @@
+{
+  "method": "query/agents",
+  "params": {
+    "cwd": "/repo",
+    "params": {}
+  }
+}

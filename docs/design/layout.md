@@ -1,6 +1,6 @@
 # Window layout
 
-- **Code:** `crates/app/src/root/`, `crates/app/src/title_bar/`, `crates/app/src/status_bar/`
+- **Code:** `crates/jerry-app/src/root/`, `crates/jerry-app/src/title_bar/`, `crates/jerry-app/src/status_bar/`
 - **Tokens:** `theme::{band, zone, surface, border}`
 
 ## What it's for

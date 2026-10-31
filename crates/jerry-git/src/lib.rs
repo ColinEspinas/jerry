@@ -1,0 +1,1149 @@
+//! `jerry-git`: git worktree management.
+//!
+//! Enumerates a repository's worktrees into a typed model via [`gix`], and creates and removes
+//! them through the `git` CLI - refusing to discard uncommitted work unless the caller passes
+//! `force`. See `docs/architecture/decisions.md` §5 for which of the two any given operation uses.
+//!
+//! Every invocation uses an explicit argument vector, never an interpolated shell string.
+//!
+//! **Everything here blocks.** `gix` reads the object database from disk and the CLI-backed
+//! functions wait on a child process. A caller on a UI thread must offload to a background
+//! executor.
+
+// Only production code is held to `unwrap_used`/`expect_used` and the bare-`Command::new`
+// ban (`clippy.toml`, GitHub issue #465); see `CLAUDE.md`.
+#![cfg_attr(
+    test,
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)
+)]
+
+pub mod blame;
+pub mod checkout;
+pub mod diff;
+mod error;
+pub mod graph;
+pub mod merge;
+pub mod rebase;
+pub mod remote;
+pub mod review;
+pub mod rewrite;
+pub mod run_drift;
+pub mod stage;
+pub mod undo;
+pub mod worktree_files;
+
+pub use error::{Error, GitExit};
+
+use std::ffi::OsString;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Worktree {
+    pub path: PathBuf,
+    /// The short name of the branch checked out in this worktree (e.g. `"main"`), or
+    /// `None` if `HEAD` is detached.
+    pub branch: Option<String>,
+    /// The full commit id `HEAD` currently resolves to, or `None` if the branch is
+    /// "unborn" (a freshly initialized repository with no commits yet).
+    pub head_commit: Option<String>,
+    pub is_main: bool,
+    /// See `git worktree lock`. Always `false` for the main worktree: git has no lock concept
+    /// for it, so this is not an unchecked case.
+    pub is_locked: bool,
+    /// `None` both when the worktree is unlocked and when it is locked with no `--reason`.
+    pub lock_reason: Option<String>,
+}
+
+/// Fallible per entry, so one corrupt worktree does not hide the others.
+pub type WorktreeResult = Result<Worktree, Error>;
+
+/// Lists every worktree belonging to the repository at `repo_path`, which may itself be any one
+/// of them. A bare repository reports only its linked worktrees, having no checkout of its own.
+///
+/// Entries are independent: an unreadable worktree is an `Err` in its own entry. The outer
+/// `Result` covers only failures that make listing impossible at all.
+pub fn list_worktrees(repo_path: &Path) -> Result<Vec<WorktreeResult>, Error> {
+    let repo = open_repo(repo_path)?;
+    // Normalizing to the main repository is what makes `worktrees()` enumerate all of them
+    // regardless of which one `repo_path` pointed at.
+    let main_repo = repo.main_repo().map_err(|source| Error::Open {
+        path: repo_path.to_path_buf(),
+        source: Box::new(source),
+    })?;
+
+    let mut worktrees = Vec::new();
+
+    if let Some(main_path) = main_repo.work_dir() {
+        let main_path = main_path.to_path_buf();
+        worktrees.push(describe_worktree(&main_repo, main_path, true, false, None));
+    }
+
+    let proxies = main_repo.worktrees().map_err(Error::WorktreeIo)?;
+    for proxy in proxies {
+        worktrees.push(describe_linked_worktree(proxy));
+    }
+
+    Ok(worktrees)
+}
+
+fn open_repo(repo_path: &Path) -> Result<gix::Repository, Error> {
+    gix::open(repo_path).map_err(|source| Error::Open {
+        path: repo_path.to_path_buf(),
+        source: Box::new(source),
+    })
+}
+
+fn describe_linked_worktree(proxy: gix::worktree::Proxy<'_>) -> Result<Worktree, Error> {
+    let path = proxy.base()?;
+    let is_locked = proxy.is_locked();
+    // An empty `locked` file must surface as `None`, not `Some("")`.
+    let lock_reason = proxy
+        .lock_reason()
+        .map(|reason| reason.to_string())
+        .filter(|reason| !reason.is_empty());
+    let linked_repo = proxy
+        .into_repo_with_possibly_inaccessible_worktree()
+        .map_err(|source| Error::Open {
+            path: path.clone(),
+            source: Box::new(source),
+        })?;
+    describe_worktree(&linked_repo, path, false, is_locked, lock_reason)
+}
+
+fn describe_worktree(
+    repo: &gix::Repository,
+    path: PathBuf,
+    is_main: bool,
+    is_locked: bool,
+    lock_reason: Option<String>,
+) -> Result<Worktree, Error> {
+    let mut head = repo
+        .head()
+        .map_err(|source| Error::Head(Box::new(source)))?;
+    let branch = head.referent_name().map(|name| name.shorten().to_string());
+    let head_commit = head
+        .try_peel_to_id_in_place()
+        .map_err(|source| Error::PeelHead(Box::new(source)))?
+        .map(|id| id.to_string());
+
+    Ok(Worktree {
+        path,
+        branch,
+        head_commit,
+        is_main,
+        is_locked,
+        lock_reason,
+    })
+}
+
+/// A worktree as `git worktree list --porcelain` reports it, for the sidebar's refresh watcher.
+///
+/// Shelled out rather than read through `gix` because git already computes prunability - including
+/// a corrupt or missing `gitdir` file, which a [`Path::exists`] check cannot replicate - in one
+/// cheap call. A loop running every few seconds wants that single snapshot to diff against, not a
+/// reimplementation of git's prunability rules. [`list_worktrees`] stays the source for everything
+/// else, which needs `gix` repository access anyway.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeStatus {
+    /// Absolute path to the worktree's working directory (or where it used to be, if
+    /// [`Self::is_prunable`]).
+    pub path: PathBuf,
+    pub is_main: bool,
+    pub is_bare: bool,
+    /// The full commit id `HEAD` resolves to, or `None` for an unborn branch.
+    pub head_commit: Option<String>,
+    /// The short branch name if `HEAD` is a real branch ref, `None` if detached or bare.
+    pub branch: Option<String>,
+    pub is_detached: bool,
+    pub is_locked: bool,
+    pub lock_reason: Option<String>,
+    /// Whether git considers this prunable: its metadata points at a working tree that is gone.
+    pub is_prunable: bool,
+    pub prunable_reason: Option<String>,
+}
+
+/// Lists every worktree via `git worktree list --porcelain`; see [`WorktreeStatus`] for why this
+/// exists alongside [`list_worktrees`].
+///
+/// No per-entry fallibility, unlike [`list_worktrees`]: git has already resolved every entry by
+/// the time this output exists.
+pub fn list_worktrees_porcelain(repo_path: &Path) -> Result<Vec<WorktreeStatus>, Error> {
+    let args: Vec<OsString> = vec!["worktree".into(), "list".into(), "--porcelain".into()];
+    let output = run_git(repo_path, &args)?;
+    check_success(&args, &output)?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_worktree_list_porcelain(&stdout))
+}
+
+/// Parses the porcelain form, not the default table, which is ambiguous for a path
+/// containing spaces. Each line is split on its *first* space only, so a space-containing value
+/// is never truncated. Unrecognized keys are ignored, per git's porcelain contract. CRLF is
+/// normalized first, so this parses identically on Windows.
+pub fn parse_worktree_list_porcelain(text: &str) -> Vec<WorktreeStatus> {
+    let text = text.replace("\r\n", "\n");
+    let mut items = Vec::new();
+
+    for block in text.split("\n\n") {
+        if block.trim().is_empty() {
+            continue;
+        }
+
+        let mut path: Option<PathBuf> = None;
+        let mut head_commit = None;
+        let mut branch = None;
+        let mut is_bare = false;
+        let mut is_detached = false;
+        let mut is_locked = false;
+        let mut lock_reason = None;
+        let mut is_prunable = false;
+        let mut prunable_reason = None;
+
+        for line in block.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            let (key, rest) = match line.split_once(' ') {
+                Some((key, rest)) => (key, Some(rest)),
+                None => (line, None),
+            };
+            match key {
+                "worktree" => path = rest.map(PathBuf::from),
+                "HEAD" => head_commit = rest.map(str::to_string),
+                "branch" => {
+                    branch = rest.map(|full_ref| {
+                        full_ref
+                            .strip_prefix("refs/heads/")
+                            .unwrap_or(full_ref)
+                            .to_string()
+                    })
+                }
+                "bare" => is_bare = true,
+                "detached" => is_detached = true,
+                "locked" => {
+                    is_locked = true;
+                    lock_reason = rest.map(str::to_string).filter(|reason| !reason.is_empty());
+                }
+                "prunable" => {
+                    is_prunable = true;
+                    prunable_reason = rest.map(str::to_string).filter(|reason| !reason.is_empty());
+                }
+                _ => {}
+            }
+        }
+
+        let Some(path) = path else {
+            continue;
+        };
+        // Only the first entry can be the main worktree, and a bare repository's never is.
+        let is_main = items.is_empty() && !is_bare;
+        items.push(WorktreeStatus {
+            path,
+            is_main,
+            is_bare,
+            head_commit,
+            branch,
+            is_detached,
+            is_locked,
+            lock_reason,
+            is_prunable,
+            prunable_reason,
+        });
+    }
+
+    items
+}
+
+/// Resolves `$GIT_COMMON_DIR`: the directory shared by the main worktree and every linked one.
+///
+/// git prints a relative path when run from inside the repository, so the result is resolved
+/// against `repo_path`.
+pub fn git_common_dir(repo_path: &Path) -> Result<PathBuf, Error> {
+    let args: Vec<OsString> = vec!["rev-parse".into(), "--git-common-dir".into()];
+    let output = run_git(repo_path, &args)?;
+    check_success(&args, &output)?;
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let trimmed = raw.trim();
+    Ok(absolutize(Path::new(trimmed), repo_path))
+}
+
+/// Resolves the worktree root (`git rev-parse --show-toplevel`) from any directory inside it.
+pub fn worktree_root(path: &Path) -> Result<PathBuf, Error> {
+    let args: Vec<OsString> = vec!["rev-parse".into(), "--show-toplevel".into()];
+    let output = run_git(path, &args)?;
+    check_success(&args, &output)?;
+    let raw = String::from_utf8_lossy(&output.stdout);
+    Ok(absolutize(Path::new(raw.trim()), path))
+}
+
+/// Resolves a relative `path` against `base` rather than the process's working directory, since
+/// every `git` invocation here sets `current_dir` and must resolve paths the same way.
+fn absolutize(path: &Path, base: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    }
+}
+
+/// Creates a worktree at `worktree_path`.
+///
+/// `branch` creates and checks out a new branch; otherwise `commit_ish` is checked out directly.
+/// Both `None` lets git pick its default. Positionals go after `--`, so a flag-shaped value can
+/// never be misparsed as one.
+pub fn add_worktree(
+    repo_path: &Path,
+    worktree_path: &Path,
+    branch: Option<&str>,
+    commit_ish: Option<&str>,
+) -> Result<(), Error> {
+    let worktree_path = absolutize(worktree_path, repo_path);
+
+    let mut args: Vec<OsString> = vec!["worktree".into(), "add".into()];
+    if let Some(branch) = branch {
+        args.push("-b".into());
+        args.push(branch.into());
+    }
+    args.push("--".into());
+    args.push(worktree_path.into_os_string());
+    if let Some(commit_ish) = commit_ish {
+        args.push(commit_ish.into());
+    }
+
+    let output = run_git(repo_path, &args)?;
+    check_success(&args, &output)
+}
+
+/// Whether `name` is usable as `git worktree add -b <name>`'s branch (`git check-ref-format
+/// --branch <name>`, the real arbiter for git's own ref-name rules - control characters, `~ ^ :
+/// ? * [ \`, `..`, a leading `-`, empty, `.`/`.lock` - rather than reimplementing them). `false`
+/// for anything git itself would refuse; `Err` only if `git` could not be run at all.
+pub fn is_valid_branch_name(dir: &Path, name: &str) -> Result<bool, Error> {
+    let args: Vec<OsString> = vec!["check-ref-format".into(), "--branch".into(), name.into()];
+    let output = run_git(dir, &args)?;
+    Ok(output.status.success())
+}
+
+/// Removes the worktree at `worktree_path`, refusing a dirty one with [`Error::DirtyWorktree`]
+/// unless `force`.
+///
+/// `force` passes `--force` twice: once overrides a dirty worktree, but git wants it twice to
+/// override a *locked* one, so a single flag would still silently refuse those.
+pub fn remove_worktree(repo_path: &Path, worktree_path: &Path, force: bool) -> Result<(), Error> {
+    let worktree_path = absolutize(worktree_path, repo_path);
+
+    if !force && worktree_path.is_dir() && is_dirty(&worktree_path)? {
+        return Err(Error::DirtyWorktree {
+            path: worktree_path,
+        });
+    }
+
+    let mut args: Vec<OsString> = vec!["worktree".into(), "remove".into()];
+    if force {
+        args.push("--force".into());
+        args.push("--force".into());
+    }
+    args.push("--".into());
+    args.push(worktree_path.into_os_string());
+
+    let output = run_git(repo_path, &args)?;
+    check_success(&args, &output)
+}
+
+/// Whether `worktree_dir` has uncommitted changes; any modified tracked file or untracked file
+/// counts as dirty.
+///
+/// Reads at most one byte of `git status --porcelain` - any output at all means dirty - so a huge
+/// untracked tree is never buffered. The child is killed rather than left to block on a full pipe,
+/// then reaped.
+pub fn is_dirty(worktree_dir: &Path) -> Result<bool, Error> {
+    let args: Vec<OsString> = vec![
+        "status".into(),
+        "--porcelain".into(),
+        "--untracked-files=normal".into(),
+    ];
+    let mut child = git_command(worktree_dir, &args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|source| Error::GitSpawn {
+            args: format_args(&args),
+            source,
+        })?;
+
+    let mut stdout = child.stdout.take().ok_or_else(|| Error::GitSpawn {
+        args: format_args(&args),
+        source: std::io::Error::other("git status stdout was not piped"),
+    })?;
+
+    let mut probe = [0u8; 1];
+    let found_output = loop {
+        match stdout.read(&mut probe) {
+            Ok(0) => break false,
+            Ok(_) => break true,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::WorktreeIo(err));
+            }
+        }
+    };
+    drop(stdout);
+
+    if found_output {
+        // The answer is already known; waiting out a large listing risks a full pipe.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Ok(true);
+    }
+
+    let mut stderr = String::new();
+    if let Some(mut stderr_pipe) = child.stderr.take() {
+        let _ = stderr_pipe.read_to_string(&mut stderr);
+    }
+    let status = child.wait().map_err(|source| Error::GitSpawn {
+        args: format_args(&args),
+        source,
+    })?;
+    if status.success() {
+        Ok(false)
+    } else {
+        Err(Error::GitCommand {
+            args: format_args(&args),
+            exit: GitExit::from_status(&status),
+            stderr,
+        })
+    }
+}
+
+/// Variables that could redirect `git` away from the repository `current_dir` selects. Cleared so
+/// one inherited from the launching shell cannot make this read or write the wrong repository.
+const GIT_ENV_OVERRIDES: [&str; 5] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+];
+
+/// Build a `git` [`Command`] running in `dir` with `args`: environment scrubbed of
+/// [`GIT_ENV_OVERRIDES`], stdin closed so an interactive prompt (credentials, GPG,
+/// askpass) fails fast instead of hanging forever with no way to cancel it, and constructed
+/// through [`jerry_pty::new_std_command`] so no console window flashes per spawn on Windows
+/// (GitHub issue #465).
+fn git_command(dir: &Path, args: &[OsString]) -> Command {
+    let mut command = jerry_pty::new_std_command("git");
+    command.current_dir(dir).args(args).stdin(Stdio::null());
+    for var in GIT_ENV_OVERRIDES {
+        command.env_remove(var);
+    }
+    command
+}
+
+/// Run `git` with `args` in `dir` to completion, returning its raw [`Output`] regardless
+/// of exit status.
+fn run_git(dir: &Path, args: &[OsString]) -> Result<Output, Error> {
+    git_command(dir, args)
+        .output()
+        .map_err(|source| Error::GitSpawn {
+            args: format_args(args),
+            source,
+        })
+}
+
+/// Turn a successfully-spawned but possibly-failed `git` invocation into a `Result`.
+fn check_success(args: &[OsString], output: &Output) -> Result<(), Error> {
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(Error::GitCommand {
+            args: format_args(args),
+            exit: GitExit::from_status(&output.status),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+}
+
+fn format_args(args: &[OsString]) -> String {
+    args.iter()
+        .map(|a| a.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+    use test_support::{git, seed_repo, seed_repo_at};
+
+    /// `list_worktrees`, asserting the outer call succeeds and every per-worktree entry
+    /// succeeds too, for tests where every entry is expected to be readable.
+    fn list_ok(repo_path: &Path) -> Vec<Worktree> {
+        list_worktrees(repo_path)
+            .expect("list_worktrees")
+            .into_iter()
+            .map(|entry| entry.expect("worktree entry"))
+            .collect()
+    }
+
+    #[test]
+    fn lists_main_worktree_only() {
+        let repo = seed_repo();
+        let worktrees = list_ok(repo.path());
+        assert_eq!(worktrees.len(), 1);
+        let main = &worktrees[0];
+        assert!(main.is_main);
+        assert!(!main.is_locked);
+        assert_eq!(main.lock_reason, None);
+        assert_eq!(main.branch.as_deref(), Some("main"));
+        assert!(main.head_commit.is_some());
+        assert_eq!(
+            fs::canonicalize(&main.path).expect("canonicalize"),
+            fs::canonicalize(repo.path()).expect("canonicalize")
+        );
+    }
+
+    #[test]
+    fn lists_main_and_linked_worktrees() {
+        let repo = seed_repo();
+        let linked_dir = TempDir::new().expect("tempdir");
+        let linked_path = linked_dir.path().join("linked-wt");
+        drop(linked_dir);
+
+        git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                linked_path.to_str().expect("utf8 path"),
+            ],
+        );
+
+        let worktrees = list_ok(repo.path());
+        assert_eq!(worktrees.len(), 2);
+
+        let main = worktrees.iter().find(|w| w.is_main).expect("main worktree");
+        assert_eq!(main.branch.as_deref(), Some("main"));
+
+        let linked = worktrees
+            .iter()
+            .find(|w| !w.is_main)
+            .expect("linked worktree");
+        assert_eq!(linked.branch.as_deref(), Some("feature"));
+        assert!(!linked.is_locked);
+        assert_eq!(
+            fs::canonicalize(&linked.path).expect("canonicalize"),
+            fs::canonicalize(&linked_path).expect("canonicalize")
+        );
+        // Both worktrees point at the same commit, since `feature` branched off `main`
+        // without any new commits.
+        assert_eq!(main.head_commit, linked.head_commit);
+    }
+
+    #[test]
+    fn add_worktree_creates_branch_and_checkout() {
+        let repo = seed_repo();
+        let linked_dir = TempDir::new().expect("tempdir");
+        let linked_path = linked_dir.path().join("new-wt");
+        drop(linked_dir);
+
+        add_worktree(repo.path(), &linked_path, Some("feature-a"), None)
+            .expect("add_worktree should succeed");
+
+        assert!(linked_path.join("file.txt").is_file());
+        let worktrees = list_ok(repo.path());
+        assert_eq!(worktrees.len(), 2);
+        let linked = worktrees
+            .iter()
+            .find(|w| !w.is_main)
+            .expect("linked worktree");
+        assert_eq!(linked.branch.as_deref(), Some("feature-a"));
+    }
+
+    #[test]
+    fn add_worktree_checks_out_existing_branch_via_commit_ish() {
+        let repo = seed_repo();
+        git(repo.path(), &["branch", "existing-branch"]);
+
+        let linked_dir = TempDir::new().expect("tempdir");
+        let linked_path = linked_dir.path().join("commit-ish-wt");
+        drop(linked_dir);
+
+        add_worktree(repo.path(), &linked_path, None, Some("existing-branch"))
+            .expect("add_worktree with commit_ish should check out the existing branch");
+
+        let worktrees = list_ok(repo.path());
+        let linked = worktrees
+            .iter()
+            .find(|w| !w.is_main)
+            .expect("linked worktree");
+        assert_eq!(linked.branch.as_deref(), Some("existing-branch"));
+    }
+
+    #[test]
+    fn add_worktree_rejects_flag_like_commit_ish_as_positional() {
+        let repo = seed_repo();
+        let linked_dir = TempDir::new().expect("tempdir");
+        let linked_path = linked_dir.path().join("dashy-wt");
+        drop(linked_dir);
+
+        // Behind the `--` terminator, `--detach` must read as a (nonexistent) commit-ish: git
+        // reports a bad revision rather than accepting it as an option.
+        let err = add_worktree(repo.path(), &linked_path, None, Some("--detach"))
+            .expect_err("a flag-shaped commit-ish must fail as a bad revision");
+        match err {
+            Error::GitCommand { stderr, .. } => {
+                assert!(
+                    stderr.to_lowercase().contains("invalid reference")
+                        || stderr.to_lowercase().contains("--detach"),
+                    "unexpected stderr: {stderr}"
+                );
+            }
+            other => panic!("expected Error::GitCommand, got {other:?}"),
+        }
+        assert!(!linked_path.exists());
+    }
+
+    #[test]
+    fn is_valid_branch_name_defers_to_gits_own_real_ref_format_rules() {
+        let repo = seed_repo();
+        for name in ["feature/login", "fix-123", "a"] {
+            assert!(
+                is_valid_branch_name(repo.path(), name).expect("git runs"),
+                "{name} must be accepted"
+            );
+        }
+        for name in [
+            r"\Temp\x",
+            r"a\b",
+            "..",
+            ".",
+            "",
+            "-evil",
+            "--evil",
+            "a..b",
+            "a/../../b",
+            "C:evil",
+        ] {
+            assert!(
+                !is_valid_branch_name(repo.path(), name).expect("git runs"),
+                "{name:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn detached_head_worktree_has_no_branch() {
+        let repo = seed_repo();
+        let linked_dir = TempDir::new().expect("tempdir");
+        let linked_path = linked_dir.path().join("detached-wt");
+        drop(linked_dir);
+
+        git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                "--",
+                linked_path.to_str().expect("utf8 path"),
+                "main",
+            ],
+        );
+
+        let worktrees = list_ok(repo.path());
+        let linked = worktrees
+            .iter()
+            .find(|w| !w.is_main)
+            .expect("linked worktree");
+        assert_eq!(linked.branch, None);
+        assert!(linked.head_commit.is_some());
+    }
+
+    #[test]
+    fn list_reports_lock_state_with_reason() {
+        let repo = seed_repo();
+        let linked_dir = TempDir::new().expect("tempdir");
+        let linked_path = linked_dir.path().join("locked-wt");
+        drop(linked_dir);
+        add_worktree(repo.path(), &linked_path, Some("locked-branch"), None).expect("add_worktree");
+        git(
+            repo.path(),
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                "external disk",
+                linked_path.to_str().expect("utf8 path"),
+            ],
+        );
+
+        let worktrees = list_ok(repo.path());
+        let linked = worktrees
+            .iter()
+            .find(|w| !w.is_main)
+            .expect("linked worktree");
+        assert!(linked.is_locked);
+        assert_eq!(linked.lock_reason.as_deref(), Some("external disk"));
+    }
+
+    #[test]
+    fn list_reports_lock_without_reason_as_none() {
+        let repo = seed_repo();
+        let linked_dir = TempDir::new().expect("tempdir");
+        let linked_path = linked_dir.path().join("locked-no-reason-wt");
+        drop(linked_dir);
+        add_worktree(
+            repo.path(),
+            &linked_path,
+            Some("locked-no-reason-branch"),
+            None,
+        )
+        .expect("add_worktree");
+        git(
+            repo.path(),
+            &["worktree", "lock", linked_path.to_str().expect("utf8 path")],
+        );
+
+        let worktrees = list_ok(repo.path());
+        let linked = worktrees
+            .iter()
+            .find(|w| !w.is_main)
+            .expect("linked worktree");
+        assert!(linked.is_locked);
+        assert_eq!(
+            linked.lock_reason, None,
+            "an empty `locked` file must surface as None, not Some(\"\")"
+        );
+    }
+
+    #[test]
+    fn remove_force_removes_locked_worktree() {
+        let repo = seed_repo();
+        let linked_dir = TempDir::new().expect("tempdir");
+        let linked_path = linked_dir.path().join("locked-remove-wt");
+        drop(linked_dir);
+        add_worktree(
+            repo.path(),
+            &linked_path,
+            Some("locked-remove-branch"),
+            None,
+        )
+        .expect("add_worktree");
+        git(
+            repo.path(),
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                "external disk",
+                linked_path.to_str().expect("utf8 path"),
+            ],
+        );
+
+        remove_worktree(repo.path(), &linked_path, true).expect(
+            "force=true must remove a locked worktree too (git requires --force twice for this)",
+        );
+        assert!(!linked_path.exists());
+    }
+
+    #[test]
+    fn list_worktrees_on_bare_repo_skips_main_entry() {
+        let source = seed_repo();
+        let bare_dir = TempDir::new().expect("tempdir");
+        git(
+            bare_dir.path(),
+            &[
+                "clone",
+                "--bare",
+                source.path().to_str().expect("utf8"),
+                ".",
+            ],
+        );
+
+        let linked_dir = TempDir::new().expect("tempdir");
+        let linked_path = linked_dir.path().join("bare-linked-wt");
+        drop(linked_dir);
+        add_worktree(bare_dir.path(), &linked_path, None, Some("main"))
+            .expect("add_worktree on a bare repo");
+
+        let worktrees = list_ok(bare_dir.path());
+        assert_eq!(
+            worktrees.len(),
+            1,
+            "a bare repo has no main worktree to report"
+        );
+        assert!(!worktrees[0].is_main);
+        assert_eq!(worktrees[0].branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn remove_clean_worktree_without_force_succeeds() {
+        let repo = seed_repo();
+        let linked_dir = TempDir::new().expect("tempdir");
+        let linked_path = linked_dir.path().join("clean-wt");
+        drop(linked_dir);
+
+        add_worktree(repo.path(), &linked_path, Some("clean-branch"), None).expect("add_worktree");
+        assert!(linked_path.is_dir());
+
+        remove_worktree(repo.path(), &linked_path, false).expect("remove_worktree");
+        assert!(!linked_path.exists());
+    }
+
+    #[test]
+    fn remove_refuses_dirty_tracked_file_without_force() {
+        let repo = seed_repo();
+        let linked_dir = TempDir::new().expect("tempdir");
+        let linked_path = linked_dir.path().join("dirty-wt");
+        drop(linked_dir);
+
+        add_worktree(repo.path(), &linked_path, Some("dirty-branch"), None).expect("add_worktree");
+
+        fs::write(linked_path.join("file.txt"), "changed\n").expect("write");
+
+        let err = remove_worktree(repo.path(), &linked_path, false)
+            .expect_err("remove should refuse a dirty worktree");
+        match err {
+            Error::DirtyWorktree { path } => {
+                assert_eq!(
+                    fs::canonicalize(&path).expect("canonicalize"),
+                    fs::canonicalize(&linked_path).expect("canonicalize")
+                );
+            }
+            other => panic!("expected Error::DirtyWorktree, got {other:?}"),
+        }
+        assert!(
+            linked_path.is_dir(),
+            "worktree directory must still exist after a refused removal"
+        );
+
+        remove_worktree(repo.path(), &linked_path, true).expect("forced remove should succeed");
+        assert!(!linked_path.exists());
+    }
+
+    #[test]
+    fn remove_refuses_untracked_file_without_force() {
+        let repo = seed_repo();
+        let linked_dir = TempDir::new().expect("tempdir");
+        let linked_path = linked_dir.path().join("untracked-wt");
+        drop(linked_dir);
+
+        add_worktree(repo.path(), &linked_path, Some("untracked-branch"), None)
+            .expect("add_worktree");
+
+        fs::write(linked_path.join("new_untracked.txt"), "surprise\n").expect("write");
+
+        let err = remove_worktree(repo.path(), &linked_path, false)
+            .expect_err("remove should refuse a worktree with untracked files");
+        assert!(matches!(err, Error::DirtyWorktree { .. }));
+        assert!(linked_path.is_dir());
+
+        remove_worktree(repo.path(), &linked_path, true).expect("forced remove should succeed");
+        assert!(!linked_path.exists());
+    }
+
+    #[test]
+    fn remove_detects_dirty_worktree_via_relative_path() {
+        // `worktree_path` given to `remove_worktree` here is *relative*. The dirty check
+        // and the actual `git worktree remove` call must resolve it against the same base
+        // (`repo_path`), not against the test process's own (unrelated) current working
+        // directory, or the dirty check would silently look at the wrong directory (or a
+        // nonexistent one) while the real removal still hit the correct worktree.
+        let container = TempDir::new().expect("tempdir");
+        let repo_path = container.path().join("repo");
+        fs::create_dir(&repo_path).expect("mkdir repo");
+        seed_repo_at(&repo_path);
+
+        let linked_path = container.path().join("linked");
+        add_worktree(&repo_path, &linked_path, Some("relative-branch"), None)
+            .expect("add_worktree");
+        fs::write(linked_path.join("file.txt"), "changed\n").expect("write");
+
+        let relative = Path::new("../linked");
+
+        let err = remove_worktree(&repo_path, relative, false)
+            .expect_err("a dirty worktree reached via a relative path must still be refused");
+        assert!(matches!(err, Error::DirtyWorktree { .. }));
+        assert!(linked_path.is_dir());
+
+        remove_worktree(&repo_path, relative, true)
+            .expect("forced remove via a relative path should succeed");
+        assert!(!linked_path.exists());
+    }
+
+    // --- `parse_worktree_list_porcelain` (pure, no git process needed) -----------------------
+
+    #[test]
+    fn parses_a_single_worktree_on_a_real_branch() {
+        let text = "worktree /repo\nHEAD deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\nbranch refs/heads/main\n";
+        let items = parse_worktree_list_porcelain(text);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].path, PathBuf::from("/repo"));
+        assert_eq!(
+            items[0].head_commit.as_deref(),
+            Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+        );
+        assert_eq!(items[0].branch.as_deref(), Some("main"));
+        assert!(items[0].is_main, "the first entry is the main worktree");
+        assert!(!items[0].is_bare);
+        assert!(!items[0].is_detached);
+        assert!(!items[0].is_locked);
+        assert!(!items[0].is_prunable);
+    }
+
+    #[test]
+    fn parses_multiple_worktrees_separated_by_blank_lines() {
+        let text = "worktree /repo\nHEAD aaaa\nbranch refs/heads/main\n\nworktree /repo-wt/feature\nHEAD bbbb\nbranch refs/heads/feature\n";
+        let items = parse_worktree_list_porcelain(text);
+        assert_eq!(items.len(), 2);
+        assert!(items[0].is_main);
+        assert!(
+            !items[1].is_main,
+            "only the first entry is ever the main worktree"
+        );
+        assert_eq!(items[1].path, PathBuf::from("/repo-wt/feature"));
+        assert_eq!(items[1].branch.as_deref(), Some("feature"));
+    }
+
+    #[test]
+    fn a_path_containing_spaces_is_not_truncated() {
+        // The whole point of parsing the porcelain form: naively splitting on whitespace would
+        // cut this path off after "My".
+        let text =
+            "worktree /Users/dev/My Projects/feature wt\nHEAD aaaa\nbranch refs/heads/feature\n";
+        let items = parse_worktree_list_porcelain(text);
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].path,
+            PathBuf::from("/Users/dev/My Projects/feature wt")
+        );
+    }
+
+    #[test]
+    fn detached_head_has_no_branch_and_is_flagged_detached() {
+        let text = "worktree /repo-wt/detached\nHEAD cccc\ndetached\n";
+        let items = parse_worktree_list_porcelain(text);
+        assert_eq!(items.len(), 1);
+        assert!(items[0].is_detached);
+        assert_eq!(items[0].branch, None);
+        assert_eq!(items[0].head_commit.as_deref(), Some("cccc"));
+    }
+
+    #[test]
+    fn locked_with_reason_is_captured() {
+        let text =
+            "worktree /repo-wt/locked\nHEAD aaaa\nbranch refs/heads/locked\nlocked external disk\n";
+        let items = parse_worktree_list_porcelain(text);
+        assert!(items[0].is_locked);
+        assert_eq!(items[0].lock_reason.as_deref(), Some("external disk"));
+    }
+
+    #[test]
+    fn locked_with_no_reason_surfaces_as_none() {
+        let text = "worktree /repo-wt/locked\nHEAD aaaa\nbranch refs/heads/locked\nlocked\n";
+        let items = parse_worktree_list_porcelain(text);
+        assert!(items[0].is_locked);
+        assert_eq!(items[0].lock_reason, None);
+    }
+
+    #[test]
+    fn prunable_with_reason_is_captured() {
+        let text = "worktree /repo-wt/gone\nHEAD aaaa\nbranch refs/heads/gone\nprunable gitdir file points to non-existent location\n";
+        let items = parse_worktree_list_porcelain(text);
+        assert!(items[0].is_prunable);
+        assert_eq!(
+            items[0].prunable_reason.as_deref(),
+            Some("gitdir file points to non-existent location")
+        );
+    }
+
+    #[test]
+    fn bare_entry_is_flagged_bare_and_is_never_main() {
+        let text = "worktree /bare-repo\nbare\n\nworktree /bare-repo-wt/linked\nHEAD aaaa\nbranch refs/heads/linked\n";
+        let items = parse_worktree_list_porcelain(text);
+        assert_eq!(items.len(), 2);
+        assert!(items[0].is_bare);
+        assert!(!items[0].is_main, "a bare entry is never the main worktree");
+        assert!(!items[1].is_bare);
+        assert!(
+            !items[1].is_main,
+            "the linked worktree after a bare entry still isn't main"
+        );
+    }
+
+    #[test]
+    fn empty_output_maps_to_empty_list() {
+        assert_eq!(parse_worktree_list_porcelain(""), Vec::new());
+    }
+
+    #[test]
+    fn crlf_line_endings_parse_identically_to_lf() {
+        let text = "worktree /repo\r\nHEAD aaaa\r\nbranch refs/heads/main\r\n";
+        let items = parse_worktree_list_porcelain(text);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].branch.as_deref(), Some("main"));
+    }
+
+    // --- `list_worktrees_porcelain` / `git_common_dir` (real git process) --------------------
+
+    #[test]
+    fn list_worktrees_porcelain_reports_main_and_linked() {
+        let repo = seed_repo();
+        let linked_dir = TempDir::new().expect("tempdir");
+        let linked_path = linked_dir.path().join("porcelain-linked-wt");
+        drop(linked_dir);
+        add_worktree(repo.path(), &linked_path, Some("porcelain-feature"), None)
+            .expect("add_worktree");
+
+        let items = list_worktrees_porcelain(repo.path()).expect("list_worktrees_porcelain");
+        assert_eq!(items.len(), 2);
+
+        let main = items.iter().find(|item| item.is_main).expect("main entry");
+        assert_eq!(main.branch.as_deref(), Some("main"));
+        assert!(!main.is_locked);
+        assert!(!main.is_prunable);
+
+        let linked = items
+            .iter()
+            .find(|item| !item.is_main)
+            .expect("linked entry");
+        assert_eq!(linked.branch.as_deref(), Some("porcelain-feature"));
+        assert_eq!(
+            fs::canonicalize(&linked.path).expect("canonicalize"),
+            fs::canonicalize(&linked_path).expect("canonicalize")
+        );
+    }
+
+    #[test]
+    fn list_worktrees_porcelain_reports_detached_head() {
+        let repo = seed_repo();
+        let linked_dir = TempDir::new().expect("tempdir");
+        let linked_path = linked_dir.path().join("porcelain-detached-wt");
+        drop(linked_dir);
+        git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                "--",
+                linked_path.to_str().expect("utf8 path"),
+                "main",
+            ],
+        );
+
+        let items = list_worktrees_porcelain(repo.path()).expect("list_worktrees_porcelain");
+        let linked = items
+            .iter()
+            .find(|item| !item.is_main)
+            .expect("linked entry");
+        assert!(linked.is_detached);
+        assert_eq!(linked.branch, None);
+        assert!(linked.head_commit.is_some());
+    }
+
+    #[test]
+    fn list_worktrees_porcelain_reports_lock_reason() {
+        let repo = seed_repo();
+        let linked_dir = TempDir::new().expect("tempdir");
+        let linked_path = linked_dir.path().join("porcelain-locked-wt");
+        drop(linked_dir);
+        add_worktree(repo.path(), &linked_path, Some("porcelain-locked"), None)
+            .expect("add_worktree");
+        git(
+            repo.path(),
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                "on a USB drive",
+                linked_path.to_str().expect("utf8 path"),
+            ],
+        );
+
+        let items = list_worktrees_porcelain(repo.path()).expect("list_worktrees_porcelain");
+        let linked = items
+            .iter()
+            .find(|item| !item.is_main)
+            .expect("linked entry");
+        assert!(linked.is_locked);
+        assert_eq!(linked.lock_reason.as_deref(), Some("on a USB drive"));
+    }
+
+    #[test]
+    fn list_worktrees_porcelain_flags_a_manually_deleted_worktree_as_prunable() {
+        let repo = seed_repo();
+        let linked_dir = TempDir::new().expect("tempdir");
+        let linked_path = linked_dir.path().join("porcelain-prunable-wt");
+        drop(linked_dir);
+        add_worktree(repo.path(), &linked_path, Some("porcelain-prunable"), None)
+            .expect("add_worktree");
+
+        fs::remove_dir_all(&linked_path).expect("manually delete the worktree directory");
+
+        let items = list_worktrees_porcelain(repo.path()).expect("list_worktrees_porcelain");
+        let linked = items
+            .iter()
+            .find(|item| !item.is_main)
+            .expect("linked entry");
+        assert!(
+            linked.is_prunable,
+            "git itself must flag a worktree whose directory vanished as prunable"
+        );
+    }
+
+    #[test]
+    fn list_worktrees_porcelain_on_a_non_repository_returns_err() {
+        let dir = TempDir::new().expect("tempdir");
+        let err = list_worktrees_porcelain(dir.path())
+            .expect_err("a plain directory is not a git repository");
+        assert!(matches!(err, Error::GitCommand { .. }));
+    }
+
+    #[test]
+    fn git_common_dir_resolves_to_the_dot_git_directory() {
+        let repo = seed_repo();
+        let common_dir = git_common_dir(repo.path()).expect("git_common_dir");
+        assert_eq!(
+            fs::canonicalize(&common_dir).expect("canonicalize"),
+            fs::canonicalize(repo.path().join(".git")).expect("canonicalize")
+        );
+    }
+
+    #[test]
+    fn git_common_dir_from_a_linked_worktree_resolves_to_the_same_shared_directory() {
+        let repo = seed_repo();
+        let linked_dir = TempDir::new().expect("tempdir");
+        let linked_path = linked_dir.path().join("common-dir-linked-wt");
+        drop(linked_dir);
+        add_worktree(repo.path(), &linked_path, Some("common-dir-feature"), None)
+            .expect("add_worktree");
+
+        let from_main = git_common_dir(repo.path()).expect("git_common_dir from main");
+        let from_linked = git_common_dir(&linked_path).expect("git_common_dir from linked");
+        assert_eq!(
+            fs::canonicalize(&from_main).expect("canonicalize"),
+            fs::canonicalize(&from_linked).expect("canonicalize"),
+            "every worktree of the same repository shares one common dir"
+        );
+    }
+
+    #[test]
+    fn worktree_root_from_a_nested_directory_is_the_worktree_itself() {
+        let repo = seed_repo();
+        let nested = repo.path().join("src").join("deep");
+        fs::create_dir_all(&nested).expect("nested dir");
+        let root = worktree_root(&nested).expect("worktree_root");
+        assert_eq!(
+            fs::canonicalize(&root).expect("canonicalize"),
+            fs::canonicalize(repo.path()).expect("canonicalize")
+        );
+    }
+}

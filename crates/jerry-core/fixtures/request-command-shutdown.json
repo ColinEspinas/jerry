@@ -1,0 +1,7 @@
+{
+  "method": "command/shutdown",
+  "params": {
+    "cwd": "/repo",
+    "params": {}
+  }
+}

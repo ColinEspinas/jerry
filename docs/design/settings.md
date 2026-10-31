@@ -1,6 +1,6 @@
 # Settings
 
-- **Code:** `crates/app/src/settings/`
+- **Code:** `crates/jerry-app/src/settings/`
 - **Tokens:** `theme::{settings, toggle, button, zone::SETTINGS_*}`
 
 ## What it's for

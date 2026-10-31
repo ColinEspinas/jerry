@@ -1,0 +1,11 @@
+{
+  "method": "command/session-send",
+  "params": {
+    "cwd": "/repo",
+    "params": {
+      "to": "session-1",
+      "text": "y\n",
+      "submit": true
+    }
+  }
+}

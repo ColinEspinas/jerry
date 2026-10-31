@@ -2,7 +2,7 @@
 name: checker
 description: Audits a step for fake functionality and correctness. Read-only, static inspection only - no commands run. Use after each step.
 tools: Read, Grep, Glob
-model: opus
+model: sonnet
 ---
 
 Read-only audit of the current diff. Everything below is checkable by reading the diff and the
@@ -17,7 +17,7 @@ Report in this order:
    `String` where `PathBuf` belongs, an interpolated shell string near a git invocation, a
    destructive git path lacking a dirty-working-tree refusal and its test.
 3. **Layering** — render code (`render.rs`, anything implementing `Render`/`IntoElement`) calling
-   `wt_core::`/`pty_core::`/`lsp_core::` or `std::process::Command` directly instead of dispatching
+   `jerry_git::`/`jerry_pty::`/`jerry_lsp::` or `std::process::Command` directly instead of dispatching
    a Command/Query (CLAUDE.md's architecture section, `docs/architecture/decisions.md` §3)
    — flag *new* instances in the diff; this project's existing violations are tracked separately,
    not something every diff is expected to fix.

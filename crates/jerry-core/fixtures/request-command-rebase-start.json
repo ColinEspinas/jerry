@@ -1,0 +1,15 @@
+{
+  "method": "command/rebase-start",
+  "params": {
+    "cwd": "/repo",
+    "params": {
+      "onto": "0123456789abcdef0123456789abcdef01234567",
+      "plan": [
+        {
+          "commit": "89abcdef0123456789abcdef0123456789abcdef",
+          "action": { "kind": "pick" }
+        }
+      ]
+    }
+  }
+}

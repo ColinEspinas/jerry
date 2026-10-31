@@ -1,0 +1,10 @@
+{
+  "method": "command/hook-ack",
+  "params": {
+    "cwd": "/repo",
+    "params": {
+      "agent_id": "agent-1",
+      "up_to": 3
+    }
+  }
+}

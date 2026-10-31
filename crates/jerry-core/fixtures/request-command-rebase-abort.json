@@ -1,0 +1,7 @@
+{
+  "method": "command/rebase-abort",
+  "params": {
+    "cwd": "/repo",
+    "params": {}
+  }
+}

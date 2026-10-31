@@ -1,6 +1,6 @@
 # Zone 1 — the agent rail
 
-- **Code:** `crates/app/src/rail/`
+- **Code:** `crates/jerry-app/src/rail/`
 - **Tokens:** `theme::{status, rail, band, zone}`
 
 ## What it's for
@@ -90,7 +90,7 @@ versions, including a captured nine-second stretch of real work with zero pty ou
 false positive the title signal exists to prevent.
 
 A second, structural channel exists for Claude Code specifically: its own hook system
-(`crates/app/src/hooks/`), which fires at named lifecycle events and reports *"blocked on a human"*
+(`crates/jerry-app/src/hooks/`), which fires at named lifecycle events and reports *"blocked on a human"*
 as a fact rather than an inference.
 
 ## Rules that matter

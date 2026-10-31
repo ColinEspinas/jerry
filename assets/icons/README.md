@@ -21,7 +21,7 @@ All twelve files are the **bold** weight. The design states the rule verbatim
 > **Weight:** `bold` at 15–17px (`regular`'s 1.5px stroke reads thin against `#5e646a`);
 > `regular` only at 20px+.
 
-Every named size in `crates/app/src/icons.rs` is ≤ 17px, so bold is the correct — and only
+Every named size in `crates/jerry-app/src/icons.rs` is ≤ 17px, so bold is the correct — and only
 needed — weight today. `icons::weight_for_size` and its tests hold that rule: adding a 20px+
 size fails the build's test run until the matching `regular` files are vendored here too.
 
@@ -52,6 +52,6 @@ it (the overflow menu's Settings row):
 | tab strip: terminal | `terminal-window.svg` |
 | overflow menu: Settings (§4u, issue #290) | `sliders-horizontal.svg` |
 
-`crates/app/src/icons.rs` embeds these with `include_bytes!` and serves them through
+`crates/jerry-app/src/icons.rs` embeds these with `include_bytes!` and serves them through
 `crate::fonts::Assets`, so the built binary carries them and does not read this directory at
 runtime.

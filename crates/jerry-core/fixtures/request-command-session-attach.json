@@ -1,0 +1,9 @@
+{
+  "method": "command/session-attach",
+  "params": {
+    "cwd": "/repo",
+    "params": {
+      "id": "session-1"
+    }
+  }
+}

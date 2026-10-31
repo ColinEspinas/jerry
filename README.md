@@ -230,8 +230,11 @@ registers a launcher entry; no warning appears on Linux at all, so there's nothi
 ```sh
 git clone https://github.com/ColinEspinas/jerry
 cd jerry
-cargo run --release -p app [path-to-a-repo]
+cargo build --release -p jerry-app -p jerry-host -p jerry-cli
+./target/release/jerry-app [path-to-a-repo]
 ```
+
+The app runs sessions in a separate `jerry-host` process and puts the `jerry` CLI on every terminal's PATH, so all three binaries have to be built; `cargo run -p jerry-app` alone builds only the app.
 
 Uses the toolchain pinned in [`rust-toolchain.toml`](rust-toolchain.toml). Keep `--release` unless
 you're actively recompiling — [`CLAUDE.md`](CLAUDE.md#commands) explains why a debug build isn't
@@ -290,8 +293,8 @@ Issues and PRs are welcome. [`CONTRIBUTING.md`](CONTRIBUTING.md) covers the proc
 pass before a PR opens; [`CLAUDE.md`](CLAUDE.md) is the single source of truth for how the code
 itself should look, for humans and agents alike.
 
-The workspace is four crates — `wt-core` (git), `pty-core` (processes), `lsp-core` (language servers)
-and `app` (the GPUI application, and the only crate allowed to depend on GPUI). The rules behind that
+The workspace is four crates — `jerry-git` (git), `jerry-pty` (processes), `jerry-lsp` (language servers)
+and `jerry-app` (the GPUI application, and the only crate allowed to depend on GPUI). The rules behind that
 split, and the reasoning for each, are in [`docs/architecture/`](docs/architecture/overview.md); what
 each UI surface is for and the rules a change must not break are in
 [`docs/design/`](docs/design/README.md); how a change moves from issue to merged PR is in

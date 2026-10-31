@@ -12,7 +12,7 @@ issues here get filed and never labeled, which makes `gh issue list` progressive
 ## Label taxonomy
 
 - **Type** (GitHub defaults): `bug`, `enhancement`, `documentation`, `question`.
-- **Area**: `area:core` (wt-core/pty-core/lsp-core, or the target architecture in
+- **Area**: `area:core` (jerry-git/jerry-pty/jerry-lsp, or the target architecture in
   `docs/architecture/`), `area:editor` (code surface, LSP UI), `area:terminal`, `area:ui` (rail,
   sidebar, settings, theme), `area:ci` (workflow, tooling).
 - **Status** (project-specific, already in use): `backlog` (deliberately deferred, revisit later),

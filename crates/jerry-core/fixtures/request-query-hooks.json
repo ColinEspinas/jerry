@@ -1,0 +1,9 @@
+{
+  "method": "query/hooks",
+  "params": {
+    "cwd": "/repo",
+    "params": {
+      "agent": "agent-1"
+    }
+  }
+}

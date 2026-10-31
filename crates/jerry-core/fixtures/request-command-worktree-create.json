@@ -1,0 +1,13 @@
+{
+  "method": "command/worktree-create",
+  "params": {
+    "cwd": "/repo",
+    "params": {
+      "branch": "feature/login",
+      "from": null,
+      "agent": "claude",
+      "prompt": "fix the login bug",
+      "orchestrator": false
+    }
+  }
+}

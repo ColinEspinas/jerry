@@ -1,0 +1,7 @@
+{
+  "method": "query/rebase-status",
+  "params": {
+    "cwd": "/repo",
+    "params": {}
+  }
+}

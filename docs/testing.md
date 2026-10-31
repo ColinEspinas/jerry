@@ -20,7 +20,7 @@ Every test belongs to exactly one tier, and the tier decides what it may do and 
 
 Tiers 1 and 2 are the PR gate. Tier 3 never is.
 
-Today that is 2,186 plain `#[test]` and 1,006 `#[gpui::test]` in `crates/app` alone — the split
+Today that is 2,186 plain `#[test]` and 1,006 `#[gpui::test]` in `crates/jerry-app` alone — the split
 already roughly exists, it has just never been named or enforced.
 
 A `unit` test that shells out to `git` against a tempdir repository is still a `unit` test, and so
@@ -82,11 +82,11 @@ body:
 
 ## `crates/test-support`
 
-The shared fixtures, dev-dependency only. It is **`gpui`-free** so `wt-core`, `pty-core` and
-`lsp-core` can dev-depend on it without violating
+The shared fixtures, dev-dependency only. It is **`gpui`-free** so `jerry-git`, `jerry-pty` and
+`jerry-lsp` can dev-depend on it without violating
 [`decisions.md` §1](architecture/decisions.md) — including behind a Cargo feature, which would not
 help: workspace feature unification would pull `gpui` into their dev graph anyway. GPUI-flavoured
-helpers live in `crates/app/src/test_support.rs` instead.
+helpers live in `crates/jerry-app/src/test_support.rs` instead.
 
 Add it with `test-support = { path = "../test-support" }` under `[dev-dependencies]`, then
 `use test_support::{git, seed_repo};`.
@@ -139,7 +139,7 @@ connection slot in the server it is asking about, a check that contends for the 
 needs. At `wait_until`'s 10 ms such a check measures its own polling rate. Prefer, where it exists,
 a signal the subject already emits: perturbing nothing beats polling coarsely.
 
-### GPUI fixtures (`crates/app/src/test_support.rs`)
+### GPUI fixtures (`crates/jerry-app/src/test_support.rs`)
 
 - `open_test_app(cx, repo_path) -> (Entity<AdeApp>, &mut VisualTestContext)` — a real test window
   with in-memory settings, so a test never reads or writes the developer's `settings.toml`.
@@ -148,6 +148,18 @@ a signal the subject already emits: perturbing nothing beats polling coarsely.
 
 `crate::root::focus::palette_focus_tests::open_test_app` is a re-export of the first, kept so the
 ~500 call sites that still name it keep resolving while they are migrated (GitHub issue #425).
+
+Neither ever lets a `ui`-tier test launch a real agent CLI (GitHub issue #530): both stub every
+`AgentKind`'s binary via `Agents::override_binary` with a process that idles on its own stdin and
+exits 0 once it closes, so `ProcessKind::Agent(...)` spawns something real and observable (a live
+pid, a process that goes away when its pane does) without ever being `claude`/`codex`/
+`cursor-agent`. `TerminalSpec::program`/`args` still name the kind's real binary and real computed
+arguments (`--resume <id>`, a generated `--settings <path>`) - only the actual OS spawn is
+substituted, via `TerminalSpec::spawn_override` - so a test asserting on the spec via
+`TerminalPane::spec_for_test` still pins Jerry's own argument construction. The one test that
+genuinely needs the real thing (`hooks::integration_tests`'s `external`-tier
+`a_claude_agent_spawned_through_the_real_app_path_really_reports_its_hooks`) undoes the override
+for `AgentKind::Claude` with `Agents::clear_binary_override` before it spawns.
 
 ## Running tests
 
@@ -164,9 +176,9 @@ nothing asks a contributor to run the suite on Windows, and a Windows result is 
 While iterating, scope it to what you touched:
 
 ```sh
-cargo nextest run -p wt-core
+cargo nextest run -p jerry-git
 cargo nextest run -p test-support
-cargo nextest run -p app --lib -E 'test(/my_concern_tests/)'
+cargo nextest run -p jerry-app --lib -E 'test(/my_concern_tests/)'
 ```
 
 ### The `external` tier

@@ -10,7 +10,18 @@ description = "Shared, gpui-free test fixtures for this workspace: real git repo
 workspace = true
 
 [dependencies]
-# The one dependency this crate is allowed: `seed_repo`/`seed_bare_remote` hand back a live
-# temp directory, so `TempDir` is part of the public signature rather than an implementation
-# detail. Same major version every consuming crate already dev-depends on.
+# `seed_repo`/`seed_bare_remote` hand back a live temp directory, so `TempDir` is part of the
+# public signature rather than an implementation detail. Same major version every consuming
+# crate already dev-depends on.
 tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+# `job_object`'s kill-on-close job for a test fixture that spawns a real child (issue #534) -
+# the exact same feature set `jerry-host`'s own dev-dependency on this crate already needs for
+# `process_is_alive`, so this adds no new version surface.
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
